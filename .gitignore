@@ -1,0 +1,31 @@
+## 
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# ignore ALL .out files
+*.out
+*.csv
+*.png
+*.yaml
+*.log
+*.txt
+*.pyc
+*.cpython-310
+*.sh
+
+# ignore ALL files in ANY directory named 
+figures/
+wandb/
+logs/
+lightning_logs/
+artifacts/
+results/
+src/confi_files/
+InterScale_hyperparameter_sweep/
+src/graph_transformer_long_range_niches/tmp/
+src/graph_transformer_long_range_niches/logs/
+src/graph_transformer_long_range_niches/model/__pycache__/
+src/graph_transformer_long_range_niches/tl/__pycache__/ 
+src/graph_transformer_long_range_niches/modules/__pycache__/
+CLAUDE.md
