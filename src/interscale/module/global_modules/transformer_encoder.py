@@ -98,17 +98,20 @@ class TransformerNodeEncoderHook(GlobalModule):
         )
 
         if self.long_range_attention:
-            # INSERT_YOUR_CODE
-            raise NotImplementedError("Long-range attention mask feature is currently not implemented.")
             attention_mask = create_transformer_attention_mask_from_edges(
-                batched_data.edge_index, len(batched_data.obs_names), batched_data.batch, index_nodes, self.n_heads
+                edge_index=batched_data.edge_index,
+                batch=batched_data.batch,
+                index_nodes=index_nodes,
+                num_heads=self.n_heads,
             )
-            # Convert attention_mask to same dtype as src_padding_mask
-            attention_mask = attention_mask.to(dtype=src_padding_mask.dtype)
+
         else:
-            # attention_mask = None
-            # default: mask diagonal with -inf; no attention to self
-            attention_mask = attn_mask_diagonal(batched_data.batch, index_nodes, self.n_heads, emb.device)
+            attention_mask = attn_mask_diagonal(
+                batched_data.batch,
+                index_nodes,
+                self.n_heads,
+                emb.device,
+            )
 
         attention_mask = attention_mask.to(dtype=src_padding_mask.dtype)
 
