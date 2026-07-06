@@ -39,81 +39,114 @@ def apply_mask(batched_data: Batch):
 
 
 def create_transformer_attention_mask_from_edges(
-    edge_index: torch.Tensor, num_nodes: int, batch: torch.Tensor, index_nodes: list, num_heads: int
+    edge_index: torch.Tensor, batch: torch.Tensor, index_nodes: list, num_heads: int,
 ) -> torch.Tensor:
     """
-    Creates an attention mask that is inverse to the edge indices. Unmasked = 0 and masked = -inf
-    If two nodes are connected in the adjacency matrix (edge_index = 1) then we have no attention (0) and vice versa.
+    Long-range attention mask.
 
-    Args:
-        edge_index (torch.Tensor): Edge index tensor of shape [2, num_edges]
-        num_nodes (int): Number of nodes in the graph
-        batch (torch.Tensor): Batch tensor of shape [num_nodes]
-        index_nodes (list): List of indices of nodes to keep [B, S] (range: 0, num_nodes)
-        num_heads (int): Number of attention heads
-    Returns:
-        torch.Tensor: Attention mask of shape [num_batch*num_heads, max_seq_len, max_seq_len] with 1s for no attention (True -> mask attention) and 0s for attention (False -> no mask)
+    Attention is allowed between all node pairs except:
+
+    - local graph neighbors
+    - self-attention
+
+    CLS token attends to all nodes and all nodes attend to CLS.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape:
+            [num_heads * batch_size,
+             max_seq_len + 1,
+             max_seq_len + 1]
+
+        Values:
+            0      -> unmasked
+            -inf   -> masked
     """
-    INVALID_MASK_VALUE = -float("inf")
+    INVALID_MASK_VALUE = float("-inf")
 
-    num_batch = int(batch[-1].item() + 1)
+    batch_size = int(batch[-1].item() + 1)
     max_seq_len = max(len(nodes) for nodes in index_nodes)
 
-    # Initialize with -inf (no attention allowed)
-    attention_mask = torch.full(
-        (num_batch * num_heads, max_seq_len + 1, max_seq_len + 1), INVALID_MASK_VALUE, device=edge_index.device
+    attention_mask = torch.zeros(
+        (batch_size * num_heads,
+         max_seq_len + 1,
+         max_seq_len + 1),
+        device=edge_index.device,
+        dtype=torch.float32,
     )
-    # Set the diagonal to -inf (no self-attention)
-    diag_idx = torch.arange(max_seq_len, device=edge_index.device)
-    attention_mask[:, diag_idx, diag_idx] = INVALID_MASK_VALUE
 
-    # Create full adjacency matrix + 1 for cls token (end of sequence)
-    adj_matrix = torch.zeros((num_nodes, num_nodes), device=edge_index.device)  # TODO: check if zero or ones
-    adj_matrix[edge_index[0], edge_index[1]] = INVALID_MASK_VALUE
+    edge_set = {
+        (int(src), int(dst))
+        for src, dst in edge_index.t().tolist()
+    }
 
-    # For each batch, extract the submatrix for kept nodes
-    for b in range(num_batch):
-        nodes = index_nodes[b]
+    for b, nodes in enumerate(index_nodes):
+
         seq_len = len(nodes)
-        assert seq_len + 1 <= max_seq_len + 1, f"Mismatch: seq_len+1: {seq_len + 1}, max_seq_len+1: {max_seq_len + 1}"
-        # Extract submatrix for the kept nodes
-        batch_mask = adj_matrix[nodes][:, nodes]  # Get submatrix for kept nodes
-        # INSERT_YOUR_CODE
-        assert torch.any(batch_mask != 0), "batch_mask contains only zero entries"
-        # Add row and column of ones for CLS token - full attention
-        batch_mask = torch.cat(
-            [batch_mask, torch.zeros(batch_mask.size(0), 1, device=batch_mask.device)], dim=1
-        )  # Add column
-        batch_mask = torch.cat(
-            [batch_mask, torch.zeros(1, batch_mask.size(1), device=batch_mask.device)], dim=0
-        )  # Add row
-        assert batch_mask.shape == (seq_len + 1, seq_len + 1), (
-            f"Mismatch: batch_mask.shape: {batch_mask.shape}, (seq_len+1, seq_len+1): {(seq_len + 1, seq_len + 1)}"
-        )
-        assert attention_mask.shape[-2:] == (max_seq_len + 1, max_seq_len + 1), (
-            f"Mismatch: attention_mask.shape[-2:]: {attention_mask.shape[-2:]}, (seq_len+1, seq_len+1): {(seq_len + 1, seq_len + 1)}"
-        )
-        # append inverse adjacency matrix to the end of the attention mask
-        attention_mask[b * num_heads : b * num_heads + num_heads, -(seq_len + 1) :, -(seq_len + 1) :] = batch_mask
-        # add zeros for nodes that are not in the batch
-        attention_mask[b * num_heads : b * num_heads + num_heads, :seq_len, :seq_len] = float("0")
 
-    assert not torch.any(torch.isnan(attention_mask)), "attention_mask contains NaN values"
-    print("attention_mask", attention_mask.shape, attention_mask)
+        batch_mask = torch.zeros(
+            (seq_len + 1, seq_len + 1),
+            device=edge_index.device,
+            dtype=torch.float32,
+        )
+
+        node_to_local = {
+            int(node): i
+            for i, node in enumerate(nodes)
+        }
+
+        # mask local graph edges
+        for src, dst in edge_set:
+
+            if src not in node_to_local:
+                continue
+
+            if dst not in node_to_local:
+                continue
+
+            i = node_to_local[src]
+            j = node_to_local[dst]
+
+            batch_mask[i, j] = INVALID_MASK_VALUE
+            batch_mask[j, i] = INVALID_MASK_VALUE
+
+        # mask self attention
+        diag_idx = torch.arange(seq_len, device=edge_index.device)
+
+        batch_mask[diag_idx, diag_idx] = INVALID_MASK_VALUE
+
+        # CLS token is last index and remains unmasked
+
+        attention_mask[
+            b * num_heads : (b + 1) * num_heads,
+            : seq_len + 1,
+            : seq_len + 1,
+        ] = batch_mask
+
     return attention_mask
 
 
-def attn_mask_diagonal(batch: torch.Tensor, index_nodes: list, num_heads: int, device: torch.device) -> torch.Tensor:
+def attn_mask_diagonal(
+    batch: torch.Tensor, index_nodes: list, num_heads: int, device: torch.device,
+) -> torch.Tensor:
     """
-    Sets the diagonal of the attention mask to -inf.
+    Mask self-attention between graph nodes.
+    CLS remains unmasked.
     """
-    max_seq_len = max(len(nodes) for nodes in index_nodes)
     batch_size = int(batch[-1].item() + 1)
+    max_seq_len = max(len(nodes) for nodes in index_nodes)
+
     attention_mask = torch.zeros(
-        (num_heads * batch_size, max_seq_len + 1, max_seq_len + 1), device=device, dtype=torch.float32
+        (num_heads * batch_size,
+         max_seq_len + 1,
+         max_seq_len + 1),
+        device=device,
+        dtype=torch.float32,
     )
-    # Set the diagonal to -inf (no self-attention)
+
     diag_idx = torch.arange(max_seq_len, device=device)
+
     attention_mask[:, diag_idx, diag_idx] = float("-inf")
-    # Convert attention_mask to same dtype as src_padding_mask
+
     return attention_mask
