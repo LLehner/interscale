@@ -98,6 +98,14 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
             dtype=np.float32,
         )
 
+        values = attention_matrix_df.to_numpy()
+
+        print(
+            f"NaN={np.isnan(values).any()}, "
+            f"+Inf={np.isposinf(values).any()}, "
+            f"-Inf={np.isneginf(values).any()}"
+        )
+
         if self._cfg.model.decoder.dual_decoder:
             y_pred_local_df = pd.DataFrame(index=obs_names_str, columns=range(self.n_output), dtype=np.float32)
         else:
