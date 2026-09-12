@@ -5,7 +5,7 @@ find is written into ``adata`` as ground truth, so a change to the encoder can b
 than eyeballed.
 
 Layout (defaults): two conditions x 6 donors x 2 slides = 24 slides of 1500 cells on a
-1000 x 1000 unit square. One slide is one PyG graph and one transformer sequence -- no sliding
+1000 x 1000 unit square, measured over 42 genes. One slide is one PyG graph and one transformer sequence -- no sliding
 windows -- so ``cfg.model.global_component.parameters.max_seq_len`` must be >= the cells per
 slide, otherwise :func:`interscale.tl.padding.pad_batch` subsamples tokens at random and the
 token-to-cell mapping the attention regression depends on is lost.
@@ -32,6 +32,7 @@ import pandas as pd
 from anndata import AnnData
 from scipy.sparse import csr_matrix
 from scipy.spatial.distance import cdist
+from scipy.special import ndtr
 
 CONDITIONS = ("healthy", "diseased")
 
@@ -51,15 +52,18 @@ NICHE_COMPOSITION = {
 }
 
 
-def _gene_table(n_noise_genes: int, mid_range: float, long_range: float, effect_scale: float) -> pd.DataFrame:
+def _gene_table(
+    n_noise_genes: int, lr_range: float, mid_range: float, long_range: float, effect_scale: float
+) -> pd.DataFrame:
     """Build the gene annotation, i.e. which gene belongs to which program.
 
     Parameters
     ----------
     n_noise_genes
-        Number of structure-free genes. The remaining 16 genes are the annotated programs.
-    mid_range, long_range
-        Kernel widths of the mid- and long-range interaction programs, in coordinate units.
+        Number of structure-free genes. The remaining 18 genes are the annotated programs.
+    lr_range, mid_range, long_range
+        Kernel widths of the contact-range ligand/receptor pair and of the mid- and long-range
+        interaction programs, in coordinate units.
     effect_scale
         Global multiplier on every log-fold effect; the knob for "how hard is this dataset".
 
@@ -69,7 +73,13 @@ def _gene_table(n_noise_genes: int, mid_range: float, long_range: float, effect_
         Indexed by gene name, with ``program``, ``effect_size``, ``true_length_scale``,
         ``target_cell_type`` and ``is_spatial``.
     """
-    rows = []
+    # The ligand/receptor pair leads the panel: it is the shortest-range and the most direct
+    # program, a coupling between the expression of two touching cells rather than between two
+    # cell types, so no cell-type covariate can account for it.
+    rows = [
+        {"gene": "lig_LR1", "program": "interaction_lr", "effect_size": 1.2, "true_length_scale": lr_range},
+        {"gene": "rec_LR1", "program": "interaction_lr", "effect_size": 1.2, "true_length_scale": lr_range},
+    ]
     for i in range(n_noise_genes):
         rows.append({"gene": f"noise_{i:02d}", "program": "noise", "effect_size": 0.0})
 
@@ -119,7 +129,7 @@ def _gene_table(n_noise_genes: int, mid_range: float, long_range: float, effect_
     genes["target_cell_type"] = genes.get("target_cell_type", pd.Series(dtype=object)).fillna("")
     genes["true_length_scale"] = genes.get("true_length_scale", pd.Series(dtype=float)).astype(float)
     genes["is_spatial"] = genes["program"].isin(
-        ["gradient", "interaction_short", "interaction_mid", "interaction_long"]
+        ["gradient", "interaction_lr", "interaction_short", "interaction_mid", "interaction_long"]
     )
     return genes
 
@@ -205,6 +215,12 @@ def _log_effects(
                 eff[:, j] = beta * np.exp(-obs["dist_to_center"] / row["true_length_scale"])
             elif gene == "grad_edge_sharp":
                 eff[:, j] = beta * (1.0 - np.exp(-obs["dist_to_center"] / row["true_length_scale"]))
+        elif program == "interaction_lr":
+            # The ligand follows the cell's own tone, the receptor follows the tone of the cells
+            # touching it. A cell with a high ligand therefore sits next to cells with a high
+            # receptor, and a cell with a high receptor sits next to cells with a high ligand --
+            # the coupling holds in both directions and never mentions cell type.
+            eff[:, j] = beta * (obs["lr_tone"] if gene == "lig_LR1" else obs["lr_neighbor_tone"])
         elif program == "interaction_short":
             target = obs["cell_type"] == row["target_cell_type"]
             eff[:, j] = beta * np.log1p(obs["n_senderA_short"]) * target
@@ -229,6 +245,7 @@ def _simulate_slide(
     slide: str,
     n_cells: int,
     slide_size: float,
+    lr_range: float,
     short_range: float,
     mid_range: float,
     long_range: float,
@@ -247,6 +264,14 @@ def _simulate_slide(
 
     # Short range: a plain count of senderA inside `short_range`, i.e. inside the 2-hop reach of
     # the local GCN. Mid range: a Gaussian kernel wider than that reach but well inside a slide.
+    # Contact-range ligand/receptor coupling. `lr_tone` is an independent draw per cell -- it is
+    # not a smooth spatial field, so the pair is detectable only from the expression of individual
+    # touching cells, never from the neighbourhood a cell sits in.
+    lr_tone = rng.normal(0.0, 1.0, size=n_cells)
+    contact = (dist <= lr_range) & ~np.eye(n_cells, dtype=bool)
+    n_contacts = contact.sum(1)
+    lr_neighbor_tone = (contact @ lr_tone) / np.maximum(n_contacts, 1)
+
     n_senderA_short = ((dist <= short_range) & is_sender_a[None, :]).sum(1) - is_sender_a
     kern_senderB_mid = (np.exp(-(dist**2) / (2 * mid_range**2)) * is_sender_b[None, :]).sum(1) - is_sender_b
 
@@ -259,6 +284,8 @@ def _simulate_slide(
     obs_arrays = {
         "cell_type": cell_type,
         "niche": niche,
+        "lr_tone": lr_tone,
+        "lr_neighbor_tone": lr_neighbor_tone,
         "dist_to_center": dist_to_center,
         "dist_to_hub": dist_to_hub,
         "hub_response": hub_response,
@@ -287,6 +314,9 @@ def _simulate_slide(
             "slide": slide,
             "cell_type": cell_type,
             "niche": niche,
+            "lr_tone": lr_tone,
+            "lr_neighbor_tone": lr_neighbor_tone,
+            "n_contacts": n_contacts.astype(float),
             "dist_to_center": dist_to_center,
             "dist_to_hub": dist_to_hub,
             "hub_response": hub_response,
@@ -300,7 +330,9 @@ def _simulate_slide(
         dist=dist,
         cell_type=cell_type,
         hub_response=hub_response,
+        lr_tone=lr_tone,
         condition=condition,
+        lr_range=lr_range,
         short_range=short_range,
         mid_range=mid_range,
         long_range=long_range,
@@ -315,7 +347,9 @@ def _ground_truth_edges(
     dist: np.ndarray,
     cell_type: np.ndarray,
     hub_response: np.ndarray,
+    lr_tone: np.ndarray,
     condition: str,
+    lr_range: float,
     short_range: float,
     mid_range: float,
     long_range: float,
@@ -329,6 +363,16 @@ def _ground_truth_edges(
     valid even though ``prepare_geome_dataset`` renames ``obs_names``.
     """
     frames = []
+
+    # Contact range: the ligand level of the sending cell is what raises the receptor in the cell
+    # it touches, so the edge weight is that cell's ligand tone mapped onto [0, 1]. Every cell can
+    # be a sender here -- this program is not restricted to a cell type.
+    ligand_strength = ndtr(lr_tone)
+    si, ri = np.nonzero((dist <= lr_range) & (ligand_strength[:, None] >= cutoff))
+    if len(si):
+        frames.append(
+            pd.DataFrame({"sender": si, "receiver": ri, "weight": ligand_strength[si], "range_class": "contact"})
+        )
 
     sa = np.flatnonzero(cell_type == "senderA")
     ra = np.flatnonzero(cell_type == "receiverA")
@@ -377,6 +421,7 @@ def make_synthetic(
     n_cells_per_slide: int = 1500,
     slide_size: float = 1000.0,
     n_noise_genes: int = 24,
+    lr_range: float = 20.0,
     short_range: float = 30.0,
     mid_range: float = 150.0,
     long_range: float = 400.0,
@@ -397,10 +442,14 @@ def make_synthetic(
     slide_size
         Side length of the square slide, in the same units as the interaction ranges.
     n_noise_genes
-        Structure-free genes; the 16 annotated program genes are added on top.
+        Structure-free genes; the 18 annotated program genes are added on top.
+    lr_range
+        Contact radius of the ligand/receptor pair -- the distance at which two cells count as
+        touching. Keep it below ``short_range``; at the default density it gives each cell about
+        two contacts.
     short_range, mid_range, long_range
-        The three interaction length scales. ``short_range`` should sit inside the local
-        component's reach (``spatial_neigbors_kwargs.radius`` x number of GCN layers) and
+        The three cell-type-driven interaction length scales. ``short_range`` should sit inside the
+        local component's reach (``spatial_neigbors_kwargs.radius`` x number of GCN layers) and
         ``mid_range`` outside it, so that the two scales are attributable to different components.
     n_hub_cells
         Size of the compact hub cluster that emits the tissue-scale program.
@@ -424,7 +473,7 @@ def make_synthetic(
 
     rng = np.random.default_rng(seed)
 
-    genes = _gene_table(n_noise_genes, mid_range, long_range, effect_scale)
+    genes = _gene_table(n_noise_genes, lr_range, mid_range, long_range, effect_scale)
     n_genes = len(genes)
     # Baseline abundance and overdispersion are gene properties, shared across all slides --
     # otherwise a "gene" would not mean the same thing in two slides.
@@ -457,6 +506,7 @@ def make_synthetic(
                     slide=slide,
                     n_cells=n_cells_per_slide,
                     slide_size=slide_size,
+                    lr_range=lr_range,
                     short_range=short_range,
                     mid_range=mid_range,
                     long_range=long_range,
@@ -509,6 +559,7 @@ def make_synthetic(
             "n_slides_per_donor": n_slides_per_donor,
             "n_cells_per_slide": n_cells_per_slide,
             "slide_size": slide_size,
+            "lr_range": lr_range,
             "short_range": short_range,
             "mid_range": mid_range,
             "long_range": long_range,
@@ -519,6 +570,8 @@ def make_synthetic(
         },
         "interactions": pd.DataFrame(
             [
+                {"sender": "any", "receiver": "any touching cell", "gene": "lig_LR1/rec_LR1",
+                 "range_class": "contact"},
                 {"sender": "senderA", "receiver": "receiverA", "gene": "int_short", "range_class": "short"},
                 {"sender": "senderB", "receiver": "receiverB", "gene": "int_mid", "range_class": "mid"},
                 {"sender": "hub", "receiver": "all", "gene": "int_long", "range_class": "long"},
@@ -558,6 +611,7 @@ def main() -> None:
     parser.add_argument("--n-donors-per-condition", type=int, default=6)
     parser.add_argument("--n-slides-per-donor", type=int, default=2)
     parser.add_argument("--n-cells-per-slide", type=int, default=1500)
+    parser.add_argument("--lr-range", type=float, default=20.0)
     parser.add_argument("--effect-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -566,6 +620,7 @@ def main() -> None:
         n_donors_per_condition=args.n_donors_per_condition,
         n_slides_per_donor=args.n_slides_per_donor,
         n_cells_per_slide=args.n_cells_per_slide,
+        lr_range=args.lr_range,
         effect_scale=args.effect_scale,
         seed=args.seed,
     )

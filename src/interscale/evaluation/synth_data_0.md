@@ -62,12 +62,26 @@ Cell positions are not perfectly uniform. Each slide gets its own smooth density
 feeds through into neighbour counts and QC statistics — another nuisance the regression has to
 account for.
 
-## The 40 genes
+## The 42 genes
 
 All counts come from one zero-inflated negative binomial model. Every effect below is an additive
 term in the log of the ZINB mean, so effect sizes are comparable across programs, and
 `--effect-scale` scales all of them at once to find where an architecture stops detecting things.
 
+- **1 ligand/receptor pair** (`lig_LR1`, `rec_LR1`) — the first two genes in the panel, and the
+  most direct form of interaction in the dataset. Each cell gets an independent "tone"; the
+  ligand follows the cell's own tone and the receptor follows the average tone of the cells it
+  **touches** (within 20 units, about two cells at this density). The result is the reciprocal
+  pattern you would expect from real juxtacrine signalling: a cell with a high ligand sits next to
+  cells with a high receptor, *and* a cell with a high receptor sits next to cells with a high
+  ligand.
+
+  This pair is different in kind from the three programs below, and that is the point of having
+  it. The others are driven by cell-type composition — how many `senderA` cells are nearby — so a
+  cell-type-pair covariate can account for them. This one is a coupling between the *measured
+  expression* of two individual neighbouring cells, is not restricted to any cell type, and the
+  per-cell tone is not a smooth spatial field. Neither a distance kernel nor cell-type identity
+  can explain it, so it should show up in the attention residual or nowhere at all.
 - **24 noise genes** (`noise_00` … `noise_23`) — no structure at all. They are the majority of the
   panel on purpose: a method that highlights them is reporting noise.
 - **6 cell-type markers** (`mark_senderA` …) — one per cell type. These make cell-type
@@ -76,7 +90,8 @@ term in the log of the ZINB mean, so effect sizes are comparable across programs
   `grad_up_broad` and `grad_down_broad` change gradually across the whole slide;
   `grad_center_sharp` and `grad_edge_sharp` turn over on a much shorter length scale (150 and 300
   units). Together they give a spread of spatial length scales to recover.
-- **3 interaction genes** — the ones that matter:
+- **3 further interaction genes**, all driven by cell-type composition rather than by a
+  partner's expression:
   - `int_short` — expressed by `receiverA` cells, proportional to how many `senderA` cells sit
     **within 30 units**. Build the neighbour graph with `spatial_neigbors_kwargs.radius: 30` and
     this sits inside the local GCN's two-hop reach, so the local component should be able to
@@ -110,7 +125,7 @@ competition rather than a formality.
 | `layers['log1p_norm']` | median-normalised, log1p — the layer to train on |
 | `obsm['spatial']` | coordinates |
 | `obs` | `condition`, `donor`, `slide`, `split`, `niche`, `cell_type` |
-| `obs` (exposures) | `dist_to_center`, `dist_to_hub`, `hub_response`, `n_senderA_short`, `kern_senderB_mid` — the exact quantities that drove each interaction gene |
+| `obs` (exposures) | `lr_tone`, `lr_neighbor_tone`, `n_contacts`, `dist_to_center`, `dist_to_hub`, `hub_response`, `n_senderA_short`, `kern_senderB_mid` — the exact quantities that drove each interaction gene |
 | `obs` (QC) | `total_counts`, `n_genes_by_counts`, `lib_factor` |
 | `var` | `program`, `effect_size`, `true_length_scale`, `target_cell_type`, `is_spatial` |
 | `uns['synthetic']['interaction_edges']` | every pair of cells that actually influenced each other, with weight and range class |
@@ -119,7 +134,9 @@ competition rather than a formality.
 
 The edge list is the important one. Cells are referred to by **position** in the object, which
 survives the `obs_names` renaming that `prepare_geome_dataset` does. At the default size it holds
-roughly 5,000 short-range, 142,000 mid-range and 85,000 long-range pairs.
+roughly 42,000 contact-range, 5,000 short-range, 126,000 mid-range and 77,000 long-range pairs. A
+contact edge is recorded when two cells touch and the sending cell's ligand is above the 40th
+percentile — every cell can be a sender there, since the pair is not restricted by cell type.
 
 ## Roughly what to expect
 
@@ -127,8 +144,14 @@ At default settings, on the training layer: cell-type markers separate their typ
 gradient genes correlate with distance-from-centre at about ρ ≈ 0.4, `int_short` correlates with
 the local `senderA` count at ρ ≈ 0.37 in `receiverA` cells and at ≈ 0 everywhere else, `int_mid` at
 ρ ≈ 0.51 in `receiverB` cells, and `int_long` at ρ ≈ 0.27 with the hub response in diseased slides
-and ≈ 0 in healthy ones. Noise genes correlate with nothing. Median library size is about 235
+and ≈ 0 in healthy ones. Noise genes correlate with nothing. Median library size is about 265
 counts per cell.
+
+For the ligand/receptor pair: a cell's `lig_LR1` correlates with the mean `rec_LR1` of the cells it
+touches at ρ ≈ 0.31, and its `rec_LR1` with the mean `lig_LR1` of those cells at ρ ≈ 0.36 — the
+coupling is symmetric, as intended. Widen the neighbourhood to 200 units and it collapses to
+ρ ≈ 0.06, which is the check that it really is a contact-range effect and not another smooth
+gradient. The same measurement with a noise gene gives ρ ≈ 0.01.
 
 The long-range program is the weakest of the three on purpose — it is the one a better architecture
 should be able to win on.
@@ -143,12 +166,16 @@ global embedding and the CLS token rather than the local one.
 `downstream_regression.py` asks how much of the attention is left once distance, cell-type pair
 identity, niche, counts and batch have been accounted for, and then ranks that residual against
 `interaction_edges`. A residual AUC near 0.5 means the attention was a distance kernel and nothing
-more. The three range classes are scored separately, which is the number to watch when comparing
-transformer variants: short-range should be easy, mid-range is the honest test, long-range is hard.
+more. The four range classes are scored separately, and that breakdown is the number to watch when
+comparing transformer variants: short-range should be easy, mid-range is the honest test,
+long-range is hard, and contact-range is the one no covariate in the regression can fake, since
+cell-type identity carries no information about it.
 
 ## Knobs worth turning
 
 - `--effect-scale` — shrink every effect to find an architecture's detection floor.
+- `--lr-range` — the contact radius. Raising it gives each cell more partners and a stronger
+  ligand/receptor correlation, at the cost of the pair no longer being a contact-range effect.
 - `--n-cells-per-slide` — trades detection (denser sampling of each interaction kernel) against
   sequence length.
 - `--n-donors-per-condition` — more donors make the held-out condition question harder and the
