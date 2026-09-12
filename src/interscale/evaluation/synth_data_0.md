@@ -120,8 +120,8 @@ competition rather than a formality.
 
 | where | what |
 |---|---|
-| `X`, `layers['counts']` | raw ZINB counts |
-| `layers['log1p_norm']` | median-normalised, log1p — the layer to train on |
+| `X`, `layers['log1p_norm']` | median-normalised, log1p — the layer to train on |
+| `layers['counts']` | raw ZINB counts |
 | `obsm['spatial']` | coordinates |
 | `obs` | `condition`, `donor`, `slide`, `split`, `niche`, `cell_type` |
 | `obs` (exposures) | `lr_tone`, `lr_neighbor_tone`, `n_contacts`, `dist_to_center`, `dist_to_hub`, `hub_response`, `n_senderA_short`, `kern_senderB_mid` — the exact quantities that drove each interaction gene |

@@ -464,8 +464,8 @@ def make_synthetic(
     Returns
     -------
     anndata.AnnData
-        Counts in ``X`` and ``layers['counts']``, ``layers['log1p_norm']`` for training, ground
-        truth in ``var``, ``obs`` and ``uns['synthetic']``.
+        Normalised expression in ``X`` and ``layers['log1p_norm']``, raw counts in
+        ``layers['counts']``, ground truth in ``var``, ``obs`` and ``uns['synthetic']``.
     """
     if n_donors_per_condition < n_val_donors + n_test_donors + 1:
         raise ValueError("need at least one train donor per condition")
@@ -533,16 +533,19 @@ def make_synthetic(
     var = genes.drop(columns=["base_mu", "theta", "pi"]).copy()
     var.index.name = None
 
-    adata = AnnData(X=csr_matrix(X), obs=obs, var=var)
-    adata.obsm["spatial"] = spatial.astype(np.float64)
-    adata.layers["counts"] = csr_matrix(X)
-
-    # log1p of median-normalised counts -- the layer the training configs point at. Must stay
-    # non-negative: tl.masking fills masked entries with MASK_VALUE = -1.
+    # log1p of median-normalised counts. Must stay non-negative: tl.masking fills masked entries
+    # with MASK_VALUE = -1, which has to sit outside the layer's range to be distinguishable.
     totals = np.asarray(X.sum(1))
     totals[totals == 0] = 1.0
-    norm = X / totals[:, None] * np.median(totals)
-    adata.layers["log1p_norm"] = csr_matrix(np.log1p(norm).astype(np.float32))
+    norm = np.log1p(X / totals[:, None] * np.median(totals)).astype(np.float32)
+
+    # scanpy convention: .X holds the normalised values, raw counts live in layers["counts"].
+    # log1p_norm is also kept under its own name, because the training configs address it by
+    # name through cfg.dataset.layer_key rather than reading .X.
+    adata = AnnData(X=csr_matrix(norm), obs=obs, var=var)
+    adata.obsm["spatial"] = spatial.astype(np.float64)
+    adata.layers["counts"] = csr_matrix(X)
+    adata.layers["log1p_norm"] = csr_matrix(norm)
 
     edges = pd.concat(edge_frames, ignore_index=True)
     edges["sender"] = edges["sender"].astype(np.int32)
