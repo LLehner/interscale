@@ -73,13 +73,7 @@ def _gene_table(
         Indexed by gene name, with ``program``, ``effect_size``, ``true_length_scale``,
         ``target_cell_type`` and ``is_spatial``.
     """
-    # The ligand/receptor pair leads the panel: it is the shortest-range and the most direct
-    # program, a coupling between the expression of two touching cells rather than between two
-    # cell types, so no cell-type covariate can account for it.
-    rows = [
-        {"gene": "lig_LR1", "program": "interaction_lr", "effect_size": 1.2, "true_length_scale": lr_range},
-        {"gene": "rec_LR1", "program": "interaction_lr", "effect_size": 1.2, "true_length_scale": lr_range},
-    ]
+    rows = []
     for i in range(n_noise_genes):
         rows.append({"gene": f"noise_{i:02d}", "program": "noise", "effect_size": 0.0})
 
@@ -95,7 +89,12 @@ def _gene_table(
         {"gene": "grad_edge_sharp", "program": "gradient", "effect_size": 1.5, "true_length_scale": 300.0},
     ]
 
+    # The interaction genes, shortest range first. The ligand/receptor pair leads them: it is the
+    # most direct of the four, a coupling between the expression of two touching cells rather than
+    # between two cell types, so no cell-type covariate can account for it.
     rows += [
+        {"gene": "lig_LR1", "program": "interaction_lr", "effect_size": 1.2, "true_length_scale": lr_range},
+        {"gene": "rec_LR1", "program": "interaction_lr", "effect_size": 1.2, "true_length_scale": lr_range},
         {
             "gene": "int_short",
             "program": "interaction_short",
