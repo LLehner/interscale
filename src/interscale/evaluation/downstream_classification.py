@@ -331,7 +331,11 @@ def classify(
 
     y_all = adata.obs[target].astype(str)
     groups_all = adata.obs[group_key].astype(str).to_numpy() if group_key in adata.obs else np.arange(adata.n_obs)
-    split_all = adata.obs[split_key].astype(str).to_numpy() if split_key in adata.obs else np.array(["train"] * adata.n_obs)
+    split_all = (
+        adata.obs[split_key].astype(str).to_numpy()
+        if split_key in adata.obs
+        else np.array(["train"] * adata.n_obs)
+    )
     unit_all = adata.obs[sample_key].astype(str).to_numpy() if sample_key in adata.obs else np.arange(adata.n_obs)
 
     use_cv = cv_folds is not None or level == "graph"
