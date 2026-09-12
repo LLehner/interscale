@@ -116,12 +116,27 @@ batch effect the attention regression is asked to remove. Combined with the dens
 the niche/cell-type entanglement, there is enough structure that "explains attention" is a real
 competition rather than a formality.
 
+## Preprocessing, and what is deliberately not baked in
+
+The object arrives ready to train on: normalisation is done (scanpy's `normalize_total` with no
+target sum, then `log1p` — the same call the legnini preprocessing uses for its `log1p_norm`
+layer) and all-zero cells are dropped. Note the `.X` convention differs from `legnini23_pp.h5ad`,
+which keeps raw counts in `.X`; here `.X` carries the normalised values, the scanpy way.
+
+The **spatial neighbour graph is not stored**. `prepare_geome_dataset` builds it per run from
+`cfg.dataset.spatial_neigbors_kwargs`, so the radius is a property of the experiment rather than
+of the dataset — baking one in would let the stored graph and the config disagree silently. This
+already happens in the legnini setup, where the preprocessed object carries a radius-300 graph
+while the training config asks for 200; training uses 200 and the stored graph is ignored. Run
+`sq.gr.spatial_neighbors` yourself if you want one in `obsp` for squidpy analyses.
+
 ## What ships with the object
 
 | where | what |
 |---|---|
 | `X`, `layers['log1p_norm']` | median-normalised, log1p — the layer to train on |
 | `layers['counts']` | raw ZINB counts |
+| `layers['norm_ftsqrt']` | Freeman-Tukey sqrt(x) + sqrt(x+1), the variance-stabilising alternative |
 | `obsm['spatial']` | coordinates |
 | `obs` | `condition`, `donor`, `slide`, `split`, `niche`, `cell_type` |
 | `obs` (exposures) | `lr_tone`, `lr_neighbor_tone`, `n_contacts`, `dist_to_center`, `dist_to_hub`, `hub_response`, `n_senderA_short`, `kern_senderB_mid` — the exact quantities that drove each interaction gene |

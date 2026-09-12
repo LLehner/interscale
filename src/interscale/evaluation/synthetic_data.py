@@ -560,6 +560,12 @@ def make_synthetic(
     # cfg.dataset.layer_key rather than reading .X.
     adata.layers["log1p_norm"] = adata.X.copy()
 
+    # Freeman-Tukey sqrt(x) + sqrt(x + 1), the variance-stabilising alternative the legnini
+    # preprocessing also produces. Offered so `layer_key: norm_ftsqrt` is a runnable arm here
+    # too; like log1p_norm it is non-negative, which MASK_VALUE = -1 requires.
+    counts = adata.layers["counts"]
+    adata.layers["norm_ftsqrt"] = counts.sqrt() + (counts + csr_matrix(np.ones(counts.shape))).sqrt()
+
     edges = pd.concat(edge_frames, ignore_index=True)
     edges["sender"] = edges["sender"].astype(np.int32)
     edges["receiver"] = edges["receiver"].astype(np.int32)
