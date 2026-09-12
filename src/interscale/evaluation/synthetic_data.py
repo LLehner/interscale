@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import squidpy as sq
 from anndata import AnnData
 from scipy.sparse import csr_matrix
 from scipy.spatial.distance import cdist
@@ -426,6 +427,7 @@ def make_synthetic(
     mid_range: float = 150.0,
     long_range: float = 400.0,
     n_hub_cells: int = 15,
+    graph_radius: float | None = None,
     effect_scale: float = 1.0,
     edge_weight_cutoff: float = 0.4,
     n_val_donors: int = 1,
@@ -453,6 +455,10 @@ def make_synthetic(
         ``mid_range`` outside it, so that the two scales are attributable to different components.
     n_hub_cells
         Size of the compact hub cluster that emits the tissue-scale program.
+    graph_radius
+        Radius of the reference spatial neighbour graph written to ``obsp``, in coordinate units.
+        Defaults to ``short_range``. Training does not read it -- geome rebuilds the graph from
+        ``cfg.dataset.spatial_neigbors_kwargs`` every run -- so set the config to match.
     effect_scale
         Multiplier on all log-fold effects; lower it to find an architecture's detection floor.
     edge_weight_cutoff
@@ -466,8 +472,9 @@ def make_synthetic(
     -------
     anndata.AnnData
         Ready to train on with no further preprocessing: median-normalised log1p expression in
-        ``X`` and ``layers['log1p_norm']``, raw counts kept in ``layers['counts']``, no all-zero
-        cells, and the ground truth in ``var``, ``obs`` and ``uns['synthetic']``.
+        ``X`` and ``layers['log1p_norm']``, raw counts kept in ``layers['counts']``, a
+        Freeman-Tukey layer, a reference neighbour graph in ``obsp``, no all-zero cells, and the
+        ground truth in ``var``, ``obs`` and ``uns['synthetic']``.
     """
     if n_donors_per_condition < n_val_donors + n_test_donors + 1:
         raise ValueError("need at least one train donor per condition")
@@ -566,6 +573,17 @@ def make_synthetic(
     counts = adata.layers["counts"]
     adata.layers["norm_ftsqrt"] = counts.sqrt() + (counts + csr_matrix(np.ones(counts.shape))).sqrt()
 
+    # Spatial neighbour graph, built per slide so it never crosses a graph boundary. Defaults to
+    # `short_range`, the radius at which the int_short program was planted: at that radius the
+    # local component's two hops reach exactly that program, and the mid/long ones stay outside.
+    #
+    # This is a reference graph, NOT the one training uses. geome's AddAdjMatrix calls
+    # squidpy itself on every run with cfg.dataset.spatial_neigbors_kwargs and writes
+    # obsp["adj_matrix_connectivities"] -- it never reads what is stored here. The radius is
+    # recorded in uns so a run can check its config against it rather than assume they agree.
+    graph_radius = short_range if graph_radius is None else graph_radius
+    sq.gr.spatial_neighbors(adata, coord_type="generic", radius=graph_radius, library_key="slide")
+
     edges = pd.concat(edge_frames, ignore_index=True)
     edges["sender"] = edges["sender"].astype(np.int32)
     edges["receiver"] = edges["receiver"].astype(np.int32)
@@ -585,6 +603,7 @@ def make_synthetic(
             "mid_range": mid_range,
             "long_range": long_range,
             "n_hub_cells": n_hub_cells,
+            "graph_radius": float(short_range if graph_radius is None else graph_radius),
             "effect_scale": effect_scale,
             "edge_weight_cutoff": edge_weight_cutoff,
             "seed": seed,
@@ -633,6 +652,7 @@ def main() -> None:
     parser.add_argument("--n-slides-per-donor", type=int, default=2)
     parser.add_argument("--n-cells-per-slide", type=int, default=1500)
     parser.add_argument("--lr-range", type=float, default=20.0)
+    parser.add_argument("--graph-radius", type=float, default=None)
     parser.add_argument("--effect-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -642,6 +662,7 @@ def main() -> None:
         n_slides_per_donor=args.n_slides_per_donor,
         n_cells_per_slide=args.n_cells_per_slide,
         lr_range=args.lr_range,
+        graph_radius=args.graph_radius,
         effect_scale=args.effect_scale,
         seed=args.seed,
     )

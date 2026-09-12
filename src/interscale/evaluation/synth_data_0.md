@@ -123,12 +123,20 @@ target sum, then `log1p` — the same call the legnini preprocessing uses for it
 layer) and all-zero cells are dropped. Note the `.X` convention differs from `legnini23_pp.h5ad`,
 which keeps raw counts in `.X`; here `.X` carries the normalised values, the scanpy way.
 
-The **spatial neighbour graph is not stored**. `prepare_geome_dataset` builds it per run from
-`cfg.dataset.spatial_neigbors_kwargs`, so the radius is a property of the experiment rather than
-of the dataset — baking one in would let the stored graph and the config disagree silently. This
-already happens in the legnini setup, where the preprocessed object carries a radius-300 graph
-while the training config asks for 200; training uses 200 and the stored graph is ignored. Run
-`sq.gr.spatial_neighbors` yourself if you want one in `obsp` for squidpy analyses.
+A **reference spatial neighbour graph** is built per slide and stored in `obsp`, at a radius
+defaulting to `short_range` (30) — the radius at which the local component's two hops reach the
+`int_short` program exactly, leaving mid and long outside. Its radius is recorded as
+`graph_radius` in `uns['synthetic']['params']`.
+
+It is a reference, **not the graph training uses**. geome's `AddAdjMatrix` calls squidpy itself on
+every run with `cfg.dataset.spatial_neigbors_kwargs` and writes `obsp['adj_matrix_connectivities']`
+— it never reads what is stored here, so the config alone decides the neighbourhood. That is why
+`graph_radius` is recorded: a run can verify its config against it instead of assuming they agree.
+`run_synthetic_pipeline.py` does exactly that and refuses to train on a mismatch.
+
+The failure this guards against is real and already present elsewhere: `legnini23_pp.h5ad` carries
+a radius-300 graph while `legnini23.yaml` trains at 200. Training uses 200 and the stored graph is
+silently ignored.
 
 ## What ships with the object
 
