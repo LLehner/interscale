@@ -29,6 +29,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import scanpy as sc
 from anndata import AnnData
 from scipy.sparse import csr_matrix
 from scipy.spatial.distance import cdist
@@ -464,8 +465,9 @@ def make_synthetic(
     Returns
     -------
     anndata.AnnData
-        Normalised expression in ``X`` and ``layers['log1p_norm']``, raw counts in
-        ``layers['counts']``, ground truth in ``var``, ``obs`` and ``uns['synthetic']``.
+        Ready to train on with no further preprocessing: median-normalised log1p expression in
+        ``X`` and ``layers['log1p_norm']``, raw counts kept in ``layers['counts']``, no all-zero
+        cells, and the ground truth in ``var``, ``obs`` and ``uns['synthetic']``.
     """
     if n_donors_per_condition < n_val_donors + n_test_donors + 1:
         raise ValueError("need at least one train donor per condition")
@@ -533,19 +535,30 @@ def make_synthetic(
     var = genes.drop(columns=["base_mu", "theta", "pi"]).copy()
     var.index.name = None
 
-    # log1p of median-normalised counts. Must stay non-negative: tl.masking fills masked entries
-    # with MASK_VALUE = -1, which has to sit outside the layer's range to be distinguishable.
-    totals = np.asarray(X.sum(1))
-    totals[totals == 0] = 1.0
-    norm = np.log1p(X / totals[:, None] * np.median(totals)).astype(np.float32)
-
-    # scanpy convention: .X holds the normalised values, raw counts live in layers["counts"].
-    # log1p_norm is also kept under its own name, because the training configs address it by
-    # name through cfg.dataset.layer_key rather than reading .X.
-    adata = AnnData(X=csr_matrix(norm), obs=obs, var=var)
+    adata = AnnData(X=csr_matrix(X), obs=obs, var=var)
     adata.obsm["spatial"] = spatial.astype(np.float64)
-    adata.layers["counts"] = csr_matrix(X)
-    adata.layers["log1p_norm"] = csr_matrix(norm)
+
+    # An all-zero cell carries no signal and divides by zero on normalisation; every downstream
+    # entry point would otherwise have to filter for it (interscale.tl.remove_zero_expression_cells
+    # exists for exactly that). Dropping it here is what lets callers treat the output as ready
+    # to train on. At default settings none occur -- the lowest per-cell total is around 40.
+    keep = np.asarray(adata.X.sum(axis=1)).ravel() > 0
+    if not keep.all():
+        print(f"dropping {int((~keep).sum())} all-zero cells")
+        adata = adata[keep].copy()
+
+    # Normalisation lives here so the object arrives analysis-ready: scanpy's own median
+    # normalisation and log1p, run through scanpy rather than reimplemented.
+    #
+    # The result has to stay non-negative -- tl.masking fills masked entries with
+    # MASK_VALUE = -1, which is only distinguishable from a real measurement while it sits
+    # outside the layer's range.
+    adata.layers["counts"] = adata.X.copy()
+    sc.pp.normalize_total(adata)
+    sc.pp.log1p(adata)
+    # Also kept under its own name: the training configs address it through
+    # cfg.dataset.layer_key rather than reading .X.
+    adata.layers["log1p_norm"] = adata.X.copy()
 
     edges = pd.concat(edge_frames, ignore_index=True)
     edges["sender"] = edges["sender"].astype(np.int32)
