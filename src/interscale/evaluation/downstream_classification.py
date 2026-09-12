@@ -1,9 +1,12 @@
 """Downstream task 1: how much of an ``.obs`` label is linearly readable from the embeddings.
 
-The question this answers is not "can we classify" but "which scale carries the label, and does
-the embedding beat the raw expression it was built from". Both are answered by running the same
-probe over several feature sets -- local embedding, global embedding, CLS token, their
-concatenation, raw expression, and a shuffled-label null -- and reporting them in one table.
+The question this answers is not "can we classify" but "which representation carries the label, and
+does it beat the raw expression it was built from". Both are answered by running the same probe
+over several feature sets at once -- local embedding, global embedding, CLS token, their
+concatenation, any other embedding in ``.obsm`` (``X_pca``, ``X_scVI``, a precomputed CellCharter
+or BANKSY representation), raw expression, and a shuffled-label null -- and reporting them in one
+table. Feature sets are named as ``"a+b"`` strings or plain dicts, so an arbitrary combination of
+embeddings and ``.obs`` covariates needs no change to this module.
 
 Two rules keep the numbers honest:
 
@@ -19,7 +22,8 @@ covariate without touching this file.
 Run as a script::
 
     python src/interscale/evaluation/downstream_classification.py \
-        --h5ad results/synth_data_0_model_output.h5ad --target cell_type --level node
+        --h5ad results/synth_data_0_model_output.h5ad --target cell_type --level node \
+        --features X_pca X_scVI combined_local_emb+combined_global_emb
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -126,11 +131,73 @@ def build_features(
     return np.concatenate(blocks, axis=1), names
 
 
-def default_feature_sets(adata: AnnData, prefix: str = "combined") -> dict[str, dict]:
+def available_embeddings(adata: AnnData, *, max_dim: int = 1024) -> list[str]:
+    """``.obsm`` keys that look like a per-cell embedding, whatever produced them.
+
+    This is what lets the probe work on `X_pca`, `X_scVI`, CellCharter or BANKSY embeddings
+    without knowing anything about them: anything 2-D, numeric and not absurdly wide qualifies.
+
+    Three kinds of key are skipped. ``spatial`` is coordinates, not a representation. Attention
+    matrices are ``[n_cells, max_seq_len]`` with padding, not an embedding. And ``y_pred`` arrays
+    are the model's own output, which for a classification target would hand the probe the answer.
+    """
+    found = []
+    for key in adata.obsm:
+        if key == "spatial" or key.endswith("_attn_matrix") or "y_pred" in key:
+            continue
+        arr = adata.obsm[key]
+        arr = arr.to_numpy() if hasattr(arr, "to_numpy") else np.asarray(arr)
+        if arr.ndim == 2 and arr.shape[1] <= max_dim and np.issubdtype(arr.dtype, np.number):
+            found.append(key)
+    return sorted(found)
+
+
+def feature_sets_from_spec(adata: AnnData, specs: Sequence[str]) -> dict[str, dict]:
+    """Build feature sets from ``"a+b"`` strings, so any combination can be named in one place.
+
+    Each token is resolved in order against ``.obsm`` (an embedding), ``.obs`` (a covariate, one-hot
+    encoded when categorical), or the literals ``"expression"``/``"X"`` (the expression matrix,
+    PCA-reduced). Tokens joined by ``+`` are concatenated into a single feature matrix.
+
+    Examples
+    --------
+    ``["combined_local_emb+combined_global_emb", "X_scVI", "X_pca+cell_type"]`` gives three feature
+    sets: the two InterScale embeddings together, an scVI embedding on its own, and a PCA of the
+    expression with the cell-type annotation appended.
+    """
+    sets: dict[str, dict] = {}
+    for spec in specs:
+        obsm_keys, obs_keys, expression = [], [], False
+        for token in (t.strip() for t in spec.split("+")):
+            if not token:
+                continue
+            if token in ("expression", "X"):
+                expression = True
+            elif token in adata.obsm:
+                obsm_keys.append(token)
+            elif token in adata.obs:
+                obs_keys.append(token)
+            else:
+                raise KeyError(
+                    f"'{token}' is in neither adata.obsm nor adata.obs. "
+                    f"Embeddings available: {available_embeddings(adata)}"
+                )
+        sets[spec] = {"obsm": tuple(obsm_keys), "obs": tuple(obs_keys), "expression": expression}
+    return sets
+
+
+def default_feature_sets(
+    adata: AnnData, prefix: str = "combined", *, include_all_embeddings: bool = True
+) -> dict[str, dict]:
     """Feature sets worth probing by default, skipping the ones this object does not carry.
 
     The point of keeping local, global and CLS apart is attribution: a label readable from the
-    global embedding but not the local one is a tissue-scale property, and vice versa.
+    global embedding but not the local one is a tissue-scale property, and vice versa. With
+    ``include_all_embeddings``, every other embedding in ``.obsm`` -- ``X_pca``, ``X_scVI``, a
+    precomputed CellCharter representation -- is probed alongside them as its own set, which is
+    what makes the output a comparison rather than a single score.
+
+    Pass :func:`feature_sets_from_spec` instead for combinations this function would not guess.
     """
     sets: dict[str, dict] = {}
     if f"{prefix}_local_emb" in adata.obsm:
@@ -142,6 +209,12 @@ def default_feature_sets(adata: AnnData, prefix: str = "combined") -> dict[str, 
     cls_cols = [c for c in (f"{prefix}_cls_horizontal", f"{prefix}_cls_vertical") if c in adata.obs]
     if cls_cols:
         sets["cls"] = {"obs": tuple(cls_cols)}
+
+    if include_all_embeddings:
+        already = {k for spec in sets.values() for k in spec.get("obsm", ())}
+        for key in available_embeddings(adata):
+            if key not in already:
+                sets[key] = {"obsm": (key,)}
     return sets
 
 
@@ -247,8 +320,9 @@ def classify(
         Column of ``adata.obs`` to predict -- ``cell_type``, ``condition``, ``niche``, ``slide``, ...
     feature_sets
         ``{name: {"obsm": (...), "obs": (...), "expression": bool}}``. Defaults to
-        :func:`default_feature_sets`, so any ``.obs``/``.obsm`` annotation can be probed by
-        passing a dict instead of editing this module.
+        :func:`default_feature_sets`, which picks up every embedding in ``.obsm``. Build your own
+        with :func:`feature_sets_from_spec` (``["local_emb+global_emb", "X_scVI"]``) -- any
+        embedding, covariate or combination of them works, with no change to this module.
     prefix
         Prefix the model wrote its output under (``get_model_output(prefix=...)``).
     level
@@ -388,8 +462,15 @@ def main() -> None:
     parser.add_argument("--split-key", type=str, default="split")
     parser.add_argument("--layer", type=str, default="log1p_norm")
     parser.add_argument("--cv-folds", type=int, default=None)
-    parser.add_argument("--obs-features", type=str, nargs="*", default=None,
-                        help="extra .obs columns to probe as their own feature set")
+    parser.add_argument(
+        "--features", type=str, nargs="*", default=None,
+        help=(
+            "feature sets to probe, one per argument, tokens joined by '+'. A token is an .obsm "
+            "key, an .obs column, or 'expression'. Example: --features X_scVI "
+            "combined_local_emb+combined_global_emb X_pca+cell_type. "
+            "Default: every embedding in .obsm, plus the local/global/CLS sets."
+        ),
+    )
     parser.add_argument("--metric", type=str, default="balanced_accuracy")
     parser.add_argument("--out", type=Path, default=None, help="write the tidy table as CSV")
     args = parser.parse_args()
@@ -397,9 +478,11 @@ def main() -> None:
     import anndata as ad
 
     adata = ad.read_h5ad(args.h5ad)
-    feature_sets = default_feature_sets(adata, args.prefix)
-    if args.obs_features:
-        feature_sets["obs_features"] = {"obs": tuple(args.obs_features)}
+    feature_sets = (
+        feature_sets_from_spec(adata, args.features) if args.features else default_feature_sets(adata, args.prefix)
+    )
+    print(f"embeddings found: {available_embeddings(adata)}")
+    print(f"feature sets: {list(feature_sets)}")
 
     results = classify(
         adata,
