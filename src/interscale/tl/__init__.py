@@ -8,7 +8,13 @@ from .anchors import (
     local_reach_um,
     profile_by_distance,
 )
-from .geome_utils import label_codes, optional_fields, prepare_a2d_dataset, prepare_geome_dataset
+from .geome_utils import (
+    label_codes,
+    optional_fields,
+    prepare_a2d_dataset,
+    prepare_geome_dataset,
+    warn_missing_categories,
+)
 from .masking import (
     MASK_STRATEGIES,
     apply_mask,
@@ -25,6 +31,7 @@ from .utils import check_and_update_cfg, set_full_reproducibility
 
 __all__ = [
     "prepare_geome_dataset",
+    "warn_missing_categories",
     "label_codes",
     "optional_fields",
     "prepare_a2d_dataset",

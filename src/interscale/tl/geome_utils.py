@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import torch
@@ -130,6 +132,67 @@ def prepare_a2d_dataset(cfg: CN):
         )
 
 
+def warn_missing_categories(adata, split_key: str, cfg: CN) -> list[str]:
+    """Warn once per (column, split) where a split contains no cells of some category.
+
+    A categorical is narrowed three separate times on the way to its one-hot encoding -- the
+    split subset drops unused categories on the view, ``transforms.Subset`` drops them again, and
+    ``ToCategoryIterator(preserve_categories=...)`` then preserves only what is left. The two
+    consequences are very different, and neither is obvious from where it surfaces:
+
+    * for ``dataset.prediction_obs`` the run **fails**, because ``n_output`` is derived from the
+      full object while ``y`` is built per split, so the widths disagree -- but it fails deep in
+      the training step with ``"y_true and y_pred must have the same shape"``, which names
+      nothing that would lead anyone back to a missing cell type;
+    * for the optional annotations (``celltype_key`` and friends) the encoding is now repaired by
+      :class:`_RestoreCategories`, so the columns still mean the same thing in every split -- but
+      the *data* genuinely has none of that category there, which anything sampling per category
+      in that split needs to know.
+
+    Returns
+    -------
+    list of str
+        The messages emitted, so a caller or a test can inspect them.
+    """
+    _, optional_keys = optional_fields(cfg)
+    prediction_obs = cfg.dataset.prediction_obs
+    keys = list(dict.fromkeys(([prediction_obs] if prediction_obs else []) + optional_keys))
+
+    messages = []
+    for key in keys:
+        column = adata.obs.get(key)
+        if column is None or not isinstance(column.dtype, pd.CategoricalDtype):
+            continue
+        full = list(column.cat.categories)
+        for split in pd.unique(adata.obs[split_key]):
+            present = set(column[adata.obs[split_key] == split].dropna().astype(str))
+            missing = [c for c in full if str(c) not in present]
+            if not missing:
+                continue
+
+            if key == prediction_obs:
+                consequence = (
+                    f"Its one-hot label will have {len(full) - len(missing)} columns in that split "
+                    f"while n_output is {len(full)}, so training will stop with "
+                    '"y_true and y_pred must have the same shape". Merge the category, restratify '
+                    "the split, or drop those cells."
+                )
+            else:
+                consequence = (
+                    "Category ordering is preserved across splits, so the annotation itself stays "
+                    "correct; but anything that samples per category in that split -- "
+                    "composition-matched negatives, for one -- has nothing to draw for it."
+                )
+
+            message = (
+                f"Split {split!r} contains no cells of {key!r} categor"
+                f"{'y' if len(missing) == 1 else 'ies'} {missing!r}. {consequence}"
+            )
+            messages.append(message)
+            warnings.warn(message, UserWarning, stacklevel=2)
+    return messages
+
+
 class _RestoreCategories:
     """Preprocess step re-instating the full object's categories on the given obs columns.
 
@@ -203,6 +266,7 @@ def prepare_geome_dataset(adata, cfg: CN):
         f"split_key '{cfg.dataset.split_key}' not found in adata.obs columns"
     )
     split_key = cfg.dataset.split_key
+    warn_missing_categories(adata, split_key, cfg)
 
     # initalize object to save train, val and test PyG datas
     datas_train, datas_val, datas_test = list(), list(), list()

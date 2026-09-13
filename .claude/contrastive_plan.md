@@ -63,17 +63,26 @@ so they are not the thing that tells you nothing moved.
   expression clustering. `cfg.dataset.celltype_key` now attaches an existing annotation.
 - Whether the SimCSE floor (two passes, dropout-only) is strong enough to change the
   ordering of Stages 1–3.
-- **Auxiliary-loss heads are not in the `.pt`.** They live on the `TrainingPlan`, so
-  `BaseModel.save` — which writes only `module.state_dict()` — omits them, while Lightning's
-  `ModelCheckpoint` (the `.ckpt`) does include them. Verified: a run with one parameterised term
-  gave 31 module keys / 0 aux keys in the `.pt` and 31 / 2 in the `.ckpt`, and `BaseModel.load`
-  reads the `.pt`. Harmless for inference, where the head is discarded anyway; it bites when
-  *resuming* training, which silently reinitialises the expander — no error, just a loss jump.
-  The one-line fix is to attach the composite to the module instead of the plan, so
-  `state_dict()` and `parameters()` both find it and `load(strict=False)` restores it. Decide in
-  Stage 1, when there is a real parameter at stake.
+- ~~Auxiliary-loss heads are not in the `.pt`.~~ **Resolved** — see below.
 
-**Found while implementing Stage 0** (all pre-existing, none fixed here)
+**Resolved during Stage 0**
+
+- **Auxiliary-loss heads now live on the module, not the training plan.** They were outside
+  `module.state_dict()`, which is all `BaseModel.save` writes — so the `.pt` carried 0 aux keys
+  while Lightning's `.ckpt` carried them, and `BaseModel.load` reads the `.pt`. Harmless at
+  inference, where the head is discarded anyway, but a resumed run silently reinitialised the
+  expander: no error, just a loss jump. `BaseModel._attach_aux_losses` now builds the composite
+  at model construction — early enough for `load_state_dict(strict=False)` to reach it — and
+  `TrainingPlan.aux_losses` is a read-only view of the module's. Verified by a save/reload round
+  trip restoring a trained head, and in both backward-compatible directions (a checkpoint with no
+  aux keys, and aux keys loaded into a model with no terms).
+
+  **The cost is cosmetic and worth stating: a training-only object now hangs off the model.** The
+  terms and their heads are part of `module.state_dict()` and show up in a parameter count, while
+  being unused at inference. That was the price of having one placement answer all three
+  questions — optimiser, checkpoint, reload — instead of three mechanisms that can disagree.
+
+**Found while implementing Stage 0** (pre-existing)
 
 - `val` never logged `combined_loss` although `train` and `test` did, and `test` logged
   `kl_loss` without `sync_dist` while logging everything else with it. Both are reproduced in
@@ -96,8 +105,10 @@ so they are not the thing that tells you nothing moved.
   1 meaning `b` in one and `c` in the other, and the run raises before any of that is used).
   Note this is an *accidental* guard — it holds only because the two numbers come from different
   objects — and the message, "y_true and y_pred must have the same shape", names nothing that
-  would lead anyone to a missing cell type. A check at dataset-prep time naming the absent
-  category would be a real improvement.
+  would lead anyone to a missing cell type. **`tl.warn_missing_categories`, called from
+  `prepare_geome_dataset`, now covers both cases**: one warning per (column, split) naming the
+  absent categories, and saying either which failure it is about to cause (`prediction_obs`) or
+  that the encoding is fine but the data is empty there (the optional annotations).
 
 ## Design principles
 
