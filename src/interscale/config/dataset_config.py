@@ -44,6 +44,23 @@ def get_dataset_cfg(cfg):
     # rate is a different quantity from a per-cell one (MAE/GraphMAE use 0.25-0.75 for features).
     cfg.dataset.mask_percentage = 0.2
 
+    # Optional per-cell annotations attached to every PyG Data object when set. All default to
+    # None, which attaches nothing and leaves the graphs byte-identical to before.
+    #
+    # These exist for the auxiliary/contrastive objectives (see `.claude/contrastive_plan.md`):
+    # `slide_key` restricts a negative pool to one slide so batch effect does not become the
+    # cheapest discriminator; `celltype_key` stratifies composition-matched negative sampling;
+    # `spatial_key` supplies coordinates for spatial crops. `condition_key` is attached for
+    # *evaluation and auditing only* -- it must never enter a training objective, or a probe on
+    # condition stops meaning anything.
+    #
+    # An obs column arrives as a one-hot `[N, n_categories]` float, not as integer codes; use
+    # `interscale.tl.label_codes` to read it. An obsm key arrives as its matrix, `[N, D]`.
+    cfg.dataset.slide_key = None
+    cfg.dataset.condition_key = None
+    cfg.dataset.celltype_key = None
+    cfg.dataset.spatial_key = None
+
     # Segmentation robustness parameters
     cfg.dataset.segmentation_robustness = None  # [node_fraction, overflow_fraction] or None
     # only needed for segmentation robustness experiments
