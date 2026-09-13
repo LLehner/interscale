@@ -424,6 +424,68 @@ class TrainingPlan(pl.LightningModule):
 
         return loss
 
+    #: Per-mode differences between the three steps: the metric collection to update, and
+    #: whether logging is synchronised across ranks.
+    _MODE_METRICS = {"train": "train_metrics", "val": "valid_metrics", "test": "test_metrics"}
+
+    def _log_scalar(self, name: str, value: torch.Tensor, sync_dist: bool) -> None:
+        self.log(name, value, on_step=False, on_epoch=True, batch_size=int(self.batch_size), sync_dist=sync_dist)
+
+    def _step(self, batch, mode: Literal["train", "val", "test"]):
+        """The shared body of ``training_step`` / ``validation_step`` / ``test_step``.
+
+        These were three near-identical copies. They are one so that a new loss term is wired in
+        once, and so the three cannot drift apart -- which they already had: ``val`` never logged
+        ``combined_loss`` although ``train`` and ``test`` did, and ``test`` logged ``kl_loss``
+        without ``sync_dist`` while logging everything else with it. Both quirks are reproduced
+        below rather than quietly fixed, so that this refactor changes no number; see the
+        ``mode != "val"`` guard and the ``sync_dist=False`` on the KL log.
+
+        Parameters
+        ----------
+        batch
+            The batch as collated by the dataloader.
+        mode
+            Which split is running; selects the metric collection and the log prefix.
+
+        Returns
+        -------
+        torch.Tensor
+            The scalar to optimise (``train``) or report.
+        """
+        metrics = getattr(self, self._MODE_METRICS[mode])
+        sync_dist = mode == "test"
+
+        out = self.module._common_step(batch, self.prediction_task, self.prediction_level)
+        y_pred, y_true, entry_mask, attn = out.y_pred, out.y_true, out.entry_mask, out.attn
+
+        # Modules that decode twice (DualDecoderCombinedModule) report each half separately.
+        if not hasattr(self.module, "compute_separate_losses"):
+            return self._compute_and_log_metrics(y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask)
+
+        separate_losses = self.module.compute_separate_losses(self.loss, self.loss_type, y_pred, y_true, entry_mask)
+
+        for key in ("local_loss", "global_loss", "combined_loss"):
+            # `val` never logged combined_loss; preserved to keep this refactor number-identical.
+            if key == "combined_loss" and mode == "val":
+                continue
+            if separate_losses.get(key) is not None:
+                self._log_scalar(f"{mode}_{key}", separate_losses[key], sync_dist)
+
+        # Metrics are computed from the combined predictions, as before.
+        loss = self._compute_and_log_metrics(y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask)
+
+        if separate_losses.get("kl_loss") is not None:
+            kl_loss = separate_losses["kl_loss"]
+            # KL annealing/weighting (beta): a fixed weight, or drive it from self.current_epoch.
+            kl_weight = getattr(self.hparams, "kl_weight", 1.0)
+            # sync_dist=False even under `test`, matching the previous code.
+            self._log_scalar(f"{mode}_kl_loss", kl_loss, False)
+            loss = loss + kl_weight * kl_loss
+
+        assert not torch.isnan(loss), "loss is NaN"
+        return loss
+
     def training_step(self, batch):
         """Training step for the model.
 
@@ -431,207 +493,15 @@ class TrainingPlan(pl.LightningModule):
         -------
             loss: torch.nn.Module
         """
-        out = self.module._common_step(batch, self.prediction_task, self.prediction_level)
-        y_pred, y_true, entry_mask, attn = out.y_pred, out.y_true, out.entry_mask, out.attn
-
-        # Check if module supports separate loss computation (e.g., DualDecoderCombinedModule)
-        if hasattr(self.module, "compute_separate_losses"):
-            separate_losses = self.module.compute_separate_losses(self.loss, self.loss_type, y_pred, y_true, entry_mask)
-
-            # Log separate losses (on_step=False, on_epoch=True to match existing pattern)
-            if separate_losses.get("local_loss") is not None:
-                self.log(
-                    "train_local_loss",
-                    separate_losses["local_loss"],
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=False,
-                )
-            if separate_losses.get("global_loss") is not None:
-                self.log(
-                    "train_global_loss",
-                    separate_losses["global_loss"],
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=False,
-                )
-            if separate_losses.get("combined_loss") is not None:
-                self.log(
-                    "train_combined_loss",
-                    separate_losses["combined_loss"],
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=False,
-                )
-
-            #  compute and log metrics using combined predictions
-            loss = self._compute_and_log_metrics(
-                y_pred, y_true, "train", self.train_metrics, attn=attn, entry_mask=entry_mask
-            )
-
-            if separate_losses.get("kl_loss") is not None:
-                kl_loss = separate_losses["kl_loss"]
-
-                # KL Annealing/Weighting (beta)
-                # You can use a fixed weight or a scheduler (e.g., self.current_epoch)
-                kl_weight = getattr(self.hparams, "kl_weight", 1.0)
-                weighted_kl = kl_weight * kl_loss
-
-                self.log(
-                    "train_kl_loss",
-                    kl_loss,
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=False,
-                )
-
-                # Add KL to the final loss to be backpropagated
-                loss += weighted_kl
-
-            assert not torch.isnan(loss), "loss is NaN"
-            return loss
-        else:
-            return self._compute_and_log_metrics(
-                y_pred, y_true, "train", self.train_metrics, attn=attn, entry_mask=entry_mask
-            )
-        # return self._compute_and_log_metrics(y_pred, y_true, 'train', self.train_metrics, attn=attn)
+        return self._step(batch, "train")
 
     def validation_step(self, batch):
         """Validation step for the model."""
-        out = self.module._common_step(batch, self.prediction_task, self.prediction_level)
-        y_pred, y_true, entry_mask, attn = out.y_pred, out.y_true, out.entry_mask, out.attn
-
-        # Check if module supports separate loss computation (e.g., DualDecoderCombinedModule)
-        if hasattr(self.module, "compute_separate_losses"):
-            separate_losses = self.module.compute_separate_losses(self.loss, self.loss_type, y_pred, y_true, entry_mask)
-
-            # Log separate losses (on_step=False, on_epoch=True to match existing pattern)
-            if separate_losses.get("local_loss") is not None:
-                self.log(
-                    "val_local_loss",
-                    separate_losses["local_loss"],
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=False,
-                )
-            if separate_losses.get("global_loss") is not None:
-                self.log(
-                    "val_global_loss",
-                    separate_losses["global_loss"],
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=False,
-                )
-
-            #  compute and log metrics using combined predictions
-            loss = self._compute_and_log_metrics(
-                y_pred, y_true, "val", self.valid_metrics, attn=attn, entry_mask=entry_mask
-            )
-
-            if separate_losses.get("kl_loss") is not None:
-                kl_loss = separate_losses["kl_loss"]
-
-                # KL Annealing/Weighting (beta)
-                # You can use a fixed weight or a scheduler (e.g., self.current_epoch)
-                kl_weight = getattr(self.hparams, "kl_weight", 1.0)
-                weighted_kl = kl_weight * kl_loss
-
-                self.log(
-                    "val_kl_loss",
-                    kl_loss,
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=False,
-                )
-
-                # Add KL to the final loss to be backpropagated
-                loss += weighted_kl
-
-            assert not torch.isnan(loss), "loss is NaN"
-            return loss
-        else:
-            return self._compute_and_log_metrics(
-                y_pred, y_true, "val", self.valid_metrics, attn=attn, entry_mask=entry_mask
-            )
-
-        # return self._compute_and_log_metrics(y_pred, y_true, 'val', self.valid_metrics, attn=attn)
+        return self._step(batch, "val")
 
     def test_step(self, batch):
         """Test step for the model."""
-        out = self.module._common_step(batch, self.prediction_task, self.prediction_level)
-        y_pred, y_true, entry_mask, attn = out.y_pred, out.y_true, out.entry_mask, out.attn
-        # Check if module supports separate loss computation (e.g., DualDecoderCombinedModule)
-        if hasattr(self.module, "compute_separate_losses"):
-            separate_losses = self.module.compute_separate_losses(self.loss, self.loss_type, y_pred, y_true, entry_mask)
-
-            # Log separate losses (on_step=False, on_epoch=True to match existing pattern, sync_dist=True for test)
-            if separate_losses.get("local_loss") is not None:
-                self.log(
-                    "test_local_loss",
-                    separate_losses["local_loss"],
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=True,
-                )
-            if separate_losses.get("global_loss") is not None:
-                self.log(
-                    "test_global_loss",
-                    separate_losses["global_loss"],
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=True,
-                )
-            if separate_losses.get("combined_loss") is not None:
-                self.log(
-                    "test_combined_loss",
-                    separate_losses["combined_loss"],
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=True,
-                )
-
-            #  compute and log metrics using combined predictions
-            loss = self._compute_and_log_metrics(
-                y_pred, y_true, "test", self.test_metrics, attn=attn, entry_mask=entry_mask
-            )
-
-            if separate_losses.get("kl_loss") is not None:
-                kl_loss = separate_losses["kl_loss"]
-
-                # KL Annealing/Weighting (beta)
-                # You can use a fixed weight or a scheduler (e.g., self.current_epoch)
-                kl_weight = getattr(self.hparams, "kl_weight", 1.0)
-                weighted_kl = kl_weight * kl_loss
-
-                self.log(
-                    "test_kl_loss",
-                    kl_loss,
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=int(self.batch_size),
-                    sync_dist=False,
-                )
-
-                # Add KL to the final loss to be backpropagated
-                loss += weighted_kl
-
-            assert not torch.isnan(loss), "loss is NaN"
-            return loss
-        else:
-            return self._compute_and_log_metrics(
-                y_pred, y_true, "test", self.test_metrics, attn=attn, entry_mask=entry_mask
-            )
-        # return self._compute_and_log_metrics(y_pred, y_true, 'test', self.test_metrics,attn=attn)
+        return self._step(batch, "test")
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""
