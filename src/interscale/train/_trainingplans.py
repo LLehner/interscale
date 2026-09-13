@@ -190,11 +190,16 @@ class TrainingPlan(pl.LightningModule):
     ):
         super().__init__()
         self.module = module
-        # Auxiliary terms added beside the reconstruction criterion. Empty unless some
-        # `optim.aux_loss_weights` entry is non-zero, in which case `build_aux_losses` has already
-        # constructed exactly those terms. Held as a submodule so any heads they own are found by
-        # `configure_optimizers`.
-        self.aux_losses = aux_losses if aux_losses is not None else CompositeAuxLoss({}, {})
+        # Auxiliary terms added beside the reconstruction criterion; empty unless some
+        # `optim.aux_loss_weights` entry is non-zero. They are stored on the MODULE, not here, so
+        # that their heads travel with `module.state_dict()` and `module.parameters()` -- see
+        # `BaseModel._attach_aux_losses`. `self.aux_losses` is a read-only view of that; binding
+        # them here as well would register the same parameters under two parents and hand the
+        # optimiser each of them twice.
+        if aux_losses is not None:
+            self.module.aux_losses = aux_losses
+        elif getattr(self.module, "aux_losses", None) is None:
+            self.module.aux_losses = CompositeAuxLoss({}, {})
         self.prediction_task = prediction_task
         self.prediction_level = prediction_level
         self.loss_type = loss
@@ -431,6 +436,11 @@ class TrainingPlan(pl.LightningModule):
 
         return loss
 
+    @property
+    def aux_losses(self) -> CompositeAuxLoss:
+        """The auxiliary terms, which live on the module -- see ``__init__``."""
+        return self.module.aux_losses
+
     #: Per-mode differences between the three steps: the metric collection to update, and
     #: whether logging is synchronised across ranks.
     _MODE_METRICS = {"train": "train_metrics", "val": "valid_metrics", "test": "test_metrics"}
@@ -536,10 +546,9 @@ class TrainingPlan(pl.LightningModule):
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""
         params = []
+        # Includes any projection/expander heads: the auxiliary terms are a submodule of
+        # `self.module`, so collecting them separately here would add the same parameters twice.
         params.extend(filter(lambda p: p.requires_grad, self.module.parameters()))
-        # Projection/expander heads live on the auxiliary terms, not on the module, so they have
-        # to be collected explicitly or they would never be updated.
-        params.extend(filter(lambda p: p.requires_grad, self.aux_losses.parameters()))
         # if self.model.local_component is not None:
         #     params.extend(filter(lambda p: p.requires_grad, self.module.local_component.parameters()))
         # if self.model.global_component is not None:

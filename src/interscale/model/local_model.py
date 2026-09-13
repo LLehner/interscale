@@ -37,6 +37,8 @@ class LocalModel(NodeMaskingTrainingPlan, BaseModel):
             mask_strategy=self._cfg.dataset.mask_strategy,
         )
 
+        self._attach_aux_losses()
+
     @torch.inference_mode()
     def get_model_output(self, adata: AnnData | None = None, prefix: str = ""):
         """Save the embeddings, predictions and attentionsin the adata object.

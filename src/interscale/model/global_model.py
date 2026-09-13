@@ -43,6 +43,8 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
             type_gex_embedding=self._cfg.model.global_component.parameters.type_gex_embedding,
         )
 
+        self._attach_aux_losses()
+
     # @torch.inference_mode() Not possible because of pytorch hook for self attention relevance
     def get_model_output(self, adata: AnnData | None = None, prefix: str = ""):
         """Save the embeddings, predictions and attentionsin the adata object.

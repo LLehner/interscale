@@ -53,6 +53,8 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
 
         self._model_summary_string = self._model_summary_string + self.module.get_model_summary()
 
+        self._attach_aux_losses()
+
     def get_model_output(self, adata: AnnData | None = None, prefix: str = ""):
         """Save the embeddings, predictions and attentionsin the adata object.
 

@@ -10,7 +10,6 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.trainer import seed_everything
 
 from interscale.tl.utils import get_model_filename_prefix
-from interscale.train.aux_losses import build_aux_losses
 from interscale.train._trainingplans import TrainingPlan
 from interscale.train._utils import MetricsHistory, NodeMaskResampleCallback
 
@@ -128,7 +127,9 @@ class NodeMaskingTrainingPlan:
         performance_callback = None
 
         # defines optimizers, training step, val step, logged metrics
-        aux_losses = build_aux_losses(self._cfg, self.module)
+        # Built and attached at model construction (BaseModel._attach_aux_losses), so that a
+        # reloaded checkpoint's heads are already in place rather than being replaced here.
+        aux_losses = self.module.aux_losses
         if aux_losses:
             print(f"Auxiliary losses: {dict(aux_losses.weights)} (views required: {aux_losses.requires_views})")
 

@@ -445,6 +445,25 @@ class BaseModel(metaclass=BaseModelMeta):
     def train(self):
         """Trains the model."""
 
+    def _attach_aux_losses(self) -> None:
+        """Build the configured auxiliary loss terms and hang them off ``self.module``.
+
+        Called at the end of every concrete model's ``__init__``, which is the only point early
+        enough to matter: ``load`` constructs the model and then calls
+        ``module.load_state_dict(..., strict=False)``, so a head that does not exist by then
+        cannot receive its weights and would be silently reinitialised on a resumed run.
+
+        The terms live on the *module* rather than on the training plan so that one placement
+        answers three questions at once -- ``module.parameters()`` finds the heads for the
+        optimiser, ``module.state_dict()`` carries them into ``BaseModel.save``, and
+        ``load_state_dict(strict=False)`` restores them while still tolerating a checkpoint from
+        before any of this existed. The cost is cosmetic: a training-only object hangs off the
+        model, and is simply unused at inference, where the heads are discarded anyway.
+        """
+        from interscale.train.aux_losses import build_aux_losses
+
+        self.module.aux_losses = build_aux_losses(self._cfg, self.module)
+
     def _register_local_component(self) -> LocalModule:
         """Register local component based on name.
         Instance must be defined in InterScale.module.local_components.

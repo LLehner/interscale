@@ -316,3 +316,100 @@ def test_an_enabled_term_is_logged_and_reaches_the_optimiser(cfg, registry):
     expected = 0.5 * (logged["train_e2e_probe"] + logged["train_e2e_slides"])
     assert logged["train_aux_total"] == pytest.approx(float(expected), rel=1e-5)
     assert not torch.equal(before, composite.terms["e2e_probe"].head.weight), "the head never trained"
+
+
+# --------------------------------------------------------------------------- persistence
+
+
+def _module_with_head(cfg, registry_name="persisted"):
+    """A module carrying one parameterised auxiliary term, built twice per test in places."""
+    if registry_name not in AUX_LOSSES:
+
+        @register_aux_loss(registry_name)
+        class Persisted(AuxLoss):
+            def __init__(self, cfg, module=None):
+                super().__init__()
+                self.head = nn.Linear(module.n_embed, 3)
+
+            def forward(self, out, batch):
+                return {registry_name: self.head(out.view.tokens()).pow(2).mean()}
+
+    module = _tiny_module()
+    setattr(cfg.optim.aux_loss_weights, registry_name, 1.0)
+    module.aux_losses = build_aux_losses(cfg, module)
+    return module
+
+
+def test_heads_are_part_of_the_module_state_dict(cfg, registry):
+    """`BaseModel.save` writes only `module.state_dict()`; a head outside it is lost on reload."""
+    module = _module_with_head(cfg)
+
+    keys = [k for k in module.state_dict() if "aux_losses" in k]
+
+    assert keys == ["aux_losses.terms.persisted.head.weight", "aux_losses.terms.persisted.head.bias"]
+
+
+def test_a_trained_head_survives_a_state_dict_round_trip(cfg, registry):
+    """The point of the whole placement: resuming must not silently reinitialise the head."""
+    trained = _module_with_head(cfg)
+    with torch.no_grad():
+        trained.aux_losses.terms["persisted"].head.weight.fill_(0.123)
+
+    fresh = _module_with_head(cfg)
+    before = fresh.aux_losses.terms["persisted"].head.weight.detach().clone()
+    fresh.load_state_dict(trained.state_dict(), strict=False)
+    after = fresh.aux_losses.terms["persisted"].head.weight
+
+    assert not torch.equal(before, after), "load did not reach the head"
+    assert torch.equal(after, trained.aux_losses.terms["persisted"].head.weight)
+
+
+def test_a_checkpoint_without_heads_still_loads(cfg, registry):
+    """Checkpoints predating auxiliary losses must keep loading; `strict=False` carries that."""
+    old_state = _tiny_module().state_dict()
+    module = _module_with_head(cfg)
+
+    missing, unexpected = module.load_state_dict(old_state, strict=False)
+
+    assert all("aux_losses" in k for k in missing), f"unexpected missing keys: {missing}"
+    assert unexpected == []
+
+
+def test_a_checkpoint_with_heads_loads_into_a_model_that_has_none(cfg, registry):
+    """Turning a term off must not make earlier checkpoints unloadable."""
+    state = _module_with_head(cfg).state_dict()
+    plain = _tiny_module()
+    plain.aux_losses = build_aux_losses(get_cfg_defaults(), plain)  # no weights -> no terms
+
+    missing, unexpected = plain.load_state_dict(state, strict=False)
+
+    assert all("aux_losses" in k for k in unexpected), f"unexpected extras: {unexpected}"
+    assert missing == []
+
+
+def test_the_optimiser_is_not_handed_the_same_parameter_twice(cfg, registry):
+    """The terms hang off the module, so collecting them again separately would duplicate them."""
+    from interscale.train._trainingplans import TrainingPlan
+
+    module = _module_with_head(cfg)
+    plan = TrainingPlan(
+        module, "regression", "node", "MSELoss", "cell", batch_size=2,
+        lr_scheduler="CosineWarmupScheduler", lr_warmup=1, lr_max_epochs=2,
+    )
+    [optimizer], _ = plan.configure_optimizers()
+
+    params = [p for group in optimizer.param_groups for p in group["params"]]
+    assert len(params) == len({id(p) for p in params})
+    assert any(p is module.aux_losses.terms["persisted"].head.weight for p in params)
+
+
+def test_the_plan_exposes_the_modules_terms(cfg, registry):
+    from interscale.train._trainingplans import TrainingPlan
+
+    module = _module_with_head(cfg)
+    plan = TrainingPlan(
+        module, "regression", "node", "MSELoss", "cell", batch_size=2,
+        lr_scheduler="CosineWarmupScheduler", lr_warmup=1, lr_max_epochs=2,
+    )
+
+    assert plan.aux_losses is module.aux_losses
