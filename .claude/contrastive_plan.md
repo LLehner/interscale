@@ -12,14 +12,36 @@ Last updated 2026-09-13. Update this table in the same commit as the work it des
 "Implemented, unverified" is a real state — a stage is only `done` when something external
 says so (a test, a reproduced number, a run that was actually looked at).
 
+Work happens on the `contrastive-learning` branch.
+
 | stage | state | verified by | date |
 |---|---|---|---|
-| 0 — plumbing (`StepOutput`, `gather_tokens`, composite loss, step collapse) | not started | | |
-| 0b — probe battery | not started | | |
+| 0 — plumbing (`StepOutput`, `gather_tokens`, composite loss, step collapse, dataset fields) | **done** | 119 tests pass; `scripts/equivalence_harness.py` reports IDENTICAL against the pre-refactor baseline | 2026-09-13 |
+| 0b — probe battery | not started (deliberately skipped for now) | | |
 | 1 — VICReg var/cov, no views | not started | | |
 | 2 — context NCE, composition-matched negatives | not started | | |
 | 3 — two views (NT-Xent / VICReg invariance) | not started | | |
 | 4 — interaction-destroying negatives | not started | | |
+
+### The gate
+
+`scripts/equivalence_harness.py` runs four short deterministic trainings covering every
+`_common_step` implementation and all three loss paths, and compares per-epoch metric histories
+exactly. Every Stage 0 commit was checked against a baseline captured before the first change.
+Read its docstring before the next refactor; the tests passed at every intermediate point too,
+so they are not the thing that tells you nothing moved.
+
+### How Stage 0 differed from this plan
+
+- **No transitional `__iter__` on `StepOutput`.** The plan allowed one so the four producers
+  could migrate one at a time. All four, and all three consumers, turned out to be a single
+  commit's worth of work, so the shim was never needed — and the plan already said to delete it
+  at exactly that point.
+- **The step collapse (0.4) was done before the composite-loss scaffolding (0.3)**, since
+  otherwise the aux wiring would have been written three times and two copies deleted.
+- **Projection heads (0.5) are deferred to Stage 1.** The extension point exists — an `AuxLoss`
+  owns its own head, and `configure_optimizers` collects it — but a shared head-builder with no
+  consumer would be untested dead code. Stage 1's expander is its first user.
 
 **Decided so far**
 
@@ -38,9 +60,28 @@ says so (a test, a reproduced number, a run that was actually looked at).
 
 - Expander width for VICReg: 256 is a guess against `n_embed = 16`, unswept.
 - Source of the `celltype` stratifier for Stage 2 — existing annotation vs. a stored
-  expression clustering.
+  expression clustering. `cfg.dataset.celltype_key` now attaches an existing annotation.
 - Whether the SimCSE floor (two passes, dropout-only) is strong enough to change the
   ordering of Stages 1–3.
+- **Auxiliary-loss heads are not persisted.** They live on the `TrainingPlan`, so
+  `BaseModel.save` (which writes only `module.state_dict()`) does not store them. Correct for
+  inference, where the head is discarded anyway, but resuming a run would silently reinitialise
+  the expander. Decide in Stage 1, when there is a real parameter at stake.
+
+**Found while implementing Stage 0** (all pre-existing, none fixed here)
+
+- `val` never logged `combined_loss` although `train` and `test` did, and `test` logged
+  `kl_loss` without `sync_dist` while logging everything else with it. Both are reproduced in
+  `_step` so the refactor changed no number; each deserves its own `Fix` commit.
+- `TrainingPlan(lr_scheduler=None)` returns a scheduler dict whose `"scheduler"` entry is
+  `None`, which Lightning rejects — so that documented option cannot actually be used.
+- `prepare_geome_dataset` reads `cfg.model.global_component.parameters.type_gex_embedding`
+  unconditionally, so a local-only config (no global component name) raises `AttributeError`
+  before any training starts.
+- Categoricals were being narrowed three times before one-hot encoding (split subsetting,
+  `transforms.Subset`, then `preserve_categories` preserving only what was left). Fixed for the
+  new optional fields via `_RestoreCategories`; the same exposure exists for a classification
+  `prediction_obs` whose label is absent from a split.
 
 ## Design principles
 
