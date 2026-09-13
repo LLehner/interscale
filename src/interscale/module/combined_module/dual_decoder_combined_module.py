@@ -3,7 +3,7 @@ from typing import Literal
 import torch
 from yacs.config import CfgNode as CN
 
-from interscale.module.base import BaseModule, GlobalModule, LocalModule
+from interscale.module.base import BaseModule, GlobalModule, LocalModule, StepOutput, ViewOutput
 from interscale.tl.masking import masked_loss
 
 
@@ -135,9 +135,14 @@ class DualDecoderCombinedModule(BaseModule):
     def _common_step(self, batch, prediction_task, prediction_level: Literal["node", "graph"]):
         """Shared step between train, val and test.
 
-        Returns predictions and ground truth for both local and global decoders over EVERY cell
-        the transformer produced -- not only the masked ones. `entry_mask_combined` marks the
-        entries the loss is restricted to; the metrics use everything.
+        Returns
+        -------
+        StepOutput
+            ``y_pred``/``y_true`` are the stacked ``[2N, ...]`` local-then-global form, over
+            EVERY cell the transformer produced -- not only the masked ones.
+            ``entry_mask`` marks the entries the loss is restricted to; the metrics use
+            everything. The single view carries both embeddings and the ``padded_node_idx``
+            that aligns them.
         """
         batch_masked, _, _ = self._common_step_masking(batch)
 
@@ -156,6 +161,7 @@ class DualDecoderCombinedModule(BaseModule):
             self._n_masked_nodes = None
             self._is_graph_level = True
             entry_mask_combined = None
+            padded_node_idx = None
         elif prediction_level == "node":
             y_true, padded_node_idx, entry_mask = self.global_module._process_batch_for_metrics(
                 batch, prediction_task, prediction_level, pad_index_nodes
@@ -194,7 +200,20 @@ class DualDecoderCombinedModule(BaseModule):
         assert not torch.any(torch.isnan(y_pred_combined)), "y_pred contains NaN values"
         assert not torch.any(torch.isnan(y_true_combined)), "y_true contains NaN values"
 
-        return local_embedding, global_embedding, y_pred_combined, y_true_combined, attn, entry_mask_combined
+        return StepOutput(
+            y_pred=y_pred_combined,
+            y_true=y_true_combined,
+            entry_mask=entry_mask_combined,
+            views=[
+                ViewOutput(
+                    local_embedding=local_embedding,
+                    global_embedding=global_embedding,
+                    src_padding_mask=src_padding_mask,
+                    padded_node_idx=padded_node_idx,
+                    attn=attn,
+                )
+            ],
+        )
 
     def get_separate_predictions(self, y_pred_combined, y_true_combined):
         """Get separate predictions and ground truth for local and global decoders.

@@ -2,6 +2,7 @@ from abc import abstractmethod
 from typing import Literal
 
 from ._base_module import BaseModule
+from ._step_output import StepOutput, ViewOutput
 
 
 class LocalModule(BaseModule):
@@ -32,19 +33,12 @@ class LocalModule(BaseModule):
 
         Returns
         -------
-        local_embedding: torch.Tensor
-            Size: [N, E]
-        global_embedding: torch.Tensor
-            Size: [N, E]
-        y_pred: torch.Tensor
-            Size: [B, C] (classification, masked cells) or [N, F] (regression, ALL cells)
-        y_true: torch.Tensor
-            Size: [B, ] (classification, masked cells) or [N, F] (regression, ALL cells)
-        attn: None
-            This module has no attention; returned for a uniform `_common_step` contract.
-        entry_mask: torch.Tensor | None
-            Size: [N, F] for regression, marking the entries the LOSS is scored on; the metrics
-            use every cell. None for classification.
+        StepOutput
+            ``y_pred``/``y_true`` are ``[B, C]``/``[B, ]`` for classification (masked cells only)
+            and ``[N, F]`` for regression (ALL cells). ``entry_mask`` marks the entries the LOSS
+            is scored on; the metrics use every cell. The single view carries only
+            ``local_embedding`` ``[N, E]`` -- this module has no global component, no padding and
+            no attention.
         """
         # Mask nodes
         batch_masked, mask_idx, entry_mask = self._common_step_masking(batch)
@@ -67,7 +61,12 @@ class LocalModule(BaseModule):
             y_true = batch.y[mask_idx]  # batch without mask because constant otherwise
             assert y_true.shape == y_pred.shape
             # Class labels are not gene entries, so there is nothing for an entry mask to select.
-            return local_embedding, None, y_pred, y_true, None, None
+            return StepOutput(
+                y_pred=y_pred,
+                y_true=y_true,
+                entry_mask=None,
+                views=[ViewOutput(local_embedding=local_embedding)],
+            )
 
         if "regression" in prediction_task:
             # Every cell is scored. `entry_mask` says which entries the LOSS uses: the gene mask
@@ -79,7 +78,12 @@ class LocalModule(BaseModule):
             if entry_mask is None:
                 entry_mask = batch.mask.bool().unsqueeze(1).expand_as(y_true)
             assert entry_mask.shape == y_pred.shape
-            return local_embedding, None, y_pred, y_true, None, entry_mask
+            return StepOutput(
+                y_pred=y_pred,
+                y_true=y_true,
+                entry_mask=entry_mask,
+                views=[ViewOutput(local_embedding=local_embedding)],
+            )
 
         assert False, "Prediction task not supported"
 

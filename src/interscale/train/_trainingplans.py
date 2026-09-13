@@ -431,9 +431,8 @@ class TrainingPlan(pl.LightningModule):
         -------
             loss: torch.nn.Module
         """
-        local_embedding, global_embedding, y_pred, y_true, attn, entry_mask = self.module._common_step(
-            batch, self.prediction_task, self.prediction_level
-        )
+        out = self.module._common_step(batch, self.prediction_task, self.prediction_level)
+        y_pred, y_true, entry_mask, attn = out.y_pred, out.y_true, out.entry_mask, out.attn
 
         # Check if module supports separate loss computation (e.g., DualDecoderCombinedModule)
         if hasattr(self.module, "compute_separate_losses"):
@@ -503,9 +502,8 @@ class TrainingPlan(pl.LightningModule):
 
     def validation_step(self, batch):
         """Validation step for the model."""
-        local_embedding, global_embedding, y_pred, y_true, attn, entry_mask = self.module._common_step(
-            batch, self.prediction_task, self.prediction_level
-        )
+        out = self.module._common_step(batch, self.prediction_task, self.prediction_level)
+        y_pred, y_true, entry_mask, attn = out.y_pred, out.y_true, out.entry_mask, out.attn
 
         # Check if module supports separate loss computation (e.g., DualDecoderCombinedModule)
         if hasattr(self.module, "compute_separate_losses"):
@@ -567,9 +565,8 @@ class TrainingPlan(pl.LightningModule):
 
     def test_step(self, batch):
         """Test step for the model."""
-        local_embedding, global_embedding, y_pred, y_true, attn, entry_mask = self.module._common_step(
-            batch, self.prediction_task, self.prediction_level
-        )
+        out = self.module._common_step(batch, self.prediction_task, self.prediction_level)
+        y_pred, y_true, entry_mask, attn = out.y_pred, out.y_true, out.entry_mask, out.attn
         # Check if module supports separate loss computation (e.g., DualDecoderCombinedModule)
         if hasattr(self.module, "compute_separate_losses"):
             separate_losses = self.module.compute_separate_losses(self.loss, self.loss_type, y_pred, y_true, entry_mask)

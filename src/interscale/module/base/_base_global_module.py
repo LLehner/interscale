@@ -6,6 +6,7 @@ import torch
 from sklearn.decomposition import NMF, PCA
 
 from ._base_module import BaseModule
+from ._step_output import StepOutput, ViewOutput
 
 
 class GlobalModule(BaseModule):
@@ -290,20 +291,13 @@ class GlobalModule(BaseModule):
 
         Returns
         -------
-        local_embedding: torch.Tensor
-            Size: [N, E]
-        global_embedding: torch.Tensor
-            Size: [N, E] with SEQ_LEN_MASK for padding nodes.
-        y_pred: torch.Tensor
-            Size: [N, C] (classification) or [N, F] (regression) with SEQ_LEN_MASK for padding nodes.
-        y_true: torch.Tensor
-            Size: [N, C] (classification) or [N, F] (regression) with SEQ_LEN_MASK for padding nodes.
-        attn_matrix: torch.Tensor
-            Stacked per-layer attention weights.
-        entry_mask: torch.Tensor | None
-            Size: [N, F], marking the entries the LOSS is scored on. y_pred/y_true cover every
-            cell the transformer produced, not just the masked ones -- see
-            `_process_batch_for_metrics`.
+        StepOutput
+            ``y_pred``/``y_true`` are ``[N, C]`` (classification) or ``[N, F]`` (regression) over
+            every cell the transformer produced, not just the masked ones -- see
+            ``_process_batch_for_metrics``. ``entry_mask`` marks the entries the LOSS is scored
+            on. The single view carries the padded ``global_embedding`` ``[S, B, E]``, its
+            ``src_padding_mask``, the ``padded_node_idx`` that maps tokens back to batch node
+            order, and the stacked per-layer attention.
         """
         # Mask nodes  - before GEX embedding because otherwise embedding contains information about masked nodes
         batch_masked, _, _ = self._common_step_masking(batch)
@@ -332,6 +326,7 @@ class GlobalModule(BaseModule):
         if prediction_task == "classification" and prediction_level == "graph":
             y_true = batch.y[batch.ptr[:-1]]
             entry_mask = None
+            padded_node_idx = None
         else:
             y_true, padded_node_idx, entry_mask = self._process_batch_for_metrics(
                 batch, prediction_task, prediction_level, pad_index_nodes
@@ -347,7 +342,19 @@ class GlobalModule(BaseModule):
         assert not torch.any(torch.isnan(y_pred)), "y_pred contains NaN values"
         assert not torch.any(torch.isnan(y_true)), "y_true contains NaN values"
 
-        return None, global_embedding, y_pred, y_true, attn_matrix, entry_mask
+        return StepOutput(
+            y_pred=y_pred,
+            y_true=y_true,
+            entry_mask=entry_mask,
+            views=[
+                ViewOutput(
+                    global_embedding=global_embedding,
+                    src_padding_mask=src_padding_mask,
+                    padded_node_idx=padded_node_idx,
+                    attn=attn_matrix,
+                )
+            ],
+        )
 
     def get_global_embeddings(self, x, edge_index):
         return self.forward(x, edge_index)

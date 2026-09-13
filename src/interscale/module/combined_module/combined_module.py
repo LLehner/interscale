@@ -3,7 +3,7 @@ from typing import Literal
 import torch
 from yacs.config import CfgNode as CN
 
-from interscale.module.base import BaseModule, GlobalModule, LocalModule
+from interscale.module.base import BaseModule, GlobalModule, LocalModule, StepOutput, ViewOutput
 
 
 class CombinedModule(BaseModule):
@@ -67,9 +67,14 @@ class CombinedModule(BaseModule):
     def _common_step(self, batch, prediction_task, prediction_level: Literal["node", "graph"]):
         """Shared step between train, val and test.
 
-        y_pred/y_true cover every cell the transformer produced. The trailing `entry_mask`
-        `[N, F]` marks the entries the LOSS is restricted to -- the gene mask under gene masking,
-        the per-cell mask broadcast over all genes under cell masking.
+        Returns
+        -------
+        StepOutput
+            ``y_pred``/``y_true`` cover every cell the transformer produced. ``entry_mask``
+            ``[N, F]`` marks the entries the LOSS is restricted to -- the gene mask under gene
+            masking, the per-cell mask broadcast over all genes under cell masking. The single
+            view carries both embeddings: ``local_embedding`` ``[N, E]`` in batch node order and
+            the padded ``global_embedding``, joined by ``padded_node_idx``.
         """
         batch_masked, _, _ = self._common_step_masking(batch)
 
@@ -81,6 +86,7 @@ class CombinedModule(BaseModule):
         if prediction_task == "classification" and prediction_level == "graph":
             y_true = batch.y[batch.ptr[:-1]]
             entry_mask = None
+            padded_node_idx = None
         else:
             y_true, padded_node_idx, entry_mask = self.global_module._process_batch_for_metrics(
                 batch, prediction_task, prediction_level, pad_index_nodes
@@ -93,7 +99,20 @@ class CombinedModule(BaseModule):
         assert not torch.any(torch.isnan(y_pred)), "y_pred contains NaN values"
         assert not torch.any(torch.isnan(y_true)), "y_true contains NaN values"
 
-        return local_embedding, global_embedding, y_pred, y_true, attn_matrix, entry_mask
+        return StepOutput(
+            y_pred=y_pred,
+            y_true=y_true,
+            entry_mask=entry_mask,
+            views=[
+                ViewOutput(
+                    local_embedding=local_embedding,
+                    global_embedding=global_embedding,
+                    src_padding_mask=src_padding_mask,
+                    padded_node_idx=padded_node_idx,
+                    attn=attn_matrix,
+                )
+            ],
+        )
 
     def get_model_summary(self) -> str:
         """Returns a string containing the model's parameters summary.

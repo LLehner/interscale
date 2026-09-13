@@ -1,5 +1,6 @@
 from ._base_global_module import GlobalModule
 from ._base_local_module import LocalModule
 from ._base_module import BaseModule
+from ._step_output import StepOutput, ViewOutput
 
-__all__ = ["BaseModule", "LocalModule", "GlobalModule"]
+__all__ = ["BaseModule", "LocalModule", "GlobalModule", "StepOutput", "ViewOutput"]
