@@ -56,6 +56,12 @@ class ViewOutput:
     padded_node_idx: torch.Tensor | None = None
     attn: torch.Tensor | None = None
 
+    def tokens(self) -> torch.Tensor:
+        """``[N_kept, E]`` real cell tokens -- see :func:`gather_tokens`."""
+        if self.global_embedding is None or self.src_padding_mask is None:
+            raise ValueError("This view has no padded global embedding to gather tokens from.")
+        return gather_tokens(self.global_embedding, self.src_padding_mask)
+
 
 @dataclass
 class StepOutput:
@@ -97,3 +103,46 @@ class StepOutput:
     def attn(self) -> torch.Tensor | None:
         """Shorthand for ``self.view.attn``."""
         return self.view.attn
+
+
+def gather_cls(global_embedding: torch.Tensor) -> torch.Tensor:
+    """The CLS token of each graph: ``[B, E]``.
+
+    The CLS token is *appended*, so it sits at the LAST sequence position -- not the first, as
+    BERT-style diagrams suggest. It is the one position every cell can attend to, which is also
+    what keeps a fully blocked long-range attention row from being all ``-inf``.
+    """
+    return global_embedding[-1, :, :]
+
+
+def gather_tokens(global_embedding: torch.Tensor, src_padding_mask: torch.Tensor) -> torch.Tensor:
+    """Real cell tokens as ``[N_kept, E]``, CLS and padding removed, in ``padded_node_idx`` order.
+
+    The single place that knows which end of the sequence is which. Two things it exists to stop,
+    both of which fail silently rather than raising:
+
+    * **CLS in the token set.** CLS attends to every cell and is similar to everything, so as a
+      contrastive negative it contributes a large, meaningless repulsive gradient to every anchor,
+      and as a reconstruction target it is a row with no cell behind it.
+    * **Padding in the token set.** Padded positions are identical to one another, so they inflate
+      any covariance and satisfy any variance floor without a single real cell varying.
+
+    ``pad_batch`` LEFT-pads, so a graph's tokens occupy the *last* positions before CLS. Boolean
+    indexing by ``~src_padding_mask`` is order-preserving either way, which is why this works
+    without knowing the padding side -- but nothing else here may assume the tokens start at 0.
+
+    Parameters
+    ----------
+    global_embedding
+        ``[S + 1, B, E]`` padded transformer output, CLS last.
+    src_padding_mask
+        ``[B, S + 1]`` boolean, ``True`` where the position is padding.
+
+    Returns
+    -------
+    torch.Tensor
+        ``[N_kept, E]``, row ``i`` being the cell named by ``padded_node_idx[i]``.
+    """
+    h = global_embedding[:-1]  # drop CLS -> [S, B, E]
+    h = torch.permute(h, (1, 0, 2))  # [B, S, E]
+    return h[~src_padding_mask[:, :-1]]  # [N_kept, E]

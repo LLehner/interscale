@@ -1,6 +1,14 @@
 from ._base_global_module import GlobalModule
 from ._base_local_module import LocalModule
 from ._base_module import BaseModule
-from ._step_output import StepOutput, ViewOutput
+from ._step_output import StepOutput, ViewOutput, gather_cls, gather_tokens
 
-__all__ = ["BaseModule", "LocalModule", "GlobalModule", "StepOutput", "ViewOutput"]
+__all__ = [
+    "BaseModule",
+    "LocalModule",
+    "GlobalModule",
+    "StepOutput",
+    "ViewOutput",
+    "gather_cls",
+    "gather_tokens",
+]

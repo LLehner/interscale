@@ -145,3 +145,47 @@ def test_entry_mask_is_carried_for_gene_masking():
     assert out.entry_mask is not None
     assert out.entry_mask.shape == out.y_true.shape
     assert torch.equal(out.entry_mask, batch.gene_mask[out.view.padded_node_idx])
+
+
+# --------------------------------------------------------------------------- the gather helpers
+
+
+def test_gather_tokens_agrees_with_the_decoder_input():
+    """`predict` was the only place this logic lived; extracting it must not move a single row."""
+    from interscale.module.base import gather_tokens
+
+    batch = make_batch(sizes=(6, 9, 4))
+    module = build_module()
+    out = module._common_step(batch, "regression", "node")
+    v = out.view
+
+    tokens = gather_tokens(v.global_embedding, v.src_padding_mask)
+
+    assert tokens.shape == (len(v.padded_node_idx), N_EMBED)
+    assert torch.equal(tokens, v.tokens())
+    # The decoder applied to these tokens is exactly the y_pred the step returned.
+    assert torch.allclose(module.decoder(tokens), out.y_pred)
+
+
+def test_gather_tokens_excludes_cls_and_padding():
+    """The CLS token sits at the last sequence position and must never enter the token set."""
+    from interscale.module.base import gather_cls, gather_tokens
+
+    batch = make_batch(sizes=(3, 9))
+    out = build_module(max_seq_len=32)._common_step(batch, "regression", "node")
+    v = out.view
+    s_plus_one, b, e = v.global_embedding.shape
+
+    tokens = gather_tokens(v.global_embedding, v.src_padding_mask)
+    cls = gather_cls(v.global_embedding)
+
+    assert cls.shape == (b, e)
+    # Every padded position and every CLS row is dropped: only the real cells survive.
+    assert len(tokens) == batch.num_nodes < b * s_plus_one
+    for row in cls:
+        assert not (tokens == row).all(dim=1).any(), "a CLS row leaked into the token set"
+
+
+def test_view_without_a_global_embedding_refuses_to_gather():
+    with pytest.raises(ValueError, match="no padded global embedding"):
+        ViewOutput(local_embedding=torch.zeros(2, 3)).tokens()

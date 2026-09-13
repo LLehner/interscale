@@ -6,7 +6,7 @@ import torch
 from sklearn.decomposition import NMF, PCA
 
 from ._base_module import BaseModule
-from ._step_output import StepOutput, ViewOutput
+from ._step_output import StepOutput, ViewOutput, gather_cls, gather_tokens
 
 
 class GlobalModule(BaseModule):
@@ -274,15 +274,10 @@ class GlobalModule(BaseModule):
         """
         ## Graph-level prediction: get cls_token from last position
         if "graph" in prediction_level:
-            cls_token = global_embedding[-1, :, :]  # [B, E]
-            return self.decoder(cls_token)
+            return self.decoder(gather_cls(global_embedding))
         ## Node-level prediction: remove cls_token from last position
         elif "node" in prediction_level:
-            h_graph = global_embedding[:-1]  # [E, B, C]
-            h_graph = torch.permute(h_graph, (1, 0, 2))  # [B, S, E]
-            src_padding_mask = src_padding_mask[:, :-1]  # True = Pad, False = Node
-            masked_output = h_graph[~src_padding_mask]  # [N, E]
-            return self.decoder(masked_output)
+            return self.decoder(gather_tokens(global_embedding, src_padding_mask))
         else:
             raise Exception("Choose a valid prediction tasks (graph or node).")
 
