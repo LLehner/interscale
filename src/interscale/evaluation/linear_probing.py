@@ -1,4 +1,4 @@
-"""Downstream task 1: how much of an ``.obs`` label is linearly readable from the embeddings.
+"""Linear probes: what is readable from the embeddings, by a model simple enough to prove it.
 
 The question this answers is not "can we classify" but "which representation carries the label, and
 does it beat the raw expression it was built from". Both are answered by running the same probe
@@ -20,7 +20,7 @@ covariate without touching this file.
 
 Run as a script::
 
-    python src/interscale/evaluation/downstream_classification.py \
+    python src/interscale/evaluation/linear_probing.py \
         --h5ad results/synth_data_0_model_output.h5ad --target cell_type --level node \
         --features X_pca X_scVI combined_local_emb+combined_global_emb
 """
@@ -38,9 +38,20 @@ import pandas as pd
 from anndata import AnnData
 from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, balanced_accuracy_score, f1_score, roc_auc_score
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import (
+    average_precision_score,
+    balanced_accuracy_score,
+    f1_score,
+    r2_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
@@ -427,7 +438,7 @@ def classify(
     out.insert(1, "target", target)
     out.insert(2, "level", level)
     out.insert(3, "estimator", estimator)
-    adata.uns.setdefault("downstream_classification", {})[f"{target}__{level}"] = out
+    adata.uns.setdefault("linear_probing", {}).setdefault("classification", {})[f"{target}__{level}"] = out
     return out
 
 
@@ -439,6 +450,171 @@ def summarize(results: pd.DataFrame, metric: str = "balanced_accuracy") -> pd.Da
         .agg(["mean", "std", "count"])
         .sort_values("mean", ascending=False)
     )
+
+
+# ---------------------------------------------------------------------------------------
+# Continuous probes: can a gene, or a continuous covariate, be read back out?
+# ---------------------------------------------------------------------------------------
+
+REGRESSORS = {
+    "ridge": lambda seed: Ridge(alpha=1.0, random_state=seed),
+    "rf": lambda seed: RandomForestRegressor(n_estimators=200, random_state=seed, n_jobs=-1),
+    "gbm": lambda seed: HistGradientBoostingRegressor(random_state=seed),
+}
+
+
+def targets_of_interest(adata: AnnData, *, n_noise_controls: int = 4, random_state: int = 0) -> list[str]:
+    """Genes worth probing one at a time: every annotated programme, plus noise genes as controls.
+
+    The controls are the point. A probe that reconstructs `int_mid` at R^2 0.4 has said nothing
+    until you know what it does on a gene with no structure at all -- the embedding reconstructs
+    whatever it kept, and on the ``hvg=False`` arm what it kept is mostly noise. Reading the two
+    side by side is what separates "found the programme" from "kept the loudest genes".
+    """
+    if "program" not in adata.var.columns:
+        raise KeyError("adata.var has no 'program' column; pass the target genes explicitly")
+    programme = [g for g, p in adata.var["program"].items() if p != "noise"]
+    noise = [g for g, p in adata.var["program"].items() if p == "noise"]
+    rng = np.random.default_rng(random_state)
+    controls = list(rng.choice(noise, size=min(n_noise_controls, len(noise)), replace=False)) if noise else []
+    return programme + controls
+
+
+def _program_of(adata: AnnData, target: str) -> str:
+    """Label a target by its planted programme, or as a covariate when it is an ``.obs`` column."""
+    if target in adata.var_names and "program" in adata.var.columns:
+        return str(adata.var["program"][target])
+    return "covariate" if target not in adata.var_names else ""
+
+
+def _resolve_target(adata: AnnData, target: str, layer: str | None) -> np.ndarray:
+    """A target is either a gene (from ``var_names``) or a numeric ``.obs`` column."""
+    if target in adata.var_names:
+        X = adata.layers[layer] if layer is not None else adata.X
+        col = X[:, adata.var_names.get_loc(target)]
+        return np.asarray(col.todense()).ravel() if hasattr(col, "todense") else np.asarray(col).ravel()
+    if target in adata.obs.columns and pd.api.types.is_numeric_dtype(adata.obs[target]):
+        return adata.obs[target].to_numpy(dtype=np.float64)
+    raise KeyError(f"'{target}' is neither a gene in var_names nor a numeric .obs column")
+
+
+def probe_continuous(
+    adata: AnnData,
+    targets: Sequence[str],
+    *,
+    feature_sets: dict[str, dict] | None = None,
+    prefix: str = "combined",
+    split_key: str = "split",
+    group_key: str | None = "donor",
+    estimator: str = "ridge",
+    baselines: tuple[str, ...] = ("expression", "shuffled"),
+    layer: str | None = "log1p_norm",
+    n_pca: int = 30,
+    cv_folds: int | None = None,
+    random_state: int = 0,
+) -> pd.DataFrame:
+    """Predict each target separately from each feature set, and report how well.
+
+    One model per (feature set, target): the question is which genes an embedding retained, and
+    fitting them jointly would let an easy gene carry a hard one.
+
+    **The expression baseline drops the target gene from its own features.** Without that it
+    reads its own answer and scores 1.0, which is not a baseline but a tautology. Note this does
+    not apply to the embeddings: an embedding trained to reconstruct the panel is *supposed* to
+    contain the target, and how much of it survived the bottleneck is exactly the measurement.
+
+    Parameters
+    ----------
+    adata
+        Object carrying the model output.
+    targets
+        Gene names or numeric ``.obs`` columns. :func:`targets_of_interest` builds a sensible
+        default: every annotated programme gene plus a few noise genes as controls.
+    feature_sets, prefix, split_key, group_key, estimator, baselines, layer, n_pca, cv_folds
+        As in :func:`classify`. ``estimator`` indexes :data:`REGRESSORS`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per ``(target, feature_set, eval, fold, metric)``, with ``r2`` and ``pearson_r``.
+    """
+    if estimator not in REGRESSORS:
+        raise KeyError(f"unknown estimator '{estimator}'. Available: {sorted(REGRESSORS)}")
+
+    feature_sets = dict(feature_sets or default_feature_sets(adata, prefix))
+    if "expression" in baselines:
+        feature_sets["expression"] = {"expression": True}
+    if not feature_sets:
+        raise ValueError("no feature sets to probe")
+
+    split = adata.obs[split_key].astype(str).to_numpy() if split_key in adata.obs else np.array(["train"] * adata.n_obs)
+    groups = adata.obs[group_key].astype(str).to_numpy() if group_key in adata.obs else np.arange(adata.n_obs)
+    use_cv = cv_folds is not None
+    rng = np.random.default_rng(random_state)
+
+    # Feature matrices do not depend on the target, so build each once rather than per gene.
+    built: dict[str, np.ndarray] = {}
+    for name, spec in feature_sets.items():
+        built[name] = build_features(
+            adata,
+            obsm_keys=tuple(spec.get("obsm", ())),
+            obs_keys=tuple(spec.get("obs", ())),
+            expression=bool(spec.get("expression", False)),
+            layer=layer,
+            n_pca=0 if spec.get("expression") else n_pca,  # keep genes identifiable so the target can be dropped
+            random_state=random_state,
+        )[0]
+
+    gene_pos = {g: i for i, g in enumerate(adata.var_names)}
+    rows = []
+    for target in targets:
+        y = _resolve_target(adata, target, layer)
+        for name, X in built.items():
+            if name == "expression" and target in gene_pos:
+                X = np.delete(X, gene_pos[target], axis=1)  # never let a gene predict itself
+
+            variants = {name: y}
+            if "shuffled" in baselines:
+                variants[f"{name}__shuffled"] = rng.permutation(y)
+
+            for vname, y_v in variants.items():
+                if use_cv:
+                    splitter = GroupKFold(n_splits=min(cv_folds, len(np.unique(groups))))
+                    folds = list(splitter.split(X, y_v, groups=groups))
+                    evals = [("cv", tr, te) for tr, te in folds]
+                else:
+                    tr = np.flatnonzero(split == "train")
+                    evals = [(ev, tr, np.flatnonzero(split == ev)) for ev in ("val", "test")]
+
+                for fold, (ev, tr, te) in enumerate(evals):
+                    if len(te) == 0 or len(tr) == 0:
+                        continue
+                    model = Pipeline([("scale", StandardScaler()), ("reg", REGRESSORS[estimator](random_state))])
+                    model.fit(X[tr], y_v[tr])
+                    pred = model.predict(X[te])
+                    r = np.corrcoef(pred, y_v[te])[0, 1] if np.std(pred) > 0 and np.std(y_v[te]) > 0 else 0.0
+                    rows.append({
+                        "target": target,
+                        "program": _program_of(adata, target),
+                        "feature_set": vname,
+                        "eval": ev,
+                        "fold": fold,
+                        "estimator": estimator,
+                        "r2": r2_score(y_v[te], pred),
+                        "pearson_r": float(r),
+                    })
+
+    out = pd.DataFrame(rows)
+    adata.uns.setdefault("linear_probing", {})["continuous"] = out
+    return out
+
+
+def summarize_by_target(results: pd.DataFrame, metric: str = "r2", eval_split: str | None = None) -> pd.DataFrame:
+    """Targets as rows, feature sets as columns -- the per-gene summary, at a glance."""
+    df = results if eval_split is None else results[results["eval"] == eval_split]
+    df = df[~df["feature_set"].str.endswith("__shuffled")]
+    table = df.pivot_table(index=["program", "target"], columns="feature_set", values=metric, aggfunc="mean")
+    return table.sort_values(by=list(table.columns)[0], ascending=False)
 
 
 def main() -> None:
