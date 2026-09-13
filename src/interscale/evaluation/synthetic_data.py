@@ -55,14 +55,23 @@ NICHE_COMPOSITION = {
 
 
 def _gene_table(
-    n_noise_genes: int, lr_range: float, mid_range: float, long_range: float, effect_scale: float
+    n_noise_genes: int,
+    n_batch_genes: int,
+    batch_effect_sd: float,
+    lr_range: float,
+    mid_range: float,
+    long_range: float,
+    effect_scale: float,
 ) -> pd.DataFrame:
     """Build the gene annotation, i.e. which gene belongs to which program.
 
     Parameters
     ----------
     n_noise_genes
-        Number of structure-free genes. The remaining 18 genes are the annotated programs.
+        Number of structure-free genes.
+    n_batch_genes, batch_effect_sd
+        How many genes carry a per-slide offset, and the standard deviation of that offset in
+        log space.
     lr_range, mid_range, long_range
         Kernel widths of the contact-range ligand/receptor pair and of the mid- and long-range
         interaction programs, in coordinate units.
@@ -123,6 +132,15 @@ def _gene_table(
         {"gene": "cond_up_1", "program": "condition_de", "effect_size": 1.0},
         {"gene": "cond_up_2", "program": "condition_de", "effect_size": 0.8},
         {"gene": "cond_down_1", "program": "condition_de", "effect_size": -1.0},
+    ]
+
+    # Technical, not biological: each of these shifts by its own amount on each slide, the same
+    # shift for every cell of that slide. Nuisance the model should NOT be rewarded for tracking
+    # -- they are what makes "can the embedding tell slides apart" a meaningful question, and what
+    # the batch block of the attention regression has to absorb.
+    rows += [
+        {"gene": f"batch_{i + 1:02d}", "program": "batch_effect", "effect_size": batch_effect_sd}
+        for i in range(n_batch_genes)
     ]
 
     genes = pd.DataFrame(rows).set_index("gene")
@@ -191,6 +209,7 @@ def _log_effects(
     obs: dict[str, np.ndarray],
     condition: str,
     slide_size: float,
+    batch_offsets: dict[str, float],
 ) -> np.ndarray:
     """Per-cell, per-gene log-fold effect on the ZINB mean.
 
@@ -234,6 +253,9 @@ def _log_effects(
             eff[:, j] = beta * obs["hub_response"] * diseased
         elif program == "condition_de":
             eff[:, j] = beta * diseased
+        elif program == "batch_effect":
+            # One draw per (slide, gene), constant across the slide's cells.
+            eff[:, j] = beta * batch_offsets[gene]
     return eff
 
 
@@ -252,6 +274,7 @@ def _simulate_slide(
     long_range: float,
     n_hub_cells: int,
     edge_weight_cutoff: float,
+    batch_offsets: dict[str, float],
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame]:
     """Simulate one slide: coordinates, annotations, counts and the ground-truth edge list."""
     pos = _sample_positions(rng, n_cells, slide_size)
@@ -294,7 +317,7 @@ def _simulate_slide(
         "kern_senderB_mid": kern_senderB_mid,
     }
 
-    log_eff = _log_effects(genes, obs_arrays, condition, slide_size)
+    log_eff = _log_effects(genes, obs_arrays, condition, slide_size, batch_offsets)
 
     # Library size: a per-cell lognormal times a per-slide factor. The slide factor is the batch
     # effect the downstream regression is asked to partial out.
@@ -422,6 +445,8 @@ def make_synthetic(
     n_cells_per_slide: int = 1500,
     slide_size: float = 1000.0,
     n_noise_genes: int = 24,
+    n_batch_genes: int = 3,
+    batch_effect_sd: float = 0.3,
     lr_range: float = 20.0,
     short_range: float = 30.0,
     mid_range: float = 150.0,
@@ -444,7 +469,12 @@ def make_synthetic(
     slide_size
         Side length of the square slide, in the same units as the interaction ranges.
     n_noise_genes
-        Structure-free genes; the 18 annotated program genes are added on top.
+        Structure-free genes; the annotated program genes are added on top.
+    n_batch_genes, batch_effect_sd
+        Genes carrying a per-slide offset, and the standard deviation of that offset in log space.
+        Technical variation the model should not be rewarded for tracking: it is what makes slide
+        classification from the embedding a meaningful probe, and what the batch block of the
+        attention regression has to absorb.
     lr_range
         Contact radius of the ligand/receptor pair -- the distance at which two cells count as
         touching. Keep it below ``short_range``; at the default density it gives each cell about
@@ -481,7 +511,9 @@ def make_synthetic(
 
     rng = np.random.default_rng(seed)
 
-    genes = _gene_table(n_noise_genes, lr_range, mid_range, long_range, effect_scale)
+    genes = _gene_table(
+        n_noise_genes, n_batch_genes, batch_effect_sd, lr_range, mid_range, long_range, effect_scale
+    )
     n_genes = len(genes)
     # Baseline abundance and overdispersion are gene properties, shared across all slides --
     # otherwise a "gene" would not mean the same thing in two slides.
@@ -494,6 +526,7 @@ def make_synthetic(
     genes["pi"] = pi
 
     obs_frames, pos_list, count_list, edge_frames = [], [], [], []
+    batch_offset_rows = []
     offset = 0
     for condition in CONDITIONS:
         for d in range(n_donors_per_condition):
@@ -506,6 +539,13 @@ def make_synthetic(
                 split = "train"
             for s in range(n_slides_per_donor):
                 slide = f"{donor}_s{s + 1}"
+                # One offset per (slide, batch gene), drawn here so the same gene shifts by a
+                # different amount on each slide -- which is what a batch effect is.
+                offsets = {
+                    gene: float(rng.normal(0.0, 1.0))
+                    for gene in genes.index[genes["program"] == "batch_effect"]
+                }
+                batch_offset_rows.append({"slide": slide, **offsets})
                 obs, pos, counts, edges = _simulate_slide(
                     rng,
                     genes,
@@ -520,6 +560,7 @@ def make_synthetic(
                     long_range=long_range,
                     n_hub_cells=n_hub_cells,
                     edge_weight_cutoff=edge_weight_cutoff,
+                    batch_offsets=offsets,
                 )
                 obs["split"] = split
                 obs_frames.append(obs)
@@ -603,6 +644,8 @@ def make_synthetic(
             "mid_range": mid_range,
             "long_range": long_range,
             "n_hub_cells": n_hub_cells,
+            "n_batch_genes": n_batch_genes,
+            "batch_effect_sd": batch_effect_sd,
             "graph_radius": float(short_range if graph_radius is None else graph_radius),
             "effect_scale": effect_scale,
             "edge_weight_cutoff": edge_weight_cutoff,
@@ -619,6 +662,9 @@ def make_synthetic(
             ]
         ),
         "niche_composition": pd.DataFrame(NICHE_COMPOSITION).T.fillna(0.0),
+        # The per-slide shift actually drawn for each batch gene, so the nuisance is ground
+        # truth rather than something to be inferred back out.
+        "batch_offsets": pd.DataFrame(batch_offset_rows).set_index("slide"),
     }
     return adata
 

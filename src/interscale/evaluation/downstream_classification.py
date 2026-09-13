@@ -299,7 +299,10 @@ def classify(
         is the right level for slide- or condition-scale targets.
     sample_key, split_key, group_key
         ``.obs`` columns naming the aggregation unit, the train/val/test split and the grouping
-        variable (donor) that grouped CV must not break across folds.
+        variable (donor) that grouped CV must not break across folds. ``group_key=None``, or a
+        name absent from ``.obs``, disables grouping so folds are cut over individual cells --
+        which is what a target nested inside the grouping variable, such as ``slide`` within
+        ``donor``, requires.
     estimator
         One of :data:`ESTIMATORS`.
     baselines
@@ -356,6 +359,22 @@ def classify(
         if level == "graph":
             X, y, groups, split = _aggregate(X, y_all, groups_all, split_all, unit_all)
         classes = np.unique(y)
+
+        if not use_cv:
+            # A split built to hold out whole groups can leave the eval folds with classes the
+            # training fold never saw -- `slide` under a donor split is the clean example, since
+            # no slide appears in two splits. The probe would then score ~0 and look like a
+            # finding rather than an impossible question.
+            train_classes = set(np.unique(y[split == "train"]))
+            eval_classes = set(np.unique(y[np.isin(split, ("val", "test"))]))
+            if eval_classes and not (eval_classes & train_classes):
+                raise ValueError(
+                    f"no class of '{target}' appears in both the train and the eval splits "
+                    f"({len(train_classes)} train, {len(eval_classes)} eval, 0 shared), so the "
+                    f"stored split cannot score it. Pass cv_folds to cross-validate over the "
+                    f"whole object instead, with group_key=None if the target is nested inside "
+                    f"the grouping variable."
+                )
 
         variants = {name: y}
         if "shuffled" in baselines:

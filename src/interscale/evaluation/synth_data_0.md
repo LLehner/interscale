@@ -62,7 +62,7 @@ Cell positions are not perfectly uniform. Each slide gets its own smooth density
 feeds through into neighbour counts and QC statistics — another nuisance the regression has to
 account for.
 
-## The 42 genes
+## The 45 genes
 
 All counts come from one zero-inflated negative binomial model. Every effect below is an additive
 term in the log of the ZINB mean, so effect sizes are comparable across programs, and
@@ -102,6 +102,16 @@ term in the log of the ZINB mean, so effect sizes are comparable across programs
     a **400-unit scale**, and **present only in diseased slides**. It needs long-range context
     *and* the condition; geometry alone will not produce it. The rule is identical on every
     diseased slide, so it is also a test of whether patterns transfer across slides.
+- **3 batch genes** (`batch_01` … `batch_03`) — each shifts by its own amount on each slide, the
+  same shift for every cell of that slide, drawn from a normal with standard deviation
+  `batch_effect_sd` (0.3) in log space. Purely technical: nothing biological varies with it, and
+  the model should *not* be rewarded for tracking it. They are what makes "can the embedding tell
+  slides apart" a meaningful probe, and what the batch block of the attention regression has to
+  absorb. The shifts actually drawn are recorded in `uns['synthetic']['batch_offsets']`.
+
+  At default settings the between-slide spread of mean expression is ~0.14–0.24 for these genes
+  against ~0.05 for noise and marker genes, and raw expression classifies slide identity at about
+  0.42 balanced accuracy against a 0.17 baseline — detectable, but a long way from dominant.
 - **3 condition genes** (`cond_up_1`, `cond_up_2`, `cond_down_1`) — simply shifted in diseased
   slides, with no spatial structure. They make condition classification solvable without any
   interaction being found, which is what makes them a useful control for the CLS-token analysis.
@@ -152,6 +162,7 @@ silently ignored.
 | `var` | `program`, `effect_size`, `true_length_scale`, `target_cell_type`, `is_spatial` |
 | `uns['synthetic']['interaction_edges']` | every pair of cells that actually influenced each other, with weight and range class |
 | `uns['synthetic']['interactions']` | the four programs in one small table, negative control included |
+| `uns['synthetic']['batch_offsets']` | the per-slide shift drawn for each batch gene |
 | `uns['synthetic']['params']` | every parameter the run used |
 
 The edge list is the important one. Cells are referred to by **position** in the object, which
@@ -187,6 +198,12 @@ should be able to win on.
 The informative comparisons here are `cell_type` and `niche` at node level — local embedding versus
 global embedding versus raw expression — and `condition` at graph level, which should live in the
 global embedding and the CLS token rather than the local one.
+
+`slide` is the one probe where **lower is better**: it asks how much slide-specific technical
+variation the embedding absorbed. It also needs its own evaluation, because the split is by donor
+and therefore no slide appears in both train and eval — score it by cross-validation over cells
+with grouping off (`cv_folds=5, group_key=None`). Using the stored split instead raises, rather
+than silently reporting the ~0 that an impossible question earns.
 
 `downstream_regression.py` asks how much of the attention is left once distance, cell-type pair
 identity, niche, counts and batch have been accounted for, and then ranks that residual against
