@@ -457,6 +457,7 @@ def make_synthetic(
     edge_weight_cutoff: float = 0.4,
     n_val_donors: int = 1,
     n_test_donors: int = 1,
+    hvg: bool = True,
     seed: int = 0,
 ) -> AnnData:
     """Simulate the full multi-slide dataset.
@@ -495,6 +496,14 @@ def make_synthetic(
         Kernel weight above which a pair enters the ground-truth edge list.
     n_val_donors, n_test_donors
         Donors per condition held out for val and test. The rest are train.
+    hvg
+        Whether the genes carrying a programme are the variable ones. ``True`` (default) gives
+        every gene a high, near-Poisson baseline with no zero inflation, so the planted effects
+        dominate and noise genes sit near-constant -- signal-to-noise variance ratio around 10x,
+        and no noise gene in the ten most variable. ``False`` draws the baseline, dispersion and
+        dropout per gene at random, which leaves noise genes as variable as programme genes
+        (ratio ~1.0x, six of the ten most variable) and lets them win the encoder's bottleneck.
+        Keep ``False`` as the harder comparison arm, not as the default.
     seed
         Seed for the single :class:`numpy.random.Generator` driving the simulation.
 
@@ -517,13 +526,36 @@ def make_synthetic(
     n_genes = len(genes)
     # Baseline abundance and overdispersion are gene properties, shared across all slides --
     # otherwise a "gene" would not mean the same thing in two slides.
-    genes["base_mu"] = np.exp(rng.uniform(np.log(0.5), np.log(20.0), size=n_genes))
-    genes["theta"] = np.exp(rng.uniform(np.log(1.0), np.log(10.0), size=n_genes))
-    pi = rng.uniform(0.05, 0.35, size=n_genes)
-    # Program genes get less dropout: a signal that is zero-inflated away is not a detectable
-    # pattern, it is noise with extra steps.
-    pi[genes["program"].to_numpy() != "noise"] = rng.uniform(0.02, 0.10, size=int((genes["program"] != "noise").sum()))
-    genes["pi"] = pi
+    if hvg:
+        # Signal-dominant. Every gene gets a high, near-Poisson baseline, so sampling noise is
+        # small next to the planted log-fold effects and what separates a programme gene from a
+        # noise gene is the programme, not the draw. Noise genes end up near-constant across
+        # cells -- a uniformly expressed background.
+        #
+        # This is the variant to use when reading gene rankings. The encoder compresses G genes
+        # into n_embed dimensions by minimising summed squared error, so it keeps the highest
+        # variance genes first, whatever they mean. Under `hvg=False` the loudest genes are
+        # noise, and the ranking reports that faithfully -- a property of the data, not a model
+        # failure. Measured signal-to-noise variance ratio: ~10x here against ~1.0x there.
+        #
+        # Zero inflation is switched off (pi = 0), which makes this arm negative-binomial rather
+        # than zero-inflated. It has to be: on a gene whose log1p mean is ~3.7, dropping even 2%
+        # of entries to zero contributes ~0.27 of variance on its own, which is an order of
+        # magnitude more than everything else here and would drown the programme signal it is
+        # supposed to leave visible. Dropout realism is what the hvg=False arm is for.
+        genes["base_mu"] = rng.uniform(30.0, 60.0, size=n_genes)
+        genes["theta"] = np.full(n_genes, 200.0)
+        genes["pi"] = np.zeros(n_genes)
+    else:
+        genes["base_mu"] = np.exp(rng.uniform(np.log(0.5), np.log(20.0), size=n_genes))
+        genes["theta"] = np.exp(rng.uniform(np.log(1.0), np.log(10.0), size=n_genes))
+        pi = rng.uniform(0.05, 0.35, size=n_genes)
+        # Program genes get less dropout: a signal that is zero-inflated away is not a detectable
+        # pattern, it is noise with extra steps.
+        pi[genes["program"].to_numpy() != "noise"] = rng.uniform(
+            0.02, 0.10, size=int((genes["program"] != "noise").sum())
+        )
+        genes["pi"] = pi
 
     obs_frames, pos_list, count_list, edge_frames = [], [], [], []
     batch_offset_rows = []
@@ -646,6 +678,7 @@ def make_synthetic(
             "n_hub_cells": n_hub_cells,
             "n_batch_genes": n_batch_genes,
             "batch_effect_sd": batch_effect_sd,
+            "hvg": bool(hvg),
             "graph_radius": float(short_range if graph_radius is None else graph_radius),
             "effect_scale": effect_scale,
             "edge_weight_cutoff": edge_weight_cutoff,
@@ -699,6 +732,8 @@ def main() -> None:
     parser.add_argument("--n-cells-per-slide", type=int, default=1500)
     parser.add_argument("--lr-range", type=float, default=20.0)
     parser.add_argument("--graph-radius", type=float, default=None)
+    parser.add_argument("--no-hvg", dest="hvg", action="store_false",
+                        help="noise-dominant variant: programme genes are no more variable than noise")
     parser.add_argument("--effect-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -709,6 +744,7 @@ def main() -> None:
         n_cells_per_slide=args.n_cells_per_slide,
         lr_range=args.lr_range,
         graph_radius=args.graph_radius,
+        hvg=args.hvg,
         effect_scale=args.effect_scale,
         seed=args.seed,
     )

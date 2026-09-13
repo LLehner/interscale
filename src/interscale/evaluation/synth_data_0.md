@@ -68,6 +68,30 @@ All counts come from one zero-inflated negative binomial model. Every effect bel
 term in the log of the ZINB mean, so effect sizes are comparable across programs, and
 `--effect-scale` scales all of them at once to find where an architecture stops detecting things.
 
+### `hvg` — which genes are the variable ones
+
+This switch decides whether the programme genes or the noise genes carry the variance, and it
+matters more than it sounds. The encoder compresses 45 genes into `n_embed` (16) dimensions by
+minimising summed squared error, so it keeps the **most variable** genes first, whatever they
+mean. Whichever genes are loudest is what the embedding — and therefore the gene ranking — will be
+about.
+
+- **`hvg=True` (default)** — every gene gets a high, near-Poisson baseline and no zero inflation,
+  so the planted log-fold effects are what moves a gene. Noise genes sit near-constant: a
+  uniformly expressed background. Measured at default size: noise variance 0.06 against 0.35 for
+  programme genes (**5.6×**), and **no noise gene among the ten most variable** — the top three
+  are `lig_LR1`, `int_mid`, `rec_LR1`. Use this arm whenever you intend to read a gene ranking.
+- **`hvg=False`** — baseline, dispersion and dropout are drawn per gene at random. Noise genes end
+  up as variable as programme genes (ratio **1.0×**, six of the ten most variable are noise), so
+  they win the bottleneck and dominate the top of the reconstruction ranking. This is not a model
+  failure when it happens; it is the data saying the loudest genes are meaningless. Keep it as the
+  harder comparison arm.
+
+Zero inflation is off in the `hvg=True` arm, making it negative-binomial rather than
+zero-inflated. It has to be: on a gene whose log1p mean is ~3.7, dropping even 2% of entries to
+zero adds ~0.27 of variance by itself, an order of magnitude more than everything else and enough
+to drown the signal it is meant to leave visible. Dropout realism is what `hvg=False` is for.
+
 - **24 noise genes** (`noise_00` … `noise_23`) — no structure at all. They are the majority of the
   panel on purpose: a method that highlights them is reporting noise.
 - **6 cell-type markers** (`mark_senderA` …) — one per cell type. These make cell-type
@@ -216,6 +240,7 @@ cell-type identity carries no information about it.
 ## Knobs worth turning
 
 - `--effect-scale` — shrink every effect to find an architecture's detection floor.
+- `--no-hvg` — the noise-dominant arm described above, for comparison against the default.
 - `--lr-range` — the contact radius. Raising it gives each cell more partners and a stronger
   ligand/receptor correlation, at the cost of the pair no longer being a contact-range effect.
 - `--n-cells-per-slide` — trades detection (denser sampling of each interaction kernel) against
