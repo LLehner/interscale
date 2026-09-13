@@ -180,8 +180,8 @@ def warn_missing_categories(adata, split_key: str, cfg: CN) -> list[str]:
             else:
                 consequence = (
                     "Category ordering is preserved across splits, so the annotation itself stays "
-                    "correct; but anything that samples per category in that split -- "
-                    "composition-matched negatives, for one -- has nothing to draw for it."
+                    "correct; but anything that samples per category in that split, e.g. "
+                    "composition-matched negatives, has nothing to draw for it."
                 )
 
             message = (
