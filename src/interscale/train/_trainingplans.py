@@ -12,6 +12,7 @@ from interscale.module.base._base_module import BaseModule
 from interscale.nn import CosineWarmupScheduler
 from interscale.tl.masking import masked_loss
 
+from .aux_losses import CompositeAuxLoss
 from .losses import BalancedPearsonCorrelationLoss, SCE_EntropyATT_Loss, SCELoss
 
 
@@ -178,6 +179,7 @@ class TrainingPlan(pl.LightningModule):
         class_weights: np.ndarray | None = None,
         class_labels: list[str] | None = None,
         *,
+        aux_losses: CompositeAuxLoss | None = None,
         lr_scheduler: None | Literal["ReduceLROnPlateau", "CosineWarmupScheduler"] = None,
         weight_decay: float = 1e-6,
         lr: float = 1e-3,
@@ -188,6 +190,11 @@ class TrainingPlan(pl.LightningModule):
     ):
         super().__init__()
         self.module = module
+        # Auxiliary terms added beside the reconstruction criterion. Empty unless some
+        # `optim.aux_loss_weights` entry is non-zero, in which case `build_aux_losses` has already
+        # constructed exactly those terms. Held as a submodule so any heads they own are found by
+        # `configure_optimizers`.
+        self.aux_losses = aux_losses if aux_losses is not None else CompositeAuxLoss({}, {})
         self.prediction_task = prediction_task
         self.prediction_level = prediction_level
         self.loss_type = loss
@@ -461,7 +468,8 @@ class TrainingPlan(pl.LightningModule):
 
         # Modules that decode twice (DualDecoderCombinedModule) report each half separately.
         if not hasattr(self.module, "compute_separate_losses"):
-            return self._compute_and_log_metrics(y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask)
+            loss = self._compute_and_log_metrics(y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask)
+            return self._add_aux_losses(loss, out, batch, mode, sync_dist)
 
         separate_losses = self.module.compute_separate_losses(self.loss, self.loss_type, y_pred, y_true, entry_mask)
 
@@ -483,8 +491,30 @@ class TrainingPlan(pl.LightningModule):
             self._log_scalar(f"{mode}_kl_loss", kl_loss, False)
             loss = loss + kl_weight * kl_loss
 
+        loss = self._add_aux_losses(loss, out, batch, mode, sync_dist)
         assert not torch.isnan(loss), "loss is NaN"
         return loss
+
+    def _add_aux_losses(self, loss, out, batch, mode: str, sync_dist: bool):
+        """Add the weighted auxiliary terms to ``loss`` and log each one.
+
+        Returns ``loss`` untouched -- the same tensor object, not an equal one -- when no term is
+        enabled, which is the default. That is deliberate: an unconditional ``loss + 0`` would be
+        numerically identical but would still make every existing run take a different code path,
+        and the point of this scaffolding is that it is inert until something is switched on.
+
+        Terms are logged *unweighted*, under ``<mode>_<name>``, because the unweighted value is
+        what stays comparable across runs that weight the term differently. The weighted sum is
+        logged separately as ``<mode>_aux_total``.
+        """
+        if not self.aux_losses:
+            return loss
+
+        aux_total, reported = self.aux_losses(out, batch)
+        for name, value in reported.items():
+            self._log_scalar(f"{mode}_{name}", value, sync_dist)
+        self._log_scalar(f"{mode}_aux_total", aux_total, sync_dist)
+        return loss + aux_total
 
     def training_step(self, batch):
         """Training step for the model.
@@ -507,6 +537,9 @@ class TrainingPlan(pl.LightningModule):
         """Configure optimizers and learning rate schedulers."""
         params = []
         params.extend(filter(lambda p: p.requires_grad, self.module.parameters()))
+        # Projection/expander heads live on the auxiliary terms, not on the module, so they have
+        # to be collected explicitly or they would never be updated.
+        params.extend(filter(lambda p: p.requires_grad, self.aux_losses.parameters()))
         # if self.model.local_component is not None:
         #     params.extend(filter(lambda p: p.requires_grad, self.module.local_component.parameters()))
         # if self.model.global_component is not None:

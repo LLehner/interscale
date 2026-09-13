@@ -34,4 +34,29 @@ def get_optim_cfg(cfg):
     # Metric driving EarlyStopping / ModelCheckpoint / the LR scheduler.
     # "auto" -> val_f1_macro for classification, val_loss for regression.
     cfg.optim.monitor = "auto"
+
+    # Auxiliary loss terms added beside `optim.loss`, as name -> weight. A weight of 0.0 means the
+    # term is never constructed, so every existing config keeps behaving exactly as before. Flat
+    # float keys rather than a list of nested nodes, so a sweep can set
+    # `optim.aux_loss_weights.<name>` through merge_from_list with no special handling. See
+    # `interscale.train.aux_losses` and `.claude/contrastive_plan.md`.
+    cfg.optim.aux_loss_weights = CN()
+
+    # Shared settings for the contrastive terms. Inert until one of them carries a weight.
+    cfg.optim.contrastive = CN()
+    # NT-Xent / InfoNCE temperature. Deliberately not 0.1: the softmax denominator already weights
+    # negatives by similarity, and here the most similar cells are the ones most likely to share
+    # the anchor's interaction program, so the weighting wants flattening rather than sharpening.
+    cfg.optim.contrastive.temperature = 0.5
+    # Which tokens may serve as negatives for an anchor. "within_slide" keeps batch effect from
+    # becoming the cheapest way to tell two cells apart.
+    cfg.optim.contrastive.negatives = "within_slide"
+    # Hops of the anchor's own spatial neighbourhood removed from the negative pool; they are
+    # near-certain false negatives. Match the local component's num_layers.
+    cfg.optim.contrastive.exclude_khop = 2
+    # Hidden/output widths of the heads the contrastive terms read through. Separate heads because
+    # the loss families disagree about normalisation: InfoNCE wants L2-normalised outputs, VICReg
+    # explicitly does not.
+    cfg.optim.contrastive.projector_dims = [64]
+    cfg.optim.contrastive.expander_dims = [256]
     return cfg

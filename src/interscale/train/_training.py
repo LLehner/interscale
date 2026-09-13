@@ -10,6 +10,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.trainer import seed_everything
 
 from interscale.tl.utils import get_model_filename_prefix
+from interscale.train.aux_losses import build_aux_losses
 from interscale.train._trainingplans import TrainingPlan
 from interscale.train._utils import MetricsHistory, NodeMaskResampleCallback
 
@@ -127,6 +128,10 @@ class NodeMaskingTrainingPlan:
         performance_callback = None
 
         # defines optimizers, training step, val step, logged metrics
+        aux_losses = build_aux_losses(self._cfg, self.module)
+        if aux_losses:
+            print(f"Auxiliary losses: {dict(aux_losses.weights)} (views required: {aux_losses.requires_views})")
+
         training_plan = self._training_plan_cls(
             self.module,
             self.prediction_task,
@@ -137,6 +142,7 @@ class NodeMaskingTrainingPlan:
             self.class_weights,
             self.class_labels if self.prediction_task == "classification" else None,
             **plan_kwargs,
+            aux_losses=aux_losses,
             lr_scheduler=self._cfg.optim.lr_scheduler,
             weight_decay=self._cfg.optim.wd,
             lr=self._cfg.optim.lr,
