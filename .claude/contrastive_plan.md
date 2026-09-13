@@ -63,10 +63,15 @@ so they are not the thing that tells you nothing moved.
   expression clustering. `cfg.dataset.celltype_key` now attaches an existing annotation.
 - Whether the SimCSE floor (two passes, dropout-only) is strong enough to change the
   ordering of Stages 1–3.
-- **Auxiliary-loss heads are not persisted.** They live on the `TrainingPlan`, so
-  `BaseModel.save` (which writes only `module.state_dict()`) does not store them. Correct for
-  inference, where the head is discarded anyway, but resuming a run would silently reinitialise
-  the expander. Decide in Stage 1, when there is a real parameter at stake.
+- **Auxiliary-loss heads are not in the `.pt`.** They live on the `TrainingPlan`, so
+  `BaseModel.save` — which writes only `module.state_dict()` — omits them, while Lightning's
+  `ModelCheckpoint` (the `.ckpt`) does include them. Verified: a run with one parameterised term
+  gave 31 module keys / 0 aux keys in the `.pt` and 31 / 2 in the `.ckpt`, and `BaseModel.load`
+  reads the `.pt`. Harmless for inference, where the head is discarded anyway; it bites when
+  *resuming* training, which silently reinitialises the expander — no error, just a loss jump.
+  The one-line fix is to attach the composite to the module instead of the plan, so
+  `state_dict()` and `parameters()` both find it and `load(strict=False)` restores it. Decide in
+  Stage 1, when there is a real parameter at stake.
 
 **Found while implementing Stage 0** (all pre-existing, none fixed here)
 
@@ -78,10 +83,21 @@ so they are not the thing that tells you nothing moved.
 - `prepare_geome_dataset` reads `cfg.model.global_component.parameters.type_gex_embedding`
   unconditionally, so a local-only config (no global component name) raises `AttributeError`
   before any training starts.
-- Categoricals were being narrowed three times before one-hot encoding (split subsetting,
-  `transforms.Subset`, then `preserve_categories` preserving only what was left). Fixed for the
-  new optional fields via `_RestoreCategories`; the same exposure exists for a classification
-  `prediction_obs` whose label is absent from a split.
+- Categoricals are narrowed three times before one-hot encoding — split subsetting drops unused
+  categories on the *view*, `transforms.Subset` drops them again with an empty `key_value`, and
+  only then does `preserve_categories` run, preserving what is left rather than what was there.
+  Fixed for the new optional fields via `_RestoreCategories`, which had no other guard.
+
+  A classification `prediction_obs` missing a label from one split **is exposed to the same
+  narrowing but fails loudly rather than silently**, so it needs no fix: `n_output` comes from
+  `summary_stats["n_prediction_obs"]` on the *full* object while `y` is built per split, so a
+  dropped category is a width mismatch and `_compute_and_log_metrics` asserts. Verified by
+  running it (4 classes, `d` absent from train and `b` from val: both splits width 3 with column
+  1 meaning `b` in one and `c` in the other, and the run raises before any of that is used).
+  Note this is an *accidental* guard — it holds only because the two numbers come from different
+  objects — and the message, "y_true and y_pred must have the same shape", names nothing that
+  would lead anyone to a missing cell type. A check at dataset-prep time naming the absent
+  category would be a real improvement.
 
 ## Design principles
 
