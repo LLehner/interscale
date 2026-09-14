@@ -385,6 +385,10 @@ class OnlineProbeCallback(Callback):
         # Per-metric history, {chart_key: {series_name: [(epoch, value), ...]}}. Kept so each
         # wandb chart can be re-rendered with the full curve every time it is refreshed.
         self._history: dict[str, dict[str, list[tuple[int, float]]]] = {}
+        # Probe rounds completed, which paces the chart refresh. Counted in rounds rather than
+        # read off trainer.current_epoch because the post-fit trainer.validate() reports the
+        # epoch training ended on, so an epoch-based cadence could skip the final render.
+        self._rounds = 0
 
     # ---------------------------------------------------------------- Lightning hooks
 
@@ -407,7 +411,9 @@ class OnlineProbeCallback(Callback):
             pl_module.log(name, value, on_step=False, on_epoch=True, batch_size=int(self._cfg.dataset.batch_size))
 
         self._record(trainer, results)
-        self._publish_charts(trainer)
+        # trainer.validate() after fit restores the best checkpoint and revalidates, so this is
+        # the run's final and most representative probe -- always chart it.
+        self._publish_charts(final=trainer.state.fn != "fit")
 
     # ---------------------------------------------------------------- the probe itself
 
@@ -541,15 +547,25 @@ class OnlineProbeCallback(Callback):
         return series
 
     def _record(self, trainer, results: dict[str, float]) -> None:
+        self._rounds += 1
         epoch = trainer.current_epoch
         for chart_key, points in self.chart_series(trainer, results).items():
             chart = self._history.setdefault(chart_key, {})
             for series_name, value in points.items():
                 chart.setdefault(series_name, []).append((epoch, value))
 
-    def _publish_charts(self, trainer) -> None:
-        """Re-render one wandb line chart per target, with every embedding as its own line."""
+    def _publish_charts(self, *, final: bool = False) -> None:
+        """Re-render one wandb line chart per target, with every embedding as its own line.
+
+        Throttled by ``probe.chart_every_n_epochs``: every refresh re-uploads the whole curve
+        as a fresh wandb Table, so refreshing on every round costs O(epochs^2) bytes and one
+        file per chart per round. ``final=True`` overrides the cadence so the end-of-run chart
+        is always complete.
+        """
         if not self._probe_cfg.wandb_charts or not self._cfg.wandb.use:
+            return
+        cadence = max(1, int(self._probe_cfg.chart_every_n_epochs))
+        if not final and self._rounds % cadence != 0:
             return
 
         try:

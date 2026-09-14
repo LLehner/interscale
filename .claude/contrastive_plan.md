@@ -8,16 +8,19 @@ prediction intermediate.
 
 ## Status
 
-Last updated 2026-09-13. Update this table in the same commit as the work it describes.
+Last updated 2026-09-14. Update this table in the same commit as the work it describes.
 "Implemented, unverified" is a real state — a stage is only `done` when something external
 says so (a test, a reproduced number, a run that was actually looked at).
 
-Work happens on the `contrastive-learning` branch.
+Work now happens on `main`. The `contrastive-learning` branch was fast-forwarded into it on
+2026-09-14 (main was a strict ancestor, so no merge commit) because Stage 0b needs `StepOutput`
+and the optional dataset fields, and there was no reason to keep those off main once Stage 0 was
+verified. The branch still exists but is behind; do not commit to it.
 
 | stage | state | verified by | date |
 |---|---|---|---|
 | 0 — plumbing (`StepOutput`, `gather_tokens`, composite loss, step collapse, dataset fields) | **done** | 119 tests pass; `scripts/equivalence_harness.py` reports IDENTICAL against the pre-refactor baseline | 2026-09-13 |
-| 0b — probe battery | not started (deliberately skipped for now) | | |
+| 0b — probe battery | **partly done** — online probes exist (`evaluation/online_probes.py`, commit `b88b76f`); the attention-flow control and the donor-grouped protocol do not | 156 tests pass; the `noise_00` negative control reads ~0.02 R2 where it read 0.33 before the masking fix, on a real synth_data_0 run | 2026-09-14 |
 | 1 — VICReg var/cov, no views | not started | | |
 | 2 — context NCE, composition-matched negatives | not started | | |
 | 3 — two views (NT-Xent / VICReg invariance) | not started | | |
@@ -284,7 +287,35 @@ checkpoints still load.
 
 ## Stage 0b — the yardstick (do this before Stage 1)
 
-You cannot evaluate Stage 1 without it. A script over
+**Status: partly built.** [`evaluation/online_probes.py`](../src/interscale/evaluation/online_probes.py)
+now runs probes *during* training as a Lightning callback, gated on `cfg.probe.use`. It reads the
+same target out of the local and the global embedding with one readout, fit on train and scored on
+val, and logs each pair as flat `val_probe_<target>_<metric>_<embedding>` scalars plus a wandb
+chart carrying both lines. Targets are any attached annotation (`probe.classification_targets`,
+so `slide` and `condition` are available once their `dataset.*_key` is set) and any gene
+(`probe.regression_genes`).
+
+What that covers and what it does not:
+
+- **Covered**: interaction-program membership (as per-gene regression on `int_short`/`int_mid`/`int_long`),
+  slide identity and condition (as categorical probes), reconstruction (already logged).
+- **Not covered**: `niche` is not in `tl.geome_utils.OPTIONAL_FIELDS`, so it cannot be attached yet.
+  The **net-attention-flow control on the `medulla` `senderB`→`receiverA` pair is not implemented at
+  all**, and it is the measurement that separates "learned composition" from "learned interaction" —
+  Stage 1 cannot be called evaluated without it.
+- **Different protocol**: the online probe fits on train and scores on val. It does *not* do the
+  donor-grouped CV that `linear_probing.py` does, so its absolute numbers are not comparable with
+  that script's. Use `linear_probing.py` for the post-hoc, publishable version and the online probe
+  for watching a run.
+
+One finding from building it, which applies to any probe added here: **restrict probes to masked
+cells**. An unmasked cell's own expression is in the encoder input, so a linear readout recovers
+the target by inverting the embedding. On synth_data_0 at `mask_percentage` 0.3 the structure-free
+`noise_00` control probed at **R2 0.33 from both embeddings**; restricted to masked cells it sits
+at **~0.02**. A negative control that does not read as negative invalidates every other number in
+the battery. `probe.masked_cells_only` defaults to True and should stay there.
+
+The full battery, from the original plan — a script over
 [`evaluation/linear_probing.py`](../src/interscale/evaluation/linear_probing.py) (which
 already does donor-grouped CV) reporting, for every run:
 
@@ -488,7 +519,7 @@ optim:
 | stage | new | modified |
 |---|---|---|
 | 0 | `module/base/_step_output.py`, `train/aux_losses.py` | 4× `_common_step`, `_trainingplans.py`, `optim_config.py`, `tl/geome_utils.py` |
-| 0b | `evaluation/probe_battery.py` | — |
+| 0b | `evaluation/online_probes.py`, `config/probe_config.py` | `config/__init__.py` (validation), `train/_training.py` (callback), `evaluation/__init__.py` |
 | 1 | — | `aux_losses.py`, `_base_global_module.py` (expander) |
 | 2 | — | `aux_losses.py`, `tl/geome_utils.py` (celltype field) |
 | 3 | `tl/augment.py` | `_base_global_module.py` (multi-pass), `geome_dataloader.py` |

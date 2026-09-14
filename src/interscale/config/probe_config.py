@@ -70,8 +70,17 @@ def get_probe_cfg(cfg):
 
     # Log a wandb custom chart per target with local and global as two lines on ONE plot.
     # The flat scalars below are logged either way -- they are what EarlyStopping,
-    # ModelCheckpoint and a sweep's ranking metric can actually monitor; the chart is purely
-    # for reading a run off the dashboard. Ignored when `wandb.use` is False.
+    # ModelCheckpoint, a sweep's ranking metric and any CROSS-RUN comparison actually read;
+    # the chart is a within-run convenience. Ignored when `wandb.use` is False.
     cfg.probe.wandb_charts = True
+    # How often to re-render those charts, counted in probe rounds rather than epochs.
+    #
+    # Each refresh uploads one wandb Table per chart holding the FULL curve so far, so the cost
+    # is quadratic in run length: refreshing every round over 200 epochs is ~1400 table files
+    # per run and megabytes of duplicated history, which on a 5-trial sweep is mostly sync time.
+    # The charts are for watching a run, not for reading a number off, so a coarse cadence
+    # loses nothing. The final validation pass always publishes regardless of this, so the
+    # end-of-run chart is complete whatever it is set to.
+    cfg.probe.chart_every_n_epochs = 10
 
     return cfg

@@ -393,3 +393,67 @@ def test_disabled_probe_validates_anything():
     cfg.probe.use = False
     cfg.probe.embeddings = ["nonsense"]
     _validate_probe(cfg)
+
+
+# --------------------------------------------------------------------------- chart cadence
+
+
+class _ChartSpy(OnlineProbeCallback):
+    """Records how often the wandb charts would actually be re-rendered."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.published = 0
+
+    def _publish_charts(self, *, final=False):
+        cadence = max(1, int(self._probe_cfg.chart_every_n_epochs))
+        if not final and self._rounds % cadence != 0:
+            return
+        self.published += 1
+
+
+def _tick(callback, epoch, final=False):
+    class _Trainer:
+        current_epoch = epoch
+        callback_metrics = {"val_local_loss": 1.0, "val_global_loss": 0.9}
+
+    callback._record(_Trainer(), {probe_metric_name("celltype", "precision", "local"): 0.5})
+    callback._publish_charts(final=final)
+
+
+def test_charts_are_throttled_to_the_configured_cadence():
+    """Every refresh re-uploads the whole curve, so the cost is quadratic in run length."""
+    cfg = probe_cfg()
+    cfg.probe.chart_every_n_epochs = 5
+    callback = _ChartSpy(cfg, GENES)
+
+    for epoch in range(20):
+        _tick(callback, epoch)
+
+    assert callback.published == 4  # rounds 5, 10, 15, 20
+
+
+def test_final_validation_always_publishes_a_chart():
+    """trainer.validate() runs on the restored best checkpoint -- that chart must not be skipped."""
+    cfg = probe_cfg()
+    cfg.probe.chart_every_n_epochs = 100
+    callback = _ChartSpy(cfg, GENES)
+
+    for epoch in range(3):
+        _tick(callback, epoch)
+    assert callback.published == 0
+
+    _tick(callback, 3, final=True)
+    assert callback.published == 1
+
+
+def test_history_keeps_every_round_even_when_charts_are_throttled():
+    """Throttling must only skip the upload, never drop a point from the curve."""
+    cfg = probe_cfg()
+    cfg.probe.chart_every_n_epochs = 10
+    callback = _ChartSpy(cfg, GENES)
+
+    for epoch in range(7):
+        _tick(callback, epoch)
+
+    assert len(callback._history["celltype_precision"]["local"]) == 7
