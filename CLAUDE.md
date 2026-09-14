@@ -125,6 +125,42 @@ The registered ablation pairs are `<dataset>/node_reg` (cell) vs `<dataset>/node
 
 Post-hoc analysis utilities operating on the `adata` produced by `save_evaluation_results`/`get_model_output`: gene loadings, gene-rank analysis, gene-set covariance, latent-space analysis, graph classification metrics, and network/attention stream visualization (`net_streams.py`).
 
+#### Online probes (`evaluation/online_probes.py`)
+
+`linear_probing.py` probes a finished run's `.h5ad`. `online_probes.py` probes *during* training,
+as a Lightning callback, so a local-vs-global comparison is a curve rather than one end-of-run
+number. It is off unless `cfg.probe.use` (see `config/probe_config.py`); when off, no callback is
+built and the trainer is unchanged.
+
+Every probe reads the **same target out of both embeddings** with the same readout — the gap
+between the two columns is the point, not either number alone. Targets are `probe.classification_targets`
+(an optional annotation attached to the PyG graphs, so `celltype` requires `dataset.celltype_key`;
+scored with macro precision/recall via logistic regression) and `probe.regression_genes` (a column
+of `adata.var_names`; scored with MSE and R2 via ridge). Results are logged as flat
+`val_probe_<target>_<metric>_<embedding>` scalars — monitorable by EarlyStopping/ModelCheckpoint/a
+sweep — plus, under wandb, one custom chart per target carrying both embeddings as two lines.
+
+Three invariants, each guarding a failure that does not raise:
+
+- **`probe.masked_cells_only` must stay True.** An unmasked cell's own expression is in the encoder
+  input, so a readout recovers the target by inverting the embedding rather than by using anything
+  the model learned. Measured on synth_data_0 at `mask_percentage` 0.3, the structure-free `noise_00`
+  control probed at **R2 0.33 from both embeddings** with the restriction off and **~0.02** with it
+  on. A negative control that does not read as negative makes every other probe unreadable.
+- **The probe consumes no RNG.** It builds its own `shuffle=False` loaders over `datamodule.train_data`
+  / `val_data` rather than iterating `train_dataloader()`, whose shuffle draws from the same torch
+  generator the training batch order comes from — so enabling the probe would reorder training
+  batches and change the model being measured. Dropout is off, masks are read not redrawn, and the
+  subsample uses its own seeded numpy generator.
+- **Both halves see identical rows.** The local embedding is gathered by `ViewOutput.padded_node_idx`,
+  the same index that brings global tokens into cell order; row sets are built once per target and
+  shared by both embeddings. Misalignment scores at chance, which reads like a real negative result.
+
+The readout is fit on train and scored on val (standard linear probing), which costs one extra
+no-grad pass over each split — `probe.every_n_epochs` is the knob for that. The val mask is fixed
+for the whole run (`NodeMaskResampleCallback` only redraws train), so the scored rows are stable
+across epochs and the curve is comparable.
+
 ## Repository conventions
 
 - Numpy-style docstrings (see `docs/contributing.md`); many docstring lint rules are intentionally disabled in `pyproject.toml` for legacy modules, but new public APIs should still be documented in numpy style since `sphinx-autodoc-typehints`/napoleon render them for the docs site.

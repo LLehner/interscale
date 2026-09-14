@@ -7,6 +7,7 @@ from .global_component_config import get_global_component_cfg
 from .local_component_config import get_local_component_cfg
 from .model_config import get_model_cfg
 from .optim_config import get_optim_cfg
+from .probe_config import get_probe_cfg
 from .wandb_config import get_wandb_cfg
 
 
@@ -19,6 +20,7 @@ def get_cfg_defaults():
     cfg = get_model_cfg(cfg)
     cfg = get_optim_cfg(cfg)
     cfg = get_dataset_cfg(cfg)
+    cfg = get_probe_cfg(cfg)
 
     return cfg
 
@@ -164,6 +166,60 @@ def _validate_optim(cfg):
         )
 
 
+def _validate_probe(cfg):
+    """Reject probe settings that would cost a forward pass and measure nothing.
+
+    Every check here is a silent no-op that is otherwise only discoverable by reading an empty
+    panel at the end of a sweep: a probe with no targets, a categorical target whose annotation
+    was never attached to the graphs, or an embedding name no module produces.
+
+    Raises
+    ------
+    ValueError
+        If ``probe.use`` is set but the probe block cannot produce a single number.
+    """
+    from interscale.evaluation.online_probes import EMBEDDINGS
+
+    if not cfg.probe.use:
+        return
+
+    if cfg.probe.every_n_epochs < 1:
+        raise ValueError(f"probe.every_n_epochs must be >= 1, got {cfg.probe.every_n_epochs} (the probe never runs).")
+
+    unknown = sorted(set(cfg.probe.embeddings) - set(EMBEDDINGS))
+    if unknown:
+        raise ValueError(f"probe.embeddings names no such representation: {unknown}. Known: {sorted(EMBEDDINGS)}.")
+    if not cfg.probe.embeddings:
+        raise ValueError(
+            "probe.use is True but probe.embeddings is empty, so there is nothing to read a target out of."
+        )
+
+    if not cfg.probe.classification_targets and not cfg.probe.regression_genes:
+        raise ValueError(
+            "probe.use is True but neither probe.classification_targets nor probe.regression_genes "
+            "names a target. The probe would pay for a full extra pass over train and val and log "
+            "nothing."
+        )
+
+    # A categorical target is read off the PyG Data object, and the annotation only reaches it
+    # when its `dataset.*_key` is set -- see `tl.geome_utils.OPTIONAL_FIELDS`. Caught here
+    # rather than at the first probe epoch, which on a warm-up-limited run is 40 epochs in.
+    from interscale.tl.geome_utils import OPTIONAL_FIELDS
+
+    for target in cfg.probe.classification_targets:
+        if target not in OPTIONAL_FIELDS:
+            raise ValueError(
+                f"probe.classification_targets names '{target}', which is not an attachable "
+                f"annotation. Known: {sorted(k for k, (_, src) in OPTIONAL_FIELDS.items() if src == 'obs')}."
+            )
+        cfg_key, _source = OPTIONAL_FIELDS[target]
+        if getattr(cfg.dataset, cfg_key, None) is None:
+            raise ValueError(
+                f"probe.classification_targets asks for '{target}' but dataset.{cfg_key} is unset, "
+                f"so that annotation is never attached to the graphs and the probe has no labels."
+            )
+
+
 def load_config(cfg_path=None, overrides=None):
     """Loads and optionally overrides config values.
 
@@ -193,6 +249,7 @@ def load_config(cfg_path=None, overrides=None):
     if not cfg_paths and not overrides:
         _validate_optim(cfg)
         _validate_masking(cfg)
+        _validate_probe(cfg)
         cfg.freeze()
         return cfg
 
@@ -212,5 +269,6 @@ def load_config(cfg_path=None, overrides=None):
 
     _validate_optim(cfg)
     _validate_masking(cfg)
+    _validate_probe(cfg)
     cfg.freeze()
     return cfg

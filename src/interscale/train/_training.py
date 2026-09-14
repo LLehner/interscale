@@ -9,6 +9,7 @@ from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, Mode
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.trainer import seed_everything
 
+from interscale.evaluation.online_probes import build_probe_callback
 from interscale.tl.utils import get_model_filename_prefix
 from interscale.train._trainingplans import TrainingPlan
 from interscale.train._utils import MetricsHistory, NodeMaskResampleCallback
@@ -122,6 +123,16 @@ class NodeMaskingTrainingPlan:
         lr_monitor = LearningRateMonitor(logging_interval="epoch")
         self.history_ = MetricsHistory()
         mask_resample_callback = NodeMaskResampleCallback() if self._cfg.dataset.mask_percentage > 0 else None
+        # None unless cfg.probe.use, so a run without probes builds the trainer it always did.
+        # Reads adata for var_names only -- the probe resolves gene names to batch.x columns.
+        probe_callback = build_probe_callback(self._cfg, self._adata)
+        if probe_callback is not None:
+            print(
+                f"Online probes every {self._cfg.probe.every_n_epochs} epoch(s) on "
+                f"{list(self._cfg.probe.embeddings)}: "
+                f"classification={list(self._cfg.probe.classification_targets)}, "
+                f"genes={list(self._cfg.probe.regression_genes)}"
+            )
         checkpoint_callback = None
         loss_callback = None
         performance_callback = None
@@ -211,6 +222,7 @@ class NodeMaskingTrainingPlan:
                 self.history_,
                 mask_resample_callback,
                 checkpoint_callback,
+                probe_callback,
             ]
             if callback is not None
         ]
