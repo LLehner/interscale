@@ -56,10 +56,22 @@ def get_dataset_cfg(cfg):
     #
     # An obs column arrives as a one-hot `[N, n_categories]` float, not as integer codes; use
     # `interscale.tl.label_codes` to read it. An obsm key arrives as its matrix, `[N, D]`.
+    # obsm matrix holding NUMERIC probe targets (e.g. dist_to_center, hub_response). geome
+    # cannot attach a numeric obs column -- it hands back a pandas Series and dies at torch.cat
+    # -- so continuous covariates have to arrive as an obsm matrix. `probe.regression_obs` names
+    # the obs columns and the training entrypoint stacks them into this key; the column ORDER is
+    # `probe.regression_obs`, which is what lets the probe index them by name.
+    cfg.dataset.probe_obsm_key = None
+
     cfg.dataset.slide_key = None
     cfg.dataset.condition_key = None
     cfg.dataset.celltype_key = None
     cfg.dataset.spatial_key = None
+
+    # Run trainer.test() after fitting. Costs a third full pass and triples the metric names in
+    # the logger (every train_/val_ metric gains a test_ twin) for a number that should only be
+    # looked at once, at the end of a project. Kept True so existing runs are unchanged.
+    cfg.dataset.evaluate_test = True
 
     # Segmentation robustness parameters
     cfg.dataset.segmentation_robustness = None  # [node_fraction, overflow_fraction] or None

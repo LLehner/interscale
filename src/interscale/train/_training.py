@@ -272,7 +272,7 @@ class NodeMaskingTrainingPlan:
             print("WARNING: no best checkpoint found; evaluating FINAL-epoch weights.")
 
         trainer.validate(training_plan, datamodule)
-        if self.train_size + self.validation_size < 1:
+        if self._cfg.dataset.evaluate_test and self.train_size + self.validation_size < 1:
             trainer.test(training_plan, datamodule)
 
         # Print early stopping information if it was used

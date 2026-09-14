@@ -6,7 +6,7 @@ from ._gene_set_covariance import gene_set_covariance, spatial_covariance_plot
 from ._latent_analysis import _get_Z, calculate_dim_importance, get_genes_dim, latent_rank_report
 from .graph_classification import calculate_pr_auc, pr_auc_curve, scale_cls_by_sample
 from .net_streams import plot_all_spatial_net_streams, plot_flow_clusters, plot_global_directionality
-from .online_probes import OnlineProbeCallback, build_probe_callback, probe_metric_name
+from .online_probes import OnlineProbeCallback, build_probe_callback, build_probe_obsm, probe_metric_name
 
 __all__ = [
     "gene_loadings",
@@ -25,5 +25,6 @@ __all__ = [
     "calculate_dim_importance",
     "OnlineProbeCallback",
     "build_probe_callback",
+    "build_probe_obsm",
     "probe_metric_name",
 ]

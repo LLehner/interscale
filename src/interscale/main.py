@@ -8,6 +8,7 @@ import squidpy as sq
 import interscale as interscale
 from interscale.config import load_config
 from interscale.config.cli import add_config_args, print_registry, resolve_cfg_from_args
+from interscale.evaluation.online_probes import build_probe_obsm
 from interscale.geome_dataloader import GraphAnnDataModule
 from interscale.pp import apply_segmentation_noise
 from interscale.tl import prepare_geome_dataset, remove_zero_expression_cells, set_full_reproducibility
@@ -78,6 +79,10 @@ def main(cfg, model_type):
         )
 
         model = interscale.model.CombinedModel(adata, cfg=cfg)
+
+    # Numeric probe targets must become an obsm matrix before the graphs are built; geome
+    # cannot attach a numeric obs column. No-op unless probe.regression_obs is set.
+    build_probe_obsm(adata, cfg)
 
     pyg_data_list, _ = prepare_geome_dataset(adata, cfg)
     dm = GraphAnnDataModule(

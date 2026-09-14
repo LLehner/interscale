@@ -71,14 +71,20 @@ CLASSIFICATION_METRICS = ("precision", "recall")
 REGRESSION_METRICS = ("mse", "r2")
 
 
-def probe_metric_name(target: str, metric: str, embedding: str) -> str:
-    """The flat scalar name a probe result is logged under.
+#: Prefix for every probe scalar. The slash is load-bearing: wandb groups panels into sections
+#: by the text before the first "/", so this is what keeps the probe numbers out of the default
+#: section where InterScale's own train_/val_ metrics live. Monitor strings match on the full
+#: name, so "probe/celltype_precision_global" is still usable as optim.monitor.
+PROBE_PREFIX = "probe"
 
-    Flat and ``val_``-prefixed rather than slash-nested, because these names have to be usable
-    as ``optim.monitor`` / an EarlyStopping monitor / a sweep's ranking metric, and those match
-    on exactly this string.
+
+def probe_metric_name(target: str, metric: str, embedding: str) -> str:
+    """The scalar name a probe result is logged under.
+
+    All probes are scored on the validation split, so the name carries no ``val_`` -- the
+    prefix already says these are probe numbers and nothing else produces them.
     """
-    return f"val_probe_{target}_{metric}_{embedding}"
+    return f"{PROBE_PREFIX}/{target}_{metric}_{embedding}"
 
 
 @dataclass
@@ -154,9 +160,11 @@ def collect_features(
     embeddings: tuple[str, ...],
     gene_index: dict[str, int],
     categorical_targets: tuple[str, ...],
+    obs_targets: tuple[str, ...],
     mask_strategy: str,
     batch_size: int,
     device,
+    corrupt: bool = True,
 ) -> ProbeBatchFeatures:
     """Run ``module`` over ``data_list`` and gather embeddings and probe targets.
 
@@ -176,6 +184,9 @@ def collect_features(
         ``{gene_name: column of batch.x}`` for the continuous targets.
     categorical_targets
         Names of optional annotations attached to the ``Data`` objects, e.g. ``("celltype",)``.
+    obs_targets
+        Names of the numeric obs columns carried in ``batch.probe_targets``, in the column order
+        the entrypoint stacked them.
     mask_strategy
         ``cfg.dataset.mask_strategy``. Passed explicitly rather than sniffed from whether a
         ``gene_mask`` attribute happens to be present, for the reason ``tl/masking.py``
@@ -187,6 +198,11 @@ def collect_features(
         any batch size.
     device
         Device to move each batch to.
+    corrupt
+        True runs the model on the batch as training does, masked input and all -- required for
+        gene targets, whose value would otherwise be sitting in the encoder's input. False
+        blanks nothing, giving every cell an uncorrupted embedding, which is what a label probe
+        wants: the label is not an input, so there is no leak and masking only destroys signal.
 
     Returns
     -------
@@ -210,6 +226,16 @@ def collect_features(
             # Captured before the forward pass purely for readability: apply_mask corrupts a
             # clone, so this reference stays the uncorrupted expression either way.
             x_true = batch.x
+
+            if not corrupt:
+                # An all-False mask makes apply_mask a no-op (it assigns MASK_VALUE to an empty
+                # selection), so the encoder sees the real expression. Assigned as a NEW tensor
+                # rather than filled in place: the loader collates a fresh Batch per iteration
+                # but its tensors can share storage with the source Data objects, and writing
+                # through would destroy the training masks this split is using.
+                batch.mask = torch.zeros_like(batch.mask)
+                if getattr(batch, "gene_mask", None) is not None:
+                    batch.gene_mask = torch.zeros_like(batch.gene_mask)
 
             out = module._common_step(batch, prediction_task, prediction_level)
             view = out.view
@@ -237,6 +263,17 @@ def collect_features(
 
             batch_cat = {name: label_codes(batch, name)[idx].detach().cpu().numpy() for name in categorical_targets}
             batch_con = {gene: x_true[idx, col].detach().cpu().numpy() for gene, col in gene_index.items()}
+            if obs_targets:
+                targets = getattr(batch, "probe_targets", None)
+                if targets is None:
+                    raise AttributeError(
+                        f"probe.regression_obs asks for {list(obs_targets)} but the batch carries no "
+                        "'probe_targets'; set dataset.probe_obsm_key and stack those obs columns "
+                        "into that obsm key before building the graphs."
+                    )
+                # Column order is probe.regression_obs, fixed by whoever built the obsm.
+                for col, name in enumerate(obs_targets):
+                    batch_con[name] = targets[idx, col].detach().cpu().numpy()
 
             # Which rows the model was actually asked about. `batch.mask` is the row-wise OR of
             # `gene_mask` under gene masking, so it means "this cell is a supervision target"
@@ -370,6 +407,9 @@ class OnlineProbeCallback(Callback):
         self._probe_cfg = cfg.probe
         self._embeddings = tuple(cfg.probe.embeddings)
         self._categorical = tuple(cfg.probe.classification_targets)
+        # Column order in batch.probe_targets is exactly this order -- whoever builds the obsm
+        # must stack the columns the same way, which `build_probe_obsm` guarantees.
+        self._obs_targets = tuple(cfg.probe.regression_obs)
 
         var_names = list(var_names)
         missing = [g for g in cfg.probe.regression_genes if g not in var_names]
@@ -420,6 +460,11 @@ class OnlineProbeCallback(Callback):
     def run(self, module, datamodule, *, device) -> dict[str, float]:
         """Collect both splits, fit every (target, embedding) readout, and return the scalars.
 
+        Runs up to two passes per split, because the two kinds of target need opposite inputs:
+        a CLEAN pass for labels (never model inputs, so masking only deletes signal) and a
+        CORRUPTED pass for genes (model inputs, so an unmasked probe measures invertibility).
+        A pass is skipped entirely when no target needs it.
+
         Separated from the hook so it can be called directly in a test, with no trainer.
         """
         # Checked before the passes, not after: a mismatch means every gene name resolves to the
@@ -436,28 +481,34 @@ class OnlineProbeCallback(Callback):
             "embeddings": self._embeddings,
             "gene_index": self._gene_index,
             "categorical_targets": self._categorical,
+            "obs_targets": self._obs_targets,
             "mask_strategy": self._cfg.dataset.mask_strategy,
             "batch_size": int(self._cfg.dataset.batch_size),
             "device": device,
         }
 
-        train = collect_features(module, datamodule.train_data, **collect_kwargs)
-        val = collect_features(module, datamodule.val_data, **collect_kwargs)
-
-        # Restrict to what the model was actually asked about, THEN subsample. The other order
-        # would spend the `max_cells` budget on rows that are about to be discarded, so a cap
-        # of 20000 over a 30%-masked split would leave ~6000 usable rows rather than 20000.
-        # An unmasked cell had its own expression in the encoder input, so probing it asks
-        # whether the embedding can be inverted, not whether the model learned anything -- see
-        # probe.masked_cells_only.
-        restrict = bool(self._probe_cfg.masked_cells_only)
-        cat_train, cat_val = (self._masked(train), self._masked(val)) if restrict else (train, val)
-
         results: dict[str, float] = {}
-        # Row sets are built once per target and shared by both embeddings, so the local and
-        # global columns of a pair are always scored on identical cells.
+        wants_labels = bool(self._categorical or self._obs_targets)
+        wants_genes = bool(self._gene_index)
+
+        if wants_labels:
+            clean_train = collect_features(module, datamodule.train_data, corrupt=False, **collect_kwargs)
+            clean_val = collect_features(module, datamodule.val_data, corrupt=False, **collect_kwargs)
+            results.update(self._score_labels(clean_train, clean_val))
+
+        if wants_genes:
+            train = collect_features(module, datamodule.train_data, corrupt=True, **collect_kwargs)
+            val = collect_features(module, datamodule.val_data, corrupt=True, **collect_kwargs)
+            results.update(self._score_genes(train, val))
+
+        return results
+
+    def _score_labels(self, train: ProbeBatchFeatures, val: ProbeBatchFeatures) -> dict[str, float]:
+        """Categorical and numeric-obs targets, on every cell of the clean pass."""
+        results: dict[str, float] = {}
+        x_train, x_val = self._capped(train), self._capped(val)
+
         for target in self._categorical:
-            x_train, x_val = self._capped(cat_train), self._capped(cat_val)
             for embedding in x_train.embeddings:
                 scores = score_classification(
                     x_train.embeddings[embedding],
@@ -469,6 +520,25 @@ class OnlineProbeCallback(Callback):
                 )
                 for metric, value in scores.items():
                     results[probe_metric_name(target, metric, embedding)] = value
+
+        for target in self._obs_targets:
+            for embedding in x_train.embeddings:
+                scores = score_regression(
+                    x_train.embeddings[embedding],
+                    x_train.continuous[target],
+                    x_val.embeddings[embedding],
+                    x_val.continuous[target],
+                    alpha=float(self._probe_cfg.ridge_alpha),
+                )
+                for metric, value in scores.items():
+                    results[probe_metric_name(target, metric, embedding)] = value
+
+        return results
+
+    def _score_genes(self, train: ProbeBatchFeatures, val: ProbeBatchFeatures) -> dict[str, float]:
+        """Gene targets, restricted to the held-out entries of the corrupted pass."""
+        restrict = bool(self._probe_cfg.masked_cells_only)
+        results: dict[str, float] = {}
 
         for gene in self._gene_index:
             # Selected per gene, not once: under mask_strategy "gene" the held-out entries are
@@ -539,8 +609,8 @@ class OnlineProbeCallback(Callback):
             series["recon_loss"] = recon
 
         for name, value in results.items():
-            # val_probe_<target>_<metric>_<embedding> -> chart "<target>_<metric>", series <embedding>
-            body = name[len("val_probe_") :]
+            # probe/<target>_<metric>_<embedding> -> chart "<target>_<metric>", series <embedding>
+            body = name[len(PROBE_PREFIX) + 1 :]
             target_metric, _, embedding = body.rpartition("_")
             series.setdefault(target_metric, {})[embedding] = value
 
@@ -591,6 +661,66 @@ class OnlineProbeCallback(Callback):
             )
         if payload:
             wandb.log(payload, commit=False)
+
+
+def build_probe_obsm(adata, cfg) -> bool:
+    """Stack ``probe.regression_obs`` into ``adata.obsm[cfg.dataset.probe_obsm_key]``.
+
+    geome cannot attach a numeric ``obs`` column -- it returns a pandas Series and dies inside
+    ``torch.cat`` -- so continuous covariates have to reach the graphs as an obsm matrix. This
+    lives beside :func:`collect_features`, which reads the matrix back by position, so the two
+    cannot disagree about column order.
+
+    Call it BEFORE ``prepare_geome_dataset``; afterwards the graphs are already built.
+
+    Parameters
+    ----------
+    adata
+        Mutated in place: the obsm key is added.
+    cfg
+        Read for ``probe.regression_obs`` and ``dataset.probe_obsm_key``.
+
+    Returns
+    -------
+    bool
+        True if a matrix was written, False if there was nothing to write.
+
+    Raises
+    ------
+    KeyError
+        If a named column is not in ``adata.obs``.
+    ValueError
+        If ``dataset.probe_obsm_key`` is unset, or a column is not numeric -- a categorical
+        column silently coerced to codes would be probed as though its labels were a ruler.
+    """
+    names = list(getattr(cfg.probe, "regression_obs", []) or [])
+    if not names:
+        return False
+
+    key = cfg.dataset.probe_obsm_key
+    if not key:
+        raise ValueError(
+            f"probe.regression_obs names {names} but dataset.probe_obsm_key is unset, so there "
+            "is no obsm key to stack them into and the graphs would carry no probe_targets."
+        )
+
+    missing = [c for c in names if c not in adata.obs.columns]
+    if missing:
+        raise KeyError(f"probe.regression_obs names columns that are not in adata.obs: {missing}")
+
+    import pandas as pd
+
+    non_numeric = [c for c in names if not pd.api.types.is_numeric_dtype(adata.obs[c])]
+    if non_numeric:
+        raise ValueError(
+            f"probe.regression_obs must name NUMERIC obs columns; {non_numeric} are not. A "
+            "categorical column belongs in probe.classification_targets instead -- regressing on "
+            "its codes would treat the category order as a distance."
+        )
+
+    adata.obsm[key] = np.asarray(adata.obs[names].to_numpy(), dtype=np.float32)
+    print(f"probe targets -> adata.obsm['{key}']: {names}")
+    return True
 
 
 def build_probe_callback(cfg, adata):

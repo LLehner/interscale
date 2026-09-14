@@ -14,6 +14,7 @@ import interscale as interscale
 from interscale.config import load_config
 from interscale.config.cli import add_config_args, print_registry, resolve_cfg_from_args
 from interscale.config.sweep import ARM_PARAM, apply_sweep_config, build_sweep_config, load_arms
+from interscale.evaluation.online_probes import build_probe_obsm
 from interscale.geome_dataloader import GraphAnnDataModule
 from interscale.pp.segmentation_noise import apply_segmentation_noise
 from interscale.tl import prepare_geome_dataset, remove_zero_expression_cells
@@ -198,6 +199,10 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
 
         model = interscale.model.CombinedModel(adata, cfg=cfg)
         print_memory_usage("After CombinedModel creation")
+
+    # Numeric probe targets must become an obsm matrix before the graphs are built; geome
+    # cannot attach a numeric obs column. No-op unless probe.regression_obs is set.
+    build_probe_obsm(adata, cfg)
 
     print_memory_usage("Before prepare_geome_dataset")
     pyg_data_list, _ = prepare_geome_dataset(adata, cfg)

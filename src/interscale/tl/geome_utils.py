@@ -14,6 +14,9 @@ OPTIONAL_FIELDS = {
     "condition": ("condition_key", "obs"),
     "celltype": ("celltype_key", "obs"),
     "pos": ("spatial_key", "obsm"),
+    # Numeric probe targets, stacked into one matrix because geome cannot attach a numeric obs
+    # column. See `cfg.dataset.probe_obsm_key`.
+    "probe_targets": ("probe_obsm_key", "obsm"),
 }
 
 

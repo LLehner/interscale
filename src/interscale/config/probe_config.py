@@ -39,17 +39,31 @@ def get_probe_cfg(cfg):
     # `apply_mask` leaves untouched because it corrupts a clone. Scored with MSE and R2.
     cfg.probe.regression_genes = []
 
-    # Restrict every probe to the cells the model was actually asked to reconstruct.
+    # Continuous targets that are NOT genes: numeric `adata.obs` columns such as
+    # `dist_to_center` or `hub_response`. Like the categorical targets these never enter the
+    # model's input, so they are scored on the clean pass. Requires `dataset.probe_obsm_key`,
+    # which the training entrypoint fills from these names.
+    cfg.probe.regression_obs = []
+
+    # WHICH CELLS EACH TARGET IS SCORED ON. This is not one policy but two, because the two
+    # kinds of target have opposite failure modes:
     #
-    # Leave this True. With it False the probe scores mostly cells whose own expression was
-    # handed to the encoder as input, so a linear readout recovers the target by copying it
-    # back out of the embedding -- measured on synth_data_0 at mask_percentage 0.3, the
-    # structure-free `noise_00` control probed at R2 0.33 from BOTH embeddings after three
-    # epochs, which is the identity map showing through, not a finding. Restricted to masked
-    # cells the same control sits near 0, which is what a negative control is for.
+    # * GENE targets are part of `batch.x`, i.e. the model's own input. Scoring them on a cell
+    #   whose expression was handed to the encoder measures whether the embedding can be
+    #   inverted, not whether the model learned anything -- measured on synth_data_0 at
+    #   mask_percentage 0.3, the structure-free `noise_00` control probed at R2 0.33 from BOTH
+    #   embeddings, and ~0.02 once restricted to masked cells. So gene targets are scored on the
+    #   CORRUPTED pass, masked entries only, and `masked_cells_only` below governs that.
     #
-    # Under mask_strategy "gene" the restriction is per (cell, gene) for the regression
-    # targets, and "cell had at least one gene masked" for the categorical ones.
+    # * LABEL targets (`classification_targets`, `regression_obs`) are never model inputs, so
+    #   there is nothing to leak and masking only deletes signal. They are scored on a CLEAN
+    #   pass -- every cell, nothing blanked -- which is the ordinary linear-probing question
+    #   "does this embedding encode cell identity". Masking them is why cell type scored ~0.2
+    #   on synth_data_0: with the cell's own marker gene blanked, the label is only recoverable
+    #   through the niche, whose Bayes-optimal macro precision is 0.19. Unmasked, a readout on
+    #   raw expression reaches 0.74.
+    #
+    # Applies to GENE targets only. Leave it True; see above for what turning it off measures.
     cfg.probe.masked_cells_only = True
 
     # L2 penalty of the ridge readout. A probe is meant to measure what is linearly present,

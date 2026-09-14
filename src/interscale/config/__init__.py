@@ -194,11 +194,20 @@ def _validate_probe(cfg):
             "probe.use is True but probe.embeddings is empty, so there is nothing to read a target out of."
         )
 
-    if not cfg.probe.classification_targets and not cfg.probe.regression_genes:
+    if not (cfg.probe.classification_targets or cfg.probe.regression_genes or cfg.probe.regression_obs):
         raise ValueError(
-            "probe.use is True but neither probe.classification_targets nor probe.regression_genes "
-            "names a target. The probe would pay for a full extra pass over train and val and log "
-            "nothing."
+            "probe.use is True but no probe target is named (classification_targets, "
+            "regression_genes, regression_obs). The probe would pay for a full extra pass over "
+            "train and val and log nothing."
+        )
+
+    # Numeric obs targets reach the graphs through an obsm matrix, because geome cannot attach a
+    # numeric obs column. Without the key the graphs carry no probe_targets and the probe raises
+    # mid-run instead of at config load.
+    if cfg.probe.regression_obs and not cfg.dataset.probe_obsm_key:
+        raise ValueError(
+            f"probe.regression_obs names {list(cfg.probe.regression_obs)} but "
+            "dataset.probe_obsm_key is unset, so those columns are never attached to the graphs."
         )
 
     # A categorical target is read off the PyG Data object, and the annotation only reaches it

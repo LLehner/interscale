@@ -137,16 +137,27 @@ between the two columns is the point, not either number alone. Targets are `prob
 (an optional annotation attached to the PyG graphs, so `celltype` requires `dataset.celltype_key`;
 scored with macro precision/recall via logistic regression) and `probe.regression_genes` (a column
 of `adata.var_names`; scored with MSE and R2 via ridge). Results are logged as flat
-`val_probe_<target>_<metric>_<embedding>` scalars — monitorable by EarlyStopping/ModelCheckpoint/a
-sweep — plus, under wandb, one custom chart per target carrying both embeddings as two lines.
+`probe/<target>_<metric>_<embedding>` scalars — monitorable by EarlyStopping/ModelCheckpoint/a
+sweep — plus, under wandb, one custom chart per target carrying both embeddings as two lines. The
+`probe/` prefix is load-bearing: wandb sections split on the text before the first `/`, so it keeps
+these out of the default panel section where InterScale's own `train_`/`val_` metrics live.
+
+Numeric `obs` targets reach the graphs as an **obsm matrix** (`dataset.probe_obsm_key`), because
+geome cannot attach a numeric obs column — it returns a pandas Series and dies in `torch.cat`.
+`evaluation.build_probe_obsm` stacks them and must run *before* `prepare_geome_dataset`; every
+entrypoint (`main.py`, `main_sweep.py`) already calls it.
 
 Three invariants, each guarding a failure that does not raise:
 
-- **`probe.masked_cells_only` must stay True.** An unmasked cell's own expression is in the encoder
-  input, so a readout recovers the target by inverting the embedding rather than by using anything
-  the model learned. Measured on synth_data_0 at `mask_percentage` 0.3, the structure-free `noise_00`
-  control probed at **R2 0.33 from both embeddings** with the restriction off and **~0.02** with it
-  on. A negative control that does not read as negative makes every other probe unreadable.
+- **Gene targets are masked; label targets are not.** These are opposite failure modes and the
+  probe runs a separate pass for each. A *gene* is part of `batch.x`, so scoring it on a cell the
+  encoder was given measures invertibility, not learning: on synth_data_0 at `mask_percentage` 0.3
+  the structure-free `noise_00` control probed at **R2 0.33 from both embeddings** unrestricted and
+  **~0.02** restricted to masked cells — `probe.masked_cells_only` governs this and must stay True.
+  A *label* (`classification_targets`, `regression_obs`) is never a model input, so there is nothing
+  to leak and masking only deletes signal: masking cell type held it at **0.22** macro precision,
+  which is the Bayes ceiling given only the niche (0.19), while the clean pass reaches **0.46** after
+  three epochs against a raw-expression ceiling of 0.74.
 - **The probe consumes no RNG.** It builds its own `shuffle=False` loaders over `datamodule.train_data`
   / `val_data` rather than iterating `train_dataloader()`, whose shuffle draws from the same torch
   generator the training batch order comes from — so enabling the probe would reorder training

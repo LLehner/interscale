@@ -69,6 +69,9 @@ def make_data_list(sizes=(6, 9), seed=0, mask_strategy="node"):
         d = Data(x=x, edge_index=torch.tensor([src, dst], dtype=torch.long))
         d.embeddings = torch.tensor(rng.normal(size=(n, N_EMBED)), dtype=torch.float32)
 
+        # Numeric probe targets, as build_probe_obsm would stack them.
+        d.probe_targets = torch.tensor(rng.normal(size=(n, 2)), dtype=torch.float32)
+
         codes = rng.integers(0, N_CELLTYPES, size=n)
         one_hot = np.zeros((n, N_CELLTYPES), dtype=np.float32)
         one_hot[np.arange(n), codes] = 1.0
@@ -111,7 +114,7 @@ class _Datamodule:
         self.setup_called = True
 
 
-def collect(data_list, module=None, mask_strategy="node"):
+def collect(data_list, module=None, mask_strategy="node", corrupt=True, obs_targets=()):
     return collect_features(
         module or build_module(mask_strategy=mask_strategy),
         data_list,
@@ -120,9 +123,11 @@ def collect(data_list, module=None, mask_strategy="node"):
         embeddings=("local", "global"),
         gene_index={"g0": 0, "g3": 3},
         categorical_targets=("celltype",),
+        obs_targets=obs_targets,
         mask_strategy=mask_strategy,
         batch_size=2,
         device=torch.device("cpu"),
+        corrupt=corrupt,
     )
 
 
@@ -138,6 +143,8 @@ def test_metric_name_round_trips_through_the_chart_grouping():
     name = probe_metric_name("gene_int_long", "mse", "global")
     series = callback.chart_series(None, {name: 0.5})
 
+    # The "probe/" prefix is what keeps these out of wandb's default panel section.
+    assert name == "probe/gene_int_long_mse_global"
     assert series == {"gene_int_long_mse": {"global": 0.5}}
 
 
@@ -358,7 +365,7 @@ def test_probe_without_targets_is_rejected():
 
     cfg = get_cfg_defaults()
     cfg.probe.use = True
-    with pytest.raises(ValueError, match="names a target"):
+    with pytest.raises(ValueError, match="no probe target is named"):
         _validate_probe(cfg)
 
 
@@ -457,3 +464,130 @@ def test_history_keeps_every_round_even_when_charts_are_throttled():
         _tick(callback, epoch)
 
     assert len(callback._history["celltype_precision"]["local"]) == 7
+
+
+# --------------------------------------------------------------------------- clean vs corrupted
+
+
+def test_clean_pass_leaves_every_cell_unmasked():
+    """`corrupt=False` must blank nothing, so a label probe sees the real expression.
+
+    This is what makes a label probe answer "does the embedding encode cell identity" rather
+    than "can identity be inferred from the neighbourhood" -- two different questions with very
+    different ceilings (0.74 vs 0.22 macro precision on synth_data_0).
+    """
+    data_list = make_data_list(sizes=(20, 20))
+    features = collect(data_list, corrupt=False)
+
+    assert features.cell_masked is not None
+    assert not features.cell_masked.any(), "clean pass must report no held-out cells"
+    # and the corrupted pass on the same graphs still does
+    assert collect(data_list, corrupt=True).cell_masked.any()
+
+
+def test_clean_pass_does_not_disturb_the_training_masks():
+    """The probe must not write through to the Data objects the training loop is using."""
+    data_list = make_data_list(sizes=(20, 20))
+    before = [d.mask.clone() for d in data_list]
+
+    collect(data_list, corrupt=False)
+
+    for d, original in zip(data_list, before, strict=True):
+        assert torch.equal(d.mask, original), "clean pass overwrote a split's training mask"
+
+
+def test_obs_targets_are_collected_from_probe_targets():
+    data_list = make_data_list()
+    module = build_module()
+    features = collect(data_list, module, obs_targets=("dist_to_center", "hub_response"))
+
+    batch = Batch.from_data_list(data_list)
+    idx = module._common_step(batch, "regression", "node").view.padded_node_idx
+
+    for col, name in enumerate(("dist_to_center", "hub_response")):
+        np.testing.assert_allclose(features.continuous[name], batch.probe_targets[idx, col].numpy(), rtol=1e-5)
+
+
+def test_missing_probe_targets_raises_a_pointed_error():
+    data_list = make_data_list()
+    for d in data_list:
+        del d.probe_targets
+
+    with pytest.raises(AttributeError, match="probe_obsm_key"):
+        collect(data_list, obs_targets=("dist_to_center",))
+
+
+def test_label_and_gene_targets_are_scored_on_different_passes():
+    """Labels on the clean pass, genes on the held-out entries -- the whole point of the split."""
+    cfg = probe_cfg()
+    cfg.probe.regression_genes = ["g0"]
+    cfg.probe.regression_obs = ["dist_to_center"]
+    callback = OnlineProbeCallback(cfg, GENES)
+
+    results = callback.run(
+        build_module(),
+        _Datamodule(make_data_list(sizes=(40, 40)), make_data_list(sizes=(40,), seed=7)),
+        device=torch.device("cpu"),
+    )
+
+    assert probe_metric_name("celltype", "precision", "global") in results
+    assert probe_metric_name("dist_to_center", "r2", "global") in results
+    assert probe_metric_name("gene_g0", "mse", "global") in results
+    assert all(name.startswith("probe/") for name in results)
+
+
+def test_no_gene_targets_skips_the_corrupted_pass_entirely():
+    """A label-only probe should not pay for a second pass it has no use for."""
+    cfg = probe_cfg()
+    cfg.probe.regression_genes = []
+    cfg.probe.regression_obs = []
+    callback = OnlineProbeCallback(cfg, GENES)
+
+    calls = []
+    import interscale.evaluation.online_probes as mod
+
+    real = mod.collect_features
+    mod.collect_features = lambda *a, **kw: (calls.append(kw["corrupt"]), real(*a, **kw))[1]
+    try:
+        callback.run(
+            build_module(),
+            _Datamodule(make_data_list(sizes=(30,)), make_data_list(sizes=(30,), seed=5)),
+            device=torch.device("cpu"),
+        )
+    finally:
+        mod.collect_features = real
+
+    assert calls == [False, False], f"expected two clean passes and no corrupted pass, got {calls}"
+
+
+def test_obs_target_must_be_numeric():
+    """A categorical column regressed on its codes would treat category order as a distance."""
+    import pandas as pd
+    from anndata import AnnData
+
+    from interscale.evaluation.online_probes import build_probe_obsm
+
+    adata = AnnData(np.zeros((4, 2), dtype=np.float32))
+    adata.obs["numeric"] = [1.0, 2.0, 3.0, 4.0]
+    adata.obs["categorical"] = pd.Categorical(["a", "b", "a", "b"])
+
+    cfg = probe_cfg()
+    cfg.dataset.probe_obsm_key = "probe_targets"
+
+    cfg.probe.regression_obs = ["categorical"]
+    with pytest.raises(ValueError, match="NUMERIC"):
+        build_probe_obsm(adata, cfg)
+
+    cfg.probe.regression_obs = ["numeric"]
+    assert build_probe_obsm(adata, cfg)
+    np.testing.assert_allclose(adata.obsm["probe_targets"][:, 0], [1.0, 2.0, 3.0, 4.0])
+
+
+def test_obs_targets_without_an_obsm_key_are_rejected_at_config_load():
+    from interscale.config import _validate_probe
+
+    cfg = get_cfg_defaults()
+    cfg.probe.use = True
+    cfg.probe.regression_obs = ["dist_to_center"]
+    with pytest.raises(ValueError, match="probe_obsm_key is unset"):
+        _validate_probe(cfg)
