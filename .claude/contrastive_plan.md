@@ -8,7 +8,7 @@ prediction intermediate.
 
 ## Status
 
-Last updated 2026-09-16 (0b completed). Update this table in the same commit as the work it describes.
+Last updated 2026-09-16 (stage 1 implemented). Update this table in the same commit as the work it describes.
 "Implemented, unverified" is a real state — a stage is only `done` when something external
 says so (a test, a reproduced number, a run that was actually looked at).
 
@@ -21,7 +21,7 @@ verified. The branch still exists but is behind; do not commit to it.
 |---|---|---|---|
 | 0 — plumbing (`StepOutput`, `gather_tokens`, composite loss, step collapse, dataset fields) | **done** | 119 tests pass; `scripts/equivalence_harness.py` reports IDENTICAL against the pre-refactor baseline | 2026-09-13 |
 | 0b — probe battery | **done** — online probes (`b88b76f`), split-independence check (`ddfccdc`), attention-flow control (`cd15021`, `11a2622`) | 201 tests pass; `noise_00` reads ~0.02 R2 on a real synth_data_0 run; the flow control's sign convention is pinned against `compute_hierarchical_net_flow`. **Not yet run against a real trained attention matrix** — see below | 2026-09-16 |
-| 1 — VICReg var/cov, no views | not started | | |
+| 1 — VICReg | **implemented, unverified** — all three terms, selectable beside *or instead of* reconstruction | 231 tests pass; equivalence harness IDENTICAL; all three configurations run end to end through `CombinedModel`. **No real training run yet** — no probe numbers, no tuning | 2026-09-16 |
 | 2 — context NCE, composition-matched negatives | not started | | |
 | 2b — scale-matched pairing (local: same-neighbourhood; global: distant-same-slide) | not started | | |
 | 3 — two views (NT-Xent / VICReg invariance) | not started | | |
@@ -407,6 +407,42 @@ move the right way. Log per-dimension std every epoch (VICReg Fig. 4 uses exactl
 catch slow collapse).
 
 ---
+
+### How Stage 1 differed from this plan
+
+The plan scoped Stage 1 as *variance and covariance only, no views*. It shipped with all three
+terms, because "VICReg selectable instead of the reconstruction loss" needs the invariance term —
+and invariance needs two views, which was Stage 3 plumbing. What made that affordable was that
+**dropout already makes two passes differ**: `_forward_views` runs `_common_step` once per view
+and the encoder's own stochasticity supplies the difference, so the SimCSE floor arrived for free
+and Stage 3's view sampler now only has to replace *how* the views differ, not build the
+machinery.
+
+Three configurations, all from one term:
+
+| `optim.loss` | `vicreg_lambda` | what it is | passes |
+|---|---|---|---|
+| a criterion | 0 | collapse regulariser beside reconstruction — Stage 1 as planned | 1 |
+| a criterion | > 0 | the hybrid | 2 |
+| `none` | > 0 | VICReg as the whole objective | 2 |
+
+**Two things found while building it, both now fixed and tested:**
+
+* `<mode>_loss` logged only the reconstruction half, not what was actually optimised. Harmless
+  until now; fatal under `optim.loss: none`, where it is a constant zero — and `val_loss` is what
+  EarlyStopping and ModelCheckpoint monitor for a regression run, so every such run would have
+  stopped at `patience` with a flat curve.
+* **Dropout-only views vanish under evaluation.** `validation_step` runs in `eval()`, where the
+  encoder is deterministic, so the two views coincide exactly and `val_vicreg_inv` is identically
+  0.0 — confirmed on a real run. It means "no stochasticity in eval", not "the views agree". The
+  Stage 3 sampler corrupts the *input*, which does not depend on training mode, and fixes it.
+
+**What is not verified.** No real training run: the numbers above come from 3-epoch smoke runs on
+the harness's synthetic data. Two things to watch on the first proper run — at defaults the
+variance term sits near 15 of its maximum 25 (embedding std ~0.4 against `gamma` 1), so the
+objective is initially almost entirely "increase variance"; and `vicreg_cov` *rose* over those
+epochs, which is what a `mu`-dominated balance does. The λ/μ/ν balance is the first thing to
+sweep, not the last.
 
 ## Stage 2 — context contrast with composition-matched negatives
 
