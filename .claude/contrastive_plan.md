@@ -8,7 +8,7 @@ prediction intermediate.
 
 ## Status
 
-Last updated 2026-09-16. Update this table in the same commit as the work it describes.
+Last updated 2026-09-16 (0b completed). Update this table in the same commit as the work it describes.
 "Implemented, unverified" is a real state — a stage is only `done` when something external
 says so (a test, a reproduced number, a run that was actually looked at).
 
@@ -20,12 +20,48 @@ verified. The branch still exists but is behind; do not commit to it.
 | stage | state | verified by | date |
 |---|---|---|---|
 | 0 — plumbing (`StepOutput`, `gather_tokens`, composite loss, step collapse, dataset fields) | **done** | 119 tests pass; `scripts/equivalence_harness.py` reports IDENTICAL against the pre-refactor baseline | 2026-09-13 |
-| 0b — probe battery | **partly done** — online probes exist (`evaluation/online_probes.py`, commit `b88b76f`); the attention-flow control and the donor-grouped protocol do not | 156 tests pass; the `noise_00` negative control reads ~0.02 R2 where it read 0.33 before the masking fix, on a real synth_data_0 run | 2026-09-14 |
+| 0b — probe battery | **done** — online probes (`b88b76f`), split-independence check (`ddfccdc`), attention-flow control (`cd15021`, `11a2622`) | 201 tests pass; `noise_00` reads ~0.02 R2 on a real synth_data_0 run; the flow control's sign convention is pinned against `compute_hierarchical_net_flow`. **Not yet run against a real trained attention matrix** — see below | 2026-09-16 |
 | 1 — VICReg var/cov, no views | not started | | |
 | 2 — context NCE, composition-matched negatives | not started | | |
 | 2b — scale-matched pairing (local: same-neighbourhood; global: distant-same-slide) | not started | | |
 | 3 — two views (NT-Xent / VICReg invariance) | not started | | |
 | 4 — interaction-destroying negatives | not started | | |
+
+### What Stage 0b ended up being
+
+Three pieces, all driven by config and none naming a cell type, niche or column:
+
+* **Online probes** (`evaluation/online_probes.py`) — local-vs-global readouts during training,
+  so attribution is a curve. Targets are config lists; adding one needs no code change.
+* **Split independence** (`tl.check_split_independence`, `dataset.group_key`) — the "donor-grouped
+  protocol", generalised. `group_key` names the unit of statistical independence (donor, patient,
+  mouse, batch — *not* hardcoded as donor), and `prepare_geome_dataset` reports any group whose
+  cells straddle splits. It reports rather than enforces: a straddling split is sometimes
+  unavoidable, and the repair depends on study design. Unset means no check **and no claim** —
+  not a false all-clear.
+* **Attention-flow control** (`evaluation/flow_control.py`) — the instrument the probes cannot be.
+  Null pairs (co-occurring, non-interacting) are scored on |flow|, since either direction is a
+  violation; optional signal pairs are scored signed, so `"a>b"` and `"b>a"` are different
+  claims. `null_percentile` uses a **midrank**, which matters: flow matrices are sparse, and under
+  a plain `<=` a perfectly clean null pair sitting at 0 alongside every other zero ranks at the
+  *top* of its tie group and reads as violated exactly when it passes.
+
+**The orientation trap, now pinned by a test.** `compute_hierarchical_net_flow` deliberately
+inverts the sign ("information as opposite of attention"), so A attending to B is reported as
+flow *from* B. A configured `"senderA>receiverA"` therefore claims information flows senderA →
+receiverA while the attention runs the other way. Getting this backwards inverts every
+interpretation without changing a single magnitude — no probe, and no other test, would catch it.
+
+**What is not verified.** The control has only been run against synthetic flow matrices and a
+hand-built attention matrix, not against `_attn_matrix` from a trained model. The arithmetic and
+the orientation are pinned; what a real flow matrix's `null_percentile` looks like is unknown
+until Stage 2 needs it.
+
+**Also generalised while here:** `dataset.extra_obs_keys` attaches any obs column under its own
+name, so `OPTIONAL_FIELDS` now holds only the roles the code reads *by name* (`slide` for negative
+sampling, `group` for the split check, `celltype` for the flow control). A new probe target or
+stratifier is a config line. Reserved names are rejected — an obs column called `mask` would
+otherwise replace the corruption mask with a label and train against its own annotation silently.
 
 ### The gate
 
