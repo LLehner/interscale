@@ -429,7 +429,10 @@ matches the scale it is supposed to encode, instead of one pairing policy for bo
 | component | positive | negative |
 |---|---|---|
 | local | two cells from the **same neighbourhood** | cells **not** from the same neighbourhood |
-| global | two **distant** cells on the **same slide** | random cells from a **different slide** *or* from the anchor's **nearest neighbourhood** |
+| global | two **distant** cells on the **same slide** | a *mixture*, sampled per negative: with probability `p` a random cell from **another slide**, otherwise one from the anchor's **nearest neighbourhood** |
+
+The mixture is per-negative, not two separate runs: each negative slot independently draws which
+kind it is. `p = 0` is pure within-slide.
 
 The global row's second negative option is the appealing one: "a long-range program is not the
 same thing as a local niche" is the loss-side statement of the architecture's own `M = 1 - A`
@@ -457,20 +460,47 @@ slides pushed apart, loss zero, nothing about interaction learned. That is the b
 failure this plan restricts negatives to one slide to avoid — reached from the other direction,
 and it would look like a *good* loss curve the whole way down.
 
-So split the global row into two arms and treat them differently:
+**Mixing the two negative kinds does not neutralise this, and the mixture is what is proposed.**
+It is worth being precise about what mixing changes, because the intuition that the within-slide
+half "cancels" the cross-slide half is wrong in a specific way:
 
-* **`near_negative` arm** (positive: distant, same slide; negative: the anchor's k-hop
-  neighbourhood) — the one worth running. Both sides are within-slide, so slide identity carries
-  no information about which is which and cannot be the discriminator.
-* **`cross_slide_negative` arm** (positive: distant, same slide; negative: another slide) — run it
-  as a **deliberate positive control for the failure**, not as a candidate objective. It should
-  drive the slide-identity probe up and the interaction probe flat. Having that curve makes the
-  slide-ID alarm quantitative instead of a rule of thumb.
+* A slide-encoding representation *perfectly* solves the cross-slide fraction — anchor and
+  positive share a slide, the negative does not, so slide identity separates them exactly.
+* It *maximally fails* the within-slide fraction — anchor, positive and near negative are all on
+  one slide, so slide identity gives that fraction zero discriminative power.
 
-If the `near_negative` arm also drives slide-ID up, the distant-same-slide positive is degenerate
-on its own and needs a constraint that makes two distant cells plausibly *related* rather than
-merely co-resident — matched niche, or matched local embedding — at the cost of reintroducing a
-label. Decide that after seeing the probe, not before.
+So the optimum stops being pure slide encoding, but it becomes **slide identity *plus* a near/far
+component** — you get the thing you wanted *and* a batch component, not one instead of the other.
+With `n_embed = 16` shared with reconstruction, that capacity is genuinely spent.
+
+The training dynamics make it worse than the static argument suggests. NT-Xent weights negatives
+by similarity, so early on the cross-slide negatives are similar to the anchor, carry large
+gradient, and the cheapest way to reduce that term is to separate slides. Once separated they are
+dissimilar, their weight collapses, and they fall silent — having already spent the first epochs
+teaching the model the one variable the probes are supposed to test for.
+
+And the cross-slide negatives buy nothing: all the discriminative work wanted here — *distant
+cells on this slide belong together, my immediate neighbours do not* — is carried entirely by the
+within-slide negatives. Cross-slide ones are easy negatives pointed at the wrong variable.
+
+**If the motive for `p > 0` is collapse prevention**, that is a real worry with a better answer:
+Stage 1's variance and covariance terms provide uniformity pressure with no negatives at all, so
+nothing about slide identity gets rewarded. Reach for that first.
+
+**If `p > 0` is still wanted, constrain what "another slide" means.** The harmful variable is not
+the slide, it is the technical covariate the slide carries. Sample cross-slide negatives from the
+**same donor and the same condition**, so "different slide" means a different section rather than
+a different batch. That also keeps the objective clear of condition, per the rule above. This
+needs a `dataset.donor_key`, which does not exist yet — a one-line extension of the Stage 0
+`OPTIONAL_FIELDS` mechanism, not new plumbing.
+
+**Measure the cost rather than argue about it.** Sweep `p` (0, 0.25, 0.5) with everything else
+fixed and read the slide-identity probe. If `p > 0` raises it, that is the price, quantified —
+and a `p = 1` run is a free positive control that makes the slide-ID alarm a number rather than a
+rule of thumb. If even `p = 0` drives slide-ID up, then the distant-same-slide *positive* is
+degenerate on its own and needs a constraint making two distant cells plausibly related rather
+than merely co-resident (matched niche, or matched local embedding), at the cost of reintroducing
+a label. Decide that after seeing the probe, not before.
 
 ### Knobs
 
@@ -482,7 +512,9 @@ optim:
   contrastive:
     near_hops: 1              # what counts as "same neighbourhood" for the local positive
     distant_min_um: 200       # how far apart a global positive must be, in `pos` units
-    global_negatives: near    # near | cross_slide -- see the two arms above
+    cross_slide_fraction: 0.0 # p: per-negative probability of drawing from another slide
+    cross_slide_match: [donor, condition]   # hold these fixed when crossing slides, so
+                              # "another slide" is another section and not another batch
 ```
 
 `distant_min_um` wants setting against the neighbour-graph radius (`spatial_neigbors_kwargs`),
@@ -629,8 +661,11 @@ Things that fail silently rather than loudly:
       never directly constrained by a contrastive term
 - [ ] `celltype` used only as a negative-sampling stratifier, never as a target
 - [ ] a proposed corruption is actually visible to the encoder (see the `GCNConv` note above)
-- [ ] a distant-same-slide positive is paired with a *within-slide* negative, or the exact
-      optimum of the objective is a slide classifier
+- [ ] a distant-same-slide positive is paired with *within-slide* negatives — any cross-slide
+      fraction makes slide identity a rewarded direction, and mixing does not cancel it, it just
+      adds a near/far component alongside it
+- [ ] if cross-slide negatives are used anyway, donor and condition are held fixed across the
+      pair, so "another slide" is another section rather than another batch
 
 ## Appendix D — pre-existing issue worth a separate look
 
