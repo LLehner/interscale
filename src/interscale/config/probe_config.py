@@ -97,4 +97,22 @@ def get_probe_cfg(cfg):
     # end-of-run chart is complete whatever it is set to.
     cfg.probe.chart_every_n_epochs = 10
 
+    # ------------------------------------------------------------------ attention-flow control
+    # Read POST-HOC by `interscale.evaluation.flow_control`, not by the online callback: getting
+    # attention out costs an S x S matrix per head per layer, which is not something to pay every
+    # validation epoch. They live here because they are part of the same yardstick.
+    #
+    # Pairs are "sender>receiver" strings naming values of whatever `dataset.celltype_key`
+    # carries -- no cell type is known to the code.
+    #
+    # NULL pairs: expected to carry NO flow -- types that co-occur spatially without interacting.
+    # This is the control that separates "attention follows co-occurrence" from "attention
+    # follows signalling", and without one a flow map is unfalsifiable. Scored on absolute value,
+    # since flow either way is a violation.
+    cfg.probe.flow_null_pairs = []
+    # SIGNAL pairs: expected to carry flow IN THAT DIRECTION. Optional -- the control works from
+    # null pairs alone via `null_percentile` -- but giving both turns the gate into one number,
+    # `separation`. Scored signed, so "a>b" and "b>a" are different claims.
+    cfg.probe.flow_signal_pairs = []
+
     return cfg
