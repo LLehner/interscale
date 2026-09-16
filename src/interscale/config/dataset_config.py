@@ -78,6 +78,16 @@ def get_dataset_cfg(cfg):
     cfg.dataset.celltype_key = None
     cfg.dataset.spatial_key = None
 
+    # Any further obs columns to attach, by name. Each becomes a `Data` attribute of the same
+    # name, one-hot encoded if categorical, and is covered by the same category-preservation and
+    # missing-category warning as the named keys above.
+    #
+    # This exists so that adding a probe target, a stratifier or a grouping variable never
+    # requires editing `OPTIONAL_FIELDS`. The named keys above are the ones the *code* reads by
+    # name (negative sampling reads `slide`, the flow control reads `celltype`); everything else
+    # a dataset happens to carry -- niche, region, tumour stage, timepoint -- belongs here.
+    cfg.dataset.extra_obs_keys = []
+
     # Run trainer.test() after fitting. Costs a third full pass and triples the metric names in
     # the logger (every train_/val_ metric gains a test_ twin) for a number that should only be
     # looked at once, at the end of a project. Kept True so existing runs are unchanged.

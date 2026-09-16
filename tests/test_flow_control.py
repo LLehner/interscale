@@ -199,3 +199,89 @@ def test_the_orientation_matches_the_real_flow_computation():
 
     # And the control reads it the same way round: "B>A" is the claim that holds.
     assert net_flow_control(flow, ["A>B"], ["B>A"])["signal_flow"] > 0
+
+
+# --------------------------------------------------------------------------- the cfg entry point
+
+
+def _attention_adata(celltype_col="cell_type", condition=None):
+    """Four cells, two types, A attending to B, in the shape get_model_output produces."""
+    from anndata import AnnData
+
+    n = 4
+    adata = AnnData(X=np.abs(np.random.default_rng(0).normal(size=(n, 3))).astype(np.float32) + 0.1)
+    adata.obs[celltype_col] = pd.Categorical(["A", "A", "B", "B"])
+    adata.obs["sample"] = pd.Categorical(["s1"] * n)
+    if condition is not None:
+        adata.obs["cond"] = pd.Categorical([condition] * n)
+    adata.obs_names = [f"c{i}" for i in range(n)]
+
+    attention = np.zeros((n, n), dtype=np.float32)
+    attention[0:2, 2:4] = 1.0
+    adata.obsm["_attn_matrix"] = attention
+    return adata
+
+
+def _cfg(**dataset):
+    from interscale.config import get_cfg_defaults
+
+    cfg = get_cfg_defaults()
+    cfg.dataset.sample_key = ["sample"]
+    for key, value in dataset.items():
+        setattr(cfg.dataset, key, value)
+    return cfg
+
+
+def test_from_adata_resolves_every_key_from_config():
+    from interscale.evaluation.flow_control import net_flow_control_from_adata
+
+    cfg = _cfg(celltype_key="cell_type")
+    cfg.probe.flow_null_pairs = ["A>B"]
+    cfg.probe.flow_signal_pairs = ["B>A"]
+
+    table = net_flow_control_from_adata(_attention_adata(), cfg)
+
+    assert table.index.tolist() == ["all_samples"]
+    assert table.loc["all_samples", "signal_flow"] > 0
+
+
+def test_from_adata_uses_whatever_the_dataset_calls_its_columns():
+    """No column name is assumed -- the next dataset will not call it `cell_type`."""
+    from interscale.evaluation.flow_control import net_flow_control_from_adata
+
+    cfg = _cfg(celltype_key="annotation_v3")
+    cfg.probe.flow_null_pairs = ["A>B"]
+
+    table = net_flow_control_from_adata(_attention_adata(celltype_col="annotation_v3"), cfg)
+
+    assert "null_flow" in table.columns
+
+
+def test_from_adata_splits_by_condition_when_one_is_configured():
+    from interscale.evaluation.flow_control import net_flow_control_from_adata
+
+    cfg = _cfg(celltype_key="cell_type", condition_key="cond")
+    cfg.probe.flow_null_pairs = ["A>B"]
+
+    table = net_flow_control_from_adata(_attention_adata(condition="healthy"), cfg)
+
+    assert table.index.tolist() == ["healthy"]
+
+
+def test_from_adata_without_a_celltype_key_says_what_is_missing():
+    from interscale.evaluation.flow_control import net_flow_control_from_adata
+
+    cfg = _cfg()
+    cfg.probe.flow_null_pairs = ["A>B"]
+
+    with pytest.raises(ValueError, match="dataset.celltype_key"):
+        net_flow_control_from_adata(_attention_adata(), cfg)
+
+
+def test_from_adata_without_null_pairs_refuses_rather_than_passing():
+    from interscale.evaluation.flow_control import net_flow_control_from_adata
+
+    cfg = _cfg(celltype_key="cell_type")
+
+    with pytest.raises(ValueError, match="at least one null pair"):
+        net_flow_control_from_adata(_attention_adata(), cfg)

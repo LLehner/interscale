@@ -137,3 +137,57 @@ def test_annotations_survive_collation(cfg):
     # The bridge a contrastive negative pool needs: token -> its graph -> its annotation.
     assert batch.batch.shape == (n,)
     assert label_codes(batch, "celltype").shape == (n,)
+
+
+# --------------------------------------------------------------------------- arbitrary extras
+
+
+def test_extra_obs_keys_attach_under_their_own_names(cfg):
+    """Adding an annotation must not require editing OPTIONAL_FIELDS."""
+    cfg.dataset.extra_obs_keys = ["niche", "region"]
+
+    fields, preserve = optional_fields(cfg)
+
+    assert fields == {"niche": ["obs/niche"], "region": ["obs/region"]}
+    assert sorted(preserve) == ["niche", "region"]
+
+
+def test_extras_and_named_keys_coexist(cfg):
+    cfg.dataset.celltype_key = "cell_type"
+    cfg.dataset.extra_obs_keys = ["niche"]
+
+    fields, preserve = optional_fields(cfg)
+
+    assert fields["celltype"] == ["obs/cell_type"]
+    assert fields["niche"] == ["obs/niche"]
+    assert sorted(preserve) == ["cell_type", "niche"]
+
+
+@pytest.mark.parametrize("reserved", ["x", "mask", "edge_index", "gene_mask"])
+def test_an_extra_may_not_shadow_a_field_the_pipeline_builds(cfg, reserved):
+    """`mask` is the dangerous one: it would replace the corruption mask with a label."""
+    cfg.dataset.extra_obs_keys = [reserved]
+
+    with pytest.raises(ValueError, match="collides"):
+        optional_fields(cfg)
+
+
+def test_an_extra_may_not_shadow_a_named_key_in_use(cfg):
+    cfg.dataset.celltype_key = "cell_type"
+    cfg.dataset.extra_obs_keys = ["celltype"]
+
+    with pytest.raises(ValueError, match="collides"):
+        optional_fields(cfg)
+
+
+def test_an_extra_survives_the_pipeline_with_its_categories_intact(cfg):
+    """Extras get the same category preservation as the named keys, not a weaker path."""
+    cfg.dataset.extra_obs_keys = ["cell_type"]
+    adata = _adata()
+
+    datas = _prepare(cfg, adata)
+    graphs = datas[0] + datas[1]
+
+    widths = {g.cell_type.shape[1] for g in graphs}
+    assert widths == {3}, f"category width differs across graphs: {widths}"
+    assert label_codes(graphs[0], "cell_type").shape == (graphs[0].num_nodes,)

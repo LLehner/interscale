@@ -6,9 +6,19 @@ import torch
 from geome import ann2data, iterables, transforms
 from yacs.config import CfgNode as CN
 
+#: Names the pipeline builds itself. An ``extra_obs_keys`` entry may not shadow one of these:
+#: attaching an obs column called ``mask`` would replace the corruption mask with a label and the
+#: run would train against its own annotation without failing.
+RESERVED_FIELD_NAMES = {"x", "y", "edge_index", "obs_names", "embeddings", "batch", "mask", "gene_mask"}
+
 #: Optional annotations attached to every PyG ``Data``: attribute name -> (config key, source).
 #: Each is attached only when its ``cfg.dataset.*`` entry is set, so the default config produces
 #: exactly the graphs it always did. See ``get_dataset_cfg`` for what each is for.
+#:
+#: This dict holds only the roles the CODE reads by name -- negative sampling reads ``slide``,
+#: the split check reads ``group``, the flow control reads ``celltype``. Anything a dataset
+#: merely carries (niche, region, stage, timepoint) goes through ``dataset.extra_obs_keys``
+#: instead, so a new annotation never needs an entry here.
 OPTIONAL_FIELDS = {
     "slide": ("slide_key", "obs"),
     "group": ("group_key", "obs"),
@@ -45,6 +55,20 @@ def optional_fields(cfg: CN) -> tuple[dict[str, list[str]], list[str]]:
         fields[name] = [f"{source}/{key}"]
         if source == "obs":
             preserve.append(key)
+
+    # Arbitrary further obs columns, attached under their own names. The point of this branch is
+    # that a new probe target or stratifier never needs a code change -- OPTIONAL_FIELDS holds
+    # only the handful of roles the code reads *by name*.
+    for key in getattr(cfg.dataset, "extra_obs_keys", []) or []:
+        if key in fields or key in RESERVED_FIELD_NAMES:
+            raise ValueError(
+                f"dataset.extra_obs_keys entry {key!r} collides with a field the pipeline already "
+                f"builds ({sorted(RESERVED_FIELD_NAMES | set(fields))}). Rename the obs column, or "
+                "use the dedicated dataset.*_key for that role."
+            )
+        fields[key] = [f"obs/{key}"]
+        preserve.append(key)
+
     return fields, preserve
 
 

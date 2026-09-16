@@ -188,3 +188,72 @@ def net_flow_control_report(
         frame = value["mean"] if isinstance(value, dict) else value
         rows[group] = net_flow_control(frame, null_pairs, signal_pairs)
     return pd.DataFrame.from_dict(rows, orient="index").rename_axis("group")
+
+
+def net_flow_control_from_adata(
+    adata,
+    cfg,
+    *,
+    window_key: str | None = None,
+    compute_net: bool = True,
+) -> pd.DataFrame:
+    """Run the control on a model-output ``adata``, taking every key from ``cfg``.
+
+    The one-call entry point: it resolves the annotation columns from ``cfg.dataset`` and the
+    pairs from ``cfg.probe``, computes the net flow, and scores it. Nothing dataset-specific is
+    assumed -- which column carries the cell type, which the sample, which the condition, and
+    which pairs are null all come from config.
+
+    Parameters
+    ----------
+    adata
+        The object produced by ``get_model_output`` / ``save_evaluation_results``, carrying the
+        per-window attention in ``obsm["_attn_matrix"]``.
+    cfg
+        Reads ``dataset.celltype_key``, ``dataset.sample_key``, ``dataset.condition_key``,
+        ``probe.flow_null_pairs`` and ``probe.flow_signal_pairs``.
+    window_key
+        Column identifying the attention windows. Defaults to the sample key, which is correct
+        whenever one graph is one sample -- the usual layout here. Pass it explicitly for a
+        sliding-window run, where several windows share a sample.
+    compute_net
+        Passed through: net flow (sender minus receiver) rather than raw aggregated attention.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per condition (or one ``all_samples`` row when no condition key is set), with the
+        columns of :func:`net_flow_control`.
+
+    Raises
+    ------
+    ValueError
+        If ``dataset.celltype_key`` is unset, since the flow matrix is indexed by cell type and
+        there is nothing sensible to fall back to.
+    """
+    from interscale.evaluation.net_streams import compute_hierarchical_net_flow
+
+    celltype_key = cfg.dataset.celltype_key
+    if celltype_key is None:
+        raise ValueError(
+            "net_flow_control_from_adata needs dataset.celltype_key: the flow matrix is indexed "
+            "by cell type, and the control's pairs name values of that column."
+        )
+
+    sample_key = cfg.dataset.sample_key[0] if cfg.dataset.sample_key else None
+    if sample_key is None:
+        raise ValueError("net_flow_control_from_adata needs dataset.sample_key to group windows.")
+
+    flows = compute_hierarchical_net_flow(
+        adata,
+        window_key=window_key if window_key is not None else sample_key,
+        sample_key=sample_key,
+        condition_key=cfg.dataset.condition_key,
+        cell_type_col=celltype_key,
+        compute_net=compute_net,
+    )
+    return net_flow_control_report(
+        flows,
+        null_pairs=list(cfg.probe.flow_null_pairs),
+        signal_pairs=list(cfg.probe.flow_signal_pairs) or None,
+    )
