@@ -498,3 +498,21 @@ def test_misaligned_views_are_rejected_with_the_cause():
 
     with pytest.raises(ValueError, match="max_seq_len"):
         aligned_view_tokens(out)
+
+
+def test_an_underscored_value_is_reported_but_not_optimised(cfg, registry):
+    """Embedding std is the motivating case: it reveals collapse and must not be maximised."""
+
+    @register_aux_loss("with_diagnostic")
+    class WithDiagnostic(AuxLoss):
+        def __init__(self, cfg, module=None):
+            super().__init__()
+
+        def forward(self, out, batch):
+            return {"with_diagnostic": torch.tensor(2.0), "_diag": torch.tensor(100.0)}
+
+    cfg.optim.aux_loss_weights.with_diagnostic = 3.0
+    total, reported = build_aux_losses(cfg)(make_out(), None)
+
+    assert total == pytest.approx(6.0), "the diagnostic must not enter the objective"
+    assert reported["_diag"] == pytest.approx(100.0), "but it must still be logged"

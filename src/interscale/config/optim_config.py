@@ -41,6 +41,10 @@ def get_optim_cfg(cfg):
     # `optim.aux_loss_weights.<name>` through merge_from_list with no special handling. See
     # `interscale.train.aux_losses` and `.claude/contrastive_plan.md`.
     cfg.optim.aux_loss_weights = CN()
+    # VICReg (variance-invariance-covariance). 0.0 leaves it unbuilt. See
+    # `optim.contrastive.vicreg_*` for the coefficients within it, and `optim.loss: none` for
+    # running it INSTEAD of a reconstruction criterion rather than beside one.
+    cfg.optim.aux_loss_weights.vicreg = 0.0
 
     # Shared settings for the contrastive terms. Inert until one of them carries a weight.
     cfg.optim.contrastive = CN()
@@ -59,4 +63,24 @@ def get_optim_cfg(cfg):
     # explicitly does not.
     cfg.optim.contrastive.projector_dims = [64]
     cfg.optim.contrastive.expander_dims = [256]
+    # Which embedding the contrastive/VICReg terms read: "global" for the transformer's per-cell
+    # tokens, "local" for the graph component's, "auto" for whichever the model has. "auto" is
+    # what lets one config block serve LocalModel, GlobalModel and CombinedModel unchanged.
+    cfg.optim.contrastive.embedding = "auto"
+
+    # VICReg coefficients, named as in the paper: lambda weights invariance, mu variance, nu
+    # covariance. These live INSIDE the term because they are part of VICReg's definition;
+    # `optim.aux_loss_weights.vicreg` is the outer scale against the reconstruction loss.
+    #
+    # lambda > 0 is what makes the term need two views, so it is also the switch between "a
+    # collapse regulariser beside reconstruction" and "a self-supervised objective in its own
+    # right". Paper defaults are 25 / 25 / 1.
+    cfg.optim.contrastive.vicreg_lambda = 25.0
+    cfg.optim.contrastive.vicreg_mu = 25.0
+    cfg.optim.contrastive.vicreg_nu = 1.0
+    # Grouping for the variance hinge: "auto" uses the attached `slide` if there is one and the
+    # graph index otherwise; "none" pools the whole batch. Leave it on "auto" -- a batch-level
+    # hinge can be satisfied entirely by between-slide variance, i.e. by the batch effect, while
+    # every cell inside a slide collapses to one point.
+    cfg.optim.contrastive.vicreg_group = "auto"
     return cfg

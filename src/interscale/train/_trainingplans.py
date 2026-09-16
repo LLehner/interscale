@@ -129,6 +129,11 @@ def masked_regression_metrics(
     }
 
 
+#: ``optim.loss`` values that mean "no reconstruction criterion at all". The objective is then
+#: whatever ``optim.aux_loss_weights`` provides -- VICReg on its own, say. Config validation
+#: rejects the combination of no criterion and no auxiliary term, which would train on nothing.
+NO_LOSS = (None, "none", "None")
+
 CLASSIFICATION_LOSSES = ["CrossEntropy", "WeightedCE"]
 REGRESSION_LOSSES = [
     "MSELoss",
@@ -243,7 +248,9 @@ class TrainingPlan(pl.LightningModule):
     def _setup_classification_loss(
         loss: Literal["CrossEntropy", "WeightedCE"], class_weights: torch.Tensor | None = None
     ):
-        """Setup loss function based on prediction task and configuration."""
+        """Setup loss function based on prediction task and configuration. None disables it."""
+        if loss in NO_LOSS:
+            return None
         assert loss in CLASSIFICATION_LOSSES, "Classification must be run with CrossEntropy or WeightedCE loss."
         if loss == "CrossEntropy":
             return nn.CrossEntropyLoss()
@@ -254,7 +261,9 @@ class TrainingPlan(pl.LightningModule):
             return nn.CrossEntropyLoss(weight=class_weights.float())
 
     def _setup_regression_loss(self, loss: Literal[REGRESSION_LOSSES]):
-        """Setup loss function based on prediction task and configuration."""
+        """Setup loss function based on prediction task and configuration. None disables it."""
+        if loss in NO_LOSS:
+            return None
         assert loss in REGRESSION_LOSSES, (
             f"{loss} not in {REGRESSION_LOSSES}"
         )  # "Regression must be run with MSELoss, GaussianNLL or SmoothL1 loss."
@@ -317,7 +326,7 @@ class TrainingPlan(pl.LightningModule):
         #     y_pred = y_pred[mask_idx]
         #     y_true = y_true[mask_idx]
 
-        loss = self.loss(y_pred, y_true)
+        loss = self._zero(y_pred) if self.loss is None else self.loss(y_pred, y_true)
         metrics = metrics(y_pred.argmax(dim=1), y_true.argmax(dim=1))
         metrics[f"{mode}_loss"] = loss
 
@@ -360,7 +369,12 @@ class TrainingPlan(pl.LightningModule):
             The masked-only versions are logged alongside under a ``masked_`` prefix; they are
             the honest held-out score and the two differ a lot, so read the prefix.
         """
-        if self.loss_type == "SCE_EntropyATT_Loss":
+        if self.loss is None:
+            # No reconstruction criterion: the objective comes entirely from the auxiliary terms.
+            # Metrics are still computed and logged -- they say what the representation can do,
+            # which is exactly the question when nothing is being reconstructed.
+            loss = self._zero(y_pred)
+        elif self.loss_type == "SCE_EntropyATT_Loss":
             # Takes attention as a third argument, so it cannot go through masked_loss. Zeroing
             # the unmasked entries restricts its row-wise cosine to the masked coordinates,
             # which is what the row-structured branch of masked_loss does too.
@@ -390,6 +404,11 @@ class TrainingPlan(pl.LightningModule):
         metrics[f"{mode}_loss"] = loss
         return loss, metrics
 
+    @staticmethod
+    def _zero(reference: torch.Tensor) -> torch.Tensor:
+        """A zero on the right device and dtype, so `loss + aux` needs no special case."""
+        return torch.zeros((), device=reference.device, dtype=reference.dtype)
+
     def forward(self, *args, **kwargs):
         """Passthrough to the module's forward method."""
         return self.module(
@@ -406,6 +425,7 @@ class TrainingPlan(pl.LightningModule):
         metrics: MetricCollection,
         attn: torch.Tensor | None,
         entry_mask: torch.Tensor | None = None,
+        extra_loss: torch.Tensor | None = None,
     ):
         """Helper method to log metrics for training, validation, or test steps.
 
@@ -429,6 +449,14 @@ class TrainingPlan(pl.LightningModule):
 
         elif "regression" in self.prediction_task:
             loss, metrics = self._regression_metrics(y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask)
+
+        if extra_loss is not None:
+            # `<mode>_loss` must be the quantity actually optimised, not the reconstruction half
+            # of it. It is what EarlyStopping and ModelCheckpoint monitor for a regression run,
+            # so under `optim.loss: none` -- where the reconstruction half is a constant zero --
+            # logging that half would give a flat curve and stop every run at `patience`.
+            loss = loss + extra_loss
+            metrics[f"{mode}_loss"] = loss
 
         # Set sync_dist=True only for test mode
         sync_dist = mode == "test"
@@ -476,10 +504,15 @@ class TrainingPlan(pl.LightningModule):
         out = self._forward_views(batch)
         y_pred, y_true, entry_mask, attn = out.y_pred, out.y_true, out.entry_mask, out.attn
 
-        # Modules that decode twice (DualDecoderCombinedModule) report each half separately.
-        if not hasattr(self.module, "compute_separate_losses"):
-            loss = self._compute_and_log_metrics(y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask)
-            return self._add_aux_losses(loss, out, batch, mode, sync_dist)
+        # Computed before the metrics so that `<mode>_loss` can be logged as the full objective.
+        aux_total = self._aux_losses(out, batch, mode, sync_dist)
+
+        # Modules that decode twice (DualDecoderCombinedModule) report each half separately --
+        # but there are no halves to report when no reconstruction criterion is configured.
+        if self.loss is None or not hasattr(self.module, "compute_separate_losses"):
+            return self._compute_and_log_metrics(
+                y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask, extra_loss=aux_total
+            )
 
         separate_losses = self.module.compute_separate_losses(self.loss, self.loss_type, y_pred, y_true, entry_mask)
 
@@ -491,7 +524,9 @@ class TrainingPlan(pl.LightningModule):
                 self._log_scalar(f"{mode}_{key}", separate_losses[key], sync_dist)
 
         # Metrics are computed from the combined predictions, as before.
-        loss = self._compute_and_log_metrics(y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask)
+        loss = self._compute_and_log_metrics(
+            y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask, extra_loss=aux_total
+        )
 
         if separate_losses.get("kl_loss") is not None:
             kl_loss = separate_losses["kl_loss"]
@@ -501,7 +536,6 @@ class TrainingPlan(pl.LightningModule):
             self._log_scalar(f"{mode}_kl_loss", kl_loss, False)
             loss = loss + kl_weight * kl_loss
 
-        loss = self._add_aux_losses(loss, out, batch, mode, sync_dist)
         assert not torch.isnan(loss), "loss is NaN"
         return loss
 
@@ -540,26 +574,25 @@ class TrainingPlan(pl.LightningModule):
         out.views = [out.view, *(o.view for o in extra)]
         return out
 
-    def _add_aux_losses(self, loss, out, batch, mode: str, sync_dist: bool):
-        """Add the weighted auxiliary terms to ``loss`` and log each one.
+    def _aux_losses(self, out, batch, mode: str, sync_dist: bool):
+        """Evaluate and log the auxiliary terms; return their weighted total, or None.
 
-        Returns ``loss`` untouched -- the same tensor object, not an equal one -- when no term is
-        enabled, which is the default. That is deliberate: an unconditional ``loss + 0`` would be
-        numerically identical but would still make every existing run take a different code path,
-        and the point of this scaffolding is that it is inert until something is switched on.
+        ``None`` -- not a zero -- when no term is enabled, which is the default. The caller then
+        skips the addition entirely, so an unweighted run takes exactly the code path it took
+        before any of this existed rather than an arithmetically-equal one.
 
         Terms are logged *unweighted*, under ``<mode>_<name>``, because the unweighted value is
         what stays comparable across runs that weight the term differently. The weighted sum is
-        logged separately as ``<mode>_aux_total``.
+        logged as ``<mode>_aux_total``, and folded into ``<mode>_loss`` by the caller.
         """
         if not self.aux_losses:
-            return loss
+            return None
 
         aux_total, reported = self.aux_losses(out, batch)
         for name, value in reported.items():
             self._log_scalar(f"{mode}_{name}", value, sync_dist)
         self._log_scalar(f"{mode}_aux_total", aux_total, sync_dist)
-        return loss + aux_total
+        return aux_total
 
     def training_step(self, batch):
         """Training step for the model.

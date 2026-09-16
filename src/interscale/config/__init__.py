@@ -140,6 +140,33 @@ def _validate_masking(cfg):
         )
 
 
+def _validate_objective(cfg):
+    """Reject a config that leaves the model with nothing to optimise.
+
+    ``optim.loss: none`` switches the reconstruction criterion off so an auxiliary objective --
+    VICReg, say -- can be the whole task. With no auxiliary weight set either, the total loss is
+    a constant zero: training runs, every metric is logged, and not one parameter moves in a way
+    that means anything. That is a slow failure to notice, so it fails at config load instead.
+
+    Raises
+    ------
+    ValueError
+        If no reconstruction criterion and no auxiliary term is enabled.
+    """
+    from interscale.train._trainingplans import NO_LOSS
+
+    if cfg.optim.loss not in NO_LOSS:
+        return
+    weights = dict(cfg.optim.aux_loss_weights)
+    if any(float(w) != 0.0 for w in weights.values()):
+        return
+    raise ValueError(
+        f"optim.loss is {cfg.optim.loss!r} (no reconstruction criterion) and every "
+        "optim.aux_loss_weights entry is 0, so the objective is a constant zero. Set a "
+        "criterion, or give an auxiliary term a weight (e.g. aux_loss_weights.vicreg)."
+    )
+
+
 def _validate_optim(cfg):
     """Reject configs whose training-length settings stop a run inside the LR warm-up.
 
@@ -258,6 +285,7 @@ def load_config(cfg_path=None, overrides=None):
     if not cfg_paths and not overrides:
         _validate_optim(cfg)
         _validate_masking(cfg)
+        _validate_objective(cfg)
         _validate_probe(cfg)
         cfg.freeze()
         return cfg

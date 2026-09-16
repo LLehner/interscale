@@ -19,6 +19,7 @@ thing to forget, and forgetting it produces a run that trains quietly on the wro
 
 from __future__ import annotations
 
+import warnings
 from abc import abstractmethod
 
 import torch
@@ -26,6 +27,7 @@ import torch.nn as nn
 from yacs.config import CfgNode as CN
 
 from interscale.module.base import StepOutput
+from interscale.train.vicreg import covariance_term, invariance_term, variance_term
 
 
 class AuxLoss(nn.Module):
@@ -56,8 +58,11 @@ class AuxLoss(nn.Module):
         Returns
         -------
         dict[str, torch.Tensor]
-            Named scalar terms. Names are logged verbatim under the mode prefix, so a term may
-            report several numbers (a total and its parts) and each will appear separately.
+            Named scalar terms, each added to the objective and logged under the mode prefix.
+
+            A name beginning with ``_`` is **reported but not summed** -- a diagnostic rather
+            than part of the objective. Embedding standard deviation is the motivating case:
+            it is the number that reveals a slow collapse, and it must not also be optimised.
         """
 
 
@@ -137,7 +142,8 @@ class CompositeAuxLoss(nn.Module):
         -------
         total : torch.Tensor
             The weighted sum to add to the reconstruction loss. A zero scalar when nothing is
-            enabled -- deliberately a tensor, so the caller needs no special case.
+            enabled -- deliberately a tensor, so the caller needs no special case. Names
+            beginning with ``_`` are excluded: they are diagnostics, not objectives.
         reported : dict[str, torch.Tensor]
             Every scalar each term reported, unweighted, for logging. Weighting is not folded in
             because the unweighted value is the one that is comparable across runs with different
@@ -154,7 +160,8 @@ class CompositeAuxLoss(nn.Module):
                 if key in reported:
                     raise ValueError(f"Two auxiliary terms both reported {key!r}; names must be unique.")
                 reported[key] = value
-                total = total + weight * value
+                if not key.startswith("_"):
+                    total = total + weight * value
 
         return total, reported
 
@@ -197,3 +204,141 @@ def build_aux_losses(cfg: CN, module: nn.Module | None = None) -> CompositeAuxLo
 
     terms = {name: AUX_LOSSES[name](cfg, module) for name in enabled}
     return CompositeAuxLoss(terms, enabled)
+
+
+def build_expander(n_input: int, dims: list[int]) -> nn.Module:
+    """The MLP VICReg's terms are computed on: ``Linear -> BN -> ReLU`` per hidden, then Linear.
+
+    The paper puts the variance and covariance terms on an *expanded* embedding -- 8192-d against
+    a 2048-d representation -- and its own sweep says the width matters a great deal (Table 12:
+    256-d reaches 55.9%, 8192-d 68.6%). This model's ``n_embed`` is 16, where decorrelating every
+    dimension is a far harsher constraint and competes directly with the decoder's need for them.
+    Expanding first is what keeps the regulariser off the representation itself.
+
+    An empty ``dims`` gives the identity, which applies the terms to the embedding directly -- a
+    deliberate option, and the ablation that says whether the expander earned its parameters.
+    """
+    if not dims:
+        return nn.Identity()
+    layers: list[nn.Module] = []
+    in_dim = n_input
+    for width in dims[:-1]:
+        layers += [nn.Linear(in_dim, width), nn.BatchNorm1d(width), nn.ReLU(inplace=True)]
+        in_dim = width
+    layers.append(nn.Linear(in_dim, dims[-1]))
+    return nn.Sequential(*layers)
+
+
+@register_aux_loss("vicreg")
+class VICRegAuxLoss(AuxLoss):
+    """VICReg as an auxiliary term: variance + covariance always, invariance when two views run.
+
+    Three configurations, all reached from the same class:
+
+    * ``vicreg_mu``/``vicreg_nu`` only -- one forward pass, no pairing, no negatives. A collapse
+      regulariser beside the reconstruction loss; the cheapest useful thing in the plan.
+    * all three coefficients, with ``optim.loss`` still set -- the hybrid.
+    * all three, with ``optim.loss: none`` -- VICReg as the whole objective.
+
+    ``requires_views`` is 2 exactly when the invariance coefficient is non-zero, so asking for
+    the invariance term is what turns two-view mode on. Nothing else needs setting, and nothing
+    else can be forgotten.
+
+    Which embedding the terms read is ``optim.contrastive.embedding``: ``"global"`` for the
+    transformer's per-cell tokens, ``"local"`` for the graph component's, or ``"auto"`` (the
+    default) for whichever the model has -- which is what lets one config block serve
+    ``LocalModel``, ``GlobalModel`` and ``CombinedModel``.
+    """
+
+    def __init__(self, cfg, module=None):
+        super().__init__()
+        contrastive = cfg.optim.contrastive
+        self.lam = float(contrastive.vicreg_lambda)
+        self.mu = float(contrastive.vicreg_mu)
+        self.nu = float(contrastive.vicreg_nu)
+        self.embedding = contrastive.embedding
+        self.group_by = contrastive.vicreg_group
+
+        # An instance attribute shadowing the class one: how many passes to run is a property of
+        # THIS configuration, not of the class.
+        self.requires_views = 2 if self.lam > 0 else 1
+
+        n_embed = getattr(module, "n_embed", None) if module is not None else None
+        self.expander = build_expander(n_embed, list(contrastive.expander_dims)) if n_embed else nn.Identity()
+
+        if self.lam == 0 and self.mu == 0 and self.nu == 0:
+            raise ValueError(
+                "aux_loss_weights.vicreg is non-zero but every VICReg coefficient "
+                "(optim.contrastive.vicreg_lambda/mu/nu) is 0, so the term contributes nothing."
+            )
+        if self.mu == 0 and self.lam > 0:
+            warnings.warn(
+                "VICReg with an invariance term but no variance term (vicreg_mu = 0) collapses: "
+                "mapping every cell to one point satisfies invariance exactly. The paper's "
+                "Table 7 reports collapse for every such combination.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    def _embeddings(self, out: StepOutput) -> list[torch.Tensor]:
+        """One ``[N, E]`` matrix per view, from whichever embedding is configured."""
+        wants_global = self.embedding == "global" or (
+            self.embedding == "auto" and out.view.global_embedding is not None
+        )
+        if wants_global:
+            if out.view.global_embedding is None:
+                raise ValueError(
+                    "optim.contrastive.embedding is 'global' but this module produced none. Use "
+                    "'local' or 'auto' for a LocalModel."
+                )
+            return aligned_view_tokens(out)
+
+        if out.view.local_embedding is None:
+            raise ValueError(
+                "optim.contrastive.embedding is 'local' but this module produced none. Use "
+                "'global' or 'auto' for a GlobalModel."
+            )
+        return [view.local_embedding for view in out.views]
+
+    def _groups(self, out: StepOutput, batch, n_rows: int) -> torch.Tensor | None:
+        """Row labels for the per-slide variance hinge, or None to pool the whole batch.
+
+        Prefers an attached ``slide`` annotation over the graph index, because several windows
+        can come from one slide and it is the SLIDE that carries the batch effect the grouping
+        exists to keep out of the hinge.
+        """
+        if self.group_by == "none":
+            return None
+
+        index = out.view.padded_node_idx
+        slide = getattr(batch, "slide", None)
+        if slide is not None:
+            codes = slide.argmax(dim=1) if slide.dim() > 1 else slide
+            return codes[index] if index is not None else codes[:n_rows]
+
+        graph = getattr(batch, "batch", None)
+        if graph is None:
+            return None
+        return graph[index] if index is not None else graph[:n_rows]
+
+    def forward(self, out: StepOutput, batch) -> dict[str, torch.Tensor]:
+        """The VICReg objective, with each coefficient's contribution reported separately."""
+        embeddings = self._embeddings(out)
+        projected = [self.expander(z) for z in embeddings]
+        groups = self._groups(out, batch, projected[0].shape[0])
+
+        terms: dict[str, torch.Tensor] = {}
+
+        if self.mu:
+            variance = torch.stack([variance_term(z, groups=groups) for z in projected]).mean()
+            terms["vicreg_var"] = self.mu * variance
+        if self.nu:
+            covariance = torch.stack([covariance_term(z) for z in projected]).mean()
+            terms["vicreg_cov"] = self.nu * covariance
+        if self.lam:
+            terms["vicreg_inv"] = self.lam * invariance_term(projected[0], projected[1])
+
+        # Not summed (leading underscore): the collapse diagnostic, which VICReg's Figure 4 reads
+        # to see a representation shrinking long before a loss curve shows it.
+        terms["_vicreg_std"] = projected[0].std(dim=0).mean().detach()
+        return terms
