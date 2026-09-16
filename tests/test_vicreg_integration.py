@@ -145,3 +145,75 @@ def test_an_empty_expander_is_allowed_as_the_ablation():
 
     assert isinstance(composite.terms["vicreg"].expander, torch.nn.Identity)
     _fit(_plan(module, composite))
+
+
+# --------------------------------------------------------------------------- which module
+
+
+def _gcn_module():
+    from interscale.module.local_modules.GCN import GCN
+
+    return GCN(
+        n_layers=2, hidden_dim=16, dropout_local=0.3,
+        n_input=6, n_output=6, n_embed=8, decoder_type="linear",
+        dropout_decoder=0.0, decoder_hidden_dims=[8],
+        mask_percentage=0.3, mask_strategy="node",
+    )
+
+
+def _local_batch():
+    from torch_geometric.data import Batch, Data
+
+    def graph(n, seed):
+        g = torch.Generator().manual_seed(seed)
+        src = list(range(n - 1)) + list(range(1, n))
+        data = Data(
+            x=torch.randn(n, 6, generator=g),
+            edge_index=torch.tensor([src, list(range(1, n)) + list(range(n - 1))], dtype=torch.long),
+        )
+        data.mask = torch.rand(n, generator=g) < 0.4
+        data.mask[0] = True
+        data.obs_names = torch.arange(n)
+        return data
+
+    return Batch.from_data_list([graph(7, 0), graph(9, 1)])
+
+
+def _two_view_out(module, batch):
+    out = module._common_step(batch, "regression", "node")
+    out.views = [out.view, module._common_step(batch, "regression", "node").view]
+    return out
+
+
+@pytest.mark.parametrize("embedding", ["auto", "local"])
+def test_vicreg_runs_on_a_local_only_module(embedding):
+    """A GCN has no transformer tokens; `auto` must fall back to the local embedding.
+
+    This is what lets one config block serve LocalModel, GlobalModel and CombinedModel: the
+    alternative is a `contrastive` section that has to be rewritten per model type.
+    """
+    module = _gcn_module().train()
+    cfg = _cfg(embedding=embedding, expander_dims=[32])
+    composite = build_aux_losses(cfg, module)
+
+    total, reported = composite(_two_view_out(module, _local_batch()), _local_batch())
+
+    assert {"vicreg_var", "vicreg_cov", "vicreg_inv"} <= set(reported)
+    total.backward()
+    assert module.input_proj.weight.grad is not None, "the term never reached the encoder"
+
+
+def test_asking_for_global_on_a_local_module_says_what_to_do():
+    module = _gcn_module().train()
+    batch = _local_batch()
+    composite = build_aux_losses(_cfg(embedding="global", expander_dims=[32]), module)
+
+    with pytest.raises(ValueError, match="'global' but this module produced none"):
+        composite(_two_view_out(module, batch), batch)
+
+
+def test_local_and_global_are_separately_selectable_on_a_combined_run():
+    """On a model with both, `embedding` chooses which scale the regulariser acts on."""
+    module = _tiny_module()  # transformer: has global tokens, no local embedding
+    assert build_aux_losses(_cfg(embedding="global"), module).terms["vicreg"].embedding == "global"
+    assert build_aux_losses(_cfg(embedding="local"), module).terms["vicreg"].embedding == "local"
