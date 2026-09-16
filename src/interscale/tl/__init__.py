@@ -9,6 +9,7 @@ from .anchors import (
     profile_by_distance,
 )
 from .geome_utils import (
+    check_split_independence,
     label_codes,
     optional_fields,
     prepare_a2d_dataset,
@@ -32,6 +33,7 @@ from .utils import check_and_update_cfg, set_full_reproducibility
 __all__ = [
     "prepare_geome_dataset",
     "warn_missing_categories",
+    "check_split_independence",
     "label_codes",
     "optional_fields",
     "prepare_a2d_dataset",

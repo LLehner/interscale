@@ -64,6 +64,16 @@ def get_dataset_cfg(cfg):
     cfg.dataset.probe_obsm_key = None
 
     cfg.dataset.slide_key = None
+    # The unit of statistical independence -- usually donor, patient, or processing batch. Two
+    # cells sharing a value here are not independent observations, so a split that puts one such
+    # group on both sides lets any readout (the model's own val metrics, and every probe) score by
+    # recognising the group rather than the biology. Setting it enables
+    # `tl.check_split_independence`, which reports that rather than assuming it away.
+    #
+    # Deliberately not named `donor_key`: the column that carries non-independence differs by
+    # dataset -- donor, patient, mouse, slide, run -- and hardcoding one of them into the API
+    # would make the check unusable on the next dataset.
+    cfg.dataset.group_key = None
     cfg.dataset.condition_key = None
     cfg.dataset.celltype_key = None
     cfg.dataset.spatial_key = None

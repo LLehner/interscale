@@ -11,6 +11,7 @@ from yacs.config import CfgNode as CN
 #: exactly the graphs it always did. See ``get_dataset_cfg`` for what each is for.
 OPTIONAL_FIELDS = {
     "slide": ("slide_key", "obs"),
+    "group": ("group_key", "obs"),
     "condition": ("condition_key", "obs"),
     "celltype": ("celltype_key", "obs"),
     "pos": ("spatial_key", "obsm"),
@@ -196,6 +197,63 @@ def warn_missing_categories(adata, split_key: str, cfg: CN) -> list[str]:
     return messages
 
 
+def check_split_independence(adata, split_key: str, group_key: str | None) -> list[str]:
+    """Warn when one group's cells land in more than one split.
+
+    ``group_key`` names the unit of statistical independence -- donor, patient, mouse, processing
+    batch. Cells sharing a value are not independent observations, so a split that straddles one
+    lets any readout score by recognising the group instead of the biology: the encoder's own
+    validation metrics, and every probe fitted on train and scored on val.
+
+    This *reports* rather than enforces, for two reasons. A straddling split is sometimes
+    deliberate (a single-donor dataset has no other option), and the right repair -- regroup,
+    re-split, drop a group -- depends on the study design, not on anything visible from here.
+
+    Nothing is checked when ``group_key`` is None, which is the default. A dataset that does not
+    name its grouping simply gets the previous behaviour; it does not get a false all-clear,
+    because no claim is made either way.
+
+    Parameters
+    ----------
+    adata
+        The full object, before any split subsetting.
+    split_key
+        ``adata.obs`` column holding ``train``/``val``/``test``.
+    group_key
+        ``adata.obs`` column naming the unit of independence, or None to skip.
+
+    Returns
+    -------
+    list of str
+        The messages emitted, so a caller or a test can inspect them.
+    """
+    if group_key is None:
+        return []
+    if group_key not in adata.obs.columns:
+        message = (
+            f"dataset.group_key is {group_key!r} but that column is not in adata.obs, so the "
+            "split cannot be checked for group leakage. Either add the column or unset group_key."
+        )
+        warnings.warn(message, UserWarning, stacklevel=2)
+        return [message]
+
+    groups = adata.obs.groupby(group_key, observed=True)[split_key].unique()
+    messages = []
+    for group, splits in groups.items():
+        splits = sorted(str(x) for x in splits)
+        if len(splits) < 2:
+            continue
+        message = (
+            f"{group_key} {group!r} has cells in {len(splits)} splits ({', '.join(splits)}). "
+            "Cells of one group are not independent, so anything fitted on one split and scored "
+            "on another -- validation metrics, and every probe -- can score by recognising the "
+            f"group rather than the biology. Split by {group_key!r} instead of by cell."
+        )
+        messages.append(message)
+        warnings.warn(message, UserWarning, stacklevel=2)
+    return messages
+
+
 class _RestoreCategories:
     """Preprocess step re-instating the full object's categories on the given obs columns.
 
@@ -270,6 +328,7 @@ def prepare_geome_dataset(adata, cfg: CN):
     )
     split_key = cfg.dataset.split_key
     warn_missing_categories(adata, split_key, cfg)
+    check_split_independence(adata, split_key, cfg.dataset.group_key)
 
     # initalize object to save train, val and test PyG datas
     datas_train, datas_val, datas_test = list(), list(), list()
