@@ -61,6 +61,38 @@ class AuxLoss(nn.Module):
         """
 
 
+def aligned_view_tokens(out: StepOutput) -> list[torch.Tensor]:
+    """Token matrices for every view, after checking that row *i* is the same cell in each.
+
+    Any two-view term is a statement about *pairs of the same cell*, and the one way that
+    silently stops being true here is ``pad_batch``: when a graph is larger than ``max_seq_len``
+    it keeps a RANDOM subset, so two passes over one batch can retain different cells. The shapes
+    still match, the loss still produces a plausible number, and the model trains towards nothing.
+
+    Returns
+    -------
+    list of torch.Tensor
+        One ``[N_kept, E]`` matrix per view, all row-aligned.
+
+    Raises
+    ------
+    ValueError
+        If the views kept different cells, naming the cause and the fix.
+    """
+    reference = out.view.padded_node_idx
+    for i, view in enumerate(out.views[1:], start=1):
+        if reference is None or view.padded_node_idx is None:
+            continue
+        if not torch.equal(reference, view.padded_node_idx):
+            raise ValueError(
+                f"View 0 and view {i} kept different cells, so a per-cell pairing between them is "
+                "meaningless. This happens when a graph is larger than "
+                "model.global_component.parameters.max_seq_len, where pad_batch subsamples "
+                "tokens at random per pass. Raise max_seq_len to at least the largest graph."
+            )
+    return [view.tokens() for view in out.views]
+
+
 #: Name -> class. A name here must also appear in ``cfg.optim.aux_loss_weights``.
 AUX_LOSSES: dict[str, type[AuxLoss]] = {}
 

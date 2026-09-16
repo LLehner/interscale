@@ -473,7 +473,7 @@ class TrainingPlan(pl.LightningModule):
         metrics = getattr(self, self._MODE_METRICS[mode])
         sync_dist = mode == "test"
 
-        out = self.module._common_step(batch, self.prediction_task, self.prediction_level)
+        out = self._forward_views(batch)
         y_pred, y_true, entry_mask, attn = out.y_pred, out.y_true, out.entry_mask, out.attn
 
         # Modules that decode twice (DualDecoderCombinedModule) report each half separately.
@@ -504,6 +504,41 @@ class TrainingPlan(pl.LightningModule):
         loss = self._add_aux_losses(loss, out, batch, mode, sync_dist)
         assert not torch.isnan(loss), "loss is NaN"
         return loss
+
+    def _forward_views(self, batch):
+        """Run the module once per view an auxiliary term asked for, and merge them.
+
+        How many views to run is read off the enabled terms (``CompositeAuxLoss.requires_views``),
+        not from a separate config switch -- a switch would be one more thing to forget, and
+        forgetting it trains the wrong objective without complaining.
+
+        The extra passes go through the *same* ``_common_step``, so no module changes are needed:
+        the views differ only by whatever stochasticity is already inside the encoder. Today that
+        is dropout, which makes a two-view run the SimCSE floor -- the baseline everything richer
+        has to beat. Independent corruption draws per view come with the view sampler in Stage 3.
+
+        ``y_pred`` / ``y_true`` are taken from the first view, so the reconstruction term and
+        every metric are computed exactly as in a single-view run.
+
+        **Dropout-only views vanish under evaluation.** ``validation_step`` and ``test_step`` run
+        with the module in ``eval()``, where the encoder is deterministic -- so the two views
+        coincide exactly and any invariance term between them is identically zero. A
+        ``val_vicreg_inv`` of 0.0 therefore means "no stochasticity in eval", not "the views
+        agree", and ``val_loss`` under a VICReg-only objective reports its variance and
+        covariance halves alone. Stage 3's view sampler corrupts the *input*, which does not
+        depend on training mode and fixes this.
+        """
+        out = self.module._common_step(batch, self.prediction_task, self.prediction_level)
+        n_views = self.aux_losses.requires_views
+        if n_views <= 1:
+            return out
+
+        extra = [
+            self.module._common_step(batch, self.prediction_task, self.prediction_level)
+            for _ in range(n_views - 1)
+        ]
+        out.views = [out.view, *(o.view for o in extra)]
+        return out
 
     def _add_aux_losses(self, loss, out, batch, mode: str, sync_dist: bool):
         """Add the weighted auxiliary terms to ``loss`` and log each one.

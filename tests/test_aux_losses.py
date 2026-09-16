@@ -413,3 +413,88 @@ def test_the_plan_exposes_the_modules_terms(cfg, registry):
     )
 
     assert plan.aux_losses is module.aux_losses
+
+
+# --------------------------------------------------------------------------- multiple views
+
+
+def test_a_two_view_term_receives_two_row_aligned_views(cfg, registry):
+    """`requires_views` is the only switch: asking for two is what makes two passes happen."""
+    import lightning.pytorch as pl
+
+    from interscale.train._trainingplans import TrainingPlan
+    from interscale.train.aux_losses import aligned_view_tokens
+
+    seen = {}
+
+    @register_aux_loss("two_view_probe")
+    class TwoViewProbe(AuxLoss):
+        requires_views = 2
+
+        def __init__(self, cfg, module=None):
+            super().__init__()
+
+        def forward(self, out, batch):
+            views = aligned_view_tokens(out)
+            mode = "train" if module.training else "eval"
+            seen["n_views"] = len(views)
+            seen["aligned"] = all(v.shape == views[0].shape for v in views)
+            seen[f"differ_{mode}"] = not torch.equal(views[0], views[1])
+            return {"two_view_probe": (views[0] - views[1]).pow(2).mean()}
+
+    module = _tiny_module()
+    module.transformer_encoder.layers[0].dropout1.p = 0.5  # make the two passes visibly differ
+    cfg.optim.aux_loss_weights.two_view_probe = 1.0
+    composite = build_aux_losses(cfg, module)
+    assert composite.requires_views == 2
+
+    plan = TrainingPlan(
+        module, "regression", "node", "MSELoss", "cell", batch_size=2, aux_losses=composite,
+        lr_scheduler="CosineWarmupScheduler", lr_warmup=1, lr_max_epochs=2,
+    )
+    trainer = pl.Trainer(
+        max_epochs=1, accelerator="cpu", logger=False, enable_checkpointing=False,
+        enable_progress_bar=False, enable_model_summary=False,
+    )
+    trainer.fit(plan, datamodule=_tiny_datamodule())
+
+    assert seen["n_views"] == 2
+    assert seen["aligned"]
+    assert seen["differ_train"], "two training passes with dropout on must not be identical"
+    # And the caveat that comes with dropout-only views: in eval mode the encoder is
+    # deterministic, so the two views coincide exactly and any invariance term is identically
+    # zero on validation. See `_forward_views`.
+    assert not seen["differ_eval"]
+
+
+def test_a_single_view_term_still_runs_one_pass(cfg, registry):
+    """The default path must be untouched: one view, one forward."""
+    from interscale.train._trainingplans import TrainingPlan
+
+    module = _tiny_module()
+    plan = TrainingPlan(
+        module, "regression", "node", "MSELoss", "cell", batch_size=2,
+        lr_scheduler="CosineWarmupScheduler", lr_warmup=1, lr_max_epochs=2,
+    )
+    assert plan.aux_losses.requires_views == 1
+
+
+def test_misaligned_views_are_rejected_with_the_cause():
+    """pad_batch subsamples at random above max_seq_len, so two passes can keep different cells."""
+    from interscale.module.base import StepOutput, ViewOutput
+    from interscale.train.aux_losses import aligned_view_tokens
+
+    def view(idx):
+        return ViewOutput(
+            global_embedding=torch.randn(4, 1, 3),
+            src_padding_mask=torch.zeros(1, 4, dtype=torch.bool),
+            padded_node_idx=torch.tensor(idx),
+        )
+
+    out = StepOutput(
+        y_pred=torch.zeros(3, 2), y_true=torch.zeros(3, 2),
+        views=[view([0, 1, 2]), view([0, 1, 5])],
+    )
+
+    with pytest.raises(ValueError, match="max_seq_len"):
+        aligned_view_tokens(out)
