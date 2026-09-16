@@ -8,7 +8,7 @@ prediction intermediate.
 
 ## Status
 
-Last updated 2026-09-14. Update this table in the same commit as the work it describes.
+Last updated 2026-09-16. Update this table in the same commit as the work it describes.
 "Implemented, unverified" is a real state — a stage is only `done` when something external
 says so (a test, a reproduced number, a run that was actually looked at).
 
@@ -23,6 +23,7 @@ verified. The branch still exists but is behind; do not commit to it.
 | 0b — probe battery | **partly done** — online probes exist (`evaluation/online_probes.py`, commit `b88b76f`); the attention-flow control and the donor-grouped protocol do not | 156 tests pass; the `noise_00` negative control reads ~0.02 R2 where it read 0.33 before the masking fix, on a real synth_data_0 run | 2026-09-14 |
 | 1 — VICReg var/cov, no views | not started | | |
 | 2 — context NCE, composition-matched negatives | not started | | |
+| 2b — scale-matched pairing (local: same-neighbourhood; global: distant-same-slide) | not started | | |
 | 3 — two views (NT-Xent / VICReg invariance) | not started | | |
 | 4 — interaction-destroying negatives | not started | | |
 
@@ -58,6 +59,12 @@ so they are not the thing that tells you nothing moved.
   same ranking. τ on the high side (~0.5) instead.
 - Positives are never defined by transcriptomic similarity — a sender and a receiver in the
   same program are different cell types with dissimilar transcriptomes.
+- A corruption is only useful if the architecture can *see* it. `GCNConv` aggregates
+  `Σ_j a_ij W x_j` with `a_ij = 1/√(d_i d_j)`, so permuting expression *within* a neighbourhood is
+  invariant up to degree differences — and on a near-regular kNN graph that is invisible. The
+  Stage 4 permutation is therefore global-within-cell-type (which changes each neighbourhood's
+  vector multiset), never within-neighbourhood. Check every proposed negative against the
+  encoder's invariances before building it: a no-op corruption gives a flat loss and looks wired.
 
 **Open questions**
 
@@ -414,6 +421,82 @@ side, and the anchor's own k-hop neighbours come out of the denominator entirely
 
 ---
 
+## Stage 2b — scale-matched pairing (local vs. global)
+
+An add-on to test, not a replacement for Stage 2. The idea: give each component the pairing that
+matches the scale it is supposed to encode, instead of one pairing policy for both.
+
+| component | positive | negative |
+|---|---|---|
+| local | two cells from the **same neighbourhood** | cells **not** from the same neighbourhood |
+| global | two **distant** cells on the **same slide** | random cells from a **different slide** *or* from the anchor's **nearest neighbourhood** |
+
+The global row's second negative option is the appealing one: "a long-range program is not the
+same thing as a local niche" is the loss-side statement of the architecture's own `M = 1 - A`
+attention mask, which already forbids the transformer from attending inside the GNN's receptive
+field. Making that complementarity an objective rather than only a constraint is a genuinely
+new thing to try, and it is cheap — one forward pass, no views.
+
+Every field it needs already exists from Stage 0: `pos` for distance, `edge_index` for
+neighbourhood, `batch.batch` / `slide` for slide identity. It is a pairing *policy* over the
+existing `AuxLoss` interface, not new plumbing.
+
+### Two predicted failure modes — measure them, do not assume they are avoided
+
+**The local positive may be satisfied at initialisation.** A GCN already averages over the
+neighbourhood, so two cells from one neighbourhood share most of their input before any training;
+under anchor masking they share even more. "Same neighbourhood ⇒ close" is then close to a
+Laplacian smoothness penalty on something already smoothed. Not worthless — it is the DGI /
+proximity-embedding objective — but check the loss actually falls from a non-trivial starting
+value before concluding it taught the model anything. A flat-from-step-0 curve is the tell.
+
+**The global pairing, taken literally, is a recipe for a slide classifier.** If *every* pair of
+distant cells on a slide is a positive and *every* cross-slide pair is a negative, the exact
+optimum is "encode which slide you are on": all cells of slide *k* collapse to one point, all
+slides pushed apart, loss zero, nothing about interaction learned. That is the batch-effect
+failure this plan restricts negatives to one slide to avoid — reached from the other direction,
+and it would look like a *good* loss curve the whole way down.
+
+So split the global row into two arms and treat them differently:
+
+* **`near_negative` arm** (positive: distant, same slide; negative: the anchor's k-hop
+  neighbourhood) — the one worth running. Both sides are within-slide, so slide identity carries
+  no information about which is which and cannot be the discriminator.
+* **`cross_slide_negative` arm** (positive: distant, same slide; negative: another slide) — run it
+  as a **deliberate positive control for the failure**, not as a candidate objective. It should
+  drive the slide-identity probe up and the interaction probe flat. Having that curve makes the
+  slide-ID alarm quantitative instead of a rule of thumb.
+
+If the `near_negative` arm also drives slide-ID up, the distant-same-slide positive is degenerate
+on its own and needs a constraint that makes two distant cells plausibly *related* rather than
+merely co-resident — matched niche, or matched local embedding — at the cost of reintroducing a
+label. Decide that after seeing the probe, not before.
+
+### Knobs
+
+```yaml
+optim:
+  aux_loss_weights:
+    local_neighbourhood_nce: 0.0
+    global_distant_nce: 0.0
+  contrastive:
+    near_hops: 1              # what counts as "same neighbourhood" for the local positive
+    distant_min_um: 200       # how far apart a global positive must be, in `pos` units
+    global_negatives: near    # near | cross_slide -- see the two arms above
+```
+
+`distant_min_um` wants setting against the neighbour-graph radius (`spatial_neigbors_kwargs`),
+not guessed: "distant" has to mean well outside the local component's reach, or the two rows of
+the table are contrasting the same thing.
+
+### What would count as success
+
+Beyond the usual probe directions: the local and global embeddings should become **less**
+redundant, not more. The online probes already report both separately, so the readout is whether
+the gap between them widens on targets that are scale-specific — niche composition readable from
+local, tissue-scale program readable from global — while slide identity stays flat for the
+`near_negative` arm.
+
 ## Stage 3 — two views
 
 The first stage that costs 2× compute. Only worth it if Stages 1–2 have moved the probes.
@@ -483,6 +566,10 @@ destroyed*: permute expression vectors **within cell type** across the slide. Ev
 neighbourhood keeps an identical cell-type composition; what is destroyed is the
 correlation between a cell's state and its neighbours' states.
 
+This is deliberately a *global* within-type permutation, not a per-neighbourhood one: a
+symmetric aggregator is near-blind to a shuffle inside one neighbourhood (see **Decided so
+far**), so that variant would be a no-op the loss could never reduce.
+
 Contrast with the label-free global permutation (the standard DGI corruption), which shuffles
 across all cells: that destroys composition too, so the model can win on niche identity alone
 and never learn interaction. The within-type restriction is the whole point.
@@ -522,6 +609,7 @@ optim:
 | 0b | `evaluation/online_probes.py`, `config/probe_config.py` | `config/__init__.py` (validation), `train/_training.py` (callback), `evaluation/__init__.py` |
 | 1 | — | `aux_losses.py`, `_base_global_module.py` (expander) |
 | 2 | — | `aux_losses.py`, `tl/geome_utils.py` (celltype field) |
+| 2b | — | `aux_losses.py`, `optim_config.py` (three knobs); needs `pos` and `slide` from stage 0 |
 | 3 | `tl/augment.py` | `_base_global_module.py` (multi-pass), `geome_dataloader.py` |
 | 4 | — | `tl/augment.py`, `aux_losses.py` |
 
@@ -540,6 +628,9 @@ Things that fail silently rather than loudly:
 - [ ] projector/expander discarded at inference; the embedding the linear decoder reads is
       never directly constrained by a contrastive term
 - [ ] `celltype` used only as a negative-sampling stratifier, never as a target
+- [ ] a proposed corruption is actually visible to the encoder (see the `GCNConv` note above)
+- [ ] a distant-same-slide positive is paired with a *within-slide* negative, or the exact
+      optimum of the objective is a slide classifier
 
 ## Appendix D — pre-existing issue worth a separate look
 
