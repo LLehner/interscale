@@ -229,6 +229,27 @@ def build_expander(n_input: int, dims: list[int]) -> nn.Module:
     return nn.Sequential(*layers)
 
 
+
+def _encoder_dropout(cfg) -> float:
+    """Largest dropout rate configured anywhere in the encoder.
+
+    Two passes over one batch currently differ only through the encoder's own stochasticity, so
+    this is what decides whether a two-view term has anything to compare. Reads defensively: a
+    component may be absent (``GlobalModel`` has no local one) or carry no ``parameters`` node at
+    all (``Precomputed``).
+    """
+    rates = [0.0]
+    for component, name in (
+        (getattr(cfg.model, "local_component", None), "dropout_local"),
+        (getattr(cfg.model, "global_component", None), "dropout_global"),
+    ):
+        params = getattr(component, "parameters", None) if component is not None else None
+        rate = getattr(params, name, None) if params is not None else None
+        if rate is not None:
+            rates.append(float(rate))
+    return max(rates)
+
+
 @register_aux_loss("vicreg")
 class VICRegAuxLoss(AuxLoss):
     """VICReg as an auxiliary term: variance + covariance always, invariance when two views run.
@@ -276,6 +297,18 @@ class VICRegAuxLoss(AuxLoss):
                 "VICReg with an invariance term but no variance term (vicreg_mu = 0) collapses: "
                 "mapping every cell to one point satisfies invariance exactly. The paper's "
                 "Table 7 reports collapse for every such combination.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if self.lam > 0 and _encoder_dropout(cfg) == 0:
+            warnings.warn(
+                "vicreg_lambda > 0 asks for an invariance term between two views, but every "
+                "encoder dropout is 0 -- and dropout is currently the only thing that makes two "
+                "passes differ. The views are then identical, the invariance term is exactly 0.0, "
+                "and VICReg degenerates to variance+covariance, which its own Table 7 reports as "
+                "collapse. Set model.local_component.parameters.dropout_local or "
+                "model.global_component.parameters.dropout_global above 0, or wait for the "
+                "Stage 3 view sampler, which corrupts the input instead.",
                 UserWarning,
                 stacklevel=2,
             )

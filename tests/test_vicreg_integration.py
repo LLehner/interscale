@@ -5,6 +5,8 @@ coefficients decide how many forward passes run, that the term reaches the optim
 switching the reconstruction criterion off leaves a real objective rather than a constant zero.
 """
 
+import warnings
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -217,3 +219,33 @@ def test_local_and_global_are_separately_selectable_on_a_combined_run():
     module = _tiny_module()  # transformer: has global tokens, no local embedding
     assert build_aux_losses(_cfg(embedding="global"), module).terms["vicreg"].embedding == "global"
     assert build_aux_losses(_cfg(embedding="local"), module).terms["vicreg"].embedding == "local"
+
+
+def test_an_invariance_term_with_no_encoder_stochasticity_warns():
+    """Dropout is currently the ONLY thing making two passes differ; at 0 there is no task.
+
+    Confirmed on a real run: with every dropout at 0, `train_vicreg_inv` is exactly 0.0 even in
+    training mode, so VICReg silently degenerates to variance+covariance -- which its own Table 7
+    reports as collapse.
+    """
+    cfg = _cfg()
+    cfg.model.local_component.parameters = type(cfg.model)()
+    cfg.model.local_component.parameters.dropout_local = 0.0
+    cfg.model.global_component.parameters = type(cfg.model)()
+    cfg.model.global_component.parameters.dropout_global = 0.0
+
+    with pytest.warns(UserWarning, match="every .*dropout is 0"):
+        build_aux_losses(cfg, _tiny_module())
+
+
+def test_no_warning_when_some_dropout_is_configured():
+    cfg = _cfg()
+    cfg.model.global_component.parameters = type(cfg.model)()
+    cfg.model.global_component.parameters.dropout_global = 0.1
+    module = _tiny_module()  # built outside the filter: torch emits its own unrelated warnings
+
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        build_aux_losses(cfg, module)
+
+    assert not [w for w in record if "dropout is 0" in str(w.message)]
