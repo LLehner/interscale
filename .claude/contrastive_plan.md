@@ -8,7 +8,7 @@ prediction intermediate.
 
 ## Status
 
-Last updated 2026-09-16 (stage 1 implemented). Update this table in the same commit as the work it describes.
+Last updated 2026-09-18. **Read section 'What the probes cannot tell you' before interpreting any probe result.** Update this table in the same commit as the work it describes.
 "Implemented, unverified" is a real state — a stage is only `done` when something external
 says so (a test, a reproduced number, a run that was actually looked at).
 
@@ -21,7 +21,7 @@ verified. The branch still exists but is behind; do not commit to it.
 |---|---|---|---|
 | 0 — plumbing (`StepOutput`, `gather_tokens`, composite loss, step collapse, dataset fields) | **done** | 119 tests pass; `scripts/equivalence_harness.py` reports IDENTICAL against the pre-refactor baseline | 2026-09-13 |
 | 0b — probe battery | **done** — online probes (`b88b76f`), split-independence check (`ddfccdc`), attention-flow control (`cd15021`, `11a2622`) | 201 tests pass; `noise_00` reads ~0.02 R2 on a real synth_data_0 run; the flow control's sign convention is pinned against `compute_hierarchical_net_flow`. **Not yet run against a real trained attention matrix** — see below | 2026-09-16 |
-| 1 — VICReg | **implemented, unverified** — all three terms, selectable beside *or instead of* reconstruction | 231 tests pass; equivalence harness IDENTICAL; all three configurations run end to end through `CombinedModel`. **No real training run yet** — no probe numbers, no tuning | 2026-09-16 |
+| 1 — VICReg | **implemented, unverified** — all three terms, selectable beside *or instead of* reconstruction, on the local or the global embedding | 237 tests pass; equivalence harness IDENTICAL; runs end to end through `GlobalModel` and `CombinedModel` (dual and single decoder) and on a local-only GCN. **No verified training run yet**: a real run was launched and produced probe numbers, but see 'What the probes cannot tell you' — they do not settle anything | 2026-09-16 → 09-18 |
 | 2 — context NCE, composition-matched negatives | not started | | |
 | 2b — scale-matched pairing (local: same-neighbourhood; global: distant-same-slide) | not started | | |
 | 3 — two views (NT-Xent / VICReg invariance) | not started | | |
@@ -437,12 +437,87 @@ Three configurations, all from one term:
   0.0 — confirmed on a real run. It means "no stochasticity in eval", not "the views agree". The
   Stage 3 sampler corrupts the *input*, which does not depend on training mode, and fixes it.
 
+**Two more findings from using it (both now guarded and tested):**
+
+* **`optim.loss: none` with `dual_decoder: true` leaves the local decoder untrained** — verified,
+  its parameters do not move across a run. The local *module* still learns, since the global
+  tokens are built from its embeddings, but `val_local_loss` becomes a number about an untrained
+  head. Use the hybrid when you want both decoders doing something.
+* **A two-view run with every encoder dropout at 0 has no task at all.** Dropout is currently the
+  only thing making two passes differ, so the views are identical and the invariance term is
+  exactly 0.0 *in training*, not just in eval. `build_aux_losses` now warns; `contrastive_test_1.py`
+  refuses to start.
+
 **What is not verified.** No real training run: the numbers above come from 3-epoch smoke runs on
 the harness's synthetic data. Two things to watch on the first proper run — at defaults the
 variance term sits near 15 of its maximum 25 (embedding std ~0.4 against `gamma` 1), so the
 objective is initially almost entirely "increase variance"; and `vicreg_cov` *rose* over those
 epochs, which is what a `mu`-dominated balance does. The λ/μ/ν balance is the first thing to
 sweep, not the last.
+
+## What the probes cannot tell you — measured 2026-09-18
+
+**The finding: on `synth_data_0`, a value-reconstruction probe cannot show that the global
+component is needed, for any target in the panel.** This is not a tuning problem and not a bug;
+it follows from the data.
+
+Correlation of each target with the mean of its own <=30u neighbourhood — i.e. how much of it is
+already inside the 2-hop GCN reach:
+
+| target | kind | r(cell, neighbour mean) |
+|---|---|---|
+| `lr_tone` | obs | 0.348 |
+| `int_short` | gene | 0.384 |
+| `n_senderA_short` | obs | 0.438 |
+| `noise_00` | gene | 0.462 ← the floor, from shared library/normalisation effects |
+| `int_mid` | gene | 0.451 |
+| `int_long` | gene | **0.805** |
+| `kern_senderB_mid` | obs | 0.989 |
+| `dist_to_center` | obs | 0.997 |
+| `dist_to_hub` | obs | 0.998 |
+| `hub_response` | obs | 0.998 |
+
+**Every long-range target is spatially smooth, and every smooth target is locally readable.** A
+distant influence that varies slowly in space produces a field whose value at a cell is almost
+exactly its neighbours' average, so the local component reads it off without understanding the
+mechanism at all. The only locally-hard targets are high-frequency — which are short-range by
+construction. There is no target here whose *value* requires long range.
+
+Consequences, in order of importance:
+
+1. **Predicting `int_long` and detecting the long-range interaction that produced it are different
+   claims.** An observed "R2 0.4 from both embeddings" is equally consistent with "the transformer
+   added nothing" and "the transformer learned the interaction and the probe cannot see it". Do
+   not read a probe gap as evidence about range.
+2. **`int_long` is the gene the LOCAL component should do best on** (0.805, far above the 0.46
+   floor). The expectation printed by `linear_probing.py`'s legend — "int_long: global should
+   lead" — is wrong for the reason it gives. Corrected in `contrastive_test_1.py`; the original
+   still says it.
+3. **`hub_response` / `dist_to_hub` are not the fix.** At 0.998 they are smoother than `int_long`,
+   so they are worse discriminators, not better. (Recommended in this session, then measured and
+   retracted — do not re-suggest them.)
+
+### What can test it instead
+
+* **An ablation.** `LocalModel` vs `CombinedModel` on identical config, comparing `int_long`
+  reconstruction; and `long_range_attention` on vs off. If adding the transformer does not
+  improve it, the global component contributes nothing to that target — a finding about the
+  architecture rather than about the probe. Cheap, available today, and the obvious next
+  measurement.
+* **The attention-flow control** (`evaluation/flow_control.py`, Stage 0b). It asks an
+  *attribution* question rather than a prediction one: does flow run senderA -> receiverA at long
+  range while staying flat on the composition-matched null pair? A model reading a smooth field
+  locally has no reason to produce that; a model using the distant sender does. This is why the
+  control exists as a separate instrument from the probes.
+
+### For the next benchmark dataset
+
+A long-range target that is genuinely locally hard must be **non-smooth**: dependence on a
+specific, rare, distant source rather than a gradient. A field with a 400-unit length scale will
+always be readable from a 60-unit neighbourhood. Building one in is what would make the
+local/global split falsifiable by probes at all.
+
+---
 
 ## Stage 2 — context contrast with composition-matched negatives
 
