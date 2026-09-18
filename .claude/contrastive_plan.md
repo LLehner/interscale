@@ -22,7 +22,7 @@ verified. The branch still exists but is behind; do not commit to it.
 | 0 — plumbing (`StepOutput`, `gather_tokens`, composite loss, step collapse, dataset fields) | **done** | 119 tests pass; `scripts/equivalence_harness.py` reports IDENTICAL against the pre-refactor baseline | 2026-09-13 |
 | 0b — probe battery | **done** — online probes (`b88b76f`), split-independence check (`ddfccdc`), attention-flow control (`cd15021`, `11a2622`) | 201 tests pass; `noise_00` reads ~0.02 R2 on a real synth_data_0 run; the flow control's sign convention is pinned against `compute_hierarchical_net_flow`. **Not yet run against a real trained attention matrix** — see below | 2026-09-16 |
 | 1 — VICReg | **implemented, unverified** — all three terms, selectable beside *or instead of* reconstruction, on the local or the global embedding | 237 tests pass; equivalence harness IDENTICAL; runs end to end through `GlobalModel` and `CombinedModel` (dual and single decoder) and on a local-only GCN. **No verified training run yet**: a real run was launched and produced probe numbers, but see 'What the probes cannot tell you' — they do not settle anything | 2026-09-16 → 09-18 |
-| 2 — context NCE, composition-matched negatives | not started | | |
+| 2 — context NCE, composition-matched negatives | **implemented, unverified** — one pass, contiguous composition-matched negatives, `scattered`/`match_composition` ablations | 275 tests pass; equivalence harness IDENTICAL across 4 cases / 12 epoch records; runs end to end through the training plan in the hybrid. **No verified training run yet** — and see the two predicted failure modes below, neither of which a falling loss would rule out | 2026-09-18 |
 | 2b — scale-matched pairing (local: same-neighbourhood; global: distant-same-slide) | not started | | |
 | 3 — two views (NT-Xent / VICReg invariance) | not started | | |
 | 4 — interaction-destroying negatives | not started | | |
@@ -439,10 +439,29 @@ Three configurations, all from one term:
 
 **Two more findings from using it (both now guarded and tested):**
 
-* **`optim.loss: none` with `dual_decoder: true` leaves the local decoder untrained** — verified,
-  its parameters do not move across a run. The local *module* still learns, since the global
-  tokens are built from its embeddings, but `val_local_loss` becomes a number about an untrained
-  head. Use the hybrid when you want both decoders doing something.
+* **`optim.loss: none` leaves every decoder untrained** — verified for the local one under
+  `dual_decoder: true`, whose parameters do not move across a run. The mechanism is not specific
+  to it: a decoder is a leaf downstream of the embedding, and the contrastive terms read tokens
+  *upstream* of it through their own projector head, so with no reconstruction criterion nothing
+  reads a decoder's output and none of them receive gradient. The *encoders* still train,
+  including the local one on a `CombinedModel`, since the global tokens are built from local
+  embeddings. What is left at the end of the run is a representation with no readout attached:
+  `val_local_loss` / `val_global_loss` are numbers about a randomly-initialised head — not NaN,
+  not obviously broken — and `val_loss` is what EarlyStopping and ModelCheckpoint monitor.
+
+  **For InterScale that also costs the interpretability substrate.** Standardised gene loadings
+  come straight out of the linear decoder's weights (see `background.md`), so a contrastive-only
+  run produces nothing to interpret, which is the point of the model.
+
+  **The remedy, if a contrastive-only run is wanted anyway: freeze the encoder and fit the decoder
+  in a second pass.** That is the standard linear-probe protocol — train the representation with
+  `optim.loss: none`, then run a short second training with the encoder parameters frozen and only
+  the decoder(s) optimised against the reconstruction criterion. It gives an honest
+  reconstruction number *and* a set of gene loadings for a representation that never saw the
+  reconstruction objective, which is a cleaner attribution than the hybrid can offer: under the
+  hybrid, loadings are shaped by both terms at once. **Not implemented** — it needs a freeze flag
+  and a second `Trainer` invocation, not new loss machinery. Use the hybrid until someone wants
+  the ablation badly enough to build it.
 * **A two-view run with every encoder dropout at 0 has no task at all.** Dropout is currently the
   only thing making two passes differ, so the views are identical and the invariance term is
   exactly 0.0 *in training*, not just in eval. `build_aux_losses` warns on that combination.
@@ -563,6 +582,79 @@ interaction program. τ is the knob that flattens that weighting, so it belongs 
 side, and the anchor's own k-hop neighbours come out of the denominator entirely.
 
 **Gate:** the medulla control stays flat. If it moves, the term learned co-occurrence.
+
+### How Stage 2 differed from this plan
+
+The plan's negative was "a random cell set from the same slide, sampled to match the cell-type
+histogram". It shipped as **another cell's actual k-hop neighbourhood**, selected for histogram
+match, because composition is not the only nuisance variable:
+
+**Spatial coherence is the second one, and the plan did not account for it.** A scattered cell set
+pools toward the slide mean while a true context is a contiguous patch. Given the smoothness
+measured on 2026-09-18 — `dist_to_center` at 0.997 with its own neighbourhood mean — "which of
+these is spatially coherent, or sits at my value of the smooth field" fully separates positive
+from negative without any interaction being learned, and it would look like a healthy loss curve
+the whole way down. Building the negative with the *same operator* as the positive holds
+contiguity fixed alongside composition. `negative_context: scattered` keeps the plan's original
+version as the ablation that says how much of the loss was ever about arrangement.
+
+**The negatives are a per-slide bank, not per-anchor.** Negatives are contexts rather than cells,
+so drawing them per anchor would cost `n_anchors × n_negatives` k-hop expansions. `n_candidates`
+contexts are built once per slide and every anchor on it selects from the same bank. This is why
+`n_candidates` must exceed `n_negatives` — with no surplus every candidate is taken regardless of
+its histogram and the matching silently does nothing, so the constructor rejects it.
+
+**Three rejection rules, not one.** A candidate is dropped if its context overlaps the anchor's,
+if its context *contains the anchor*, or if it is empty. The second is not implied by the first:
+the anchor is excluded from its own context, so a candidate context consisting only of the anchor
+overlaps nothing while being the most direct false negative available.
+
+**`anchors_masked_only` defaults to True**, for the graph-shaped form of the identity shortcut.
+An unmasked anchor's own expression is in the encoder input *and*, because the GCN aggregates over
+neighbourhoods, inside its own neighbours' embeddings — so the positive is identifiable by
+detecting the anchor's own transcriptome in the pooled context. This is the single-view analogue
+of Stage 3's "anchor's own features corrupted in both views", and the same reasoning that put
+`probe.masked_cells_only` at True.
+
+**Matching is *selection*, not construction — and that needed its own diagnostic.** Candidate
+centres are drawn uniformly from the slide, so the bank's composition coverage is whatever chance
+supplies; an anchor with a rare local composition takes the closest of a bad bank. `clean` reports
+whether a negative was *false*, not whether it was *matched*, and the loss falls either way, so
+`_context_nce_hist_gap` reports the mean L1 between the anchor's positive histogram and its chosen
+negatives'. It lies in `[0, 2]`, and it has no scale on its own: read it against the same number
+from a `match_composition: False` run, which is what no matching at all looks like on that data.
+If the two are close, the bank is too small or too uniform and `n_candidates` is the knob.
+
+**`_context_nce_clean` is the number to watch.** It is the fraction of anchors whose negatives
+were all genuinely non-overlapping. On a small slide, or with `context_hops` high enough that every
+neighbourhood touches every other, rows get filled from rejected candidates and the denominator
+quietly fills with false negatives. The loss looks entirely normal while that happens. A low value
+means `context_hops` is too large for the slide, or the slide is too small to contrast within.
+
+**Found while implementing:** `composition` derived its one-hot dtype from the boolean membership
+matrix, so the histogram matmul had no float operand. It raised rather than returning a wrong
+number, and a test caught it, but the general shape — deriving a dtype from a mask — is the kind
+that promotes silently in another arrangement.
+
+**Also done here:** `slide_codes` in `aux_losses.py` is now shared by the VICReg variance hinge and
+the contrastive negative pool, instead of VICReg's private `_groups`. Both need exactly the
+"prefer the attached `slide` over the graph index" mapping, and two copies would drift the moment
+one learned about a new field. Equivalence harness IDENTICAL across the refactor.
+
+### What is not verified
+
+No training run, real or synthetic, beyond the 1-epoch smoke fits in the test suite. Two things to
+measure on the first proper run, in this order:
+
+1. **`_context_nce_clean`, `_context_nce_hist_gap` and `_context_nce_acc`.** If `clean` is low the
+   term is training against false negatives; if `hist_gap` is no better than a
+   `match_composition: false` run the composition matching is not actually happening and the term
+   has degenerated into the naive version the stage exists to avoid; if `acc` is at 1.0 from step 0
+   the task is trivial and something is leaking — check `anchors_masked_only` first.
+2. **The medulla control and the slide-identity probe**, as the plan's gate already says. A term
+   designed to be composition-blind moving the flow control means the matching did not work.
+
+`distant_min_um` and the Stage 2b knobs are untouched; 2b remains not started.
 
 ---
 
@@ -770,8 +862,13 @@ optim:
     expander_dims: [256]
     negatives: within_slide            # within_slide | within_batch
     exclude_khop: 2                    # match local_component.num_layers
+    context_hops: 2                    # hops defining the POSITIVE context
     n_negatives: 16
     n_anchors: 512                     # 0 = all
+    n_candidates: 256                  # per-slide bank; must exceed n_negatives
+    negative_context: neighbourhood    # neighbourhood | scattered (the ablation)
+    match_composition: true            # needs dataset.celltype_key
+    anchors_masked_only: true
     augment:
       gene_mask: 0.3
       expression_noise: 0.0
@@ -785,7 +882,7 @@ optim:
 | 0 | `module/base/_step_output.py`, `train/aux_losses.py` | 4× `_common_step`, `_trainingplans.py`, `optim_config.py`, `tl/geome_utils.py` |
 | 0b | `evaluation/online_probes.py`, `config/probe_config.py` | `config/__init__.py` (validation), `train/_training.py` (callback), `evaluation/__init__.py` |
 | 1 | — | `aux_losses.py`, `_base_global_module.py` (expander) |
-| 2 | — | `aux_losses.py`, `tl/geome_utils.py` (celltype field) |
+| 2 | `train/context_nce.py` | `aux_losses.py` (`ContextNCE`, `build_projector`, `slide_codes`), `optim_config.py` (weight + 8 knobs) |
 | 2b | — | `aux_losses.py`, `optim_config.py` (three knobs); needs `pos` and `slide` from stage 0 |
 | 3 | `tl/augment.py` | `_base_global_module.py` (multi-pass), `geome_dataloader.py` |
 | 4 | — | `tl/augment.py`, `aux_losses.py` |
@@ -805,6 +902,19 @@ Things that fail silently rather than loudly:
 - [ ] projector/expander discarded at inference; the embedding the linear decoder reads is
       never directly constrained by a contrastive term
 - [ ] `celltype` used only as a negative-sampling stratifier, never as a target
+- [ ] a negative context is built by the *same operator* as the positive, so spatial coherence is
+      held fixed alongside composition — a scattered negative pools toward the slide mean and is
+      separable without any interaction being learned
+- [ ] a candidate that *contains the anchor* is rejected, not only one that overlaps the anchor's
+      context — the anchor is excluded from its own context, so the two are different tests
+- [ ] the candidate bank is larger than `n_negatives`, or the composition match selects nothing
+- [ ] anchors restricted to masked cells: the GCN puts the anchor's own expression inside its
+      neighbours' embeddings, so the positive is otherwise identifiable by self-detection
+- [ ] `_context_nce_clean` read before any conclusion — a denominator full of false negatives
+      produces an entirely normal-looking loss curve
+- [ ] `_context_nce_hist_gap` compared against a `match_composition: false` run — selecting the
+      nearest candidate from a uniformly drawn bank is not the same as finding a matched one, and
+      only this comparison says which happened
 - [ ] a proposed corruption is actually visible to the encoder (see the `GCNConv` note above)
 - [ ] a distant-same-slide positive is paired with *within-slide* negatives — any cross-slide
       fraction makes slide identity a rewarded direction, and mixing does not cancel it, it just

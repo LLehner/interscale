@@ -45,6 +45,10 @@ def get_optim_cfg(cfg):
     # `optim.contrastive.vicreg_*` for the coefficients within it, and `optim.loss: none` for
     # running it INSTEAD of a reconstruction criterion rather than beside one.
     cfg.optim.aux_loss_weights.vicreg = 0.0
+    # Context NCE (Stage 2): a cell against its own k-hop neighbourhood, with negatives matched on
+    # cell-type composition so composition cannot be the thing that separates them. One forward
+    # pass. See `optim.contrastive.context_*` and `.claude/contrastive_plan.md`.
+    cfg.optim.aux_loss_weights.context_nce = 0.0
 
     # Shared settings for the contrastive terms. Inert until one of them carries a weight.
     cfg.optim.contrastive = CN()
@@ -83,4 +87,34 @@ def get_optim_cfg(cfg):
     # hinge can be satisfied entirely by between-slide variance, i.e. by the batch effect, while
     # every cell inside a slide collapses to one point.
     cfg.optim.contrastive.vicreg_group = "auto"
+
+    # --- Context NCE (Stage 2) ---------------------------------------------------------------
+    # Hops defining the POSITIVE context: the set of cells an anchor is asked to be predictive of.
+    # Match the local component's num_layers, so the contrast is about the scale the global
+    # component is supposed to add rather than one the GCN already covers.
+    cfg.optim.contrastive.context_hops = 2
+    # Anchors scored per slide per step; 0 uses every eligible cell. Bounds the cost, which is
+    # otherwise quadratic in slide size through the overlap test.
+    cfg.optim.contrastive.n_anchors = 512
+    # Negative contexts per anchor, drawn from the per-slide candidate bank.
+    cfg.optim.contrastive.n_negatives = 16
+    # Size of that bank. Negatives are contexts rather than cells, so they are built once per
+    # slide and shared by every anchor on it -- the bank is what keeps the cost at
+    # `n_candidates` k-hop expansions instead of `n_anchors * n_negatives`. It must comfortably
+    # exceed n_negatives, or the composition match has nothing to choose between.
+    cfg.optim.contrastive.n_candidates = 256
+    # How a negative context is built. "neighbourhood" takes another cell's actual k-hop
+    # neighbourhood, so spatial coherence is held fixed alongside composition; "scattered" takes a
+    # random cell set of the same size, which leaves coherence free and is the ablation that says
+    # how much of the loss was ever about arrangement. See the module docstring of
+    # `interscale.train.context_nce`.
+    cfg.optim.contrastive.negative_context = "neighbourhood"
+    # Select negatives by nearest cell-type histogram. False draws uniformly instead -- the
+    # ablation for the matching itself. Requires `dataset.celltype_key` when True.
+    cfg.optim.contrastive.match_composition = True
+    # Restrict anchors to masked cells. An unmasked anchor's own expression is in the encoder
+    # input AND inside its neighbours' GCN aggregates, so the positive is identifiable by
+    # detecting the anchor's own transcriptome in the pooled context -- the identity shortcut,
+    # arriving through the graph rather than through augmentation.
+    cfg.optim.contrastive.anchors_masked_only = True
     return cfg

@@ -27,6 +27,19 @@ import torch.nn as nn
 from yacs.config import CfgNode as CN
 
 from interscale.module.base import StepOutput
+from interscale.train.context_nce import (
+    build_inverse,
+    composition,
+    histogram_gap,
+    info_nce,
+    khop_membership,
+    match_composition,
+    overlaps,
+    pool_contexts,
+    selection_is_clean,
+    to_token_edges,
+    valid_contexts,
+)
 from interscale.train.vicreg import covariance_term, invariance_term, variance_term
 
 
@@ -230,6 +243,63 @@ def build_expander(n_input: int, dims: list[int]) -> nn.Module:
 
 
 
+def build_projector(n_input: int, dims: list[int]) -> nn.Module:
+    """The MLP the InfoNCE terms read through -- same shape as the expander, different job.
+
+    A separate head from VICReg's on purpose: the two families disagree about normalisation.
+    InfoNCE reads an L2-normalised projection (SimCLR Table 5: 64.4 against 57.2 without it),
+    VICReg explicitly does not (its Table 8 reports L2 costing 3.5%). Sharing one head would force
+    one of them onto the other's convention, and nothing about the resulting number would say so.
+
+    The normalisation itself lives in :func:`~interscale.train.context_nce.info_nce` rather than
+    here, so the head stays a plain MLP and the loss owns its own convention.
+    """
+    return build_expander(n_input, dims)
+
+
+def slide_codes(batch, index: torch.Tensor | None, n_rows: int, group_by: str = "auto") -> torch.Tensor | None:
+    """Per-row slide label, in the row order of whatever embedding the caller is holding.
+
+    Prefers an attached ``slide`` annotation over the graph index, because several windows can
+    come from one slide and it is the SLIDE that carries the batch effect every consumer here is
+    trying to keep out of its statistics -- the VICReg variance hinge and the contrastive negative
+    pool alike.
+
+    One function rather than one per term: both need exactly this mapping, and two copies of it
+    would drift the moment one of them learned about a new field.
+
+    Parameters
+    ----------
+    batch
+        The collated batch.
+    index
+        ``padded_node_idx``, to bring a batch-node-order field into token order, or ``None`` when
+        the caller's rows are already in batch node order.
+    n_rows
+        Number of rows the caller holds, used only when ``index`` is ``None``.
+    group_by
+        ``"auto"`` for slide-then-graph as described; ``"none"`` to pool everything (returns
+        ``None``).
+
+    Returns
+    -------
+    torch.Tensor | None
+        ``[n_rows]`` integer codes, or ``None`` when there is nothing to group by.
+    """
+    if group_by == "none":
+        return None
+
+    slide = getattr(batch, "slide", None)
+    if slide is not None:
+        codes = slide.argmax(dim=1) if slide.dim() > 1 else slide
+        return codes[index] if index is not None else codes[:n_rows]
+
+    graph = getattr(batch, "batch", None)
+    if graph is None:
+        return None
+    return graph[index] if index is not None else graph[:n_rows]
+
+
 def _encoder_dropout(cfg) -> float:
     """Largest dropout rate configured anywhere in the encoder.
 
@@ -334,25 +404,8 @@ class VICRegAuxLoss(AuxLoss):
         return [view.local_embedding for view in out.views]
 
     def _groups(self, out: StepOutput, batch, n_rows: int) -> torch.Tensor | None:
-        """Row labels for the per-slide variance hinge, or None to pool the whole batch.
-
-        Prefers an attached ``slide`` annotation over the graph index, because several windows
-        can come from one slide and it is the SLIDE that carries the batch effect the grouping
-        exists to keep out of the hinge.
-        """
-        if self.group_by == "none":
-            return None
-
-        index = out.view.padded_node_idx
-        slide = getattr(batch, "slide", None)
-        if slide is not None:
-            codes = slide.argmax(dim=1) if slide.dim() > 1 else slide
-            return codes[index] if index is not None else codes[:n_rows]
-
-        graph = getattr(batch, "batch", None)
-        if graph is None:
-            return None
-        return graph[index] if index is not None else graph[:n_rows]
+        """Row labels for the per-slide variance hinge, or None to pool the whole batch."""
+        return slide_codes(batch, out.view.padded_node_idx, n_rows, self.group_by)
 
     def forward(self, out: StepOutput, batch) -> dict[str, torch.Tensor]:
         """The VICReg objective, with each coefficient's contribution reported separately."""
@@ -375,3 +428,275 @@ class VICRegAuxLoss(AuxLoss):
         # to see a representation shrinking long before a loss curve shows it.
         terms["_vicreg_std"] = projected[0].std(dim=0).mean().detach()
         return terms
+
+
+@register_aux_loss("context_nce")
+class ContextNCE(AuxLoss):
+    """A cell against its own neighbourhood, with composition-matched negative contexts.
+
+    Stage 2 of ``.claude/contrastive_plan.md``, and the first term here that makes a positive
+    claim about *content* rather than about the shape of the embedding distribution: a cell's
+    representation should be predictive of the tissue context it sits in. VICReg says "do not
+    collapse", which an embedding of pure slide identity satisfies perfectly.
+
+    One forward pass. The positive pair is not two augmented copies of one cell but two parts of
+    one sample -- the anchor token and its pooled k-hop neighbourhood -- so the spatial graph
+    supplies the pairing and ``requires_views`` stays 1. This is the CPC / Deep InfoMax family
+    rather than the SimCLR one, which is also why the term is a real number in validation: the
+    pairing is structural, where dropout-only views coincide under ``eval()`` and make
+    ``val_vicreg_inv`` identically zero.
+
+    The negatives are the design. Per slide, a **bank** of candidate contexts is built once per
+    step and shared by every anchor on that slide -- negatives are contexts, not cells, so
+    building them per anchor would cost ``n_anchors * n_negatives`` k-hop expansions instead of
+    ``n_candidates``. Each anchor then takes the candidates whose cell-type histogram is closest
+    to its own positive context's, having first discarded every candidate whose context overlaps
+    its own. Composition is thereby held fixed across the positive and the negatives, so it
+    carries no information about which is which, and the only way left to reduce the loss is to
+    encode which specific states are present and how they are arranged.
+
+    Two diagnostics are reported and not summed: the fraction of anchors whose negatives were all
+    genuinely non-overlapping, and the fraction where the positive came out on top. The first is
+    the one to watch -- on a small slide, or with ``context_hops`` high enough that every
+    neighbourhood touches every other, most rows can be filled with false negatives, and the loss
+    looks entirely normal while that happens.
+    """
+
+    requires_views = 1
+
+    def __init__(self, cfg, module=None):
+        super().__init__()
+        contrastive = cfg.optim.contrastive
+        self.temperature = float(contrastive.temperature)
+        self.embedding = contrastive.embedding
+        self.hops = int(contrastive.context_hops)
+        self.n_anchors = int(contrastive.n_anchors)
+        self.n_negatives = int(contrastive.n_negatives)
+        self.n_candidates = int(contrastive.n_candidates)
+        self.negative_context = contrastive.negative_context
+        self.match = bool(contrastive.match_composition)
+        self.masked_only = bool(contrastive.anchors_masked_only)
+
+        if self.negative_context not in ("neighbourhood", "scattered"):
+            raise ValueError(
+                "optim.contrastive.negative_context must be 'neighbourhood' or 'scattered', "
+                f"got {self.negative_context!r}."
+            )
+        if self.hops < 1:
+            raise ValueError(f"optim.contrastive.context_hops must be >= 1, got {self.hops}.")
+        if self.n_negatives < 1:
+            raise ValueError(f"optim.contrastive.n_negatives must be >= 1, got {self.n_negatives}.")
+        if self.n_candidates <= self.n_negatives:
+            raise ValueError(
+                f"optim.contrastive.n_candidates ({self.n_candidates}) must exceed n_negatives "
+                f"({self.n_negatives}): the bank is what the composition match selects FROM, so "
+                "with no surplus every candidate is taken regardless of its histogram and the "
+                "matching -- the whole point of the term -- silently does nothing."
+            )
+
+        n_embed = getattr(module, "n_embed", None) if module is not None else None
+        self.projector = build_projector(n_embed, list(contrastive.projector_dims)) if n_embed else nn.Identity()
+
+    # ------------------------------------------------------------------ inputs
+
+    def _features(self, out: StepOutput) -> tuple[torch.Tensor, torch.Tensor]:
+        """``([N_rows, E], [N_rows])`` -- the embedding to contrast and each row's batch node id.
+
+        The node id is what every structural lookup here goes through, and the two embeddings
+        reach it differently: global tokens are a padded subset named by ``padded_node_idx``,
+        while a local embedding is already one row per batch node.
+        """
+        view = out.view
+        wants_global = self.embedding == "global" or (self.embedding == "auto" and view.global_embedding is not None)
+
+        if wants_global:
+            if view.global_embedding is None:
+                raise ValueError(
+                    "optim.contrastive.embedding is 'global' but this module produced none. Use "
+                    "'local' or 'auto' for a LocalModel."
+                )
+            if view.padded_node_idx is None:
+                raise ValueError(
+                    "context_nce needs padded_node_idx to map tokens onto edge_index, and this "
+                    "step produced none -- graph-level prediction does not gather per-cell "
+                    "tokens. The term is node-level only."
+                )
+            return view.tokens(), view.padded_node_idx
+
+        if view.local_embedding is None:
+            raise ValueError(
+                "optim.contrastive.embedding is 'local' but this module produced none. Use "
+                "'global' or 'auto' for a GlobalModel."
+            )
+        local = view.local_embedding
+        return local, torch.arange(local.shape[0], device=local.device)
+
+    def _celltypes(self, batch, node_idx: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """``([N_rows], n_types)`` cell-type codes per row.
+
+        Without an attached annotation there is nothing to match on, and an unmatched negative
+        makes the term a composition classifier -- the exact thing it exists to rule out. So this
+        raises rather than falling back to a single pseudo-type, which would leave the run looking
+        healthy while measuring something else entirely.
+        """
+        if not self.match:
+            # The `match_composition: False` ablation ranks candidates at random, so no histogram
+            # is consulted and no annotation is needed. Demanding one anyway would make the
+            # ablation unavailable on exactly the datasets where it is cheapest to run.
+            return torch.zeros(len(node_idx), dtype=torch.long, device=node_idx.device), 1
+
+        celltype = getattr(batch, "celltype", None)
+        if celltype is None:
+            raise ValueError(
+                "optim.contrastive.match_composition is True but no cell-type annotation is "
+                "attached. Set dataset.celltype_key, or set match_composition: False to draw "
+                "negatives uniformly -- but note that an unmatched negative lets cell-type "
+                "composition alone separate positive from negative, which is what this term is "
+                "designed to prevent."
+            )
+        codes = celltype.argmax(dim=1) if celltype.dim() > 1 else celltype.long()
+        n_types = celltype.shape[1] if celltype.dim() > 1 else int(codes.max().item()) + 1
+        return codes[node_idx], n_types
+
+    def _anchor_pool(self, batch, node_idx: torch.Tensor) -> torch.Tensor:
+        """``[N_rows]`` boolean: which rows may serve as anchors.
+
+        Under ``anchors_masked_only`` the answer is the masked cells, and the reason is the
+        identity shortcut in its graph-shaped form: an unmasked anchor's own expression is in the
+        encoder input *and* -- because the GCN aggregates over neighbourhoods -- inside its own
+        neighbours' embeddings, so the positive context is identifiable by detecting the anchor's
+        own transcriptome in it. Masking the anchor removes both copies at once.
+        """
+        if not self.masked_only:
+            return torch.ones(len(node_idx), dtype=torch.bool, device=node_idx.device)
+        mask = getattr(batch, "mask", None)
+        if mask is None:
+            return torch.ones(len(node_idx), dtype=torch.bool, device=node_idx.device)
+        return mask.bool()[node_idx]
+
+    # ------------------------------------------------------------------ sampling
+
+    @staticmethod
+    def _sample(pool: torch.Tensor, n: int) -> torch.Tensor:
+        """``min(n, len(pool))`` entries of ``pool`` without replacement; all of it when ``n`` is 0."""
+        if n <= 0 or len(pool) <= n:
+            return pool
+        return pool[torch.randperm(len(pool), device=pool.device)[:n]]
+
+    def _scattered(self, sizes: torch.Tensor, in_slide: torch.Tensor, n_tokens: int) -> torch.Tensor:
+        """``[C, n_tokens]`` random cell sets of the given sizes, drawn from one slide.
+
+        The ablation arm. Sizes are copied from the neighbourhood contexts they replace, so the
+        only variable this changes is contiguity -- if it were also free to change context size,
+        size would become the discriminator and the comparison would say nothing.
+        """
+        scores = torch.rand((len(sizes), n_tokens), device=sizes.device)
+        outside = torch.ones(n_tokens, dtype=torch.bool, device=sizes.device)
+        outside[in_slide] = False
+        scores[:, outside] = -1.0
+
+        order = scores.argsort(dim=1, descending=True)
+        ranks = torch.empty_like(order)
+        ranks.scatter_(1, order, torch.arange(n_tokens, device=sizes.device).expand(len(sizes), -1))
+        return ranks < sizes.clamp(max=len(in_slide)).unsqueeze(1)
+
+    # ------------------------------------------------------------------ the term
+
+    def forward(self, out: StepOutput, batch) -> dict[str, torch.Tensor]:
+        """InfoNCE over anchors from every slide in the batch, pooled into one scalar."""
+        features, node_idx = self._features(out)
+        projected = self.projector(features)
+        n_tokens = projected.shape[0]
+        device = projected.device
+
+        inverse = build_inverse(node_idx, int(batch.num_nodes))
+        token_edges = to_token_edges(batch.edge_index, inverse)
+        slides = slide_codes(batch, node_idx, n_tokens)
+        if slides is None:
+            slides = torch.zeros(n_tokens, dtype=torch.long, device=device)
+        types, n_types = self._celltypes(batch, node_idx)
+        eligible = self._anchor_pool(batch, node_idx)
+
+        losses: list[torch.Tensor] = []
+        clean: list[torch.Tensor] = []
+        correct: list[torch.Tensor] = []
+        gap: list[torch.Tensor] = []
+
+        for slide in slides.unique():
+            rows = (slides == slide).nonzero(as_tuple=True)[0]
+            anchor_pool = rows[eligible[rows]]
+            if len(anchor_pool) == 0 or len(rows) < 2:
+                continue
+
+            anchors = self._sample(anchor_pool, self.n_anchors)
+            centers = self._sample(rows, self.n_candidates)
+
+            anchor_members = khop_membership(anchors, token_edges, n_tokens, self.hops)
+            anchor_pooled, anchor_sizes = pool_contexts(anchor_members, projected)
+            keep = valid_contexts(anchor_sizes)
+            if not bool(keep.any()):
+                continue
+
+            candidate_members = khop_membership(centers, token_edges, n_tokens, self.hops)
+            _, candidate_sizes = pool_contexts(candidate_members, projected)
+            if self.negative_context == "scattered":
+                candidate_members = self._scattered(candidate_sizes, rows, n_tokens)
+            candidate_pooled, candidate_sizes = pool_contexts(candidate_members, projected)
+
+            anchors, anchor_members = anchors[keep], anchor_members[keep]
+            anchor_pooled = anchor_pooled[keep]
+
+            # A candidate is unusable if its context is empty, if it shares a cell with the
+            # anchor's context (same context under another name), or if it CONTAINS the anchor --
+            # the last is not implied by the first two, since the anchor is excluded from its own
+            # context, and it is the most direct false negative of the three.
+            rejected = overlaps(anchor_members, candidate_members)
+            rejected = rejected | candidate_members[:, anchors].t()
+            rejected = rejected | ~valid_contexts(candidate_sizes).unsqueeze(0)
+
+            anchor_hist = composition(anchor_members, types, n_types)
+            candidate_hist = composition(candidate_members, types, n_types)
+            selected = match_composition(
+                anchor_hist, candidate_hist, rejected, self.n_negatives, match=self.match
+            )
+
+            negatives = candidate_pooled[selected]  # [A, K, D]
+            losses.append(info_nce(projected[anchors], anchor_pooled, negatives, self.temperature))
+            clean.append(selection_is_clean(selected, rejected).to(projected.dtype))
+            gap.append(histogram_gap(anchor_hist, candidate_hist, selected).detach())
+            with torch.no_grad():
+                sim_pos = torch.nn.functional.cosine_similarity(projected[anchors], anchor_pooled, dim=-1)
+                sim_neg = torch.einsum(
+                    "ad,akd->ak",
+                    torch.nn.functional.normalize(projected[anchors], dim=-1),
+                    torch.nn.functional.normalize(negatives, dim=-1),
+                )
+                correct.append((sim_pos.unsqueeze(1) > sim_neg).all(dim=1).to(projected.dtype))
+
+        if not losses:
+            # Nothing scoreable this step -- every slide too small, or no masked anchor survived.
+            # Returned through `projected` so the value stays attached to the graph: a detached
+            # zero would make this term the only one in a `optim.loss: none` run with no gradient
+            # path at all, which errors rather than no-ops.
+            zero = projected.sum() * 0.0
+            return {
+                "context_nce": zero,
+                "_context_nce_clean": zero.detach(),
+                "_context_nce_acc": zero.detach(),
+                "_context_nce_hist_gap": zero.detach(),
+            }
+
+        return {
+            "context_nce": torch.stack(losses).mean(),
+            # Not summed: diagnostics. `clean` is the one that matters -- it is the fraction of
+            # anchors whose negatives were all genuinely non-overlapping, and a low value means
+            # the denominator is full of false negatives while the loss curve looks fine.
+            "_context_nce_clean": torch.cat(clean).mean().detach(),
+            "_context_nce_acc": torch.cat(correct).mean().detach(),
+            # The matching's own report card: how far the chosen negatives' cell-type histograms
+            # actually sat from the positive's. `clean` says the negatives were not false; this
+            # says they were not trivially distinguishable by composition, which is the claim the
+            # whole stage rests on. Read against the same number from a `match_composition: False`
+            # run -- alone it has no scale.
+            "_context_nce_hist_gap": torch.cat(gap).mean().detach(),
+        }
