@@ -63,6 +63,22 @@ sampling, `group` for the split check, `celltype` for the flow control). A new p
 stratifier is a config line. Reserved names are rejected — an obs column called `mask` would
 otherwise replace the corruption mask with a label and train against its own annotation silently.
 
+### Where the run scripts live (outside this repo)
+
+* `/home/lehnerl/Arbeit/github/notebooks_and_scripts/contrastive_test_1.py` — the dual-decoder
+  hybrid run (MSE + VICReg on the global embedding), built from `linear_probing.py`. Adds guards
+  on the objective, a `QuietTrainingPlan` that logs only losses and probes (the library default
+  is ~57 metrics, of which 30 are noise for this experiment), and an end-of-run report of the
+  VICReg terms it suppressed.
+* `/home/lehnerl/Arbeit/notes/contrastive_test_1.yaml` — its config, with `/lustre` paths. Copy
+  it next to `synthetic_0_probes.yaml` on the cluster; the script's `CONFIG_PATH` already points
+  there.
+* `/home/lehnerl/Arbeit/notes/contrastive_learning.txt` — the short prose version of this plan.
+
+`optim.n_epochs` must equal the script's `MAX_EPOCHS`: `CosineWarmupScheduler` is built with
+`max_epochs=optim.n_epochs`, so a longer run walks into the cosine's next half-cycle and the
+learning rate climbs back up after `n_epochs`. The script refuses to start if they disagree.
+
 ### The gate
 
 `scripts/equivalence_harness.py` runs four short deterministic trainings covering every
