@@ -63,22 +63,6 @@ sampling, `group` for the split check, `celltype` for the flow control). A new p
 stratifier is a config line. Reserved names are rejected — an obs column called `mask` would
 otherwise replace the corruption mask with a label and train against its own annotation silently.
 
-### Where the run scripts live (outside this repo)
-
-* `/home/lehnerl/Arbeit/github/notebooks_and_scripts/contrastive_test_1.py` — the dual-decoder
-  hybrid run (MSE + VICReg on the global embedding), built from `linear_probing.py`. Adds guards
-  on the objective, a `QuietTrainingPlan` that logs only losses and probes (the library default
-  is ~57 metrics, of which 30 are noise for this experiment), and an end-of-run report of the
-  VICReg terms it suppressed.
-* `/home/lehnerl/Arbeit/notes/contrastive_test_1.yaml` — its config, with `/lustre` paths. Copy
-  it next to `synthetic_0_probes.yaml` on the cluster; the script's `CONFIG_PATH` already points
-  there.
-* `/home/lehnerl/Arbeit/notes/contrastive_learning.txt` — the short prose version of this plan.
-
-`optim.n_epochs` must equal the script's `MAX_EPOCHS`: `CosineWarmupScheduler` is built with
-`max_epochs=optim.n_epochs`, so a longer run walks into the cosine's next half-cycle and the
-learning rate climbs back up after `n_epochs`. The script refuses to start if they disagree.
-
 ### The gate
 
 `scripts/equivalence_harness.py` runs four short deterministic trainings covering every
@@ -461,8 +445,7 @@ Three configurations, all from one term:
   head. Use the hybrid when you want both decoders doing something.
 * **A two-view run with every encoder dropout at 0 has no task at all.** Dropout is currently the
   only thing making two passes differ, so the views are identical and the invariance term is
-  exactly 0.0 *in training*, not just in eval. `build_aux_losses` now warns; `contrastive_test_1.py`
-  refuses to start.
+  exactly 0.0 *in training*, not just in eval. `build_aux_losses` warns on that combination.
 
 **What is not verified.** No real training run: the numbers above come from 3-epoch smoke runs on
 the harness's synthetic data. Two things to watch on the first proper run — at defaults the
@@ -507,8 +490,7 @@ Consequences, in order of importance:
    not read a probe gap as evidence about range.
 2. **`int_long` is the gene the LOCAL component should do best on** (0.805, far above the 0.46
    floor). The expectation printed by `linear_probing.py`'s legend — "int_long: global should
-   lead" — is wrong for the reason it gives. Corrected in `contrastive_test_1.py`; the original
-   still says it.
+   lead" — is wrong for the reason it gives, and the legend still states it.
 3. **`hub_response` / `dist_to_hub` are not the fix.** At 0.998 they are smoother than `int_long`,
    so they are worse discriminators, not better. (Recommended in this session, then measured and
    retracted — do not re-suggest them.)
