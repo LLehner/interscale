@@ -23,7 +23,7 @@ verified. The branch still exists but is behind; do not commit to it.
 | 0b — probe battery | **done** — online probes (`b88b76f`), split-independence check (`ddfccdc`), attention-flow control (`cd15021`, `11a2622`) | 201 tests pass; `noise_00` reads ~0.02 R2 on a real synth_data_0 run; the flow control's sign convention is pinned against `compute_hierarchical_net_flow`. **Not yet run against a real trained attention matrix** — see below | 2026-09-16 |
 | 1 — VICReg | **implemented, unverified** — all three terms, selectable beside *or instead of* reconstruction, on the local or the global embedding | 237 tests pass; equivalence harness IDENTICAL; runs end to end through `GlobalModel` and `CombinedModel` (dual and single decoder) and on a local-only GCN. **No verified training run yet**: a real run was launched and produced probe numbers, but see 'What the probes cannot tell you' — they do not settle anything | 2026-09-16 → 09-18 |
 | 2 — context NCE, composition-matched negatives | **implemented, unverified** — one pass, contiguous composition-matched negatives, `scattered`/`match_composition` ablations | 275 tests pass; equivalence harness IDENTICAL across 4 cases / 12 epoch records; runs end to end through the training plan in the hybrid. **No verified training run yet** — and see the two predicted failure modes below, neither of which a falling loss would rule out | 2026-09-18 |
-| 2b — scale-matched pairing (local: same-neighbourhood; global: distant-same-slide) | not started | | |
+| 2b — ring NCE (positive: outer ring; negative: the GNN's own neighbourhood) | **implemented, unverified** — replaces the planned distant-same-slide pairing, see below | 307 tests pass; equivalence harness IDENTICAL across 4 cases / 12 epoch records. **No training run yet** | 2026-09-21 |
 | 3 — two views (NT-Xent / VICReg invariance) | not started | | |
 | 4 — interaction-destroying negatives | not started | | |
 
@@ -766,6 +766,62 @@ the gap between them widens on targets that are scale-specific — niche composi
 local, tissue-scale program readable from global — while slide identity stays flat for the
 `near_negative` arm.
 
+### How 2b was actually built — the ring, not the distant pair
+
+**The distant-same-slide positive was dropped before implementation.** The analysis above says a
+distant same-slide pair makes slide identity a near-optimal answer, and that mixing in cross-slide
+negatives adds a near/far component *alongside* slide identity rather than replacing it. That held
+up under discussion and the pairing was replaced rather than tuned.
+
+**What shipped instead** (`train/ring_nce.py`, `RingNCE` in `aux_losses.py`):
+
+| | |
+|---|---|
+| positive | the anchor's pooled **hop annulus** — beyond the attention mask's reach, within `ring_outer_hops` |
+| negative | the anchor's own pooled **inner neighbourhood**, i.e. exactly what the GCN aggregates over |
+| extra negatives | `ring_n_negatives > 1` fills the rest with *other* anchors' cores, so every negative stays "a neighbourhood the GNN already covers" |
+
+This is `M = 1 - A` restated as an objective: the mask *forbids* the transformer from attending
+inside the GNN's receptive field; the term *asks* the embedding to describe what lies outside it.
+
+Three properties the distant-pair version did not have:
+
+* **No slide shortcut.** Both sides of the contrast come from the same anchor's neighbourhood, so
+  slide identity is constant across them and carries zero discriminative power. No cross-slide
+  negatives are needed, and none are used.
+* **No smooth-field shortcut.** The annulus is *centred on the anchor*, so positive and negative
+  sit at nearly the same place in every smooth spatial field — which is what defeated the
+  distant-cell positive on data where `dist_to_center` correlates 0.997 with its own neighbourhood
+  mean.
+* **The inner radius is derived, not configured.** `ring_inner_hops: 0` resolves through
+  `tl.resolve_local_mask_hops`, the same function the mask itself uses. A term making a claim about
+  the mask must not be able to disagree with it; setting it explicitly to a different value warns.
+
+**Condition stays out of the objective**, so principle 4 is intact. Cross-slide positives were
+considered and rejected on a concrete bind rather than a preference: unmatched ones span conditions
+and destroy the condition signal, condition-matched ones put condition in the objective. There is
+no third pairing. Batch effect is handled by *neutrality* — no term rewards slide identity — and
+measured by the slide-ID probe, not by an invariance term.
+
+**The thing to watch, and it is not a bug.** The core is naturally more similar to the anchor than
+the ring is: spatial autocorrelation puts it there, and the GCN aggregate puts the anchor's own
+expression inside its neighbours' embeddings. So `_ring_nce_gap` (cos to ring minus cos to core)
+**starts negative and is supposed to**. The question is whether it rises. Staying flat means the
+ring holds nothing the core does not also have — which on `synth_data_0`, where every long-range
+field is smooth, is a real possible outcome and would itself be a finding.
+
+`_ring_nce_kept` is the other diagnostic: the fraction of anchors with both a non-empty ring and a
+non-empty core. Low means `ring_outer_hops` reaches past the slide, or the graph is too sparse to
+form an annulus at that radius.
+
+**`ring_outer_hops` has no safe default.** It decides how far out the term pushes, and on a radius
+graph a hop is a density-dependent distance (~40 µm in a dense region, ~150 in a sparse one). It is
+the first thing to sweep. Note what it does *not* do: it does not bound what the model may attend
+to — the mask does that — so beyond it, attention is shaped by reconstruction alone.
+
+**What is not verified.** No training run. The numbers above are from the unit and integration
+suites only.
+
 ## Stage 3 — two views
 
 The first stage that costs 2× compute. Only worth it if Stages 1–2 have moved the probes.
@@ -883,7 +939,7 @@ optim:
 | 0b | `evaluation/online_probes.py`, `config/probe_config.py` | `config/__init__.py` (validation), `train/_training.py` (callback), `evaluation/__init__.py` |
 | 1 | — | `aux_losses.py`, `_base_global_module.py` (expander) |
 | 2 | `train/context_nce.py` | `aux_losses.py` (`ContextNCE`, `build_projector`, `slide_codes`), `optim_config.py` (weight + 8 knobs) |
-| 2b | — | `aux_losses.py`, `optim_config.py` (three knobs); needs `pos` and `slide` from stage 0 |
+| 2b | `train/ring_nce.py` | `aux_losses.py` (`RingNCE`), `optim_config.py` (weight + 3 knobs), `tl/utils.py` (`resolve_local_mask_hops`) |
 | 3 | `tl/augment.py` | `_base_global_module.py` (multi-pass), `geome_dataloader.py` |
 | 4 | — | `tl/augment.py`, `aux_losses.py` |
 
@@ -916,6 +972,10 @@ Things that fail silently rather than loudly:
       nearest candidate from a uniformly drawn bank is not the same as finding a matched one, and
       only this comparison says which happened
 - [ ] a proposed corruption is actually visible to the encoder (see the `GCNConv` note above)
+- [ ] the ring's inner radius equals the attention mask's reach — derived, not configured, or the
+      positive contains cells the transformer cannot attend to
+- [ ] `_ring_nce_gap` read as a *trend*, not a sign: it starts negative because the core is the
+      naturally more similar side
 - [ ] a distant-same-slide positive is paired with *within-slide* negatives — any cross-slide
       fraction makes slide identity a rewarded direction, and mixing does not cancel it, it just
       adds a near/far component alongside it

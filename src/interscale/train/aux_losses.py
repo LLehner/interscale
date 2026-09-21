@@ -40,6 +40,7 @@ from interscale.train.context_nce import (
     to_token_edges,
     valid_contexts,
 )
+from interscale.train.ring_nce import extra_negatives, pooled_ring_and_core, ring_membership, similarity_gap
 from interscale.train.vicreg import covariance_term, invariance_term, variance_term
 
 
@@ -699,4 +700,175 @@ class ContextNCE(AuxLoss):
             # whole stage rests on. Read against the same number from a `match_composition: False`
             # run -- alone it has no scale.
             "_context_nce_hist_gap": torch.cat(gap).mean().detach(),
+        }
+
+
+@register_aux_loss("ring_nce")
+class RingNCE(AuxLoss):
+    """The anchor's outer ring against its own inner neighbourhood.
+
+    The positive is a pooled hop annulus around the anchor, starting where the attention mask's
+    reach ends; the negative is the pooled neighbourhood inside it, which is exactly what the
+    local component aggregates over. So the term says: *your long-range environment is not the
+    same thing as your immediate niche* -- the ``M = 1 - A`` mask as an objective rather than only
+    a constraint.
+
+    One forward pass. The pairing is structural, so nothing depends on encoder dropout and the
+    term is a real number under ``eval()``.
+
+    The inner radius is **derived, not configured**: ``ring_inner_hops: 0`` resolves through
+    :func:`~interscale.tl.resolve_local_mask_hops`, the same function the mask itself uses. A term
+    making a claim about the mask should not be able to disagree with it.
+
+    ``ring_outer_hops`` is the parameter with no safe default. It decides how far out the term
+    pushes; unbounded would make the positive the slide mean.
+    """
+
+    requires_views = 1
+
+    def __init__(self, cfg, module=None):
+        super().__init__()
+        from interscale.tl.utils import resolve_local_mask_hops
+
+        contrastive = cfg.optim.contrastive
+        self.temperature = float(contrastive.temperature)
+        self.embedding = contrastive.embedding
+        self.n_anchors = int(contrastive.n_anchors)
+        self.n_negatives = int(contrastive.ring_n_negatives)
+        self.masked_only = bool(contrastive.anchors_masked_only)
+
+        configured_inner = int(contrastive.ring_inner_hops)
+        self.inner_hops = configured_inner or resolve_local_mask_hops(cfg)
+        self.outer_hops = int(contrastive.ring_outer_hops)
+        self.derived_inner = configured_inner == 0
+
+        if self.outer_hops <= self.inner_hops:
+            raise ValueError(
+                f"optim.contrastive.ring_outer_hops ({self.outer_hops}) must exceed the inner "
+                f"radius ({self.inner_hops}"
+                + (", derived from the attention mask" if self.derived_inner else "")
+                + "), or the ring is empty for every anchor."
+            )
+        if self.n_negatives < 1:
+            raise ValueError(f"optim.contrastive.ring_n_negatives must be >= 1, got {self.n_negatives}.")
+
+        if not self.derived_inner and configured_inner != resolve_local_mask_hops(cfg):
+            warnings.warn(
+                f"optim.contrastive.ring_inner_hops is {configured_inner} but the attention mask "
+                f"blocks {resolve_local_mask_hops(cfg)} hops, so the ring does not start where the "
+                "local component's receptive field ends. Below the mask, the positive contains "
+                "cells the transformer cannot attend to; above it, a band is left out of the "
+                "objective entirely. Set it to 0 to derive it.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if not self.masked_only:
+            warnings.warn(
+                "ring_nce with anchors_masked_only: False. The GCN puts a cell's own expression "
+                "inside its neighbours' embeddings, so an unmasked anchor is detectable in its own "
+                "core -- which is this term's NEGATIVE, making it identifiable by self-detection.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        n_embed = getattr(module, "n_embed", None) if module is not None else None
+        self.projector = build_projector(n_embed, list(contrastive.projector_dims)) if n_embed else nn.Identity()
+
+    def _features(self, out: StepOutput) -> tuple[torch.Tensor, torch.Tensor]:
+        """``([N_rows, E], [N_rows])`` -- the embedding to contrast and each row's batch node id."""
+        view = out.view
+        wants_global = self.embedding == "global" or (self.embedding == "auto" and view.global_embedding is not None)
+
+        if wants_global:
+            if view.global_embedding is None:
+                raise ValueError(
+                    "optim.contrastive.embedding is 'global' but this module produced none. Use "
+                    "'local' or 'auto' for a LocalModel."
+                )
+            if view.padded_node_idx is None:
+                raise ValueError(
+                    "ring_nce needs padded_node_idx to map tokens onto edge_index; graph-level "
+                    "prediction does not gather per-cell tokens. The term is node-level only."
+                )
+            return view.tokens(), view.padded_node_idx
+
+        if view.local_embedding is None:
+            raise ValueError(
+                "optim.contrastive.embedding is 'local' but this module produced none. Use "
+                "'global' or 'auto' for a GlobalModel."
+            )
+        local = view.local_embedding
+        return local, torch.arange(local.shape[0], device=local.device)
+
+    def _anchor_pool(self, batch, node_idx: torch.Tensor) -> torch.Tensor:
+        """``[N_rows]`` boolean: which rows may serve as anchors."""
+        if not self.masked_only:
+            return torch.ones(len(node_idx), dtype=torch.bool, device=node_idx.device)
+        mask = getattr(batch, "mask", None)
+        if mask is None:
+            return torch.ones(len(node_idx), dtype=torch.bool, device=node_idx.device)
+        return mask.bool()[node_idx]
+
+    @staticmethod
+    def _sample(pool: torch.Tensor, n: int) -> torch.Tensor:
+        if n <= 0 or len(pool) <= n:
+            return pool
+        return pool[torch.randperm(len(pool), device=pool.device)[:n]]
+
+    def forward(self, out: StepOutput, batch) -> dict[str, torch.Tensor]:
+        """InfoNCE over anchors from every slide in the batch, pooled into one scalar."""
+        features, node_idx = self._features(out)
+        projected = self.projector(features)
+        n_tokens = projected.shape[0]
+
+        inverse = build_inverse(node_idx, int(batch.num_nodes))
+        token_edges = to_token_edges(batch.edge_index, inverse)
+        slides = slide_codes(batch, node_idx, n_tokens)
+        if slides is None:
+            slides = torch.zeros(n_tokens, dtype=torch.long, device=projected.device)
+        eligible = self._anchor_pool(batch, node_idx)
+
+        losses: list[torch.Tensor] = []
+        gaps: list[torch.Tensor] = []
+        kept: list[torch.Tensor] = []
+
+        for slide in slides.unique():
+            rows = (slides == slide).nonzero(as_tuple=True)[0]
+            anchor_pool = rows[eligible[rows]]
+            if len(anchor_pool) == 0:
+                continue
+
+            anchors = self._sample(anchor_pool, self.n_anchors)
+            ring, core = ring_membership(anchors, token_edges, n_tokens, self.inner_hops, self.outer_hops)
+            ring_pooled, core_pooled, keep = pooled_ring_and_core(ring, core, projected)
+
+            kept.append(keep.to(projected.dtype))
+            if not bool(keep.any()):
+                continue
+
+            anchors = anchors[keep]
+            ring_pooled, core_pooled = ring_pooled[keep], core_pooled[keep]
+            z = projected[anchors]
+
+            # The anchor's own core is always negative 0; the rest, if any, are other anchors'
+            # cores, so every negative remains "a neighbourhood the GNN already covers".
+            negatives = torch.cat(
+                [core_pooled.unsqueeze(1), extra_negatives(core_pooled, self.n_negatives - 1)], dim=1
+            )
+            losses.append(info_nce(z, ring_pooled, negatives, self.temperature))
+            gaps.append(similarity_gap(z, ring_pooled, core_pooled).detach())
+
+        if not losses:
+            zero = projected.sum() * 0.0
+            return {"ring_nce": zero, "_ring_nce_gap": zero.detach(), "_ring_nce_kept": zero.detach()}
+
+        return {
+            "ring_nce": torch.stack(losses).mean(),
+            # Not summed: diagnostics. `gap` is cos(anchor, ring) - cos(anchor, core), which starts
+            # NEGATIVE -- spatial autocorrelation and the GCN aggregate both make the core the more
+            # similar of the two -- so what matters is whether it rises, not its sign. `kept` is the
+            # fraction of anchors that had both a ring and a core; a low value means ring_outer_hops
+            # reaches past the slide, or the graph is too sparse to form an annulus.
+            "_ring_nce_gap": torch.cat(gaps).mean().detach() if gaps else projected.sum().detach() * 0.0,
+            "_ring_nce_kept": torch.cat(kept).mean().detach(),
         }

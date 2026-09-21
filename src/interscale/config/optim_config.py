@@ -49,6 +49,10 @@ def get_optim_cfg(cfg):
     # cell-type composition so composition cannot be the thing that separates them. One forward
     # pass. See `optim.contrastive.context_*` and `.claude/contrastive_plan.md`.
     cfg.optim.aux_loss_weights.context_nce = 0.0
+    # Ring NCE: the anchor's outer ring (beyond the attention mask) against its own inner
+    # neighbourhood (what the GNN aggregates). The M = 1 - A mask restated as an objective.
+    # One forward pass. See `optim.contrastive.ring_*`.
+    cfg.optim.aux_loss_weights.ring_nce = 0.0
 
     # Shared settings for the contrastive terms. Inert until one of them carries a weight.
     cfg.optim.contrastive = CN()
@@ -117,4 +121,20 @@ def get_optim_cfg(cfg):
     # detecting the anchor's own transcriptome in the pooled context -- the identity shortcut,
     # arriving through the graph rather than through augmentation.
     cfg.optim.contrastive.anchors_masked_only = True
+
+    # --- Ring NCE -----------------------------------------------------------------------------
+    # Outer bound of the positive ring, in hops. There is no default that is right for every
+    # graph: it decides how far out the term pushes, and on a radius graph a hop is a
+    # density-dependent distance. Sweep it rather than trust this number.
+    cfg.optim.contrastive.ring_outer_hops = 6
+    # Inner bound. 0 means "the attention mask's reach", resolved from
+    # `model.global_component.parameters.long_range_mask_hops` exactly as the mask itself is --
+    # so the ring starts precisely where the local component's receptive field ends. Setting this
+    # explicitly makes the term disagree with the architecture, which is occasionally what an
+    # ablation wants and never what a real run wants.
+    cfg.optim.contrastive.ring_inner_hops = 0
+    # Negatives per anchor. 1 is the anchor's own core and nothing else -- the requested design,
+    # and a two-way softmax whose gradient is weak. Above 1, the rest are other anchors' cores on
+    # the same slide, so every negative is still "a neighbourhood the GNN already covers".
+    cfg.optim.contrastive.ring_n_negatives = 1
     return cfg
