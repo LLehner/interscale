@@ -372,3 +372,45 @@ def test_default_hops_follow_the_local_component_depth():
     bare.model.global_component.name = "self-attn-transformer"
     bare = get_global_component_cfg(bare, "self-attn-transformer")
     assert BaseModel._resolve_local_mask_hops(SimpleNamespace(_cfg=bare)) == 1
+
+
+# --------------------------------------------------------------------------- hop resolution
+
+
+def test_zero_hops_resolves_to_the_local_components_layer_count():
+    """`long_range_mask_hops: 0` means "ask the local component". The mask has to cover the GNN's
+    receptive field exactly, or the two components overlap or leave a gap between them."""
+    from interscale.config import get_cfg_defaults
+    from interscale.tl import resolve_local_mask_hops
+
+    cfg = get_cfg_defaults()
+    cfg.model.global_component.parameters = type(cfg.model)()
+    cfg.model.global_component.parameters.long_range_mask_hops = 0
+    cfg.model.local_component.parameters = type(cfg.model)()
+    cfg.model.local_component.parameters.num_layers = 3
+
+    assert resolve_local_mask_hops(cfg) == 3
+
+
+def test_an_explicit_hop_count_wins_over_the_local_component():
+    from interscale.config import get_cfg_defaults
+    from interscale.tl import resolve_local_mask_hops
+
+    cfg = get_cfg_defaults()
+    cfg.model.global_component.parameters = type(cfg.model)()
+    cfg.model.global_component.parameters.long_range_mask_hops = 1
+    cfg.model.local_component.parameters = type(cfg.model)()
+    cfg.model.local_component.parameters.num_layers = 3
+
+    assert resolve_local_mask_hops(cfg) == 1
+
+
+def test_a_model_with_no_local_component_falls_back_to_one_hop():
+    from interscale.config import get_cfg_defaults
+    from interscale.tl import resolve_local_mask_hops
+
+    cfg = get_cfg_defaults()
+    cfg.model.global_component.parameters = type(cfg.model)()
+    cfg.model.global_component.parameters.long_range_mask_hops = 0
+
+    assert resolve_local_mask_hops(cfg) == 1

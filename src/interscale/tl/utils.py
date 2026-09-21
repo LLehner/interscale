@@ -21,6 +21,27 @@ def set_full_reproducibility(seed: int = 42) -> None:
         torch.backends.cudnn.benchmark = False
 
 
+def resolve_local_mask_hops(cfg) -> int:
+    """How far the long-range attention mask reaches, in message-passing steps.
+
+    ``model.global_component.parameters.long_range_mask_hops = 0`` means "ask the local
+    component", which is the setting that keeps the two components disjoint: the mask has to
+    cover the GNN's receptive field, and that is its number of layers. A transformer-only model
+    has no local component to ask, so it falls back to a single hop.
+
+    A module-level function rather than only a ``BaseModel`` method because a *loss* needs the
+    same number: a term whose job is "contrast what the local component saw against what it did
+    not" is making a claim about the mask, and a second knob for it is a second number that can
+    silently disagree with the architecture.
+    """
+    configured = cfg.model.global_component.parameters.long_range_mask_hops
+    if configured:
+        return int(configured)
+    local = cfg.model.get("local_component", None)
+    params = local.get("parameters", None) if local is not None else None
+    return int(params.num_layers) if params is not None and "num_layers" in params else 1
+
+
 def check_and_update_cfg(
     cfg,
     prediction_task: str = None,

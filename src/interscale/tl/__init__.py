@@ -28,9 +28,10 @@ from .masking import (
 )
 from .padding import pad_batch
 from .self_attn_relevance import SelfAttentionRelevance
-from .utils import check_and_update_cfg, set_full_reproducibility
+from .utils import check_and_update_cfg, resolve_local_mask_hops, set_full_reproducibility
 
 __all__ = [
+    "resolve_local_mask_hops",
     "prepare_geome_dataset",
     "warn_missing_categories",
     "check_split_independence",

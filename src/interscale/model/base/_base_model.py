@@ -536,11 +536,9 @@ class BaseModel(metaclass=BaseModelMeta):
         field, and that is its number of layers. A transformer-only model has no local component
         to ask, so it falls back to a single hop.
         """
-        configured = self._cfg.model.global_component.parameters.long_range_mask_hops
-        if configured:
-            return int(configured)
-        params = self._cfg.model.local_component.get("parameters", None)
-        return int(params.num_layers) if params is not None and "num_layers" in params else 1
+        from interscale.tl.utils import resolve_local_mask_hops
+
+        return resolve_local_mask_hops(self._cfg)
 
     def predict_nodewise(
         self,
