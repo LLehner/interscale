@@ -1,9 +1,11 @@
 """Acceptance gate for refactors that must change no behaviour.
 
-Runs four short, fully deterministic trainings on a small synthetic dataset and dumps the
-per-epoch metric history to JSON, so a before/after pair can be compared exactly. The four cases
-are chosen to cover every `_common_step` implementation (local, global, combined, dual-decoder)
-and all three distinct loss paths (element-wise, row-structured, attention-consuming).
+Runs five short, fully deterministic trainings on a small synthetic dataset and dumps the
+per-epoch metric history to JSON, so a before/after pair can be compared exactly. The first four
+cases cover every `_common_step` implementation (local, global, combined, dual-decoder) and all
+three distinct loss paths (element-wise, row-structured, attention-consuming). The fifth is the
+only one with long-range masking on, so it is the one that sees the k-hop attention mask -- here
+the 2-layer GCN's 2-hop reach, which blocks about a third of each sample's cell pairs.
 
 This is what "verified" means for the plumbing stages in `.claude/contrastive_plan.md`: a
 refactor is done when the tests pass *and* this reports IDENTICAL. Tests alone do not cover it --
@@ -84,18 +86,24 @@ CASES = {
         "LocalModel",
         {"dual_decoder": False, "loss": "MSELoss", "mask_strategy": "node"},
     ),
+    "combined_longrange_mse_node": (
+        "CombinedModel",
+        {"dual_decoder": False, "loss": "MSELoss", "mask_strategy": "node", "long_range": True},
+    ),
 }
 
 
 def write_cfg(path: Path, h5ad: Path, model_type: str, o: dict) -> Path:
     local = "  local_component:\n    name: GCN\n" if model_type != "GlobalModel" else ""
     gex = "      type_gex_embedding: PCA\n" if model_type == "GlobalModel" else ""
+    # Written only when a case asks for it, so the other cases' yaml is unchanged.
+    long_range = "      long_range_attention: True\n" if o.get("long_range") else ""
     # The global block is written even for LocalModel: prepare_geome_dataset reads
     # cfg.model.global_component.parameters.type_gex_embedding unconditionally, and that node
     # only exists once a global component name is set. LocalModel ignores it.
     glob = (
         "  global_component:\n    name: self-attn-transformer\n"
-        "    parameters:\n      max_seq_len: 64\n      num_layers: 1\n      n_heads: 2\n" + gex
+        "    parameters:\n      max_seq_len: 64\n      num_layers: 1\n      n_heads: 2\n" + gex + long_range
     )
     path.write_text(
         "model:\n"

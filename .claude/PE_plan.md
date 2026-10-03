@@ -173,11 +173,10 @@ tensors is `implemented, unverified`, not done.
   depth, and ring NCE's inner radius equals it too; a yaml with `long_range_mask_hops` raises; a
   file config with `optim.loss: none` and zero aux weights raises. Then capture the equivalence
   baseline.
-- **0** — first add a long-range case to `scripts/equivalence_harness.py`: none of its four cases
-  turns `long_range_attention` on, and the bias merge in `forward` is exactly that path. Then
-  `pe.node`/`pe.bias` + `dataset.spatial_unit_um`, `_validate_pe`, registry, `pad_like`,
+- **0** — `pe.node`/`pe.bias` + `dataset.spatial_unit_um`, `_validate_pe`, registry, `pad_like`,
   `GlobalInput`, `attn_bias`, precompute hook, checkpoint tag, forked RNG. Verify:
-  `scripts/equivalence_harness.py` IDENTICAL with PEs off; `pad_like` reproduces `pad_batch`'s
+  `scripts/equivalence_harness.py` IDENTICAL with PEs off — including `combined_longrange_mse_node`,
+  the one case that runs the mask path the bias merge changes; `pad_like` reproduces `pad_batch`'s
   layout including the subsampling and kept-masked-node cases; a test-registered dummy node PE
   and a zero bias leave outputs unchanged.
 - **1 naive** — verify: translating every coordinate leaves the outputs unchanged.
