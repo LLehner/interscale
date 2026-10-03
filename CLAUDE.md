@@ -14,6 +14,12 @@ status table, and an invariants checklist — read it before touching `train/los
 `_trainingplans.py`, or any `_common_step`, and update its status table in the same commit as
 the work it describes.
 
+Positional encodings for the global component are planned in
+[`.claude/PE_plan.md`](.claude/PE_plan.md), with the same staged layout, status table and
+invariants. Read it before touching the transformer's input path (`common_step_local_to_global`,
+`pad_batch`, the attention mask), and update its status table in the same commit as the work it
+describes.
+
 ## Common commands
 
 This project uses `hatch` as the primary project manager (also works with `uv` or `pip`; see `docs/installation.md`).
