@@ -794,7 +794,7 @@ Three properties the distant-pair version did not have:
   distant-cell positive on data where `dist_to_center` correlates 0.997 with its own neighbourhood
   mean.
 * **The inner radius is derived, not configured.** `ring_inner_hops: 0` resolves through
-  `tl.resolve_local_mask_hops`, the same function the mask itself uses. A term making a claim about
+  `tl.local_reach_hops` on the trained module, the number the mask is built with. A term making a claim about
   the mask must not be able to disagree with it; setting it explicitly to a different value warns.
 
 **Condition stays out of the objective**, so principle 4 is intact. Cross-slide positives were
@@ -939,7 +939,7 @@ optim:
 | 0b | `evaluation/online_probes.py`, `config/probe_config.py` | `config/__init__.py` (validation), `train/_training.py` (callback), `evaluation/__init__.py` |
 | 1 | — | `aux_losses.py`, `_base_global_module.py` (expander) |
 | 2 | `train/context_nce.py` | `aux_losses.py` (`ContextNCE`, `build_projector`, `slide_codes`), `optim_config.py` (weight + 8 knobs) |
-| 2b | `train/ring_nce.py` | `aux_losses.py` (`RingNCE`), `optim_config.py` (weight + 3 knobs), `tl/utils.py` (`resolve_local_mask_hops`) |
+| 2b | `train/ring_nce.py` | `aux_losses.py` (`RingNCE`), `optim_config.py` (weight + 3 knobs), `tl/utils.py` (`resolve_local_mask_hops`, replaced by `local_reach_hops` in PE_plan Stage P) |
 | 3 | `tl/augment.py` | `_base_global_module.py` (multi-pass), `geome_dataloader.py` |
 | 4 | — | `tl/augment.py`, `aux_losses.py` |
 

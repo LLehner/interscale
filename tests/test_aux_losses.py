@@ -236,7 +236,7 @@ def _tiny_datamodule():
     return dm
 
 
-def _tiny_module():
+def _tiny_module(local_mask_hops=1):
     from interscale.module.global_modules import TransformerNodeEncoderHook
 
     return TransformerNodeEncoderHook(
@@ -247,7 +247,7 @@ def _tiny_module():
         num_layers=1,
         dim_feedforward=8,
         long_range_attention=False,
-        local_mask_hops=1,
+        local_mask_hops=local_mask_hops,
         n_input=6,
         n_output=6,
         n_embed=4,

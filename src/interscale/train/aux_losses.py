@@ -716,9 +716,10 @@ class RingNCE(AuxLoss):
     One forward pass. The pairing is structural, so nothing depends on encoder dropout and the
     term is a real number under ``eval()``.
 
-    The inner radius is **derived, not configured**: ``ring_inner_hops: 0`` resolves through
-    :func:`~interscale.tl.resolve_local_mask_hops`, the same function the mask itself uses. A term
-    making a claim about the mask should not be able to disagree with it.
+    The inner radius is **derived, not configured**: ``ring_inner_hops: 0`` takes the local
+    component's reach off the module being trained (:func:`~interscale.tl.local_reach_hops`), the
+    same number the mask is built with. A term making a claim about the mask should not be able to
+    disagree with it.
 
     ``ring_outer_hops`` is the parameter with no safe default. It decides how far out the term
     pushes; unbounded would make the positive the slide mean.
@@ -728,7 +729,7 @@ class RingNCE(AuxLoss):
 
     def __init__(self, cfg, module=None):
         super().__init__()
-        from interscale.tl.utils import resolve_local_mask_hops
+        from interscale.tl.utils import local_reach_hops
 
         contrastive = cfg.optim.contrastive
         self.temperature = float(contrastive.temperature)
@@ -738,27 +739,37 @@ class RingNCE(AuxLoss):
         self.masked_only = bool(contrastive.anchors_masked_only)
 
         configured_inner = int(contrastive.ring_inner_hops)
-        self.inner_hops = configured_inner or resolve_local_mask_hops(cfg)
-        self.outer_hops = int(contrastive.ring_outer_hops)
         self.derived_inner = configured_inner == 0
+        # What the local component mixed, read off the module this term trains: the number the
+        # attention mask was built with. 0 is a real value -- no local component, or one that does
+        # no message passing -- and makes the core the anchor alone.
+        reach = local_reach_hops(module) if module is not None else None
+        if self.derived_inner and reach is None:
+            raise ValueError(
+                "ring_nce derives its inner radius from the module's local reach "
+                "(optim.contrastive.ring_inner_hops: 0), so it must be built with the module: "
+                "build_aux_losses(cfg, module)."
+            )
+        self.inner_hops = reach if self.derived_inner else configured_inner
+        self.outer_hops = int(contrastive.ring_outer_hops)
 
         if self.outer_hops <= self.inner_hops:
             raise ValueError(
                 f"optim.contrastive.ring_outer_hops ({self.outer_hops}) must exceed the inner "
                 f"radius ({self.inner_hops}"
-                + (", derived from the attention mask" if self.derived_inner else "")
+                + (", derived from the local component's reach" if self.derived_inner else "")
                 + "), or the ring is empty for every anchor."
             )
         if self.n_negatives < 1:
             raise ValueError(f"optim.contrastive.ring_n_negatives must be >= 1, got {self.n_negatives}.")
 
-        if not self.derived_inner and configured_inner != resolve_local_mask_hops(cfg):
+        if not self.derived_inner and reach is not None and configured_inner != reach:
             warnings.warn(
-                f"optim.contrastive.ring_inner_hops is {configured_inner} but the attention mask "
-                f"blocks {resolve_local_mask_hops(cfg)} hops, so the ring does not start where the "
-                "local component's receptive field ends. Below the mask, the positive contains "
-                "cells the transformer cannot attend to; above it, a band is left out of the "
-                "objective entirely. Set it to 0 to derive it.",
+                f"optim.contrastive.ring_inner_hops is {configured_inner} but the local component "
+                f"mixes {reach} hops, which is what the attention mask blocks, so the ring does not "
+                "start where the local component's receptive field ends. Below the mask, the "
+                "positive contains cells the transformer cannot attend to; above it, a band is left "
+                "out of the objective entirely. Set it to 0 to derive it.",
                 UserWarning,
                 stacklevel=2,
             )

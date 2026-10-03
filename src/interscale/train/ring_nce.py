@@ -62,7 +62,7 @@ def ring_membership(
         Width of the returned membership matrices.
     inner_hops
         The local component's receptive field, and what the attention mask blocks. Comes from
-        :func:`interscale.tl.resolve_local_mask_hops`, not from a knob of its own.
+        :func:`interscale.tl.local_reach_hops` on the trained module, not from a knob of its own.
     outer_hops
         Outer bound of the ring. Unbounded would make the positive the slide mean, which is the
         degenerate case this parameter exists to avoid.

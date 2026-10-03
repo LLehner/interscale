@@ -1,3 +1,5 @@
+import warnings
+
 import torch
 from torch import nn
 
@@ -42,8 +44,19 @@ class TransformerNodeEncoderHook(GlobalModule):
         # Radius of the neighbourhood the transformer is blocked from, in message-passing steps.
         # It has to match the local component's depth: blocking 1 hop while the GCN mixes 2 leaves
         # the second hop reachable by both components, which is the duplication the mask exists
-        # to prevent.
+        # to prevent. The model passes the local module's `receptive_field_hops`; 0 means nothing
+        # was mixed, so only self-attention is blocked, exactly as without long-range masking.
+        if local_mask_hops < 0:
+            raise ValueError(f"local_mask_hops must be >= 0, got {local_mask_hops}.")
         self.local_mask_hops = local_mask_hops
+        if long_range_attention and local_mask_hops == 0:
+            warnings.warn(
+                "long_range_attention is on, but the local component mixes no neighbours into the "
+                "embeddings (there is none, or it does no message passing), so there is nothing to "
+                "block beyond the cell itself. The mask is the self-only default.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         # Create Transformer Encoder
         encoder_layer = CustomTransformerEncoderLayer(
@@ -103,7 +116,7 @@ class TransformerNodeEncoderHook(GlobalModule):
             else keep_indices,  # Add parameter to ensure masked nodes are kept (not during evaluation)
         )
 
-        if self.long_range_attention:
+        if self.long_range_attention and self.local_mask_hops > 0:
             # Block everything the local component has already seen, so the transformer can only
             # contribute what the GNN could not.
             attention_mask = create_transformer_attention_mask_from_edges(

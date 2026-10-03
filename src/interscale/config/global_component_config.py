@@ -16,12 +16,10 @@ def get_global_component_cfg(cfg, global_component_name):
         cfg.model.global_component.parameters.max_seq_len = (
             2000  # optionally adjust to maximum number of cells, ideally shouldnt be larger than 4000
         )
-        cfg.model.global_component.parameters.long_range_attention = (
-            False  # if True, blocks attention inside the local component's receptive field
-        )
-        # Radius of that blocked neighbourhood, in message-passing steps. 0 means "match the local
-        # component's num_layers", which is the setting that keeps the two components disjoint.
-        cfg.model.global_component.parameters.long_range_mask_hops = 0
+        # If True, blocks attention inside the local component's receptive field. There is no
+        # radius to set: the mask always covers exactly what the local module mixed (its
+        # `receptive_field_hops`), so the two components stay disjoint by construction.
+        cfg.model.global_component.parameters.long_range_attention = False
         cfg.model.global_component.parameters.type_gex_embedding = None
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

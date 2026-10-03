@@ -21,25 +21,18 @@ def set_full_reproducibility(seed: int = 42) -> None:
         torch.backends.cudnn.benchmark = False
 
 
-def resolve_local_mask_hops(cfg) -> int:
-    """How far the long-range attention mask reaches, in message-passing steps.
+def local_reach_hops(module) -> int:
+    """How many hops of the spatial graph the local component has mixed into each embedding.
 
-    ``model.global_component.parameters.long_range_mask_hops = 0`` means "ask the local
-    component", which is the setting that keeps the two components disjoint: the mask has to
-    cover the GNN's receptive field, and that is its number of layers. A transformer-only model
-    has no local component to ask, so it falls back to a single hop.
-
-    A module-level function rather than only a ``BaseModel`` method because a *loss* needs the
-    same number: a term whose job is "contrast what the local component saw against what it did
-    not" is making a claim about the mask, and a second knob for it is a second number that can
-    silently disagree with the architecture.
+    Read off the module being trained, never off the config, so that a *loss* making a claim
+    about "what the local component saw" uses the same number the long-range mask was built
+    with. A combined module and a GlobalModel's transformer carry it as ``local_mask_hops`` (0
+    when there is no local component); a local-only module reports its ``receptive_field_hops``.
     """
-    configured = cfg.model.global_component.parameters.long_range_mask_hops
-    if configured:
-        return int(configured)
-    local = cfg.model.get("local_component", None)
-    params = local.get("parameters", None) if local is not None else None
-    return int(params.num_layers) if params is not None and "num_layers" in params else 1
+    global_module = getattr(module, "global_module", module)
+    if hasattr(global_module, "local_mask_hops"):
+        return int(global_module.local_mask_hops)
+    return int(module.receptive_field_hops)
 
 
 def check_and_update_cfg(

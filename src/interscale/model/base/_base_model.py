@@ -16,8 +16,7 @@ from scvi.data._constants import (
 from scvi.data._utils import _assign_adata_uuid, _check_if_view
 from yacs.config import CfgNode as CN
 
-from interscale.module.base import GlobalModule, LocalModule
-from interscale.module.global_modules import TransformerNodeEncoderHook
+from interscale.module.base import LocalModule
 from interscale.module.local_modules import GCN
 from interscale.tl.utils import get_model_filename_prefix
 
@@ -490,55 +489,6 @@ class BaseModel(metaclass=BaseModelMeta):
             )
         else:
             raise ValueError(f"Local component {self._cfg.local_component.name} not found.")
-
-    def _register_global_component(self) -> GlobalModule:
-        """Register global component based on name.
-        Instance must be defined in InterScale.module.global_components.
-        """
-        if self._cfg.model.global_component.name == "self-attn-transformer":
-            local_mask_hops = self._resolve_local_mask_hops()
-            self._model_summary_string = self._model_summary_string + (
-                f"Global component {self._cfg.model.global_component.name}: "
-                f"max_seq_len: {self._cfg.model.global_component.parameters.max_seq_len},"
-                f"n_heads: {self._cfg.model.global_component.parameters.n_heads},"
-                f"dropout_global: {self._cfg.model.global_component.parameters.dropout_global},"
-                f"act_func: {self._cfg.model.global_component.parameters.activation_func},"
-                f"num_layers: {self._cfg.model.global_component.parameters.num_layers},"
-                f"dim_feedforward: {self._cfg.model.global_component.parameters.dim_feedforward},"
-                f"enforce long-range attention: {self._cfg.model.global_component.parameters.long_range_attention},"
-                f"local_mask_hops: {local_mask_hops}"
-            )
-            return TransformerNodeEncoderHook(
-                n_input=self.n_input,
-                n_output=self.n_output,
-                n_embed=self.n_embed,
-                decoder_type=self._cfg.model.decoder.type,
-                dropout_decoder=self._cfg.model.decoder.dropout_decoder,
-                mask_percentage=self._cfg.dataset.mask_percentage,
-                mask_strategy=self._cfg.dataset.mask_strategy,
-                max_seq_len=self._cfg.model.global_component.parameters.max_seq_len,
-                n_heads=self._cfg.model.global_component.parameters.n_heads,
-                dropout_global=self._cfg.model.global_component.parameters.dropout_global,
-                act_func=self._cfg.model.global_component.parameters.activation_func,
-                num_layers=self._cfg.model.global_component.parameters.num_layers,
-                dim_feedforward=self._cfg.model.global_component.parameters.dim_feedforward,
-                long_range_attention=self._cfg.model.global_component.parameters.long_range_attention,
-                local_mask_hops=local_mask_hops,
-            )
-        else:
-            raise ValueError(f"Global component {self._cfg.model.global_component.name} not found.")
-
-    def _resolve_local_mask_hops(self) -> int:
-        """How far the long-range mask reaches, in message-passing steps.
-
-        ``long_range_mask_hops = 0`` means "ask the local component", which is the setting that
-        actually keeps the two components disjoint: the mask has to cover the GNN's receptive
-        field, and that is its number of layers. A transformer-only model has no local component
-        to ask, so it falls back to a single hop.
-        """
-        from interscale.tl.utils import resolve_local_mask_hops
-
-        return resolve_local_mask_hops(self._cfg)
 
     def predict_nodewise(
         self,

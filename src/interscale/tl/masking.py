@@ -357,6 +357,12 @@ def create_transformer_attention_mask_from_edges(
         :class:`torch.nn.MultiheadAttention` expects of a 3-D ``attn_mask``.
     """
     device = edge_index.device if device is None else device
+    if n_hops < 1:
+        # `_local_reach` would read 0 as 1 and block the direct neighbours of a model whose local
+        # component mixed none of them.
+        raise ValueError(
+            f"n_hops must be >= 1, got {n_hops}. A reach of 0 blocks only the diagonal; use attn_mask_diagonal."
+        )
     batch = batch.to(torch.long)
     if batch.numel() != num_nodes:
         raise ValueError(f"batch has {batch.numel()} entries but num_nodes is {num_nodes}")

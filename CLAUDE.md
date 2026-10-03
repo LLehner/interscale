@@ -82,7 +82,7 @@ Three concrete models subclass `BaseModel`, differing in which components they i
 - `GlobalModel` — global (transformer) component only.
 - `CombinedModel` — both; wraps either `CombinedModule` or `DualDecoderCombinedModule` (when `cfg.model.decoder.dual_decoder` is `True`, both local and global components get their own decoder instead of sharing one).
 
-`BaseModel._register_local_component` / `_register_global_component` look up `cfg.model.local_component.name` / `cfg.model.global_component.name` and instantiate the matching module class (currently `"GCN"` and `"self-attn-transformer"` respectively) — adding a new local/global component means adding a branch here plus a corresponding config file.
+`LocalModule.from_config` / `GlobalModule.from_config` (`module/base/`) look up `cfg.model.local_component.name` / `cfg.model.global_component.name` and instantiate the matching module class (`"GCN"`, `"GIN"`, `"SCVI"`; `"self-attn-transformer"`) — adding a new local/global component means adding a branch there plus a corresponding config file. `GlobalModule.from_config` requires `local_mask_hops`: the combined modules pass their local module's `receptive_field_hops` (one hop per message-passing layer) and `GlobalModel` passes 0, so the long-range mask always covers exactly what the local component mixed. The config only switches the mask on or off (`long_range_attention`). (`BaseModel._register_local_component` is dead code.)
 
 ### Module hierarchy (`interscale.module`)
 

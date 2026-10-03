@@ -1,8 +1,9 @@
 """Ring NCE through the training plan, and the config states that would misplace the annulus.
 
 The mechanics are tested in `test_ring_nce.py`. What matters here is that the inner radius is
-derived from the attention mask rather than guessed, that the term runs in one pass, and that the
-combinations which quietly contradict the architecture say so.
+read off the module the term trains -- the number the attention mask was built with -- rather than
+guessed, that the term runs in one pass, and that the combinations which quietly contradict the
+architecture say so.
 """
 
 import pytest
@@ -17,14 +18,10 @@ from interscale.train.aux_losses import build_aux_losses
 from tests.test_aux_losses import _tiny_datamodule, _tiny_module
 
 
-def _cfg(*, mask_hops=0, local_layers=2, **contrastive):
+def _cfg(**contrastive):
     cfg = get_cfg_defaults()
     cfg.optim.aux_loss_weights.ring_nce = 1.0
     cfg.optim.contrastive.ring_outer_hops = 3
-    cfg.model.global_component.parameters = type(cfg.model)()
-    cfg.model.global_component.parameters.long_range_mask_hops = mask_hops
-    cfg.model.local_component.parameters = type(cfg.model)()
-    cfg.model.local_component.parameters.num_layers = local_layers
     for key, value in contrastive.items():
         setattr(cfg.optim.contrastive, key, value)
     return cfg
@@ -49,31 +46,39 @@ def _fit(plan):
 # --------------------------------------------------------------------------- the inner radius
 
 
-def test_the_inner_radius_is_derived_from_the_attention_mask():
+def test_the_inner_radius_is_the_modules_local_reach():
     """The point of the term is to contrast what the local component saw against what it did not,
-    so the ring has to start exactly where the mask's reach ends."""
-    term = build_aux_losses(_cfg(mask_hops=0, local_layers=2), _tiny_module()).terms["ring_nce"]
+    so the ring has to start exactly where the mask's reach ends -- and that reach is decided by
+    the module, not by the config."""
+    term = build_aux_losses(_cfg(), _tiny_module(local_mask_hops=2)).terms["ring_nce"]
 
     assert term.inner_hops == 2
     assert term.derived_inner
 
 
-def test_an_explicit_mask_hop_count_is_followed():
-    term = build_aux_losses(_cfg(mask_hops=1, local_layers=2), _tiny_module()).terms["ring_nce"]
+def test_no_local_reach_makes_the_core_the_anchor_alone():
+    """A GlobalModel has no local component, so its reach is 0 and the ring starts at the anchor's
+    direct neighbours. Reading 0 as "unset" would invent a neighbourhood nothing aggregated."""
+    term = build_aux_losses(_cfg(), _tiny_module(local_mask_hops=0)).terms["ring_nce"]
 
-    assert term.inner_hops == 1
+    assert term.inner_hops == 0
+
+
+def test_a_derived_inner_radius_needs_the_module():
+    with pytest.raises(ValueError, match="must be built with the module"):
+        build_aux_losses(_cfg())
 
 
 def test_an_inner_radius_disagreeing_with_the_mask_warns():
     """Below the mask the positive contains cells the transformer cannot attend to; above it a
     band is left out of the objective. Neither raises and both train."""
     with pytest.warns(UserWarning, match="does not start where"):
-        build_aux_losses(_cfg(mask_hops=1, ring_inner_hops=2), _tiny_module())
+        build_aux_losses(_cfg(ring_inner_hops=2), _tiny_module(local_mask_hops=1))
 
 
 def test_an_outer_radius_inside_the_inner_one_is_rejected_at_construction():
     with pytest.raises(ValueError, match="must exceed the inner radius"):
-        build_aux_losses(_cfg(mask_hops=2, ring_outer_hops=2), _tiny_module())
+        build_aux_losses(_cfg(ring_outer_hops=2), _tiny_module(local_mask_hops=2))
 
 
 def test_unmasked_anchors_warn_because_the_negative_becomes_self_detectable():
