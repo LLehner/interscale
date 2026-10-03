@@ -26,7 +26,7 @@ def get_global_component_cfg(cfg, global_component_name):
         # is the model from before PEs existed. Node encodings are summed into each cell's token;
         # the list is swept through a sweep yaml's `arms:` block, never as a raw wandb list.
         pe = cfg.model.global_component.parameters.pe = CN()
-        pe.node = []  # any of: naive, sinusoidal
+        pe.node = []  # any of: naive, sinusoidal, lap
         # Coordinate encodings read `data.pos` (needs dataset.spatial_key), in µm
         # (dataset.spatial_unit_um), with each graph's centroid subtracted: absolute slide offsets
         # are scanner artefacts. `rotate_train` rotates each graph by a random angle in training,
@@ -44,5 +44,11 @@ def get_global_component_cfg(cfg, global_component_name):
         pe.sinusoidal.dim = 32
         pe.sinusoidal.min_wavelength = 10.0
         pe.sinusoidal.max_wavelength = 1000.0
+        # The k lowest non-trivial eigenvectors of the symmetric normalised Laplacian of the same
+        # neighbour graph the local component uses (`tl.laplacian_pe`), precomputed once per graph.
+        # An eigenvector has no sign, so `sign_flip` flips each one per graph in training.
+        pe.lap = CN()
+        pe.lap.k = 8
+        pe.lap.sign_flip = True
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

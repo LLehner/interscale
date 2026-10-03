@@ -5,6 +5,7 @@ from yacs.config import CfgNode as CN
 
 from interscale.model.base._base_model import BaseModel
 from interscale.module import CombinedModule, DualDecoderCombinedModule
+from interscale.module.global_modules.positional_encodings import attach_positional_inputs
 from interscale.tl import prepare_a2d_dataset
 from interscale.train import NodeMaskingTrainingPlan
 
@@ -83,6 +84,8 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
 
         a2d = prepare_a2d_dataset(self._cfg)
         pyg, _ = list(a2d(adata))
+        # The same precomputed positional inputs the training graphs carry.
+        attach_positional_inputs(pyg, self._cfg)
 
         obs_names_str = adata.obs_names.astype(int).astype(str)
 

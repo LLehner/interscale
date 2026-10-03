@@ -255,6 +255,7 @@ def test_a_valid_pe_config_loads(tmp_path):
         (["node: [sinusoidal]", "sinusoidal:", "  dim: 30"], True, "multiple of 4"),
         (["node: [sinusoidal]", "sinusoidal:", "  max_wavelength: 5.0"], True, "max_wavelength"),
         (["node: [naive]", "naive:", "  length_scale: 0.0"], True, "length_scale"),
+        (["node: [lap]", "lap:", "  k: 0"], True, "lap.k"),
     ],
 )
 def test_invalid_pe_configs_fail_at_load(tmp_path, lines, spatial, match):
@@ -262,11 +263,12 @@ def test_invalid_pe_configs_fail_at_load(tmp_path, lines, spatial, match):
         load_config(_write(tmp_path, lines, spatial=spatial))
 
 
-def test_every_registered_encoding_is_a_node_encoding_reading_coordinates():
-    """Guards the two kinds this stage handles; a bias or a precomputed input is a later stage."""
-    assert {name: (spec.kind, spec.requires) for name, spec in PE_REGISTRY.items()} == {
-        "naive": ("node", "pos"),
-        "sinusoidal": ("node", "pos"),
+def test_the_registry_holds_the_node_encodings_built_so_far():
+    """What each encoding reads, and which precompute: a new entry has to be added here on purpose."""
+    assert {name: (spec.kind, spec.requires, spec.precompute is not None) for name, spec in PE_REGISTRY.items()} == {
+        "naive": ("node", "pos", False),
+        "sinusoidal": ("node", "pos", False),
+        "lap": ("node", "lap_pe", True),
     }
 
 
@@ -375,3 +377,194 @@ def test_the_encodings_train_end_to_end():
 
     assert torch.isfinite(trainer.logged_metrics["train_loss"])
     assert all(layer.weight.any() for layer in outputs), "the gradient never reached an encoding"
+
+
+# --------------------------------------------------------------------------- Laplacian eigenvectors
+
+
+def _geometric_graph(n, radius, seed):
+    """Undirected radius graph on random points in the unit square, as a PyG edge index."""
+    g = torch.Generator().manual_seed(seed)
+    pts = torch.rand(n, 2, generator=g)
+    close = (torch.cdist(pts, pts) < radius) & ~torch.eye(n, dtype=torch.bool)
+    return close.nonzero().t().contiguous()
+
+
+def _components(edge_index, n):
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    src, dst = edge_index.numpy()
+    return connected_components(coo_matrix(([1] * len(src), (src, dst)), shape=(n, n)), directed=False)
+
+
+def _connected_geometric_graph(n, radius):
+    for seed in range(50):
+        edge_index = _geometric_graph(n, radius, seed)
+        if _components(edge_index, n)[0] == 1:
+            return edge_index
+    raise AssertionError("no connected graph found")
+
+
+def _same_up_to_sign(a, b, atol=1e-4):
+    return all(
+        torch.allclose(a[:, j], b[:, j], atol=atol) or torch.allclose(a[:, j], -b[:, j], atol=atol)
+        for j in range(a.shape[1])
+    )
+
+
+@pytest.mark.parametrize("n", [60, 150])
+def test_lap_pe_matches_pyg_on_a_connected_graph(n):
+    """On the connected graph PyG's transform assumes, the two agree up to each column's sign. n=150
+    takes PyG's sparse path; distinct eigenvalues make the comparison well defined."""
+    from torch_geometric.data import Data
+    from torch_geometric.transforms import AddLaplacianEigenvectorPE
+
+    from interscale.tl import laplacian_pe
+
+    k = 6
+    edge_index = _connected_geometric_graph(n, radius=0.25)
+    ours = laplacian_pe(edge_index, n, k)
+    theirs = AddLaplacianEigenvectorPE(k, attr_name="pe", is_undirected=True)(
+        Data(edge_index=edge_index, num_nodes=n)
+    ).pe
+
+    assert ours.shape == (n, k)
+    assert _same_up_to_sign(ours, theirs.float())
+
+
+def test_lap_pe_sparse_and_dense_solvers_agree():
+    from interscale.tl import laplacian_pe
+
+    n, k = 300, 6
+    edge_index = _connected_geometric_graph(n, radius=0.15)
+
+    dense = laplacian_pe(edge_index, n, k, dense_max_nodes=10_000)
+    sparse = laplacian_pe(edge_index, n, k, dense_max_nodes=10)
+
+    assert torch.allclose(dense, sparse, atol=1e-4), "canonical signs make the two solvers agree exactly"
+
+
+def test_lap_pe_drops_one_trivial_eigenvector_per_component():
+    """Two components plus an isolated cell: PyG would drop only the first zero eigenvector and keep
+    a component indicator. Here no returned column lies in the zero eigenspace."""
+    from interscale.tl import laplacian_pe
+
+    a = _connected_geometric_graph(30, radius=0.35)
+    b = _connected_geometric_graph(25, radius=0.35) + 30
+    edge_index = torch.cat([a, b], dim=1)  # node 55 is isolated
+    n, k = 56, 5
+    assert _components(edge_index, n)[0] == 3
+
+    pe = laplacian_pe(edge_index, n, k).double()
+    adj = torch.zeros(n, n, dtype=torch.float64)
+    adj[edge_index[0], edge_index[1]] = 1.0
+    deg = adj.sum(1)
+    inv = torch.where(deg > 0, deg.rsqrt(), torch.zeros_like(deg))
+    lap = torch.eye(n, dtype=torch.float64) - inv[:, None] * adj * inv[None, :]
+
+    rayleigh = (pe * (lap @ pe)).sum(0) / (pe * pe).sum(0)
+    assert bool((rayleigh > 1e-6).all()), f"a trivial eigenvector was kept: {rayleigh.tolist()}"
+    assert torch.allclose(pe.norm(dim=0), torch.ones(k, dtype=torch.float64), atol=1e-4)
+    assert torch.allclose(pe.t() @ pe, torch.eye(k, dtype=torch.float64), atol=1e-4), "columns orthonormal"
+
+
+def test_lap_pe_zero_pads_a_graph_with_fewer_eigenvectors_than_k():
+    from interscale.tl import laplacian_pe
+
+    path = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]])
+    pe = laplacian_pe(path, 3, 8)
+
+    assert pe.shape == (3, 8)
+    assert pe[:, :2].abs().sum() > 0, "a 3-node path has two non-trivial eigenvectors"
+    assert not pe[:, 2:].any()
+
+
+def test_lap_pe_signs_are_canonical_so_rebuilt_graphs_match():
+    """get_model_output rebuilds the graphs; the encoding must not depend on the solver's sign."""
+    from interscale.tl import laplacian_pe
+
+    edge_index = _connected_geometric_graph(80, radius=0.25)
+    first, second = laplacian_pe(edge_index, 80, 6), laplacian_pe(edge_index, 80, 6)
+
+    assert torch.equal(first, second)
+    peak = first.abs().argmax(dim=0)
+    assert bool((first[peak, torch.arange(6)] > 0).all()), "largest-magnitude entry is positive"
+
+
+def _lap_batch(k=4, sizes=(6, 5)):
+    graphs = [torch.rand(n, 2) for n in sizes]
+    batch = _batch(*graphs, edges=False)
+    batch.lap_pe = torch.randn(sum(sizes), k)
+    return batch
+
+
+def test_lap_sign_flips_are_per_graph_training_only_and_off_the_global_rng():
+    encoding = _randomised(build_node_positional_encoding(_cfg(["lap"], lap=_lap_cfg(k=4)), N_EMBED))
+    lap = encoding.encoders["lap"]
+    batch = _lap_batch()
+    cpu = torch.device("cpu")
+
+    state = torch.get_rng_state()
+    flipped = lap.augment(batch.lap_pe, batch.batch, encoding.generator)
+    assert torch.equal(state, torch.get_rng_state()), "flips drew from the global torch RNG"
+
+    ratio = flipped / batch.lap_pe
+    assert torch.equal(ratio.abs(), torch.ones_like(ratio)), "a flip only changes signs"
+    for g in (0, 1):
+        rows = ratio[batch.batch == g]
+        assert torch.equal(rows, rows[:1].expand_as(rows)), "one sign per eigenvector per graph"
+
+    encoding.eval()
+    plain = lap.proj(batch.lap_pe)
+    assert torch.allclose(encoding(batch, dtype=torch.float32, device=cpu), plain), "no flips in eval"
+
+
+def _lap_cfg(**values):
+    from yacs.config import CfgNode as CN
+
+    node = CN()
+    node.k = values.get("k", 8)
+    node.sign_flip = values.get("sign_flip", True)
+    return node
+
+
+def test_lap_without_sign_flip_is_deterministic_in_training():
+    encoding = _randomised(build_node_positional_encoding(_cfg(["lap"], lap=_lap_cfg(k=4, sign_flip=False)), N_EMBED))
+    batch = _lap_batch()
+    cpu = torch.device("cpu")
+
+    encoding.train()
+    assert torch.equal(
+        encoding(batch, dtype=torch.float32, device=cpu), encoding(batch, dtype=torch.float32, device=cpu)
+    )
+
+
+def test_lap_reports_graphs_built_without_its_eigenvectors():
+    encoding = build_node_positional_encoding(_cfg(["lap"]), N_EMBED)
+
+    with pytest.raises(ValueError, match="attach_positional_inputs"):
+        encoding(_batch(torch.rand(4, 2), edges=False), dtype=torch.float32, device=torch.device("cpu"))
+
+
+def test_lap_rejects_eigenvectors_from_a_different_k():
+    encoding = build_node_positional_encoding(_cfg(["lap"], lap=_lap_cfg(k=8)), N_EMBED)
+
+    with pytest.raises(ValueError, match="pe.lap.k"):
+        encoding(_lap_batch(k=4), dtype=torch.float32, device=torch.device("cpu"))
+
+
+def test_attach_positional_inputs_stores_eigenvectors_only_when_enabled():
+    from torch_geometric.data import Data
+
+    from interscale.module.global_modules.positional_encodings import attach_positional_inputs
+    from interscale.tl import laplacian_pe
+
+    edge_index = _connected_geometric_graph(40, radius=0.3)
+    off, on = Data(edge_index=edge_index, num_nodes=40), Data(edge_index=edge_index, num_nodes=40)
+
+    attach_positional_inputs([off], _cfg(["naive"]))
+    attach_positional_inputs([on], _cfg(["lap"], lap=_lap_cfg(k=5)))
+
+    assert getattr(off, "lap_pe", None) is None
+    assert torch.equal(on.lap_pe, laplacian_pe(edge_index, 40, 5))

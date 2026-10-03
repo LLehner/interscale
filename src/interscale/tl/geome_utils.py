@@ -9,7 +9,8 @@ from yacs.config import CfgNode as CN
 #: Names the pipeline builds itself. An ``extra_obs_keys`` entry may not shadow one of these:
 #: attaching an obs column called ``mask`` would replace the corruption mask with a label and the
 #: run would train against its own annotation without failing.
-RESERVED_FIELD_NAMES = {"x", "y", "edge_index", "obs_names", "embeddings", "batch", "mask", "gene_mask"}
+# `lap_pe` is precomputed onto the graphs by `attach_positional_inputs` when LapPE is enabled.
+RESERVED_FIELD_NAMES = {"x", "y", "edge_index", "obs_names", "embeddings", "batch", "mask", "gene_mask", "lap_pe"}
 
 #: Optional annotations attached to every PyG ``Data``: attribute name -> (config key, source).
 #: Each is attached only when its ``cfg.dataset.*`` entry is set, so the default config produces
@@ -434,6 +435,13 @@ def prepare_geome_dataset(adata, cfg: CN):
         if "test" in np.unique(adata.obs[split_key]):
             pyg_test, _ = list(a2d(adata[adata.obs[split_key] == "test"]))
             datas_test.extend(pyg_test)
+
+    # Inputs positional encodings precompute once per graph (Laplacian eigenvectors). A no-op
+    # unless an enabled encoding needs one. Imported here: the module side imports `tl`.
+    from interscale.module.global_modules.positional_encodings import attach_positional_inputs
+
+    for datas in (datas_train, datas_val, datas_test):
+        attach_positional_inputs(datas, cfg)
 
     if "test" in np.unique(adata.obs[split_key]):
         # datas_test, adata_test = list(a2d(adata[adata.obs[split_key] == "test"]))

@@ -18,7 +18,7 @@ it. "Implemented, unverified" is a real state.
 | 0 — plumbing, no behaviour change (node half; see 'How Stages 0–2 differed') | **done** | 352 tests pass; equivalence harness IDENTICAL across 5 cases / 15 epochs incl. the long-range one; PE-on and PE-off at one seed share every other initial weight and the first forward (test, and mutation-checked: without the RNG fork it fails) | 2026-10-03 |
 | 1 — naive PE | **implemented, unverified** — translation-invariant by centring (test, mutation-checked), unit conversion, rotation on its own generator; trains finite and moves off the PE-free run through `GlobalModel`, `CombinedModel`, dual decoder and long-range; `get_model_output` runs. **No real-data run yet** | 2026-10-03 |
 | 2 — 2D sinusoidal | **implemented, unverified** — closed form and distance decay pinned; same end-to-end checks as Stage 1. **No real-data run yet** | 2026-10-03 |
-| 3 — LapPE | not started | | |
+| 3 — LapPE | **implemented, unverified** — equals PyG's `AddLaplacianEigenvectorPE` up to sign on connected graphs (both PyG solver paths); dense and sparse solvers agree exactly; one trivial eigenvector dropped per component, zero-padding, canonical signs, orthonormal columns; flips per graph, training only, off the global RNG (each mutation-checked); harness IDENTICAL with PEs off; trains finite through `GlobalModel`, `CombinedModel`, dual decoder and long-range; `get_model_output` runs; precompute 2.4 s for a 50k-cell 6-NN graph. **No real-data run yet** | 2026-10-03 |
 | 4 — RWPE | not started | | |
 | 5 — distance bias | not started | | |
 | 6 — PE probe control + ablation sweep | not started | | |
@@ -144,7 +144,10 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
 
 - **Stage 0 was built for node encodings only.** `pad_like`, `GlobalInput`, the `attn_bias`
   argument and the precompute hook have no consumer before Stages 3 and 5, so they arrive with
-  those stages rather than as untested scaffolding (the contrastive plan deferred its projection
+  those stages rather than as untested scaffolding. The precompute hook landed with Stage 3:
+  `PESpec.precompute` plus `attach_positional_inputs`, called by `prepare_geome_dataset` and both
+  models' `get_model_output`; LapPE's sign flip is the encoder's `augment` hook, which the
+  container calls in training only (the contrastive plan deferred its projection
   heads the same way). The registry already carries `kind` and `requires`, which is what they will
   plug into.
 - **Every node encoder's output layer starts at zero**, not only the distance bias's. With the RNG
@@ -173,8 +176,14 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
   differ in size, so min-max would encode the same distance differently per graph. Sinusoidal
   wavelengths are in µm (cell diameter → window extent; `get_average_local_and_global_size`
   reports both), not DETR's temperature 10000, which assumes integer positions.
-- **lap**: isolated cells and disconnected components give several zero eigenvalues — skip all
-  near-zero ones and zero-pad when fewer than `k` remain; shift-invert `eigsh` for large graphs.
+- **lap**: every connected component has its own zero eigenvalue, so exactly one trivial
+  eigenvector is dropped per component (an exact count, not a tolerance — a long, thin graph's
+  first real eigenvalue can be ~1e-6); isolated cells have eigenvalue 1 and are ordinary. Zero-pad
+  when fewer than `k` remain; shift-invert `eigsh` for large graphs; canonical signs so rebuilt
+  graphs match. **Scale:** columns are unit-norm over the whole graph, so entries shrink like
+  `1/sqrt(N)` — a 50k-cell slide gets ~10x smaller values than a 500-cell window. Harmless while a
+  run's graphs are of similar size; with mixed sizes (whole slides beside windows), scale by
+  `sqrt(N)` (a one-flag change in `tl.laplacian_pe`). Listed under open questions too.
 - **rw**: isolated nodes get zeros. On a near-regular kNN graph the return probabilities are
   almost constant, so report per-dimension variance before reading a null result as "RW doesn't
   help".
@@ -263,3 +272,6 @@ effect differs (see above). The base config must set `dataset.spatial_key`.
 - Fixed µm defaults for the wavelengths and `max_dist`, or derived per dataset from the window
   extent?
 - `rotate_train` is off by default because some tissues have a meaningful axis (layered cortex).
+- LapPE columns are unit-norm over the whole graph, so entries scale like `1/sqrt(N)`: a 50k-cell
+  slide gets ~10x smaller values than a 500-cell window. Fine while graphs in one run are of
+  similar size; with mixed sizes, scaling by `sqrt(N)` is the candidate fix (one config flag).

@@ -13,8 +13,12 @@ Three properties every node encoding keeps:
   encoders are built inside a forked RNG. A PE run and a PE-free run at the same seed therefore
   share every other initial weight and the first forward pass; whatever differs later is what the
   PE was used for.
-* **Augmentation has its own generator.** ``rotate_train`` draws from a generator seeded from
-  ``optim.seed``, never from the global torch RNG, which also decides the training batch order.
+* **Augmentation has its own generator.** ``rotate_train`` and LapPE's sign flips draw from a
+  generator seeded from ``optim.seed``, never from the global torch RNG, which also decides the
+  training batch order.
+
+Inputs that are expensive to compute -- Laplacian eigenvectors -- are precomputed once per graph by
+:func:`attach_positional_inputs` when the graphs are built, and ride on the ``Data`` object.
 
 Adding an encoding is one :func:`register_pe` entry plus one config sub-block in
 ``get_global_component_cfg``; nothing in the transformer changes.
@@ -28,6 +32,8 @@ import torch
 from torch import nn
 from torch_geometric.utils import scatter
 
+from interscale.tl.positional import laplacian_pe
+
 
 @dataclass(frozen=True)
 class PESpec:
@@ -35,25 +41,27 @@ class PESpec:
 
     ``requires`` names the ``Data`` attribute the encoder reads (``"pos"`` for coordinates).
     ``build(pe_cfg, n_embed)`` returns the encoder; ``validate(pe_cfg)`` raises on settings that
-    would fail mid-run, and runs at config load.
+    would fail mid-run, and runs at config load. ``precompute(data, pe_cfg)``, when set, returns
+    the ``requires`` attribute for one graph; :func:`attach_positional_inputs` stores it.
     """
 
     kind: str
     requires: str
     build: Callable
     validate: Callable
+    precompute: Callable | None = None
 
 
 PE_REGISTRY: dict[str, PESpec] = {}
 
 
-def register_pe(name: str, *, kind: str, requires: str, validate: Callable):
+def register_pe(name: str, *, kind: str, requires: str, validate: Callable, precompute: Callable | None = None):
     """Register ``build(pe_cfg, n_embed) -> nn.Module`` as the encoding ``name``."""
 
     def decorator(build):
         if name in PE_REGISTRY:
             raise ValueError(f"positional encoding '{name}' is already registered")
-        PE_REGISTRY[name] = PESpec(kind=kind, requires=requires, build=build, validate=validate)
+        PE_REGISTRY[name] = PESpec(kind=kind, requires=requires, build=build, validate=validate, precompute=precompute)
         return build
 
     return decorator
@@ -107,6 +115,41 @@ class SinusoidalPE(nn.Module):
         return self.proj(self.features(pos_um))
 
 
+class LapPE(nn.Module):
+    """Laplacian eigenvectors of the neighbour graph (precomputed), projected to the token width.
+
+    An eigenvector is only defined up to sign, so with ``sign_flip`` each of the ``k`` columns is
+    multiplied by a random sign per graph in training -- the standard way to make the projection
+    not depend on an arbitrary choice. Evaluation sees the canonical signs ``laplacian_pe`` fixes.
+    """
+
+    def __init__(self, n_embed: int, k: int, sign_flip: bool):
+        super().__init__()
+        self.k = int(k)
+        self.sign_flip = bool(sign_flip)
+        self.proj = _zero_(nn.Linear(self.k, n_embed))
+
+    def _check(self, eigvecs: torch.Tensor) -> torch.Tensor:
+        if eigvecs.shape[1] != self.k:
+            raise ValueError(
+                f"lap_pe has {eigvecs.shape[1]} eigenvectors per cell but pe.lap.k is {self.k}; the graphs "
+                "were built with a different config. Rebuild them (attach_positional_inputs)."
+            )
+        return eigvecs
+
+    def augment(self, eigvecs: torch.Tensor, batch: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+        """Flip each eigenvector's sign at random, independently per graph. Training only."""
+        eigvecs = self._check(eigvecs)
+        if not self.sign_flip:
+            return eigvecs
+        n_graphs = int(batch.max().item()) + 1
+        signs = torch.randint(0, 2, (n_graphs, self.k), generator=generator).to(eigvecs) * 2 - 1
+        return eigvecs * signs[batch]
+
+    def forward(self, eigvecs: torch.Tensor) -> torch.Tensor:
+        return self.proj(self._check(eigvecs))
+
+
 def _positive(value, name):
     if not value > 0:
         raise ValueError(f"model.global_component.parameters.pe.{name} must be > 0, got {value}.")
@@ -130,6 +173,10 @@ def _validate_sinusoidal(pe):
         )
 
 
+def _validate_lap(pe):
+    _positive(pe.lap.k, "lap.k")
+
+
 @register_pe("naive", kind="node", requires="pos", validate=_validate_naive)
 def _build_naive(pe, n_embed):
     return NaivePE(n_embed, int(pe.naive.hidden_dim), float(pe.naive.length_scale))
@@ -139,6 +186,17 @@ def _build_naive(pe, n_embed):
 def _build_sinusoidal(pe, n_embed):
     s = pe.sinusoidal
     return SinusoidalPE(n_embed, int(s.dim), float(s.min_wavelength), float(s.max_wavelength))
+
+
+@register_pe(
+    "lap",
+    kind="node",
+    requires="lap_pe",
+    validate=_validate_lap,
+    precompute=lambda data, pe: laplacian_pe(data.edge_index, data.num_nodes, int(pe.lap.k)),
+)
+def _build_lap(pe, n_embed):
+    return LapPE(n_embed, int(pe.lap.k), bool(pe.lap.sign_flip))
 
 
 class NodePositionalEncoding(nn.Module):
@@ -196,9 +254,41 @@ class NodePositionalEncoding(nn.Module):
                 if key == "pos":
                     inputs[key] = self.coordinates(batched_data, dtype, device)
                 else:
-                    inputs[key] = getattr(batched_data, key).to(device=device, dtype=dtype)
-            total = total + encoder(inputs[key])
+                    value = getattr(batched_data, key, None)
+                    if value is None:
+                        raise ValueError(
+                            f"positional encoding '{name}' reads `{key}` off the graphs, but they carry "
+                            "none. It is precomputed by attach_positional_inputs when the graphs are "
+                            "built (prepare_geome_dataset, get_model_output)."
+                        )
+                    inputs[key] = value.to(device=device, dtype=dtype)
+            x = inputs[key]
+            if self.training and hasattr(encoder, "augment"):
+                x = encoder.augment(x, batched_data.batch.to(device=device, dtype=torch.long), self.generator)
+            total = total + encoder(x)
         return total
+
+
+def _enabled(cfg) -> tuple[list[str], object]:
+    params = cfg.model.global_component.get("parameters", None)
+    pe = params.get("pe", None) if params is not None else None
+    return (list(pe.node) if pe is not None else []), pe
+
+
+def attach_positional_inputs(datas, cfg) -> None:
+    """Store what the enabled encodings precompute (e.g. ``lap_pe``) on each graph, in place.
+
+    Called wherever graphs are built -- ``prepare_geome_dataset`` and the models'
+    ``get_model_output`` -- so training and evaluation see the same inputs. A no-op when no enabled
+    encoding precomputes anything.
+    """
+    names, pe = _enabled(cfg)
+    for name in names:
+        spec = PE_REGISTRY[name]
+        if spec.precompute is None:
+            continue
+        for data in datas:
+            setattr(data, spec.requires, spec.precompute(data, pe))
 
 
 def build_node_positional_encoding(cfg, n_embed: int | None) -> NodePositionalEncoding | None:
@@ -207,8 +297,7 @@ def build_node_positional_encoding(cfg, n_embed: int | None) -> NodePositionalEn
     The encoders are built inside a forked RNG, so enabling one does not shift the initialisation
     of any weight built after it.
     """
-    pe = cfg.model.global_component.parameters.get("pe", None)
-    names = list(pe.node) if pe is not None else []
+    names, pe = _enabled(cfg)
     if not names:
         return None
     if n_embed is None:
