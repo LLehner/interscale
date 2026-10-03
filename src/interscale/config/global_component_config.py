@@ -21,5 +21,28 @@ def get_global_component_cfg(cfg, global_component_name):
         # `receptive_field_hops`), so the two components stay disjoint by construction.
         cfg.model.global_component.parameters.long_range_attention = False
         cfg.model.global_component.parameters.type_gex_embedding = None
+
+        # Positional encodings, see `.claude/PE_plan.md`. An empty `node` list builds nothing and
+        # is the model from before PEs existed. Node encodings are summed into each cell's token;
+        # the list is swept through a sweep yaml's `arms:` block, never as a raw wandb list.
+        pe = cfg.model.global_component.parameters.pe = CN()
+        pe.node = []  # any of: naive, sinusoidal
+        # Coordinate encodings read `data.pos` (needs dataset.spatial_key), in µm
+        # (dataset.spatial_unit_um), with each graph's centroid subtracted: absolute slide offsets
+        # are scanner artefacts. `rotate_train` rotates each graph by a random angle in training,
+        # since tissue has no canonical orientation -- off by default, because some tissues have a
+        # meaningful axis.
+        pe.center_coords = True
+        pe.rotate_train = False
+        # An MLP of the coordinates in units of `length_scale` (µm).
+        pe.naive = CN()
+        pe.naive.hidden_dim = 32
+        pe.naive.length_scale = 100.0
+        # sin/cos at dim/4 geometric wavelengths per axis, from about a cell diameter to about a
+        # graph's extent (µm). `tl.get_average_local_and_global_size` reports both for a dataset.
+        pe.sinusoidal = CN()
+        pe.sinusoidal.dim = 32
+        pe.sinusoidal.min_wavelength = 10.0
+        pe.sinusoidal.max_wavelength = 1000.0
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

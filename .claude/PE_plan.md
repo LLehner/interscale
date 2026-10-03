@@ -15,9 +15,9 @@ it. "Implemented, unverified" is a real state.
 | stage | state | verified by | date |
 |---|---|---|---|
 | P — two pre-existing fixes (mask reach from the local module, objective validator) | **done** | 331 tests pass, incl. built-model checks (GCN/GIN 1–3 layers, single and dual decoder, SCVI → 0, `GlobalModel` → 0 + warning) and GIN's reach against its gradient-measured receptive field; equivalence harness IDENTICAL (4 cases / 12 epochs — none uses long-range masking); a real `CombinedModel` run with long-range on builds a 2-hop mask and trains finite (single and dual decoder) | 2026-10-03 |
-| 0 — plumbing, no behaviour change | not started | | |
-| 1 — naive PE | not started | | |
-| 2 — 2D sinusoidal | not started | | |
+| 0 — plumbing, no behaviour change (node half; see 'How Stages 0–2 differed') | **done** | 352 tests pass; equivalence harness IDENTICAL across 5 cases / 15 epochs incl. the long-range one; PE-on and PE-off at one seed share every other initial weight and the first forward (test, and mutation-checked: without the RNG fork it fails) | 2026-10-03 |
+| 1 — naive PE | **implemented, unverified** — translation-invariant by centring (test, mutation-checked), unit conversion, rotation on its own generator; trains finite and moves off the PE-free run through `GlobalModel`, `CombinedModel`, dual decoder and long-range; `get_model_output` runs. **No real-data run yet** | 2026-10-03 |
+| 2 — 2D sinusoidal | **implemented, unverified** — closed form and distance decay pinned; same end-to-end checks as Stage 1. **No real-data run yet** | 2026-10-03 |
 | 3 — LapPE | not started | | |
 | 4 — RWPE | not started | | |
 | 5 — distance bias | not started | | |
@@ -137,8 +137,27 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
   any existing weight nor the batch order at a given seed, so seed-paired comparisons stay paired.
 - The checkpoint prefix gains `pe-<names>_` when any PE is on (unchanged otherwise). The prefix
   carries the seed but not the PE, so without this the sweep arms overwrite each other's
-  checkpoints. Loading `pe.*` weights into a config without them must raise — `strict=False`
-  would drop them silently.
+  checkpoints. A checkpoint/config mismatch in `pe.*` weights already raises: `BaseModel.load`
+  rejects any missing or unexpected key unless `allow_partial_load`.
+
+### How Stages 0–2 differed from this plan
+
+- **Stage 0 was built for node encodings only.** `pad_like`, `GlobalInput`, the `attn_bias`
+  argument and the precompute hook have no consumer before Stages 3 and 5, so they arrive with
+  those stages rather than as untested scaffolding (the contrastive plan deferred its projection
+  heads the same way). The registry already carries `kind` and `requires`, which is what they will
+  plug into.
+- **Every node encoder's output layer starts at zero**, not only the distance bias's. With the RNG
+  fork that makes "PE on" and "PE off" at one seed identical until the first optimiser step.
+- **No load guard was needed** — see the last bullet above.
+- **Each encoder validates its own sub-block** (`PESpec.validate`), so a new encoding brings its
+  checks with it; `_validate_pe` adds only the cross-cutting one (coordinates need
+  `dataset.spatial_key`).
+- **Node PEs are added after the first `norm_input`** (`common_step_local_to_global`), so the
+  second one, in `forward`, normalises token and PE together.
+- Code: `module/global_modules/positional_encodings.py` (registry, `NaivePE`, `SinusoidalPE`,
+  `NodePositionalEncoding`), built in `GlobalModule.from_config`; config in
+  `get_global_component_cfg`; tests in `tests/test_positional_encodings.py`.
 
 ## The five encodings
 
@@ -241,9 +260,6 @@ effect differs (see above). The base config must set `dataset.spatial_key`.
 
 ## Open questions
 
-- Node PE before or after the first `norm_input`? The module applies it twice
-  (`transformer_encoder.py:88` and `:154`). Proposed: after the first, so the second normalises
-  token + PE together.
 - Fixed µm defaults for the wavelengths and `max_dist`, or derived per dataset from the window
   extent?
 - `rotate_train` is off by default because some tissues have a meaningful axis (layered cortex).

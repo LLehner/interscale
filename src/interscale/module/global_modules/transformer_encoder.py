@@ -28,6 +28,7 @@ class TransformerNodeEncoderHook(GlobalModule):
         dropout_global: float = 0.1,
         long_range_attention: bool = True,
         local_mask_hops: int = 1,
+        positional_encoding: nn.Module | None = None,
         **base_module_kwargs,
     ):
 
@@ -71,6 +72,10 @@ class TransformerNodeEncoderHook(GlobalModule):
         # Register self-attention relevance hook
         self.self_attn_relevance = SelfAttentionRelevance(self.transformer_encoder)
 
+        # Node positional encodings (`positional_encodings.py`), or None when the config enables
+        # none -- in which case nothing is registered and the module is the one from before PEs.
+        self.positional_encoding = positional_encoding
+
     def common_step_local_to_global(self, batched_data, emb: torch.Tensor, eval_step: bool = False):
         """Convert local node embeddings ``[N, E]`` to padded local node embeddings ``[max_seq_len, E]``.
 
@@ -99,6 +104,11 @@ class TransformerNodeEncoderHook(GlobalModule):
         """
         # Layer normalization
         emb = self.norm_input(emb)
+        if self.positional_encoding is not None:
+            # Added to the flat [N, E] tokens BEFORE pad_batch: pad_batch subsamples with its own
+            # randomness when a graph exceeds max_seq_len, so anything per-cell must ride along
+            # here or be gathered by the index_nodes it returns -- never padded a second time.
+            emb = emb + self.positional_encoding(batched_data, dtype=emb.dtype, device=emb.device)
 
         if self.masked_nodes and not eval_step:
             keep_indices = batched_data.mask
@@ -249,5 +259,6 @@ class TransformerNodeEncoderHook(GlobalModule):
             f"num_layers: {self.num_layers}, \n"
             f"long_range_attention: {self.long_range_attention}, \n"
             f"local_mask_hops: {self.local_mask_hops}, \n"
+            f"positional_encoding: {sorted(self.positional_encoding.encoders) if self.positional_encoding else []}, \n"
         )
         return summary

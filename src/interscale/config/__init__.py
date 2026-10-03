@@ -256,6 +256,47 @@ def _validate_probe(cfg):
             )
 
 
+def _validate_pe(cfg):
+    """Reject positional-encoding settings that would fail mid-run.
+
+    Each encoding checks its own sub-block (``PESpec.validate``); this adds what the registry
+    cannot know -- whether the coordinates a coordinate encoding needs are attached at all. Without
+    ``dataset.spatial_key`` the graphs carry no ``pos``, and the failure would otherwise come at
+    the first training step, after the whole dataset was built.
+
+    Raises
+    ------
+    ValueError
+        If ``pe.node`` names an unknown or duplicate encoding, or an encoding's settings are invalid.
+    """
+    params = cfg.model.global_component.get("parameters", None)
+    pe = params.get("pe", None) if params is not None else None
+    if pe is None or not pe.node:
+        return
+
+    from interscale.module.global_modules.positional_encodings import PE_REGISTRY
+
+    names = list(pe.node)
+    unknown = sorted(set(names) - set(PE_REGISTRY))
+    if unknown:
+        raise ValueError(f"pe.node names unknown positional encodings {unknown}. Known: {sorted(PE_REGISTRY)}.")
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"pe.node lists {duplicates} more than once; each encoding is added once.")
+
+    for name in names:
+        PE_REGISTRY[name].validate(pe)
+
+    needs_pos = [name for name in names if PE_REGISTRY[name].requires == "pos"]
+    if needs_pos and cfg.dataset.spatial_key is None:
+        raise ValueError(
+            f"pe.node enables {needs_pos}, which encode cell coordinates, but dataset.spatial_key is "
+            "unset, so no coordinates are attached to the graphs. Set it (e.g. 'spatial')."
+        )
+    if needs_pos and not cfg.dataset.spatial_unit_um > 0:
+        raise ValueError(f"dataset.spatial_unit_um must be > 0, got {cfg.dataset.spatial_unit_um}.")
+
+
 def _validate(cfg):
     """Run every load-time check.
 
@@ -267,6 +308,7 @@ def _validate(cfg):
     _validate_masking(cfg)
     _validate_objective(cfg)
     _validate_probe(cfg)
+    _validate_pe(cfg)
 
 
 def load_config(cfg_path=None, overrides=None):

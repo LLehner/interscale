@@ -77,6 +77,10 @@ def get_dataset_cfg(cfg):
     cfg.dataset.condition_key = None
     cfg.dataset.celltype_key = None
     cfg.dataset.spatial_key = None
+    # Micrometres per unit of `obsm[spatial_key]`: 1.0 for coordinates already in µm, the pixel
+    # size for pixel coordinates (0.138 for Resolve MC1). Positional encodings state their length
+    # scales in µm, so this is what keeps those settings comparable across datasets.
+    cfg.dataset.spatial_unit_um = 1.0
 
     # Any further obs columns to attach, by name. Each becomes a `Data` attribute of the same
     # name, one-hot encoded if categorical, and is covered by the same category-preservation and

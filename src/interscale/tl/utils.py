@@ -65,6 +65,20 @@ def check_and_update_cfg(
     return cfg
 
 
+def _positional_encoding_tag(cfg) -> str:
+    """``pe-<names>_`` when the global component enables positional encodings, else ``""``.
+
+    Part of the checkpoint prefix because the prefix is also how a sweep keeps its trials apart:
+    it carries the seed but nothing else that a PE ablation varies, so without the tag every arm
+    of a PE sweep would overwrite the previous arm's checkpoint. Empty when off, so every name from
+    before PEs is unchanged.
+    """
+    params = cfg.model.global_component.get("parameters", None)
+    pe = params.get("pe", None) if params is not None else None
+    names = list(pe.node) if pe is not None else []
+    return f"pe-{'+'.join(names)}_" if names else ""
+
+
 def get_model_filename_prefix(cfg, local_component: bool, global_component: bool):
     """Generate the filename prefix for saving model files.
 
@@ -91,12 +105,14 @@ def get_model_filename_prefix(cfg, local_component: bool, global_component: bool
         # GlobalModel: only global component
         if cfg.model.global_component.name:
             file_name_prefix = file_name_prefix + f"{cfg.model.global_component.name}_"
+        file_name_prefix = file_name_prefix + _positional_encoding_tag(cfg)
     elif local_component and global_component:
         # CombinedModel: both components
         if cfg.model.local_component.name:
             file_name_prefix = file_name_prefix + f"{cfg.model.local_component.name}_"
         if cfg.model.global_component.name:
             file_name_prefix = file_name_prefix + f"{cfg.model.global_component.name}_"
+        file_name_prefix = file_name_prefix + _positional_encoding_tag(cfg)
         if cfg.model.decoder.dual_decoder:
             file_name_prefix = "dual_" + file_name_prefix
     else:
