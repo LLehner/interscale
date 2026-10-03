@@ -14,7 +14,7 @@ it. "Implemented, unverified" is a real state.
 
 | stage | state | verified by | date |
 |---|---|---|---|
-| P — two pre-existing fixes (mask reach from the local module, objective validator) | not started | | |
+| P — two pre-existing fixes (mask reach from the local module, objective validator) | **done** | 331 tests pass, incl. built-model checks (GCN/GIN 1–3 layers, single and dual decoder, SCVI → 0, `GlobalModel` → 0 + warning) and GIN's reach against its gradient-measured receptive field; equivalence harness IDENTICAL (4 cases / 12 epochs — none uses long-range masking); a real `CombinedModel` run with long-range on builds a 2-hop mask and trains finite (single and dual decoder) | 2026-10-03 |
 | 0 — plumbing, no behaviour change | not started | | |
 | 1 — naive PE | not started | | |
 | 2 — 2D sinusoidal | not started | | |

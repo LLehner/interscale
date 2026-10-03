@@ -256,6 +256,19 @@ def _validate_probe(cfg):
             )
 
 
+def _validate(cfg):
+    """Run every load-time check.
+
+    One list, called from both branches of :func:`load_config`. The checks used to be repeated
+    per branch, and ``_validate_objective`` only ever reached the defaults-only one -- so it never
+    ran for a config file, which is every real run.
+    """
+    _validate_optim(cfg)
+    _validate_masking(cfg)
+    _validate_objective(cfg)
+    _validate_probe(cfg)
+
+
 def load_config(cfg_path=None, overrides=None):
     """Loads and optionally overrides config values.
 
@@ -283,10 +296,7 @@ def load_config(cfg_path=None, overrides=None):
     # Documented as defaults-only, but the code below dereferences cfg_path
     # unconditionally, so None used to raise AttributeError too.
     if not cfg_paths and not overrides:
-        _validate_optim(cfg)
-        _validate_masking(cfg)
-        _validate_objective(cfg)
-        _validate_probe(cfg)
+        _validate(cfg)
         cfg.freeze()
         return cfg
 
@@ -304,8 +314,6 @@ def load_config(cfg_path=None, overrides=None):
     if overrides:
         cfg.merge_from_list(_coerce_override_values(cfg, overrides))
 
-    _validate_optim(cfg)
-    _validate_masking(cfg)
-    _validate_probe(cfg)
+    _validate(cfg)
     cfg.freeze()
     return cfg
