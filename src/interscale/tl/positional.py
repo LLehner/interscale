@@ -7,6 +7,22 @@ from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import eigsh
 
 
+def _adjacency(edge_index: torch.Tensor, n: int) -> sp.csr_matrix:
+    """The graph as an unweighted, undirected ``[n, n]`` adjacency without self loops."""
+    src, dst = edge_index.detach().cpu().numpy()
+    keep = src != dst
+    adj = sp.coo_matrix((np.ones(int(keep.sum())), (src[keep], dst[keep])), shape=(n, n)).tocsr()
+    return ((adj + adj.T) > 0).astype(np.float64)
+
+
+def _normalised(adj: sp.csr_matrix) -> sp.csr_matrix:
+    """``D^-1/2 A D^-1/2``, with isolated nodes' rows and columns left at zero."""
+    deg = np.asarray(adj.sum(axis=1)).ravel()
+    inv_sqrt = np.zeros(adj.shape[0])
+    inv_sqrt[deg > 0] = deg[deg > 0] ** -0.5
+    return (sp.diags(inv_sqrt) @ adj @ sp.diags(inv_sqrt)).tocsr()
+
+
 def laplacian_pe(edge_index: torch.Tensor, num_nodes: int, k: int, *, dense_max_nodes: int = 500) -> torch.Tensor:
     """``[num_nodes, k]`` lowest non-trivial eigenvectors of the symmetric normalised Laplacian.
 
@@ -39,15 +55,8 @@ def laplacian_pe(edge_index: torch.Tensor, num_nodes: int, k: int, *, dense_max_
     if n == 0:
         return torch.from_numpy(out)
 
-    src, dst = edge_index.detach().cpu().numpy()
-    keep = src != dst
-    adj = sp.coo_matrix((np.ones(int(keep.sum())), (src[keep], dst[keep])), shape=(n, n)).tocsr()
-    adj = ((adj + adj.T) > 0).astype(np.float64)
-
-    deg = np.asarray(adj.sum(axis=1)).ravel()
-    inv_sqrt = np.zeros(n)
-    inv_sqrt[deg > 0] = deg[deg > 0] ** -0.5
-    lap = sp.identity(n, format="csr") - sp.diags(inv_sqrt) @ adj @ sp.diags(inv_sqrt)
+    adj = _adjacency(edge_index, n)
+    lap = sp.identity(n, format="csr") - _normalised(adj)
 
     n_components, labels = connected_components(adj, directed=False)
     n_trivial = int((np.bincount(labels, minlength=n_components) > 1).sum())
@@ -66,4 +75,34 @@ def laplacian_pe(edge_index: torch.Tensor, num_nodes: int, k: int, *, dense_max_
         signs[signs == 0] = 1.0
         vecs = vecs * signs
     out[:, : vecs.shape[1]] = vecs
+    return torch.from_numpy(out)
+
+
+def random_walk_pe(edge_index: torch.Tensor, num_nodes: int, steps: int) -> torch.Tensor:
+    """``[num_nodes, steps]`` return probabilities of a random walk after t = 1..steps steps.
+
+    ``diag((D^-1 A)^t)``: the probability that a walk from a cell, stepping to a uniformly chosen
+    neighbour each time, is back at that cell after t steps -- LSPE's RWPE, GraphGPS's RWSE, and the
+    same values as PyG's ``AddRandomWalkPE``. Same graph as :func:`laplacian_pe`. Column 1 is
+    ``diag(D^-1 A)``, zero without self loops; it is kept so the encoding matches that definition.
+    Isolated cells, which have no walk, get zeros.
+
+    The full powers are never formed. ``D^-1 A`` is similar to the symmetric ``S = D^-1/2 A D^-1/2``
+    through a diagonal matrix, which leaves the diagonal of every power unchanged, and for a
+    symmetric ``S``, ``diag(S^(a+b))_i`` is the dot product of row ``i`` of ``S^a`` and ``S^b``. So
+    powers only up to ``ceil(steps / 2)`` are needed, and a power's fill-in is everything within that
+    many hops: at half the steps, a fraction of what the full powers would hold on a slide.
+    """
+    n = int(num_nodes)
+    out = np.zeros((n, steps), dtype=np.float32)
+    if n == 0 or steps == 0:
+        return torch.from_numpy(out)
+
+    sym = _normalised(_adjacency(edge_index, n))
+    powers = [sp.identity(n, format="csr")]
+    for _ in range((steps + 1) // 2):
+        powers.append((powers[-1] @ sym).tocsr())
+    for t in range(1, steps + 1):
+        a, b = (t + 1) // 2, t // 2
+        out[:, t - 1] = np.asarray(powers[a].multiply(powers[b]).sum(axis=1)).ravel()
     return torch.from_numpy(out)

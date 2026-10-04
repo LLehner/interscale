@@ -32,7 +32,7 @@ import torch
 from torch import nn
 from torch_geometric.utils import scatter
 
-from interscale.tl.positional import laplacian_pe
+from interscale.tl.positional import laplacian_pe, random_walk_pe
 
 
 @dataclass(frozen=True)
@@ -150,6 +150,36 @@ class LapPE(nn.Module):
         return self.proj(self._check(eigvecs))
 
 
+class RWPE(nn.Module):
+    """Random-walk return probabilities (precomputed), normalised, projected to the token width.
+
+    The probabilities are small and fall with the number of steps, so a BatchNorm over the batch's
+    cells puts the columns on one scale before the projection, as GraphGPS does for its RWSE. Its
+    running statistics are what evaluation uses; they only move in ``train()`` mode, and the online
+    probe runs in ``eval()``.
+
+    ``eps`` is 1e-8, not BatchNorm's 1e-5: the spread of a late step's return probability across
+    cells is ~5e-3 on a 14-neighbour graph and smaller on denser ones, so a variance of ~1e-5 is
+    typical and the default would divide by ~sqrt(2x) of it -- shrinking exactly the columns the
+    normalisation is for (to 84% at step 16 there, and further as density rises). An exactly
+    constant column, such as step 1, still comes out at zero.
+    """
+
+    def __init__(self, n_embed: int, steps: int):
+        super().__init__()
+        self.steps = int(steps)
+        self.norm = nn.BatchNorm1d(self.steps, eps=1e-8)
+        self.proj = _zero_(nn.Linear(self.steps, n_embed))
+
+    def forward(self, probs: torch.Tensor) -> torch.Tensor:
+        if probs.shape[1] != self.steps:
+            raise ValueError(
+                f"rw_pe has {probs.shape[1]} steps per cell but pe.rw.steps is {self.steps}; the graphs "
+                "were built with a different config. Rebuild them (attach_positional_inputs)."
+            )
+        return self.proj(self.norm(probs))
+
+
 def _positive(value, name):
     if not value > 0:
         raise ValueError(f"model.global_component.parameters.pe.{name} must be > 0, got {value}.")
@@ -177,6 +207,10 @@ def _validate_lap(pe):
     _positive(pe.lap.k, "lap.k")
 
 
+def _validate_rw(pe):
+    _positive(pe.rw.steps, "rw.steps")
+
+
 @register_pe("naive", kind="node", requires="pos", validate=_validate_naive)
 def _build_naive(pe, n_embed):
     return NaivePE(n_embed, int(pe.naive.hidden_dim), float(pe.naive.length_scale))
@@ -197,6 +231,17 @@ def _build_sinusoidal(pe, n_embed):
 )
 def _build_lap(pe, n_embed):
     return LapPE(n_embed, int(pe.lap.k), bool(pe.lap.sign_flip))
+
+
+@register_pe(
+    "rw",
+    kind="node",
+    requires="rw_pe",
+    validate=_validate_rw,
+    precompute=lambda data, pe: random_walk_pe(data.edge_index, data.num_nodes, int(pe.rw.steps)),
+)
+def _build_rw(pe, n_embed):
+    return RWPE(n_embed, int(pe.rw.steps))
 
 
 class NodePositionalEncoding(nn.Module):

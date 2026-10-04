@@ -8,7 +8,7 @@ node-feature vs. attention-bias split. Read [`background.md`](background.md) fir
 
 ## Status
 
-Last updated 2026-10-03. Same rules as [`contrastive_plan.md`](contrastive_plan.md): update this
+Last updated 2026-10-04. Same rules as [`contrastive_plan.md`](contrastive_plan.md): update this
 table in the same commit as the work, and a stage is `done` only when something external verified
 it. "Implemented, unverified" is a real state.
 
@@ -19,7 +19,7 @@ it. "Implemented, unverified" is a real state.
 | 1 — naive PE | **implemented, unverified** — translation-invariant by centring (test, mutation-checked), unit conversion, rotation on its own generator; trains finite and moves off the PE-free run through `GlobalModel`, `CombinedModel`, dual decoder and long-range; `get_model_output` runs. **No real-data run yet** | 2026-10-03 |
 | 2 — 2D sinusoidal | **implemented, unverified** — closed form and distance decay pinned; same end-to-end checks as Stage 1. **No real-data run yet** | 2026-10-03 |
 | 3 — LapPE | **implemented, unverified** — equals PyG's `AddLaplacianEigenvectorPE` up to sign on connected graphs (both PyG solver paths); dense and sparse solvers agree exactly; one trivial eigenvector dropped per component, zero-padding, canonical signs, orthonormal columns; flips per graph, training only, off the global RNG (each mutation-checked); harness IDENTICAL with PEs off; trains finite through `GlobalModel`, `CombinedModel`, dual decoder and long-range; `get_model_output` runs; precompute 2.4 s for a 50k-cell 6-NN graph. **No real-data run yet** | 2026-10-03 |
-| 4 — RWPE | not started | | |
+| 4 — RWPE | **implemented, unverified** — equals the definition (full dense powers) at odd and even steps, and PyG's `AddRandomWalkPE`; isolated cells → zeros; BatchNorm keeps small late-step spreads instead of squashing them (`eps` 1e-8, see notes); each mutation-checked; harness IDENTICAL with PEs off; trains finite through `GlobalModel`, `CombinedModel`, dual decoder and long-range, alone and with lap + sinusoidal; `get_model_output` runs; precompute 9.4 s for a 50k-cell, 14-neighbour graph at 16 steps. **No real-data run yet** | 2026-10-04 |
 | 5 — distance bias | not started | | |
 | 6 — PE probe control + ablation sweep | not started | | |
 
@@ -169,7 +169,7 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
 | naive | node | centred pos / `length_scale` | MLP 2 → hidden → `n_embed` | translation |
 | sinusoidal | node | centred pos (µm) | sin/cos at `dim/4` geometric wavelengths per axis → Linear | translation |
 | lap | node | `k` lowest non-trivial eigenvectors, sym. normalised Laplacian | Linear; random sign flip per vector per graph (training) | translation, rotation |
-| rw | node | `diag((D⁻¹A)^t)`, t = 1..steps | BatchNorm → Linear (GraphGPS) | translation, rotation |
+| rw | node | `diag((D⁻¹A)^t)`, t = 1..steps | BatchNorm (`eps` 1e-8) → Linear (GraphGPS) | translation, rotation |
 | distance | bias | ‖pᵢ − pⱼ‖ in µm, clamped at `max_dist` | K Gaussian RBFs → Linear(K → heads), zero-init, shared across layers | translation, rotation |
 
 - **naive / sinusoidal**: a fixed physical scale, not SpaFormer's per-FOV min-max — graphs here
@@ -184,9 +184,17 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
   `1/sqrt(N)` — a 50k-cell slide gets ~10x smaller values than a 500-cell window. Harmless while a
   run's graphs are of similar size; with mixed sizes (whole slides beside windows), scale by
   `sqrt(N)` (a one-flag change in `tl.laplacian_pe`). Listed under open questions too.
-- **rw**: isolated nodes get zeros. On a near-regular kNN graph the return probabilities are
-  almost constant, so report per-dimension variance before reading a null result as "RW doesn't
-  help".
+- **rw**: isolated nodes get zeros; step 1 is always 0 without self loops (kept for parity with
+  the standard definition). Computed from half-powers of the symmetric `D^-1/2 A D^-1/2`, which
+  has the same diagonal powers as `D^-1 A`, so a 50k-cell slide never forms 16-hop fill-in; still
+  ~9 s per 50k-cell graph at 16 steps, paid again in every sweep trial.
+  *Measured, correcting the earlier worry:* a symmetrised kNN graph is **not** near-regular (6-NN
+  gives mean degree 12, varying per cell), and return probabilities there spread across cells by
+  as much as on radius graphs (std 0.007–0.011 against means 0.02–0.14). Still check the spread
+  before reading a null result.
+  *BatchNorm `eps`:* late-step spreads are ~5e-3 (variance ~1e-5) on a 14-neighbour graph and
+  smaller on denser ones; BatchNorm's default `eps` 1e-5 would keep only 84% of the step-16 spread
+  there and ~14% at a spread of ~4e-4. GraphGPS uses the default; this uses 1e-8.
 - **distance**: zero-init, so switching it on changes nothing at step 0. With the long-range mask
   on, the bias inside the mask radius is never used — interpret `b_h(d)` only beyond it.
 

@@ -26,7 +26,7 @@ def get_global_component_cfg(cfg, global_component_name):
         # is the model from before PEs existed. Node encodings are summed into each cell's token;
         # the list is swept through a sweep yaml's `arms:` block, never as a raw wandb list.
         pe = cfg.model.global_component.parameters.pe = CN()
-        pe.node = []  # any of: naive, sinusoidal, lap
+        pe.node = []  # any of: naive, sinusoidal, lap, rw
         # Coordinate encodings read `data.pos` (needs dataset.spatial_key), in µm
         # (dataset.spatial_unit_um), with each graph's centroid subtracted: absolute slide offsets
         # are scanner artefacts. `rotate_train` rotates each graph by a random angle in training,
@@ -50,5 +50,11 @@ def get_global_component_cfg(cfg, global_component_name):
         pe.lap = CN()
         pe.lap.k = 8
         pe.lap.sign_flip = True
+        # Return probabilities of a random walk after 1..steps steps on the same graph
+        # (`tl.random_walk_pe`), precomputed once per graph. They encode local structure -- degree,
+        # triangles, density -- not position. Check their spread across cells before reading a null
+        # result: it vanishes only on a truly regular graph (a symmetrised kNN graph is not one).
+        pe.rw = CN()
+        pe.rw.steps = 16
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

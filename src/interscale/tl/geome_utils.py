@@ -9,8 +9,19 @@ from yacs.config import CfgNode as CN
 #: Names the pipeline builds itself. An ``extra_obs_keys`` entry may not shadow one of these:
 #: attaching an obs column called ``mask`` would replace the corruption mask with a label and the
 #: run would train against its own annotation without failing.
-# `lap_pe` is precomputed onto the graphs by `attach_positional_inputs` when LapPE is enabled.
-RESERVED_FIELD_NAMES = {"x", "y", "edge_index", "obs_names", "embeddings", "batch", "mask", "gene_mask", "lap_pe"}
+# `lap_pe` and `rw_pe` are precomputed onto the graphs by `attach_positional_inputs` when enabled.
+RESERVED_FIELD_NAMES = {
+    "x",
+    "y",
+    "edge_index",
+    "obs_names",
+    "embeddings",
+    "batch",
+    "mask",
+    "gene_mask",
+    "lap_pe",
+    "rw_pe",
+}
 
 #: Optional annotations attached to every PyG ``Data``: attribute name -> (config key, source).
 #: Each is attached only when its ``cfg.dataset.*`` entry is set, so the default config produces

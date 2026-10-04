@@ -27,7 +27,7 @@ from .masking import (
     sample_node_mask,
 )
 from .padding import pad_batch
-from .positional import laplacian_pe
+from .positional import laplacian_pe, random_walk_pe
 from .self_attn_relevance import SelfAttentionRelevance
 from .utils import check_and_update_cfg, local_reach_hops, set_full_reproducibility
 
@@ -41,6 +41,7 @@ __all__ = [
     "prepare_a2d_dataset",
     "pad_batch",
     "laplacian_pe",
+    "random_walk_pe",
     "check_and_update_cfg",
     "set_full_reproducibility",
     "SelfAttentionRelevance",

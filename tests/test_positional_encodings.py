@@ -256,6 +256,7 @@ def test_a_valid_pe_config_loads(tmp_path):
         (["node: [sinusoidal]", "sinusoidal:", "  max_wavelength: 5.0"], True, "max_wavelength"),
         (["node: [naive]", "naive:", "  length_scale: 0.0"], True, "length_scale"),
         (["node: [lap]", "lap:", "  k: 0"], True, "lap.k"),
+        (["node: [rw]", "rw:", "  steps: 0"], True, "rw.steps"),
     ],
 )
 def test_invalid_pe_configs_fail_at_load(tmp_path, lines, spatial, match):
@@ -269,6 +270,7 @@ def test_the_registry_holds_the_node_encodings_built_so_far():
         "naive": ("node", "pos", False),
         "sinusoidal": ("node", "pos", False),
         "lap": ("node", "lap_pe", True),
+        "rw": ("node", "rw_pe", True),
     }
 
 
@@ -568,3 +570,105 @@ def test_attach_positional_inputs_stores_eigenvectors_only_when_enabled():
 
     assert getattr(off, "lap_pe", None) is None
     assert torch.equal(on.lap_pe, laplacian_pe(edge_index, 40, 5))
+
+
+# --------------------------------------------------------------------------- random-walk return probabilities
+
+
+def _brute_force_rw(edge_index, n, steps):
+    """diag((D^-1 A)^t) from the full dense powers -- the definition, independent of any shortcut."""
+    adj = torch.zeros(n, n, dtype=torch.float64)
+    adj[edge_index[0], edge_index[1]] = 1.0
+    adj = ((adj + adj.t()) > 0).double()
+    adj.fill_diagonal_(0)
+    deg = adj.sum(1, keepdim=True)
+    walk = torch.where(deg > 0, adj / deg.clamp(min=1), torch.zeros_like(adj))
+    power, cols = torch.eye(n, dtype=torch.float64), []
+    for _ in range(steps):
+        power = power @ walk
+        cols.append(power.diagonal().clone())
+    return torch.stack(cols, dim=1)
+
+
+def test_rw_pe_equals_the_definition_at_every_step():
+    """The half-power shortcut against full dense powers: odd and even steps, and an isolated cell."""
+    from interscale.tl import random_walk_pe
+
+    edge_index = _geometric_graph(70, radius=0.2, seed=3)
+    steps = 9
+
+    ours = random_walk_pe(edge_index, 70, steps).double()
+
+    assert torch.allclose(ours, _brute_force_rw(edge_index, 70, steps), atol=1e-6)
+    assert not ours[:, 0].any(), "one step cannot return without a self loop"
+
+
+def test_rw_pe_matches_pyg():
+    from torch_geometric.data import Data
+    from torch_geometric.transforms import AddRandomWalkPE
+
+    from interscale.tl import random_walk_pe
+
+    n, steps = 120, 8
+    edge_index = _geometric_graph(n, radius=0.15, seed=4)
+
+    ours = random_walk_pe(edge_index, n, steps)
+    theirs = AddRandomWalkPE(steps, attr_name="pe")(Data(edge_index=edge_index, num_nodes=n)).pe
+
+    assert torch.allclose(ours, theirs, atol=1e-5)
+
+
+def test_rw_pe_gives_isolated_cells_zeros_and_walks_probabilities():
+    from interscale.tl import random_walk_pe
+
+    edge_index = torch.tensor([[0, 1, 1, 2, 2, 0], [1, 0, 2, 1, 0, 2]])  # a triangle; node 3 isolated
+    pe = random_walk_pe(edge_index, 4, 4)
+
+    assert not pe[3].any()
+    # On a triangle: back after 2 steps with p 1/2, after 3 steps with p 1/4 (two orientations x 1/8).
+    assert torch.allclose(pe[0], torch.tensor([0.0, 0.5, 0.25, 0.375]), atol=1e-6)
+
+
+def test_rw_encoder_normalises_small_spreads_instead_of_squashing_them():
+    """Late-step return probabilities vary across cells by ~1e-3, a variance of ~1e-6 -- below
+    BatchNorm's default eps of 1e-5, which would keep only ~30% of that spread."""
+    from interscale.tl import random_walk_pe
+
+    encoding = build_node_positional_encoding(_cfg(["rw"]), N_EMBED)
+    rw = encoding.encoders["rw"]
+    probs = random_walk_pe(_geometric_graph(400, radius=0.12, seed=6), 400, 16)
+    probs[:, 1:] = probs[:, 1:].mean(0) + (probs[:, 1:] - probs[:, 1:].mean(0)) * 0.1  # spreads ~1e-3
+
+    rw.train()
+    normed = rw.norm(probs)
+    default = nn.BatchNorm1d(16).train()(probs)
+
+    assert not normed[:, 0].any(), "step 1 is constant (no self loops) and stays at zero"
+    assert torch.allclose(normed[:, 1:].mean(0), torch.zeros(15), atol=1e-4)
+    assert bool((normed[:, 1:].std(0, unbiased=False) > 0.95).all()), "the spread is normalised to ~1"
+    assert bool((default[:, -1].std(unbiased=False) < 0.5).all()), "BatchNorm's default eps would squash it"
+
+
+def test_rw_rejects_probabilities_from_a_different_step_count():
+    encoding = build_node_positional_encoding(_cfg(["rw"]), N_EMBED)
+    batch = _batch(torch.rand(5, 2), edges=False)
+    batch.rw_pe = torch.rand(5, 4)
+
+    with pytest.raises(ValueError, match="pe.rw.steps"):
+        encoding(batch, dtype=torch.float32, device=torch.device("cpu"))
+
+
+def test_attach_positional_inputs_stores_return_probabilities_only_when_enabled():
+    from torch_geometric.data import Data
+
+    from interscale.module.global_modules.positional_encodings import attach_positional_inputs
+    from interscale.tl import random_walk_pe
+
+    edge_index = _geometric_graph(40, radius=0.3, seed=5)
+    off, on = Data(edge_index=edge_index, num_nodes=40), Data(edge_index=edge_index, num_nodes=40)
+
+    attach_positional_inputs([off], _cfg(["lap"]))
+    attach_positional_inputs([on], _cfg(["rw"]))
+
+    assert getattr(off, "rw_pe", None) is None
+    assert torch.equal(on.rw_pe, random_walk_pe(edge_index, 40, 16))
