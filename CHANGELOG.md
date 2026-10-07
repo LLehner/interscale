@@ -82,6 +82,9 @@ and this project adheres to [Semantic Versioning][].
 - Under gene masking, the row-normalising losses (`SCELoss`, `SCE_EntropyATT_Loss`,
   `BalancedPearsonCorrelationLoss`) counted a cell with no masked gene as an all-zero row. Such
   cells are now left out; at typical rates and panel sizes they almost never occur.
+- `optim.monitor` minimised only metrics ending in `loss`, so monitoring an error -- `val_mse`, or
+  the new scaled cosine error -- made early stopping and checkpointing keep the *worst* epoch. Names
+  ending in `error` or `mse` are now minimised too.
 
 ## [0.0.1]
 

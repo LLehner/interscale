@@ -182,3 +182,25 @@ def test_the_config_keeps_gamma_three_by_default_and_rejects_below_one():
     assert load_config(overrides=["optim.sce_gamma", 2]).optim.sce_gamma == 2.0
     with pytest.raises(ValueError, match="sce_gamma"):
         load_config(overrides=["optim.sce_gamma", 0.5])
+
+
+@pytest.mark.parametrize(
+    ("monitor", "mode"),
+    [
+        ("val_masked_scaled_cosine_error", "min"),
+        ("val_scaled_cosine_error", "min"),
+        ("val_mse", "min"),
+        ("val_loss", "min"),
+        ("val_r2", "max"),
+        ("val_masked_cosine_similarity", "max"),
+    ],
+)
+def test_early_stopping_minimises_errors(monitor, mode):
+    """Monitoring the SCE must not maximise it: the direction used to follow a `loss` suffix only."""
+    from types import SimpleNamespace
+
+    from interscale.train._training import NodeMaskingTrainingPlan
+
+    owner = SimpleNamespace(_cfg=SimpleNamespace(optim=SimpleNamespace(monitor=monitor)), prediction_task="regression")
+
+    assert NodeMaskingTrainingPlan._resolve_monitor(owner) == (monitor, mode)
