@@ -143,6 +143,7 @@ class NodeMaskingTrainingPlan:
             lr_warmup=self._cfg.optim.lr_warmup,
             lr_max_epochs=self._cfg.optim.n_epochs,
             patience_in_steps=steps_per_epoch,
+            sce_gamma=self._cfg.optim.sce_gamma,
         )
 
         monitor, mode = self._resolve_monitor()
