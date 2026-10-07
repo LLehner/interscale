@@ -318,6 +318,17 @@ def _validate(cfg):
     _validate_objective(cfg)
     _validate_probe(cfg)
     _validate_pe(cfg)
+    _validate_sce(cfg)
+
+
+def _validate_sce(cfg):
+    """Reject a scaled-cosine-error exponent below 1, before any data is built.
+
+    ``optim.sce_gamma`` is read by the regression metrics of every run, not only by ``SCELoss``,
+    so a bad value would otherwise surface when the training plan is constructed.
+    """
+    if not cfg.optim.sce_gamma >= 1:
+        raise ValueError(f"optim.sce_gamma must be >= 1 (GraphMAE's scaled cosine error), got {cfg.optim.sce_gamma}.")
 
 
 def load_config(cfg_path=None, overrides=None):
