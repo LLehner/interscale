@@ -1,16 +1,17 @@
 """Positional encodings (PEs) for the global (transformer) component.
 
 Selected by ``model.global_component.parameters.pe``; the staged design is in
-``.claude/PE_plan.md``. The plan has two kinds: *node* encodings, summed onto each cell's token
+``.claude/PE_plan.md``. Two kinds: *node* encodings (``pe.node``), summed onto each cell's token
 before ``pad_batch`` so that subsampling, node masking and padding carry them for free, and
-attention *biases* (not built yet). This module holds the node kind and the registry both will use.
+attention *biases* (``pe.bias``), added to the attention logits of every pair of tokens and merged
+into the attention mask where it is built.
 
-Three properties every node encoding keeps:
+Three properties every encoding keeps:
 
 * **Off is today's model.** With ``pe.node: []`` nothing is built -- no parameters, no state-dict
   keys, no RNG draws -- so a PE-free run is the run from before PEs existed.
-* **On changes nothing at step 0.** Every encoder's output projection starts at zero, and the
-  encoders are built inside a forked RNG. A PE run and a PE-free run at the same seed therefore
+* **On changes nothing at step 0.** Every encoder's output (a projection, or a bias table) starts
+  at zero, and the encoders are built inside a forked RNG. A PE run and a PE-free run at the same seed therefore
   share every other initial weight and the first forward pass; whatever differs later is what the
   PE was used for.
 * **Augmentation has its own generator.** ``rotate_train`` and LapPE's sign flips draw from a
@@ -32,6 +33,7 @@ import torch
 from torch import nn
 from torch_geometric.utils import scatter
 
+from interscale.tl.padding import pad_like
 from interscale.tl.positional import laplacian_pe, random_walk_pe
 
 
@@ -39,9 +41,11 @@ from interscale.tl.positional import laplacian_pe, random_walk_pe
 class PESpec:
     """What the rest of the code needs to know about one encoding.
 
+    ``kind`` is ``"node"`` (listed under ``pe.node``) or ``"bias"`` (under ``pe.bias``).
     ``requires`` names the ``Data`` attribute the encoder reads (``"pos"`` for coordinates).
-    ``build(pe_cfg, n_embed)`` returns the encoder; ``validate(pe_cfg)`` raises on settings that
-    would fail mid-run, and runs at config load. ``precompute(data, pe_cfg)``, when set, returns
+    ``build(pe_cfg, width)`` returns the encoder -- ``width`` is ``n_embed`` for a node encoding
+    (its output width) and ``n_heads`` for a bias (one value per head). ``validate(pe_cfg)`` raises
+    on settings that would fail mid-run, and runs at config load. ``precompute(data, pe_cfg)``, when set, returns
     the ``requires`` attribute for one graph; :func:`attach_positional_inputs` stores it.
     """
 
@@ -56,7 +60,7 @@ PE_REGISTRY: dict[str, PESpec] = {}
 
 
 def register_pe(name: str, *, kind: str, requires: str, validate: Callable, precompute: Callable | None = None):
-    """Register ``build(pe_cfg, n_embed) -> nn.Module`` as the encoding ``name``."""
+    """Register ``build(pe_cfg, width) -> nn.Module`` as the encoding ``name``."""
 
     def decorator(build):
         if name in PE_REGISTRY:
@@ -180,6 +184,68 @@ class RWPE(nn.Module):
         return self.proj(self.norm(probs))
 
 
+class DistanceBias(nn.Module):
+    """A learned function of the distance between two cells, one per head, added to their logit.
+
+    ``b_h(d)`` is piecewise linear between ``num_kernels`` knots spaced evenly over
+    ``[0, max_dist]`` (µm), and constant beyond. That is the plan's "K kernels -> Linear(K ->
+    heads)" with triangular kernels instead of Gaussians: each distance touches only its two
+    neighbouring knots, so the bias is two lookups into a ``[heads, K]`` table rather than a
+    ``[B, S, S, K]`` kernel expansion -- about 1.6 GB of activations per batch of four 2500-spot
+    graphs at K = 16. The table *is* the learned profile; :meth:`profile` reads it out.
+
+    The table starts at zero, so switching the bias on changes nothing at step 0. One table serves
+    every layer, as in Graphormer. With the long-range mask on, the pairs inside the mask never
+    reach the softmax, so the profile below the mask's reach is never trained.
+    """
+
+    def __init__(self, n_heads: int, num_kernels: int, max_dist: float):
+        super().__init__()
+        self.num_kernels = int(num_kernels)
+        self.max_dist = float(max_dist)
+        self.table = nn.Parameter(torch.zeros(int(n_heads), self.num_kernels))
+
+    def forward(self, dist: torch.Tensor) -> torch.Tensor:
+        """``[B, S, S]`` distances in µm to ``[B, heads, S, S]`` biases."""
+        last = self.num_kernels - 1
+        t = (dist * (last / self.max_dist)).clamp(max=last)
+        lower = t.floor().clamp(max=last - 1)
+        frac = (t - lower).unsqueeze(-1)
+        values = self.table.t()  # [K, heads]
+        lo = nn.functional.embedding(lower.long(), values)
+        hi = nn.functional.embedding(lower.long() + 1, values)
+        return (lo + frac * (hi - lo)).permute(0, 3, 1, 2)
+
+    def profile(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(knots [K] in µm, values [heads, K])`` -- each head's bias at each knot."""
+        return torch.linspace(0.0, self.max_dist, self.num_kernels), self.table.detach().cpu().clone()
+
+
+class LinearDistanceBias(nn.Module):
+    """One learned slope per head: ``b_h(d) = w_h * d``, with ``d`` in millimetres.
+
+    The ALiBi form. A negative slope makes a head's attention fall off with distance, a positive one
+    favours far cells; it cannot single out a particular distance, which is what the ``profile``
+    kind is for. No range to set, and ``heads`` parameters in total. Distances are taken in mm only
+    so that a slope of order 1 matters across a slide; Adam's steps do not depend on that unit.
+
+    The slopes start at zero, so switching the bias on changes nothing at step 0.
+    """
+
+    def __init__(self, n_heads: int):
+        super().__init__()
+        self.slope = nn.Parameter(torch.zeros(int(n_heads)))
+
+    def forward(self, dist: torch.Tensor) -> torch.Tensor:
+        """``[B, S, S]`` distances in µm to ``[B, heads, S, S]`` biases."""
+        return (dist / 1000.0).unsqueeze(1) * self.slope.view(1, -1, 1, 1)
+
+    def profile(self, max_dist: float = 1000.0) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(knots [2] in µm, values [heads, 2])`` -- the line at 0 and ``max_dist``, as for ``profile``."""
+        knots = torch.tensor([0.0, float(max_dist)])
+        return knots, self.slope.detach().cpu()[:, None] * (knots / 1000.0)
+
+
 def _positive(value, name):
     if not value > 0:
         raise ValueError(f"model.global_component.parameters.pe.{name} must be > 0, got {value}.")
@@ -209,6 +275,19 @@ def _validate_lap(pe):
 
 def _validate_rw(pe):
     _positive(pe.rw.steps, "rw.steps")
+
+
+DISTANCE_KINDS = ("profile", "linear")
+
+
+def _validate_distance(pe):
+    if pe.distance.kind not in DISTANCE_KINDS:
+        raise ValueError(f"pe.distance.kind must be one of {DISTANCE_KINDS}, got {pe.distance.kind!r}.")
+    if pe.distance.kind == "linear":
+        return  # num_kernels and max_dist only describe the profile
+    if pe.distance.num_kernels < 2:
+        raise ValueError(f"pe.distance.num_kernels must be >= 2 (the two ends), got {pe.distance.num_kernels}.")
+    _positive(pe.distance.max_dist, "distance.max_dist")
 
 
 @register_pe("naive", kind="node", requires="pos", validate=_validate_naive)
@@ -242,6 +321,13 @@ def _build_lap(pe, n_embed):
 )
 def _build_rw(pe, n_embed):
     return RWPE(n_embed, int(pe.rw.steps))
+
+
+@register_pe("distance", kind="bias", requires="pos", validate=_validate_distance)
+def _build_distance(pe, n_heads):
+    if pe.distance.kind == "linear":
+        return LinearDistanceBias(n_heads)
+    return DistanceBias(n_heads, int(pe.distance.num_kernels), float(pe.distance.max_dist))
 
 
 class NodePositionalEncoding(nn.Module):
@@ -314,10 +400,51 @@ class NodePositionalEncoding(nn.Module):
         return total
 
 
-def _enabled(cfg) -> tuple[list[str], object]:
+class AttentionBias(nn.Module):
+    """The enabled attention biases, laid out as a float attention mask ``[B * heads, S+1, S+1]``.
+
+    Positions are placed with :func:`~interscale.tl.padding.pad_like` from the ``index_nodes`` that
+    ``pad_batch`` returned -- never padded a second time, since ``pad_batch`` subsamples with its
+    own randomness -- so bias entry ``(i, j)`` belongs to tokens ``i`` and ``j`` of the sequence.
+    The layout is the boolean mask's: left-padded, CLS last, graph-major over heads. The CLS row and
+    column and every padding row and column carry zero, so merging the boolean mask in as ``-inf``
+    can never empty a row: CLS stays attendable for every query.
+    """
+
+    def __init__(self, encoders: dict[str, nn.Module], *, n_heads: int, spatial_unit_um: float):
+        super().__init__()
+        self.encoders = nn.ModuleDict(encoders)
+        self.n_heads = int(n_heads)
+        self.spatial_unit_um = float(spatial_unit_um)
+
+    def forward(self, batched_data, index_nodes, src_padding_mask, dtype, device) -> torch.Tensor:
+        pos = getattr(batched_data, "pos", None)
+        if pos is None:
+            raise ValueError(
+                f"attention biases {sorted(self.encoders)} need cell coordinates, but the graphs carry no "
+                "`pos`. Set dataset.spatial_key (e.g. 'spatial') so they are attached."
+            )
+        pos = pos.to(device=device, dtype=dtype) * self.spatial_unit_um
+        batch = batched_data.batch.to(device=device, dtype=torch.long)
+        n_graphs, seq_len = src_padding_mask.shape
+
+        padded = pad_like(pos, batch, index_nodes, seq_len)  # [B, S, 2]
+        # The exact path: the matrix-product shortcut loses ~µm on coordinates of a few mm.
+        dist = torch.cdist(padded, padded, compute_mode="donot_use_mm_for_euclid_dist")
+        bias = sum(encoder(dist) for encoder in self.encoders.values())  # [B, heads, S, S]
+
+        pad = src_padding_mask.to(device=device, dtype=torch.bool)
+        bias = bias.masked_fill(pad[:, None, :, None] | pad[:, None, None, :], 0.0)
+        full = bias.new_zeros(n_graphs, self.n_heads, seq_len + 1, seq_len + 1)
+        full[:, :, :seq_len, :seq_len] = bias
+        return full.reshape(n_graphs * self.n_heads, seq_len + 1, seq_len + 1)
+
+
+def _enabled(cfg, kind: str = "node") -> tuple[list[str], object]:
+    """The encodings ``pe.node`` (``kind="node"``) or ``pe.bias`` (``"bias"``) lists, and ``pe``."""
     params = cfg.model.global_component.get("parameters", None)
     pe = params.get("pe", None) if params is not None else None
-    return (list(pe.node) if pe is not None else []), pe
+    return (list(pe.get(kind, [])) if pe is not None else []), pe
 
 
 def attach_positional_inputs(datas, cfg) -> None:
@@ -327,7 +454,8 @@ def attach_positional_inputs(datas, cfg) -> None:
     ``get_model_output`` -- so training and evaluation see the same inputs. A no-op when no enabled
     encoding precomputes anything.
     """
-    names, pe = _enabled(cfg)
+    names, pe = _enabled(cfg, "node")
+    names += _enabled(cfg, "bias")[0]
     for name in names:
         spec = PE_REGISTRY[name]
         if spec.precompute is None:
@@ -342,7 +470,7 @@ def build_node_positional_encoding(cfg, n_embed: int | None) -> NodePositionalEn
     The encoders are built inside a forked RNG, so enabling one does not shift the initialisation
     of any weight built after it.
     """
-    names, pe = _enabled(cfg)
+    names, pe = _enabled(cfg, "node")
     if not names:
         return None
     if n_embed is None:
@@ -357,3 +485,16 @@ def build_node_positional_encoding(cfg, n_embed: int | None) -> NodePositionalEn
         rotate_train=pe.rotate_train,
         seed=cfg.optim.seed,
     )
+
+
+def build_attention_bias(cfg, n_heads: int) -> AttentionBias | None:
+    """Build the attention biases ``cfg`` enables, or None when ``pe.bias`` is empty.
+
+    Built inside a forked RNG, like the node encodings, so enabling one shifts no other weight.
+    """
+    names, pe = _enabled(cfg, "bias")
+    if not names:
+        return None
+    with torch.random.fork_rng(devices=[]):
+        encoders = {name: PE_REGISTRY[name].build(pe, int(n_heads)) for name in names}
+    return AttentionBias(encoders, n_heads=n_heads, spatial_unit_um=cfg.dataset.spatial_unit_um)

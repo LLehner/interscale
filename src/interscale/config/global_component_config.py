@@ -27,6 +27,8 @@ def get_global_component_cfg(cfg, global_component_name):
         # the list is swept through a sweep yaml's `arms:` block, never as a raw wandb list.
         pe = cfg.model.global_component.parameters.pe = CN()
         pe.node = []  # any of: naive, sinusoidal, lap, rw
+        # Attention biases, added to the logit of every pair of tokens: any of: distance.
+        pe.bias = []
         # Coordinate encodings read `data.pos` (needs dataset.spatial_key), in µm
         # (dataset.spatial_unit_um), with each graph's centroid subtracted: absolute slide offsets
         # are scanner artefacts. `rotate_train` rotates each graph by a random angle in training,
@@ -56,5 +58,16 @@ def get_global_component_cfg(cfg, global_component_name):
         # result: it vanishes only on a truly regular graph (a symmetrised kNN graph is not one).
         pe.rw = CN()
         pe.rw.steps = 16
+        # A learned bias per head as a function of the distance between two cells. `kind`:
+        # * `profile` -- any curve: piecewise linear between `num_kernels` knots over [0, max_dist]
+        #   (µm) and flat beyond. Can single out a distance (a ring, a threshold). Set `max_dist` to
+        #   about the largest distance that should still be told apart -- a graph's diagonal at most
+        #   (~1400 for synth_data_0's 1000 x 1000 slides, ~7000 for synth_spot's 5 mm lattices).
+        # * `linear` -- one slope per head on the distance in mm (ALiBi): attention only falls or
+        #   rises with distance. `num_kernels` and `max_dist` are ignored.
+        pe.distance = CN()
+        pe.distance.kind = "profile"
+        pe.distance.num_kernels = 16
+        pe.distance.max_dist = 2000.0
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

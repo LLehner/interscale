@@ -26,7 +26,7 @@ from .masking import (
     sample_gene_mask,
     sample_node_mask,
 )
-from .padding import pad_batch
+from .padding import pad_batch, pad_like
 from .positional import laplacian_pe, random_walk_pe
 from .self_attn_relevance import SelfAttentionRelevance
 from .utils import check_and_update_cfg, local_reach_hops, set_full_reproducibility
@@ -40,6 +40,7 @@ __all__ = [
     "optional_fields",
     "prepare_a2d_dataset",
     "pad_batch",
+    "pad_like",
     "laplacian_pe",
     "random_walk_pe",
     "check_and_update_cfg",

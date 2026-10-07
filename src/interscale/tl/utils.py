@@ -71,11 +71,14 @@ def _positional_encoding_tag(cfg) -> str:
     Part of the checkpoint prefix because the prefix is also how a sweep keeps its trials apart:
     it carries the seed but nothing else that a PE ablation varies, so without the tag every arm
     of a PE sweep would overwrite the previous arm's checkpoint. Empty when off, so every name from
-    before PEs is unchanged.
+    before PEs is unchanged. A distance bias of the non-default `linear` kind is tagged
+    `distance-linear`, since it is a different model under the same encoding name.
     """
     params = cfg.model.global_component.get("parameters", None)
     pe = params.get("pe", None) if params is not None else None
-    names = list(pe.node) if pe is not None else []
+    names = list(pe.node) + list(pe.get("bias", [])) if pe is not None else []
+    if "distance" in names and pe.distance.get("kind", "profile") != "profile":
+        names[names.index("distance")] = f"distance-{pe.distance.kind}"
     return f"pe-{'+'.join(names)}_" if names else ""
 
 

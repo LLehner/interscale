@@ -101,7 +101,7 @@ model:
         sinusoidal: {dim: 32, min_wavelength: 10.0, max_wavelength: 1000.0} # µm
         lap:        {k: 8, sign_flip: True}
         rw:         {steps: 16}
-        distance:   {num_kernels: 16, max_dist: 2000.0}                     # µm; set per dataset
+        distance:   {kind: profile, num_kernels: 16, max_dist: 2000.0}      # µm; set per dataset
 ```
 
 `_validate_pe` rejects unknown or duplicate names (listing the registry), a coordinate PE without
@@ -175,6 +175,10 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
   `[B, S, S, K]` expansion. The table is directly the learned profile.
 - **`max_dist` defaults to 2000 µm, not 500**: 500 would make everything beyond half a millimetre
   one distance, which is where synth_spot's global test sits. It stays a per-dataset setting.
+- **Two kinds, chosen by `pe.distance.kind`** (added 2026-10-07 on the user's request). `profile`
+  learns any curve of distance and needs `max_dist`; `linear` is one slope per head on the
+  distance in mm — attention can only fall or rise with distance, no range to set. Both start at
+  zero. The checkpoint tag says `distance-linear` for the second, so a sweep can run both.
 - **`b_h(d)` is readable, not logged.** `DistanceBias.profile()` returns it; logging it during
   training waits for a consumer (Stage 6's sweep).
 - Code: `DistanceBias`, `AttentionBias` and `build_attention_bias` in
@@ -189,7 +193,7 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
 | sinusoidal | node | centred pos (µm) | sin/cos at `dim/4` geometric wavelengths per axis → Linear | translation |
 | lap | node | `k` lowest non-trivial eigenvectors, sym. normalised Laplacian | Linear; random sign flip per vector per graph (training) | translation, rotation |
 | rw | node | `diag((D⁻¹A)^t)`, t = 1..steps | BatchNorm (`eps` 1e-8) → Linear (GraphGPS) | translation, rotation |
-| distance | bias | ‖pᵢ − pⱼ‖ in µm, clamped at `max_dist` | K triangular kernels → one value per head (a `[heads, K]` table, piecewise linear in d), zero-init, shared across layers | translation, rotation |
+| distance | bias | ‖pᵢ − pⱼ‖ in µm | `kind: profile`: K triangular kernels → a `[heads, K]` table, piecewise linear in d, flat beyond `max_dist`; `kind: linear`: one slope per head on d in mm (ALiBi). Zero-init, shared across layers | translation, rotation |
 
 - **naive / sinusoidal**: a fixed physical scale, not SpaFormer's per-FOV min-max — graphs here
   differ in size, so min-max would encode the same distance differently per graph. Sinusoidal

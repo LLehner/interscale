@@ -29,6 +29,7 @@ class TransformerNodeEncoderHook(GlobalModule):
         long_range_attention: bool = True,
         local_mask_hops: int = 1,
         positional_encoding: nn.Module | None = None,
+        attention_bias: nn.Module | None = None,
         **base_module_kwargs,
     ):
 
@@ -75,6 +76,9 @@ class TransformerNodeEncoderHook(GlobalModule):
         # Node positional encodings (`positional_encodings.py`), or None when the config enables
         # none -- in which case nothing is registered and the module is the one from before PEs.
         self.positional_encoding = positional_encoding
+        # Attention biases (`positional_encodings.AttentionBias`), merged into the attention mask in
+        # `common_step_local_to_global`, or None -- nothing registered, the mask stays boolean.
+        self.attention_bias = attention_bias
 
     def common_step_local_to_global(self, batched_data, emb: torch.Tensor, eval_step: bool = False):
         """Convert local node embeddings ``[N, E]`` to padded local node embeddings ``[max_seq_len, E]``.
@@ -146,6 +150,14 @@ class TransformerNodeEncoderHook(GlobalModule):
         # 0 * -inf that an "inverse adjacency" built by arithmetic would produce.
         attention_mask = attention_mask.to(dtype=torch.bool)
 
+        if self.attention_bias is not None:
+            # Merged by indexing, never by arithmetic: blocked pairs become -inf, every other pair
+            # keeps its finite bias. The bias is laid out from this call's index_nodes, and its CLS
+            # row and column are 0, so CLS stays attendable for every query and no row goes NaN.
+            # The returned mask is then a float mask, which forward() passes on as an additive one.
+            bias = self.attention_bias(batched_data, index_nodes, src_padding_mask, dtype=emb.dtype, device=emb.device)
+            attention_mask = bias.masked_fill(attention_mask, float("-inf"))
+
         return padded_emb, src_padding_mask, index_nodes, attention_mask
 
     def forward(self, padded_h_node, src_padding_mask, mask=None, register_hook: bool = True):
@@ -179,8 +191,16 @@ class TransformerNodeEncoderHook(GlobalModule):
 
         zeros = src_padding_mask.data.new(src_padding_mask.size(0), 1).fill_(0)
         src_padding_mask = torch.cat([src_padding_mask, zeros], dim=1)
+        key_padding_mask = src_padding_mask
+        if mask is not None and mask.is_floating_point():
+            # A float mask (an attention bias merged in) needs a float key-padding mask, or torch
+            # warns on every layer that mixing the two types is deprecated. The boolean one is
+            # still what this method returns, for the callers that drop padding by it.
+            key_padding_mask = torch.zeros_like(src_padding_mask, dtype=mask.dtype).masked_fill(
+                src_padding_mask, float("-inf")
+            )
         transformer_out = self.transformer_encoder(
-            padded_h_node, src_key_padding_mask=src_padding_mask, mask=mask
+            padded_h_node, src_key_padding_mask=key_padding_mask, mask=mask
         )  # (S, B, h_d)
 
         attn_matrices = []
@@ -260,5 +280,6 @@ class TransformerNodeEncoderHook(GlobalModule):
             f"long_range_attention: {self.long_range_attention}, \n"
             f"local_mask_hops: {self.local_mask_hops}, \n"
             f"positional_encoding: {sorted(self.positional_encoding.encoders) if self.positional_encoding else []}, \n"
+            f"attention_bias: {sorted(self.attention_bias.encoders) if self.attention_bias else []}, \n"
         )
         return summary

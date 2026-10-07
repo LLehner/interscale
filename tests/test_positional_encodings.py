@@ -257,6 +257,12 @@ def test_a_valid_pe_config_loads(tmp_path):
         (["node: [naive]", "naive:", "  length_scale: 0.0"], True, "length_scale"),
         (["node: [lap]", "lap:", "  k: 0"], True, "lap.k"),
         (["node: [rw]", "rw:", "  steps: 0"], True, "rw.steps"),
+        (["node: [distance]"], True, "belong under pe.bias"),
+        (["bias: [naive]"], True, "belong under pe.node"),
+        (["bias: [distance]", "distance:", "  num_kernels: 1"], True, "num_kernels"),
+        (["bias: [distance]", "distance:", "  max_dist: 0.0"], True, "max_dist"),
+        (["bias: [distance]"], False, "dataset.spatial_key"),
+        (["bias: [distance]", "distance:", "  kind: gaussian"], True, "distance.kind"),
     ],
 )
 def test_invalid_pe_configs_fail_at_load(tmp_path, lines, spatial, match):
@@ -271,6 +277,7 @@ def test_the_registry_holds_the_node_encodings_built_so_far():
         "sinusoidal": ("node", "pos", False),
         "lap": ("node", "lap_pe", True),
         "rw": ("node", "rw_pe", True),
+        "distance": ("bias", "pos", False),
     }
 
 
@@ -672,3 +679,314 @@ def test_attach_positional_inputs_stores_return_probabilities_only_when_enabled(
 
     assert getattr(off, "rw_pe", None) is None
     assert torch.equal(on.rw_pe, random_walk_pe(edge_index, 40, 16))
+
+
+# --------------------------------------------------------------------------- relative distance bias
+
+
+def test_pad_like_lays_values_out_exactly_as_pad_batch_lays_out_tokens():
+    """The layout the bias relies on, including the case that makes it non-trivial: pad_batch
+    subsampling a graph longer than max_seq_len, with masked nodes it must keep."""
+    import random
+
+    from interscale.tl import pad_batch, pad_like
+
+    sizes = (5, 9, 7)
+    batch = torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(sizes)])
+    values = torch.randn(len(batch), 3)
+    keep = torch.zeros(len(batch), dtype=torch.bool)
+    keep[[6, 9, 12]] = True  # masked nodes of graph 1, which pad_batch has to keep
+
+    for get_mask in (False, True):
+        random.seed(0)
+        padded, _, index_nodes, *_ = pad_batch(values, batch, 6, get_mask=get_mask, keep_indices=keep)
+        assert torch.equal(pad_like(values, batch, index_nodes, padded.shape[0]), padded.permute(1, 0, 2))
+
+
+def test_distance_bias_interpolates_between_knots_and_is_flat_beyond():
+    from interscale.module.global_modules.positional_encodings import DistanceBias
+
+    bias = DistanceBias(n_heads=2, num_kernels=5, max_dist=400.0)  # knots every 100 um
+    with torch.no_grad():
+        bias.table.copy_(torch.tensor([[0.0, 1.0, 3.0, 2.0, -1.0], [5.0, 4.0, 3.0, 2.0, 1.0]]))
+
+    dist = torch.tensor([[[0.0, 100.0, 150.0, 400.0, 900.0]]])
+    out = bias(dist)[0, :, 0]
+
+    assert torch.allclose(out[0], torch.tensor([0.0, 1.0, 2.0, -1.0, -1.0]))
+    assert torch.allclose(out[1], torch.tensor([5.0, 4.0, 3.5, 1.0, 1.0]))
+    knots, values = bias.profile()
+    assert torch.allclose(knots, torch.tensor([0.0, 100.0, 200.0, 300.0, 400.0]))
+    assert torch.equal(values, bias.table.detach())
+
+
+def _bias_cfg(kind="profile", **pe):
+    pe.setdefault("bias", ["distance"])
+    cfg = _cfg(**pe)
+    cfg.model.global_component.parameters.pe.distance.kind = kind
+    return cfg
+
+
+def _random_bias(cfg, n_heads, seed=2):
+    """The configured bias with random parameters -- at their zero init every bias is 0."""
+    from interscale.module.global_modules.positional_encodings import build_attention_bias
+
+    bias = build_attention_bias(cfg, n_heads)
+    gen = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for param in bias.parameters():
+            param.copy_(torch.randn(param.shape, generator=gen))
+    return bias
+
+
+def test_the_linear_bias_is_a_slope_per_head_on_the_distance_in_mm():
+    from interscale.module.global_modules.positional_encodings import LinearDistanceBias
+
+    bias = LinearDistanceBias(n_heads=2)
+    assert not bias.slope.any(), "starts at zero"
+    with torch.no_grad():
+        bias.slope.copy_(torch.tensor([-2.0, 0.5]))
+
+    out = bias(torch.tensor([[[0.0, 500.0, 3000.0]]]))[0, :, 0]
+
+    assert torch.allclose(out[0], torch.tensor([0.0, -1.0, -6.0]))
+    assert torch.allclose(out[1], torch.tensor([0.0, 0.25, 1.5]))
+    knots, values = bias.profile(max_dist=2000.0)
+    assert torch.allclose(values, torch.tensor([[0.0, -4.0], [0.0, 1.0]]))
+
+
+def test_the_distance_kind_selects_the_function_and_linear_ignores_the_profile_settings():
+    from interscale.module.global_modules.positional_encodings import (
+        DistanceBias,
+        LinearDistanceBias,
+        build_attention_bias,
+    )
+
+    assert isinstance(build_attention_bias(_bias_cfg("profile"), 2).encoders["distance"], DistanceBias)
+    linear = _bias_cfg("linear")
+    linear.model.global_component.parameters.pe.distance.num_kernels = 1  # would fail for a profile
+    assert isinstance(build_attention_bias(linear, 2).encoders["distance"], LinearDistanceBias)
+
+
+def test_the_bias_is_laid_out_like_the_mask_with_zero_cls_and_padding():
+    """Entry (b * heads + h, i, j) is head h's bias between the cells at tokens i and j of graph b:
+    left-padded, CLS last, graph-major -- the order mask.repeat_interleave(heads) uses."""
+    n_heads = 3
+    cfg = _bias_cfg()
+    bias_module = _random_bias(cfg, n_heads)
+    distance = bias_module.encoders["distance"]
+    a, b = torch.rand(4, 2) * 1500, torch.rand(6, 2) * 1500
+    batch = _batch(a, b, edges=False)
+    padding = torch.tensor([[True, True, False, False, False, False], [False] * 6])
+
+    out = bias_module(batch, [list(range(4)), list(range(6))], padding, torch.float32, torch.device("cpu"))
+
+    assert out.shape == (2 * n_heads, 7, 7)
+    for g, coords, lo in ((0, a, 2), (1, b, 0)):
+        expected = distance(torch.cdist(coords, coords).unsqueeze(0))[0]  # [heads, n, n]
+        for h in range(n_heads):
+            block = out[g * n_heads + h]
+            assert torch.allclose(block[lo:6, lo:6], expected[h], atol=1e-4), (g, h)
+            assert not block[:lo].any() and not block[:, :lo].any(), "padding carries no bias"
+            assert not block[6].any() and not block[:, 6].any(), "CLS carries no bias"
+
+
+@pytest.mark.parametrize("kind", ["profile", "linear"])
+def test_the_bias_is_translation_and_rotation_invariant(kind):
+    bias_module = _random_bias(_bias_cfg(kind), 2)
+    a = torch.rand(5, 2) * 1000
+    angle = torch.tensor(0.7)
+    rot = torch.stack([torch.stack([angle.cos(), -angle.sin()]), torch.stack([angle.sin(), angle.cos()])])
+    padding = torch.zeros(1, 5, dtype=torch.bool)
+
+    def run(coords):
+        return bias_module(_batch(coords, edges=False), [list(range(5))], padding, torch.float32, torch.device("cpu"))
+
+    assert torch.allclose(run(a), run(a @ rot.t() + torch.tensor([300.0, -200.0])), atol=1e-3)
+
+
+def _hook(cfg, *, long_range, hops, bias=None):
+    from interscale.module.global_modules import TransformerNodeEncoderHook
+
+    return TransformerNodeEncoderHook(
+        max_seq_len=64,
+        n_heads=2,
+        dropout_global=0.0,
+        act_func="relu",
+        num_layers=2,
+        dim_feedforward=16,
+        long_range_attention=long_range,
+        local_mask_hops=hops,
+        attention_bias=bias,
+        n_input=N_EMBED,
+        n_output=N_EMBED,
+        n_embed=N_EMBED,
+        decoder_type="linear",
+        dropout_decoder=0.0,
+        decoder_hidden_dims=[16],
+        mask_percentage=0.1,
+        mask_strategy="node",
+    )
+
+
+def test_blocked_pairs_become_minus_inf_and_every_other_pair_keeps_its_bias():
+    cfg = _bias_cfg()
+    plain = _hook(cfg, long_range=True, hops=1)
+    biased = _hook(cfg, long_range=True, hops=1, bias=_random_bias(cfg, 2))
+    g = torch.rand(8, 2) * 500
+    emb = torch.randn(8, N_EMBED)
+
+    boolean = plain.common_step_local_to_global(_batch(g), emb, eval_step=True)[3]
+    merged = biased.common_step_local_to_global(_batch(g), emb, eval_step=True)[3]
+    alone = biased.attention_bias(
+        _batch(g), [list(range(8))], torch.zeros(1, 8, dtype=torch.bool), torch.float32, torch.device("cpu")
+    )
+
+    assert merged.is_floating_point() and boolean.dtype == torch.bool
+    assert torch.equal(torch.isinf(merged), boolean), "-inf exactly where the boolean mask blocks"
+    assert torch.equal(merged[~boolean], alone[~boolean])
+
+
+@pytest.mark.parametrize("kind", ["profile", "linear"])
+def test_a_zero_bias_changes_nothing_and_raises_no_mask_type_warning(kind):
+    """Both kinds start at zero: the float-mask path must then compute what the boolean one did,
+    without torch's mixed-mask-type deprecation warning on every layer."""
+    import warnings
+
+    cfg = _bias_cfg(kind)
+    torch.manual_seed(0)
+    plain = _hook(cfg, long_range=True, hops=1).eval()
+    torch.manual_seed(0)
+    from interscale.module.global_modules.positional_encodings import build_attention_bias
+
+    biased = _hook(cfg, long_range=True, hops=1, bias=build_attention_bias(cfg, 2)).eval()
+    g = torch.rand(9, 2) * 500
+    emb = torch.randn(9, N_EMBED)
+
+    outs = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for module in (plain, biased):
+            padded, padding, _, mask = module.common_step_local_to_global(_batch(g), emb, eval_step=True)
+            outs.append(module(padded, padding, mask, register_hook=False)[0])
+
+    assert torch.allclose(outs[0], outs[1], atol=1e-6)
+    assert not [w for w in caught if "mismatched" in str(w.message).lower()]
+
+
+@pytest.mark.parametrize("kind", ["profile", "linear"])
+@pytest.mark.parametrize("hops", [1, 2, 3])
+def test_a_biased_dense_graph_stays_finite_and_blocked_pairs_get_no_attention(hops, kind):
+    """The long-range mask's NaN guarantee must survive the bias: on a complete graph every pair
+    is blocked, so each row keeps only CLS. Rows still sum to one and the gradient is finite."""
+    n = 10
+    cfg = _bias_cfg(kind)
+    module = _hook(cfg, long_range=True, hops=hops, bias=_random_bias(cfg, 2)).train()
+    coords = torch.rand(n, 2) * 300
+    batch = _batch(coords)
+    full = torch.ones(n, n, dtype=torch.bool).nonzero().t()
+    batch.edge_index = full[:, full[0] != full[1]]
+    emb = torch.randn(n, N_EMBED, requires_grad=True)
+
+    padded, padding, _, mask = module.common_step_local_to_global(batch, emb, eval_step=True)
+    out, _, attn = module(padded, padding, mask, register_hook=True)
+    out.sum().backward()
+
+    assert torch.isfinite(out).all() and torch.isfinite(emb.grad).all()
+    weights = attn[0]  # layer 0; one graph, so [heads, S+1, S+1]
+    assert torch.allclose(weights.sum(-1), torch.ones_like(weights.sum(-1)), atol=1e-5)
+    assert not weights[:, :n, :n].any(), "every cell-to-cell pair is blocked on a complete graph"
+
+
+def test_the_checkpoint_name_and_a_sweep_arm_carry_the_bias():
+    from interscale.config.sweep import apply_sweep_config
+    from interscale.tl.utils import get_model_filename_prefix
+
+    assert get_model_filename_prefix(_cfg(["naive"], bias=["distance"]), True, True).endswith("pe-naive+distance_")
+    assert get_model_filename_prefix(_bias_cfg("linear"), True, True).endswith("pe-distance-linear_"), (
+        "the two kinds must not share a checkpoint name"
+    )
+
+    node, bias = "model.global_component.parameters.pe.node", "model.global_component.parameters.pe.bias"
+    arms = {"none": {node: [], bias: []}, "distance": {node: [], bias: ["distance"]}}
+    cfg = _cfg()
+    cfg.freeze()
+    cfg, _ = apply_sweep_config(cfg, "hyperparmeter", {"arm": "distance"}, sweep_params=["arm"], arms=arms)
+    assert list(cfg.model.global_component.parameters.pe.bias) == ["distance"]
+
+
+@pytest.mark.parametrize("kind", ["profile", "linear"])
+def test_the_bias_trains_end_to_end(kind):
+    """Through the training plan, long-range mask on: the zero parameters move, so the gradient reaches them."""
+    import lightning.pytorch as pl
+    from torch_geometric.data import Data
+
+    from interscale.geome_dataloader import GraphAnnDataModule
+    from interscale.module.global_modules import TransformerNodeEncoderHook
+    from interscale.module.global_modules.positional_encodings import build_attention_bias
+    from interscale.train._trainingplans import TrainingPlan
+
+    def graph(n, seed):
+        g = torch.Generator().manual_seed(seed)
+        src = list(range(n - 1)) + list(range(1, n))
+        d = Data(
+            x=torch.randn(n, 6, generator=g),
+            edge_index=torch.tensor([src, list(range(1, n)) + list(range(n - 1))], dtype=torch.long),
+            pos=torch.rand(n, 2, generator=g) * 2000,
+        )
+        d.embeddings = torch.randn(n, 4, generator=g)
+        return d
+
+    dm = GraphAnnDataModule(
+        datas=[[graph(7, 0), graph(9, 1)], [graph(8, 2)], [graph(8, 3)]],
+        batch_size=2,
+        num_workers=0,
+        mask_percentage=0.3,
+        mask_strategy="node",
+        learning_type="node",
+    )
+    bias = build_attention_bias(_bias_cfg(kind, local=False), 2)
+    module = TransformerNodeEncoderHook(
+        max_seq_len=16,
+        n_heads=2,
+        dropout_global=0.0,
+        act_func="relu",
+        num_layers=1,
+        dim_feedforward=8,
+        long_range_attention=True,
+        local_mask_hops=1,
+        attention_bias=bias,
+        n_input=6,
+        n_output=6,
+        n_embed=4,
+        decoder_type="linear",
+        dropout_decoder=0.0,
+        decoder_hidden_dims=[8],
+        mask_percentage=0.3,
+        mask_strategy="node",
+        type_gex_embedding=None,
+    )
+    plan = TrainingPlan(
+        module,
+        "regression",
+        "node",
+        "MSELoss",
+        "cell",
+        batch_size=2,
+        lr_scheduler="CosineWarmupScheduler",
+        lr_warmup=1,
+        lr_max_epochs=2,
+    )
+    trainer = pl.Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+    dm.setup(stage="fit")
+    trainer.fit(plan, datamodule=dm)
+
+    assert torch.isfinite(trainer.logged_metrics["train_loss"])
+    assert all(param.any() for param in bias.parameters()), "the gradient never reached the bias"

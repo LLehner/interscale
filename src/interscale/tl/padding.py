@@ -123,3 +123,30 @@ def pad_batch(
     if get_mask:
         return padded_x, src_padding_mask, index_nodes, num_nodes, masks, max_num_nodes
     return padded_x, src_padding_mask, index_nodes, num_nodes, None, max_num_nodes
+
+
+def pad_like(values: torch.Tensor, batch: torch.Tensor, index_nodes: list, seq_len: int) -> torch.Tensor:
+    """``[B, seq_len, D]``: per-graph rows of ``values`` laid out exactly as ``pad_batch`` lays out tokens.
+
+    Graph ``b``'s kept nodes -- ``index_nodes[b]``, the selection ``pad_batch`` returned -- fill the
+    LAST positions (left padding) in that order, and the rest are zero. It reuses that selection
+    instead of drawing one, which is what keeps a per-token quantity aligned with the tokens when a
+    graph is subsampled. Calling ``pad_batch`` a second time for it would draw a different subset.
+
+    Parameters
+    ----------
+    values
+        ``[N, D]``, in batch node order.
+    batch
+        ``[N]`` graph assignment per node.
+    index_nodes
+        Per graph, the node indices ``pad_batch`` kept, relative to that graph's own node order.
+    seq_len
+        The padded length, ``pad_batch``'s ``max_num_nodes``.
+    """
+    batch = batch.to(dtype=torch.long)
+    out = values.new_zeros(len(index_nodes), seq_len, values.shape[-1])
+    for b, kept in enumerate(index_nodes):
+        rows = values[batch == b][torch.as_tensor(kept, dtype=torch.long, device=values.device)]
+        out[b, seq_len - len(kept) :] = rows
+    return out
