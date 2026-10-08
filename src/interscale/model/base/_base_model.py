@@ -36,9 +36,10 @@ class _SAVE_KEYS_NT(NamedTuple):
 SAVE_KEYS = _SAVE_KEYS_NT()
 
 # State entries that may legitimately be absent from an older checkpoint. The PCA front-end's
-# buffers were added after some checkpoints were written; `BaseModel.load` warns and carries on
-# for these, and raises for anything else. See tests/test_global_pca_persistence.py.
-_OPTIONAL_STATE_PREFIXES = ("pca_",)
+# buffers were added after some checkpoints were written, and so was the distance bias's
+# `max_dist` (re-derived from the cfg and AnnData when absent); `BaseModel.load` warns and carries
+# on for these, and raises for anything else. See tests/test_global_pca_persistence.py.
+_OPTIONAL_STATE_PREFIXES = ("pca_", "max_dist")
 
 
 # adjusted from scvi-tools
@@ -89,7 +90,11 @@ class BaseModel(metaclass=BaseModelMeta):
         cfg: CN,
     ):
         self.id = str(uuid4())  # Used for cls._manager_store keys.
-        self._cfg = cfg
+        # Settings derived from the data rather than the config (pe.distance.max_dist 0), filled
+        # in before any module is built from self._cfg.
+        from interscale.module.global_modules.positional_encodings import resolve_distance_range
+
+        self._cfg = resolve_distance_range(cfg, adata)
 
         self.prediction_task = cfg.dataset.prediction_task
         self.prediction_level = cfg.dataset.prediction_level
@@ -710,7 +715,8 @@ class BaseModel(metaclass=BaseModelMeta):
             print(
                 f"Warning: checkpoint predates these buffers, loading without them: {benign_missing}. "
                 f"A PCA front-end will refit on the first batch it sees rather than reusing the "
-                f"basis it was trained with (see tests/test_global_pca_persistence.py)."
+                f"basis it was trained with (see tests/test_global_pca_persistence.py); a distance "
+                f"bias keeps the max_dist this cfg and AnnData give, not necessarily its trained one."
             )
 
         if (hard_missing or unexpected_keys) and not allow_partial_load:

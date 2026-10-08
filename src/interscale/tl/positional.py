@@ -106,3 +106,23 @@ def random_walk_pe(edge_index: torch.Tensor, num_nodes: int, steps: int) -> torc
         a, b = (t + 1) // 2, t // 2
         out[:, t - 1] = np.asarray(powers[a].multiply(powers[b]).sum(axis=1)).ravel()
     return torch.from_numpy(out)
+
+
+def point_set_diameter(coords: np.ndarray) -> float:
+    """The largest distance between two of ``coords`` (``[n, d]``), in their own units.
+
+    Exact: the farthest pair lies on the convex hull, so only hull vertices are compared. A set
+    without a full-dimensional hull (fewer than ``d + 1`` points, or all on a line) falls back to
+    its bounding-box diagonal, which for collinear points is the same number.
+    """
+    from scipy.spatial import ConvexHull, QhullError
+    from scipy.spatial.distance import pdist
+
+    coords = np.asarray(coords, dtype=np.float64)
+    if len(coords) < 2:
+        return 0.0
+    try:
+        coords = coords[ConvexHull(coords).vertices]
+    except (QhullError, ValueError):
+        return float(np.linalg.norm(coords.max(axis=0) - coords.min(axis=0)))
+    return float(pdist(coords).max())

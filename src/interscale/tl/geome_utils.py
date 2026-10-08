@@ -449,10 +449,14 @@ def prepare_geome_dataset(adata, cfg: CN):
 
     # Inputs positional encodings precompute once per graph (Laplacian eigenvectors). A no-op
     # unless an enabled encoding needs one. Imported here: the module side imports `tl`.
-    from interscale.module.global_modules.positional_encodings import attach_positional_inputs
+    from interscale.module.global_modules.positional_encodings import (
+        attach_positional_inputs,
+        warn_if_lap_scales_differ,
+    )
 
     for datas in (datas_train, datas_val, datas_test):
         attach_positional_inputs(datas, cfg)
+    warn_if_lap_scales_differ([*datas_train, *datas_val, *datas_test], cfg)
 
     if "test" in np.unique(adata.obs[split_key]):
         # datas_test, adata_test = list(a2d(adata[adata.obs[split_key] == "test"]))

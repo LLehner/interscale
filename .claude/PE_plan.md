@@ -8,7 +8,7 @@ node-feature vs. attention-bias split. Read [`background.md`](background.md) fir
 
 ## Status
 
-Last updated 2026-10-04. Same rules as [`contrastive_plan.md`](contrastive_plan.md): update this
+Last updated 2026-10-08. Same rules as [`contrastive_plan.md`](contrastive_plan.md): update this
 table in the same commit as the work, and a stage is `done` only when something external verified
 it. "Implemented, unverified" is a real state.
 
@@ -21,7 +21,7 @@ it. "Implemented, unverified" is a real state.
 | 3 — LapPE | **implemented, unverified** — equals PyG's `AddLaplacianEigenvectorPE` up to sign on connected graphs (both PyG solver paths); dense and sparse solvers agree exactly; one trivial eigenvector dropped per component, zero-padding, canonical signs, orthonormal columns; flips per graph, training only, off the global RNG (each mutation-checked); harness IDENTICAL with PEs off; trains finite through `GlobalModel`, `CombinedModel`, dual decoder and long-range; `get_model_output` runs; precompute 2.4 s for a 50k-cell 6-NN graph. **No real-data run yet** | 2026-10-03 |
 | 4 — RWPE | **implemented, unverified** — equals the definition (full dense powers) at odd and even steps, and PyG's `AddRandomWalkPE`; isolated cells → zeros; BatchNorm keeps small late-step spreads instead of squashing them (`eps` 1e-8, see notes); each mutation-checked; harness IDENTICAL with PEs off; trains finite through `GlobalModel`, `CombinedModel`, dual decoder and long-range, alone and with lap + sinusoidal; `get_model_output` runs; precompute 9.4 s for a 50k-cell, 14-neighbour graph at 16 steps. **No real-data run yet** | 2026-10-04 |
 | 5 — distance bias | **implemented, unverified** — `pad_like` reproduces `pad_batch`'s layout incl. subsampling and kept masked nodes; bias laid out like the mask (left pad, CLS last, graph-major), zero at CLS and padding, `-inf` exactly where the mask blocks; zero table changes nothing and raises no mask-type warning; finite with rows summing to 1 on the complete-graph NaN test at hops 1–3; translation and rotation invariant; each of five layout/merge mutations caught; harness IDENTICAL with PEs off (baseline from a worktree of `e0afa60`); trains finite through `GlobalModel`, `CombinedModel`, dual decoder and long-range, alone and with node PEs, and the table moves; `get_model_output` runs. **No real-data run yet** | 2026-10-06 |
-| 6 — PE probe control + ablation sweep | not started | | |
+| 6 — PE probe control + ablation sweep | **implemented, unverified** — the `pe` column holds each cell's own encoding when `pad_batch` subsamples (checked against the cell's coordinates, mutation-checked: an ungathered column fails), is the eval encoding and leaves the PE generator alone; absent without a node PE; on the same chart as local/global; default in `probe.embeddings`. Found and fixed on the way: the probe moved the global torch RNG (every `DataLoader` iterator seeds itself off it) and Python's (`pad_batch` subsampling), so probe-on trained a different model — now restored (test, mutation-checked). `max_dist: 0` derives the largest slide diameter; stored in the checkpoint; LapPE size warning. 431 tests pass; harness IDENTICAL with PEs off (baseline from a worktree of `1faf992`); a `CombinedModel` with sinusoidal + lap + distance and the probe on trains through `model.train` and logs `probe/*_pe`. **The sweep (cluster) is not run yet** | 2026-10-08 |
 
 ## What the code already decides
 
@@ -173,8 +173,13 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
 - **Triangular kernels instead of Gaussian RBFs.** The same "K kernels → heads" form, but each
   distance touches two knots, so the bias is two lookups into a `[heads, K]` table instead of a
   `[B, S, S, K]` expansion. The table is directly the learned profile.
-- **`max_dist` defaults to 2000 µm, not 500**: 500 would make everything beyond half a millimetre
-  one distance, which is where synth_spot's global test sits. It stays a per-dataset setting.
+- **`max_dist` is derived from the data by default** (`0`, since 2026-10-08; was a fixed 2000 µm):
+  the largest slide diameter — farthest pair of cells within one `sample_key` group, over every
+  slide and split, in µm (`resolve_distance_range`, called in `BaseModel.__init__` before any
+  module is built). It is a buffer, so a checkpoint keeps the range its table was trained on even
+  when loaded onto other slides; checkpoints from before the buffer load with the re-derived value
+  (`_OPTIONAL_STATE_PREFIXES`). A module built straight from a config with `0` raises. A positive
+  value is used as is.
 - **Two kinds, chosen by `pe.distance.kind`** (added 2026-10-07 on the user's request). `profile`
   learns any curve of distance and needs `max_dist`; `linear` is one slope per head on the
   distance in mm — attention can only fall or rise with distance, no range to set. Both start at
@@ -206,7 +211,9 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
   graphs match. **Scale:** columns are unit-norm over the whole graph, so entries shrink like
   `1/sqrt(N)` — a 50k-cell slide gets ~10x smaller values than a 500-cell window. Harmless while a
   run's graphs are of similar size; with mixed sizes (whole slides beside windows), scale by
-  `sqrt(N)` (a one-flag change in `tl.laplacian_pe`). Listed under open questions too.
+  `sqrt(N)` (a one-flag change in `tl.laplacian_pe`). Not done: instead `prepare_geome_dataset`
+  logs a warning when the largest graph of a run (all splits) is more than 4x the smallest, i.e.
+  when entries differ by more than 2x.
 - **rw**: isolated nodes get zeros; step 1 is always 0 without self loops (kept for parity with
   the standard definition). Computed from half-powers of the symmetric `D^-1/2 A D^-1/2`, which
   has the same diagonal powers as `D^-1 A`, so a 50k-cell slide never forms 16-hop fill-in; still
@@ -221,9 +228,8 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
 - **distance**: zero-init, so switching it on changes nothing at step 0. With the long-range mask
   on, the bias inside the mask radius is never used — interpret `b_h(d)` only beyond it
   (`DistanceBias.profile()` returns the knots and each head's values). **`max_dist` is per
-  dataset**: beyond it every distance looks the same. The default 2000 µm covers synth_data_0
-  (diagonal ~1400); synth_spot's sparse responses depend on distances of 1–6 mm, so it needs
-  ~7000. Memory, measured at B=4 graphs of S=2500 tokens and H=4 heads (fp32): the bias is 0.40 GB
+  dataset**: beyond it every distance looks the same, which is why it is derived by default
+  (synth_data_0 ~1400, synth_spot ~7000). Memory, measured at B=4 graphs of S=2500 tokens and H=4 heads (fp32): the bias is 0.40 GB
   and autograd keeps 0.50 GB of it for the backward pass; a Gaussian `[B, S, S, K]` feature tensor
   at K=16 would be 1.60 GB on its own.
 
@@ -253,6 +259,11 @@ tensors is `implemented, unverified`, not done.
   zero; zero-init forward identical to no bias; finite on the existing dense-graph NaN test at
   hops 1–3. Log `b_h(d)` per head.
 - **6** — a `pe` probe embedding (the summed node PE) as a control column, then the sweep below.
+  *As built:* `probe.embeddings` includes `pe` by default; `online_probes.node_positional_encoding`
+  returns the **learned** encoding as added to the tokens (eval mode, so no rotation or flip), not
+  the raw coordinates/eigenvectors. Its output layers start at zero, so the column starts at
+  chance and rises as the model learns to use position. Bias-only arms (distance) have no node PE
+  and log no `pe` column — there is no per-cell quantity to probe.
 
 ## Sweeps
 
@@ -461,10 +472,11 @@ while those thresholds sit at 2.5 mm. It is not a property of the data.
 
 ## Open questions
 
-- Fixed µm defaults for the wavelengths and `max_dist`, or derived per dataset from the window
-  extent? `max_dist` matters most: beyond it the distance bias cannot tell distances apart (see
-  the distance note; synth_spot needs ~7000 µm against the 2000 default).
-- `rotate_train` is off by default because some tissues have a meaningful axis (layered cortex).
-- LapPE columns are unit-norm over the whole graph, so entries scale like `1/sqrt(N)`: a 50k-cell
-  slide gets ~10x smaller values than a 500-cell window. Fine while graphs in one run are of
-  similar size; with mixed sizes, scaling by `sqrt(N)` is the candidate fix (one config flag).
+- Resolved 2026-10-08: `max_dist` is derived per dataset (see the Stage 5 notes). The sinusoidal
+  wavelengths stay fixed µm defaults.
+- `rotate_train` stays off by default: some tissues have a meaningful axis (layered cortex). It
+  only acts in training forward passes, on the coordinate node PEs (naive, sinusoidal) — one fresh
+  angle per graph per forward pass; never in eval, `get_model_output` or the probes, and never on
+  the distance bias (already rotation-invariant), LapPE or RWPE.
+- LapPE `sqrt(N)` scaling: accepted as is (2026-10-08); a warning is logged when graph sizes in a
+  run differ more than 4x.

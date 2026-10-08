@@ -27,6 +27,9 @@ Three properties keep the measurement from disturbing what it measures:
   same torch generator the training batch order comes from -- so turning the probe on would
   reorder training batches and change the model. Dropout is off (``eval()``), masks are read from
   the ``Data`` objects rather than redrawn, and the subsample uses its own seeded numpy generator.
+  What still draws -- a ``DataLoader`` iterator seeds itself off the global torch generator even
+  unshuffled, and ``pad_batch`` subsamples long graphs with Python's ``random`` -- runs inside
+  :func:`_rng_untouched`, which restores the torch, CUDA, numpy and Python states afterwards.
 * **The encoder is not updated.** Everything runs under ``torch.no_grad()``, and the module's
   training flag is restored afterwards.
 * **The corruption is the run's own.** ``_common_step`` masks its input exactly as train and val
@@ -41,7 +44,9 @@ cell order. Nothing here may assume the two are already aligned; see ``_step_out
 
 from __future__ import annotations
 
+import random
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -55,10 +60,12 @@ from torch_geometric.loader import DataLoader
 
 from interscale.tl.geome_utils import label_codes
 
-#: The representations a probe can read a target out of, and the ``ViewOutput`` field each comes
-#: from. A model lacking a component contributes no columns for it rather than erroring, so one
-#: probe block works unchanged for LocalModel, GlobalModel and CombinedModel.
-EMBEDDINGS = ("local", "global")
+#: The representations a probe can read a target out of. ``local`` and ``global`` are the
+#: ``ViewOutput`` fields; ``pe`` is a control column, the summed node positional encoding exactly
+#: as the transformer adds it to its input tokens (see :func:`node_positional_encoding`). A model
+#: lacking a component -- or a node PE -- contributes no columns for it rather than erroring, so
+#: one probe block works unchanged for LocalModel, GlobalModel, CombinedModel and every PE arm.
+EMBEDDINGS = ("local", "global", "pe")
 
 #: Metrics reported per (target, embedding), by task. Precision and recall are macro-averaged:
 #: the synthetic cell types are not equally frequent (``stroma`` is 20-60% of a niche), and a
@@ -94,8 +101,8 @@ class ProbeBatchFeatures:
     Attributes
     ----------
     embeddings
-        ``{"local": [N, E], "global": [N, E]}``, missing a key when the model has no such
-        component.
+        ``{"local": [N, E], "global": [N, E], "pe": [N, E]}``, missing a key when the model has
+        no such component (or no node positional encoding).
     categorical
         ``{target_name: [N]}`` integer class codes.
     continuous
@@ -141,6 +148,48 @@ class ProbeBatchFeatures:
         if max_cells <= 0 or n <= max_cells:
             return self
         return self.select(rng.choice(n, size=max_cells, replace=False))
+
+
+@contextmanager
+def _rng_untouched(device):
+    """Restore every global generator the forward pass can draw from on exit.
+
+    Needed even though the probe never shuffles: each torch ``DataLoader`` iterator draws its
+    base seed from the global torch generator (``shuffle=False`` included), and ``pad_batch``
+    subsamples a graph longer than ``max_seq_len`` with Python's ``random``, in eval too. Either
+    would shift every later training draw -- batch order, node masks, dropout -- so a run with the
+    probe on would train a different model than the same run with it off.
+    """
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    devices = [device] if torch.device(device).type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        try:
+            yield
+        finally:
+            random.setstate(py_state)
+            np.random.set_state(np_state)
+
+
+def node_positional_encoding(module, batch) -> torch.Tensor | None:
+    """The summed node PE the transformer adds to ``batch``'s tokens, ``[N, E]`` in batch order.
+
+    The ``pe`` probe column. An absolute PE hands position straight to the transformer, so a
+    position-derived target (distance to a hub, a niche) can be read off the global token without
+    any learned interaction; a global probe score only counts as evidence of interaction where it
+    beats this column. It is the *learned* encoding, not the raw coordinates or eigenvectors:
+    what the tokens actually receive. Its output layers are zero-initialised, so the column
+    starts at chance and rises as the model learns to use position.
+
+    Called with the module in ``eval()``, so no rotation or sign flip is drawn and the PE
+    generator is untouched. Returns None when the module has no transformer or no node PE.
+    """
+    transformer = getattr(module, "global_module", module)
+    encoding = getattr(transformer, "positional_encoding", None)
+    if encoding is None:
+        return None
+    dtype = next(encoding.parameters()).dtype
+    return encoding(batch, dtype=dtype, device=batch.x.device)
 
 
 def _concat(chunks: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
@@ -221,77 +270,84 @@ def collect_features(
     loader = DataLoader(dataset=data_list, shuffle=False, batch_size=batch_size, num_workers=0)
 
     try:
-        for batch in loader:
-            batch = batch.to(device)
-            # Captured before the forward pass purely for readability: apply_mask corrupts a
-            # clone, so this reference stays the uncorrupted expression either way.
-            x_true = batch.x
+        with _rng_untouched(device):
+            for batch in loader:
+                batch = batch.to(device)
+                # Captured before the forward pass purely for readability: apply_mask corrupts a
+                # clone, so this reference stays the uncorrupted expression either way.
+                x_true = batch.x
 
-            if not corrupt:
-                # An all-False mask makes apply_mask a no-op (it assigns MASK_VALUE to an empty
-                # selection), so the encoder sees the real expression. Assigned as a NEW tensor
-                # rather than filled in place: the loader collates a fresh Batch per iteration
-                # but its tensors can share storage with the source Data objects, and writing
-                # through would destroy the training masks this split is using.
-                batch.mask = torch.zeros_like(batch.mask)
-                if getattr(batch, "gene_mask", None) is not None:
-                    batch.gene_mask = torch.zeros_like(batch.gene_mask)
+                if not corrupt:
+                    # An all-False mask makes apply_mask a no-op (it assigns MASK_VALUE to an empty
+                    # selection), so the encoder sees the real expression. Assigned as a NEW tensor
+                    # rather than filled in place: the loader collates a fresh Batch per iteration
+                    # but its tensors can share storage with the source Data objects, and writing
+                    # through would destroy the training masks this split is using.
+                    batch.mask = torch.zeros_like(batch.mask)
+                    if getattr(batch, "gene_mask", None) is not None:
+                        batch.gene_mask = torch.zeros_like(batch.gene_mask)
 
-            out = module._common_step(batch, prediction_task, prediction_level)
-            view = out.view
+                out = module._common_step(batch, prediction_task, prediction_level)
+                view = out.view
 
-            # `padded_node_idx` is the bridge from batch node order into token order. A module
-            # with no global component leaves it None, and then the local embedding is already
-            # the row set we want, in order.
-            idx = view.padded_node_idx
-            if idx is None:
-                if view.local_embedding is None:
-                    raise RuntimeError("Probe found neither a padded_node_idx nor a local embedding to gather.")
-                idx = torch.arange(view.local_embedding.shape[0], device=device)
+                # `padded_node_idx` is the bridge from batch node order into token order. A module
+                # with no global component leaves it None, and then the local embedding is already
+                # the row set we want, in order.
+                idx = view.padded_node_idx
+                if idx is None:
+                    if view.local_embedding is None:
+                        raise RuntimeError("Probe found neither a padded_node_idx nor a local embedding to gather.")
+                    idx = torch.arange(view.local_embedding.shape[0], device=device)
 
-            batch_emb: dict[str, np.ndarray] = {}
-            if "local" in embeddings and view.local_embedding is not None:
-                batch_emb["local"] = view.local_embedding[idx].detach().cpu().numpy()
-            if "global" in embeddings and view.global_embedding is not None:
-                batch_emb["global"] = view.tokens().detach().cpu().numpy()
+                batch_emb: dict[str, np.ndarray] = {}
+                if "local" in embeddings and view.local_embedding is not None:
+                    batch_emb["local"] = view.local_embedding[idx].detach().cpu().numpy()
+                if "global" in embeddings and view.global_embedding is not None:
+                    batch_emb["global"] = view.tokens().detach().cpu().numpy()
+                if "pe" in embeddings:
+                    # Batch node order, like the local embedding, so gathered by the same index.
+                    pe = node_positional_encoding(module, batch)
+                    if pe is not None:
+                        batch_emb["pe"] = pe[idx].detach().cpu().numpy()
 
-            if not batch_emb:
-                raise RuntimeError(
-                    f"probe.embeddings={list(embeddings)} but this module produced none of them. "
-                    "A LocalModel has no 'global' embedding and a GlobalModel no 'local' one."
-                )
-
-            batch_cat = {name: label_codes(batch, name)[idx].detach().cpu().numpy() for name in categorical_targets}
-            batch_con = {gene: x_true[idx, col].detach().cpu().numpy() for gene, col in gene_index.items()}
-            if obs_targets:
-                targets = getattr(batch, "probe_targets", None)
-                if targets is None:
-                    raise AttributeError(
-                        f"probe.regression_obs asks for {list(obs_targets)} but the batch carries no "
-                        "'probe_targets'; set dataset.probe_obsm_key and stack those obs columns "
-                        "into that obsm key before building the graphs."
+                if not batch_emb:
+                    raise RuntimeError(
+                        f"probe.embeddings={list(embeddings)} but this module produced none of them. "
+                        "A LocalModel has no 'global' embedding, a GlobalModel no 'local' one, and a "
+                        "model without a node positional encoding no 'pe' one."
                     )
-                # Column order is probe.regression_obs, fixed by whoever built the obsm.
-                for col, name in enumerate(obs_targets):
-                    batch_con[name] = targets[idx, col].detach().cpu().numpy()
 
-            # Which rows the model was actually asked about. `batch.mask` is the row-wise OR of
-            # `gene_mask` under gene masking, so it means "this cell is a supervision target"
-            # under both strategies -- see geome_dataloader._assign_random_mask.
-            batch_cell_masked = batch.mask[idx].bool().detach().cpu().numpy()
-            gene_mask = getattr(batch, "gene_mask", None) if mask_strategy == "gene" else None
-            if gene_mask is None:
-                batch_gene_masked = {gene: batch_cell_masked for gene in gene_index}
-            else:
-                batch_gene_masked = {
-                    gene: gene_mask[idx, col].bool().detach().cpu().numpy() for gene, col in gene_index.items()
-                }
+                batch_cat = {name: label_codes(batch, name)[idx].detach().cpu().numpy() for name in categorical_targets}
+                batch_con = {gene: x_true[idx, col].detach().cpu().numpy() for gene, col in gene_index.items()}
+                if obs_targets:
+                    targets = getattr(batch, "probe_targets", None)
+                    if targets is None:
+                        raise AttributeError(
+                            f"probe.regression_obs asks for {list(obs_targets)} but the batch carries no "
+                            "'probe_targets'; set dataset.probe_obsm_key and stack those obs columns "
+                            "into that obsm key before building the graphs."
+                        )
+                    # Column order is probe.regression_obs, fixed by whoever built the obsm.
+                    for col, name in enumerate(obs_targets):
+                        batch_con[name] = targets[idx, col].detach().cpu().numpy()
 
-            emb_chunks.append(batch_emb)
-            cat_chunks.append(batch_cat)
-            con_chunks.append(batch_con)
-            mask_chunks.append({"cell": batch_cell_masked})
-            gene_mask_chunks.append(batch_gene_masked)
+                # Which rows the model was actually asked about. `batch.mask` is the row-wise OR of
+                # `gene_mask` under gene masking, so it means "this cell is a supervision target"
+                # under both strategies -- see geome_dataloader._assign_random_mask.
+                batch_cell_masked = batch.mask[idx].bool().detach().cpu().numpy()
+                gene_mask = getattr(batch, "gene_mask", None) if mask_strategy == "gene" else None
+                if gene_mask is None:
+                    batch_gene_masked = {gene: batch_cell_masked for gene in gene_index}
+                else:
+                    batch_gene_masked = {
+                        gene: gene_mask[idx, col].bool().detach().cpu().numpy() for gene, col in gene_index.items()
+                    }
+
+                emb_chunks.append(batch_emb)
+                cat_chunks.append(batch_cat)
+                con_chunks.append(batch_con)
+                mask_chunks.append({"cell": batch_cell_masked})
+                gene_mask_chunks.append(batch_gene_masked)
     finally:
         module.train(was_training)
 

@@ -60,14 +60,16 @@ def get_global_component_cfg(cfg, global_component_name):
         pe.rw.steps = 16
         # A learned bias per head as a function of the distance between two cells. `kind`:
         # * `profile` -- any curve: piecewise linear between `num_kernels` knots over [0, max_dist]
-        #   (µm) and flat beyond. Can single out a distance (a ring, a threshold). Set `max_dist` to
-        #   about the largest distance that should still be told apart -- a graph's diagonal at most
-        #   (~1400 for synth_data_0's 1000 x 1000 slides, ~7000 for synth_spot's 5 mm lattices).
+        #   (µm) and flat beyond. Can single out a distance (a ring, a threshold). `max_dist` 0
+        #   derives it when the model is built: the largest slide diameter (farthest pair of cells
+        #   within one `sample_key` group) over all slides -- ~1400 for synth_data_0's
+        #   1000 x 1000 slides, ~7000 for synth_spot's 5 mm lattices. A positive value is used as is.
+        #   The checkpoint stores the range the model was trained with.
         # * `linear` -- one slope per head on the distance in mm (ALiBi): attention only falls or
         #   rises with distance. `num_kernels` and `max_dist` are ignored.
         pe.distance = CN()
         pe.distance.kind = "profile"
         pe.distance.num_kernels = 16
-        pe.distance.max_dist = 2000.0
+        pe.distance.max_dist = 0.0
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

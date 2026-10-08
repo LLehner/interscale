@@ -25,9 +25,12 @@ def get_probe_cfg(cfg):
 
     # Which representations to read the targets out of. Names are the fields of
     # `ViewOutput`: "local" is the graph component's embedding, "global" the transformer's
-    # per-cell token. A model without a component silently contributes no columns for it,
-    # which is what makes the same probe block usable for Local/Global/CombinedModel.
-    cfg.probe.embeddings = ["local", "global"]
+    # per-cell token. "pe" is a control column: the summed node positional encoding, as added
+    # to the tokens -- a global probe gain on a position-derived target means little until it
+    # beats this. A model without a component (or without a node PE) silently contributes no
+    # columns for it, which is what makes the same probe block usable for
+    # Local/Global/CombinedModel and for every arm of a PE sweep, including the PE-free one.
+    cfg.probe.embeddings = ["local", "global", "pe"]
 
     # Categorical targets, named by the OPTIONAL FIELD that carries them on the PyG Data
     # object -- so "celltype" here requires `dataset.celltype_key` to be set, and the probe

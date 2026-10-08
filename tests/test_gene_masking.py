@@ -402,11 +402,15 @@ def test_all_zero_cells_stay_distinguishable_from_masked_cells():
 # produces plausible embeddings and gene loadings, and is wrong.
 
 
-def test_optional_state_prefixes_covers_only_the_pca_buffers():
-    """The carve-out must stay narrow: widening it re-opens the silent-garbage-model hole."""
+def test_optional_state_prefixes_covers_only_the_derived_buffers():
+    """The carve-out must stay narrow: widening it re-opens the silent-garbage-model hole.
+
+    Both entries are buffers computed from the data, never learned weights: the PCA basis, and
+    the distance bias's ``max_dist``, which a model built from the same cfg re-derives.
+    """
     from interscale.model.base._base_model import _OPTIONAL_STATE_PREFIXES
 
-    assert _OPTIONAL_STATE_PREFIXES == ("pca_",)
+    assert _OPTIONAL_STATE_PREFIXES == ("pca_", "max_dist")
 
 
 def test_load_raises_on_a_key_mismatch(monkeypatch, tmp_path):

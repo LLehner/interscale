@@ -221,6 +221,12 @@ def _validate_probe(cfg):
             "probe.use is True but probe.embeddings is empty, so there is nothing to read a target out of."
         )
 
+    if list(cfg.probe.embeddings) == ["pe"] and not _node_pe_names(cfg):
+        raise ValueError(
+            "probe.embeddings is ['pe'] but no node positional encoding is enabled "
+            "(model.global_component.parameters.pe.node), so there is nothing to read a target out of."
+        )
+
     if not (cfg.probe.classification_targets or cfg.probe.regression_genes or cfg.probe.regression_obs):
         raise ValueError(
             "probe.use is True but no probe target is named (classification_targets, "
@@ -254,6 +260,13 @@ def _validate_probe(cfg):
                 f"probe.classification_targets asks for '{target}' but dataset.{cfg_key} is unset, "
                 f"so that annotation is never attached to the graphs and the probe has no labels."
             )
+
+
+def _node_pe_names(cfg) -> list[str]:
+    """``pe.node`` of the global component, or ``[]`` when there is no global component or PE block."""
+    params = cfg.model.global_component.get("parameters", None)
+    pe = params.get("pe", None) if params is not None else None
+    return list(pe.node) if pe is not None else []
 
 
 def _validate_pe(cfg):

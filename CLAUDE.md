@@ -139,7 +139,10 @@ number. It is off unless `cfg.probe.use` (see `config/probe_config.py`); when of
 built and the trainer is unchanged.
 
 Every probe reads the **same target out of both embeddings** with the same readout — the gap
-between the two columns is the point, not either number alone. Targets are `probe.classification_targets`
+between the two columns is the point, not either number alone. With a node positional encoding a
+third, control column `pe` (the summed node PE as added to the tokens) is probed too: a global gain
+on a position-derived target counts only where it beats `pe` (`.claude/PE_plan.md`, Stage 6).
+Targets are `probe.classification_targets`
 (an optional annotation attached to the PyG graphs, so `celltype` requires `dataset.celltype_key`;
 scored with macro precision/recall via logistic regression) and `probe.regression_genes` (a column
 of `adata.var_names`; scored with MSE and R2 via ridge). Results are logged as flat
@@ -168,7 +171,9 @@ Three invariants, each guarding a failure that does not raise:
   / `val_data` rather than iterating `train_dataloader()`, whose shuffle draws from the same torch
   generator the training batch order comes from — so enabling the probe would reorder training
   batches and change the model being measured. Dropout is off, masks are read not redrawn, and the
-  subsample uses its own seeded numpy generator.
+  subsample uses its own seeded numpy generator. Even an unshuffled `DataLoader` iterator seeds
+  itself off the global torch generator, and `pad_batch` subsamples long graphs with Python's
+  `random`, so `collect_features` restores every global generator afterwards (`_rng_untouched`).
 - **Both halves see identical rows.** The local embedding is gathered by `ViewOutput.padded_node_idx`,
   the same index that brings global tokens into cell order; row sets are built once per target and
   shared by both embeddings. Misalignment scores at chance, which reads like a real negative result.

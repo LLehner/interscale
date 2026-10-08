@@ -25,16 +25,20 @@ Adding an encoding is one :func:`register_pe` entry plus one config sub-block in
 ``get_global_component_cfg``; nothing in the transformer changes.
 """
 
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 from torch import nn
 from torch_geometric.utils import scatter
 
 from interscale.tl.padding import pad_like
-from interscale.tl.positional import laplacian_pe, random_walk_pe
+from interscale.tl.positional import laplacian_pe, point_set_diameter, random_walk_pe
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -202,8 +206,14 @@ class DistanceBias(nn.Module):
     def __init__(self, n_heads: int, num_kernels: int, max_dist: float):
         super().__init__()
         self.num_kernels = int(num_kernels)
-        self.max_dist = float(max_dist)
+        # A buffer, so the checkpoint carries the range the table was trained on: with `max_dist`
+        # derived from the data, a model loaded onto other slides would otherwise re-derive a
+        # different range and read every learned knot at the wrong distance.
+        self.register_buffer("max_dist", torch.tensor(float(max_dist)))
         self.table = nn.Parameter(torch.zeros(int(n_heads), self.num_kernels))
+
+    def extra_repr(self) -> str:
+        return f"num_kernels={self.num_kernels}, max_dist={float(self.max_dist):.1f} um"
 
     def forward(self, dist: torch.Tensor) -> torch.Tensor:
         """``[B, S, S]`` distances in µm to ``[B, heads, S, S]`` biases."""
@@ -218,7 +228,7 @@ class DistanceBias(nn.Module):
 
     def profile(self) -> tuple[torch.Tensor, torch.Tensor]:
         """``(knots [K] in µm, values [heads, K])`` -- each head's bias at each knot."""
-        return torch.linspace(0.0, self.max_dist, self.num_kernels), self.table.detach().cpu().clone()
+        return torch.linspace(0.0, float(self.max_dist), self.num_kernels), self.table.detach().cpu().clone()
 
 
 class LinearDistanceBias(nn.Module):
@@ -287,7 +297,8 @@ def _validate_distance(pe):
         return  # num_kernels and max_dist only describe the profile
     if pe.distance.num_kernels < 2:
         raise ValueError(f"pe.distance.num_kernels must be >= 2 (the two ends), got {pe.distance.num_kernels}.")
-    _positive(pe.distance.max_dist, "distance.max_dist")
+    if not pe.distance.max_dist >= 0:
+        raise ValueError(f"pe.distance.max_dist must be >= 0 (0 derives it from the data), got {pe.distance.max_dist}.")
 
 
 @register_pe("naive", kind="node", requires="pos", validate=_validate_naive)
@@ -327,6 +338,12 @@ def _build_rw(pe, n_embed):
 def _build_distance(pe, n_heads):
     if pe.distance.kind == "linear":
         return LinearDistanceBias(n_heads)
+    if not pe.distance.max_dist > 0:
+        raise ValueError(
+            "pe.distance.max_dist is 0, which means 'derive it from the data', but nothing derived it. "
+            "A model built from AnnData does so in its constructor (resolve_distance_range); a module "
+            "built directly from the config needs max_dist set, or resolve_distance_range(cfg, adata) first."
+        )
     return DistanceBias(n_heads, int(pe.distance.num_kernels), float(pe.distance.max_dist))
 
 
@@ -462,6 +479,75 @@ def attach_positional_inputs(datas, cfg) -> None:
             continue
         for data in datas:
             setattr(data, spec.requires, spec.precompute(data, pe))
+
+
+def resolve_distance_range(cfg, adata):
+    """``cfg`` with a derived ``pe.distance.max_dist`` when it is 0, else ``cfg`` itself.
+
+    0 means "the largest slide diameter in the data": the farthest pair of cells within any one
+    ``dataset.sample_key`` group of ``adata``, over every split, in µm. That is the longest
+    distance the bias is ever asked about, so the profile's knots span exactly the distances
+    that occur. Returns a clone -- the caller's config is not modified. Called by every model
+    constructor; a no-op unless the ``profile`` distance bias is enabled with ``max_dist`` 0.
+    """
+    names, pe = _enabled(cfg, "bias")
+    if "distance" not in names or pe.distance.kind != "profile" or pe.distance.max_dist > 0:
+        return cfg
+    max_dist = max_slide_diameter_um(adata, cfg)
+    if not max_dist > 0:
+        raise ValueError(
+            f"pe.distance.max_dist 0 asks for the largest slide diameter, but every slide in "
+            f"obsm[{cfg.dataset.spatial_key!r}] has its cells at one point. Set max_dist explicitly."
+        )
+    cfg = cfg.clone()
+    cfg.defrost()
+    cfg.model.global_component.parameters.pe.distance.max_dist = max_dist
+    cfg.freeze()
+    logger.info("pe.distance.max_dist derived from the data: %.1f um (largest slide diameter).", max_dist)
+    return cfg
+
+
+def max_slide_diameter_um(adata, cfg) -> float:
+    """The farthest pair of cells within one ``dataset.sample_key`` group, in µm, over all groups."""
+    key = cfg.dataset.spatial_key
+    if key is None or key not in adata.obsm:
+        raise ValueError(f"deriving pe.distance.max_dist needs coordinates, but obsm[{key!r}] does not exist.")
+    coords = np.asarray(adata.obsm[key], dtype=np.float64)
+    groups = adata.obs.groupby(list(cfg.dataset.sample_key), observed=True).indices
+    diameter = max(point_set_diameter(coords[rows]) for rows in groups.values())
+    return diameter * float(cfg.dataset.spatial_unit_um)
+
+
+#: LapPE entries scale like 1/sqrt(N); above this ratio of largest to smallest graph the same
+#: position is encoded at least 2x larger in the small graphs than in the large ones.
+LAP_SIZE_RATIO_WARNING = 4.0
+
+
+def warn_if_lap_scales_differ(datas, cfg) -> float | None:
+    """Warn when LapPE is on and the graphs' sizes differ by more than :data:`LAP_SIZE_RATIO_WARNING`.
+
+    Each eigenvector is unit-norm over its graph, so its entries scale like ``1/sqrt(N)``: across
+    graphs of very different size (whole slides vs windows, or a cell-level split that leaves val
+    graphs a fraction of the train ones) one encoder sees the same structure at different
+    magnitudes. Returns the size ratio, or None when LapPE is off or there is nothing to compare.
+    """
+    if "lap" not in _enabled(cfg, "node")[0]:
+        return None
+    sizes = [int(d.num_nodes) for d in datas if d.num_nodes]
+    if len(sizes) < 2:
+        return None
+    ratio = max(sizes) / min(sizes)
+    if ratio > LAP_SIZE_RATIO_WARNING:
+        logger.warning(
+            "LapPE: graph sizes range %d-%d cells (x%.1f), so eigenvector entries differ ~x%.1f in "
+            "scale between the largest and smallest graph (they go like 1/sqrt(N)). Scaling them by "
+            "sqrt(N) is the candidate fix; see .claude/PE_plan.md.",
+            min(sizes),
+            max(sizes),
+            ratio,
+            math.sqrt(ratio),
+        )
+    return ratio
 
 
 def build_node_positional_encoding(cfg, n_embed: int | None) -> NodePositionalEncoding | None:

@@ -591,3 +591,161 @@ def test_obs_targets_without_an_obsm_key_are_rejected_at_config_load():
     cfg.probe.regression_obs = ["dist_to_center"]
     with pytest.raises(ValueError, match="probe_obsm_key is unset"):
         _validate_probe(cfg)
+
+
+# --------------------------------------------------------------------------- the pe control column
+
+
+def _pe_module(node=("naive",), max_seq_len=32, **pe):
+    """A transformer whose node PE has non-zero weights (its output layers start at zero)."""
+    from interscale.config.global_component_config import get_global_component_cfg
+    from interscale.module.global_modules.positional_encodings import build_node_positional_encoding
+
+    cfg = get_cfg_defaults()
+    cfg.model.global_component.name = "self-attn-transformer"
+    cfg = get_global_component_cfg(cfg, "self-attn-transformer")
+    cfg.dataset.spatial_key = "spatial"
+    cfg.model.global_component.parameters.pe.node = list(node)
+    for key, value in pe.items():
+        setattr(cfg.model.global_component.parameters.pe, key, value)
+    encoding = build_node_positional_encoding(cfg, N_EMBED)
+    gen = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        for p in encoding.parameters():
+            p.copy_(torch.randn(p.shape, generator=gen))
+
+    module = build_module(max_seq_len=max_seq_len)
+    module.positional_encoding = encoding
+    return module
+
+
+def _with_positions(data_list, seed=3):
+    """Give each graph coordinates, and the same coordinates as its two obs probe targets."""
+    rng = np.random.default_rng(seed)
+    for d in data_list:
+        d.pos = torch.tensor(rng.uniform(0, 500, size=(d.num_nodes, 2)), dtype=torch.float32)
+        d.probe_targets = d.pos.clone()
+    return data_list
+
+
+def _collect_pe(module, data_list, embeddings=("global", "pe")):
+    return collect_features(
+        module,
+        data_list,
+        prediction_task="regression",
+        prediction_level="node",
+        embeddings=embeddings,
+        gene_index={},
+        categorical_targets=(),
+        obs_targets=("x", "y"),
+        mask_strategy="node",
+        batch_size=2,
+        device=torch.device("cpu"),
+    )
+
+
+def test_pe_column_holds_each_cells_own_encoding():
+    """Row i of the pe column is the encoding of the cell whose targets are row i.
+
+    Checked against the targets (the cell's coordinates), not against the gather the collector
+    uses, so a pe column gathered in the wrong order fails here. One graph exceeds max_seq_len:
+    without subsampling the token order is the batch order and a missing gather goes unnoticed.
+    """
+    module = _pe_module(center_coords=False, max_seq_len=8)
+    feats = _collect_pe(module, _with_positions(make_data_list(sizes=(6, 15, 7))))
+
+    pos = torch.tensor(np.stack([feats.continuous["x"], feats.continuous["y"]], axis=1))
+    expected = module.positional_encoding.encoders["naive"](pos).detach().numpy()
+
+    assert feats.embeddings["pe"].shape == feats.embeddings["global"].shape
+    np.testing.assert_allclose(feats.embeddings["pe"], expected, atol=1e-5)
+    assert np.abs(expected).max() > 0  # a zero encoding would pass any alignment check
+
+
+def test_pe_column_is_drawn_in_eval_and_touches_no_generator():
+    """Rotation and sign flips are training-only: the probe reads the eval encoding, and the
+    PE generator that drives them is not advanced, so probing does not change later training."""
+    module = _pe_module(node=("naive",), rotate_train=True, center_coords=False)
+    module.train()
+    data_list = _with_positions(make_data_list(sizes=(6, 9)))
+    pe_state = module.positional_encoding.generator.get_state()
+    torch_state = torch.random.get_rng_state()
+
+    first = _collect_pe(module, data_list).embeddings["pe"]
+    second = _collect_pe(module, data_list).embeddings["pe"]
+
+    np.testing.assert_array_equal(first, second)
+    assert torch.equal(module.positional_encoding.generator.get_state(), pe_state)
+    assert torch.equal(torch.random.get_rng_state(), torch_state)
+    assert module.training
+
+
+def test_a_model_without_a_node_pe_contributes_no_pe_column():
+    """The PE-free arm of a sweep runs the same probe block: the column is absent, not an error."""
+    feats = _collect_pe(build_module(), _with_positions(make_data_list()))
+    assert set(feats.embeddings) == {"global"}
+
+    with pytest.raises(RuntimeError, match="no 'pe' one"):
+        _collect_pe(build_module(), _with_positions(make_data_list()), embeddings=("pe",))
+
+
+def test_run_emits_a_pe_column_beside_global():
+    cfg = probe_cfg()
+    cfg.probe.regression_genes = ["g0"]
+    callback = OnlineProbeCallback(cfg, GENES)
+    module = _pe_module()
+
+    results = callback.run(
+        module,
+        _Datamodule(
+            _with_positions(make_data_list(sizes=(40, 40))), _with_positions(make_data_list(sizes=(40,), seed=7))
+        ),
+        device=torch.device("cpu"),
+    )
+
+    for embedding in ("global", "pe"):
+        assert probe_metric_name("celltype", "precision", embedding) in results
+        assert probe_metric_name("gene_g0", "mse", embedding) in results
+    assert all(np.isfinite(v) for v in results.values())
+
+
+def test_chart_series_puts_the_pe_control_on_the_same_chart():
+    callback = OnlineProbeCallback(probe_cfg(), GENES)
+    series = callback.chart_series(
+        None,
+        {
+            probe_metric_name("celltype", "precision", "global"): 0.6,
+            probe_metric_name("celltype", "precision", "pe"): 0.5,
+        },
+    )
+    assert series["celltype_precision"] == {"global": 0.6, "pe": 0.5}
+
+
+def test_pe_alone_without_a_node_pe_is_rejected():
+    from interscale.config import _validate_probe
+
+    cfg = probe_cfg()
+    cfg.probe.embeddings = ["pe"]
+    with pytest.raises(ValueError, match="no node positional encoding"):
+        _validate_probe(cfg)
+
+    # The default lists pe too, and stays valid for a model without one.
+    cfg.probe.embeddings = ["local", "global", "pe"]
+    _validate_probe(cfg)
+
+
+def test_collecting_leaves_every_global_generator_where_it_was():
+    """A DataLoader iterator seeds itself off the global torch generator even unshuffled, and
+    pad_batch subsamples a graph longer than max_seq_len with Python's random. Without the guard
+    a probe epoch shifts every later training draw, so probe-on trains a different model."""
+    import random
+
+    data_list = make_data_list(sizes=(6, 40))  # 40 > max_seq_len: pad_batch subsamples
+    module = build_module(max_seq_len=16)
+    torch_state, py_state, np_state = torch.random.get_rng_state(), random.getstate(), np.random.get_state()
+
+    collect(data_list, module=module)
+
+    assert torch.equal(torch.random.get_rng_state(), torch_state)
+    assert random.getstate() == py_state
+    assert np.array_equal(np.random.get_state()[1], np_state[1])

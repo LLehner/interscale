@@ -260,7 +260,7 @@ def test_a_valid_pe_config_loads(tmp_path):
         (["node: [distance]"], True, "belong under pe.bias"),
         (["bias: [naive]"], True, "belong under pe.node"),
         (["bias: [distance]", "distance:", "  num_kernels: 1"], True, "num_kernels"),
-        (["bias: [distance]", "distance:", "  max_dist: 0.0"], True, "max_dist"),
+        (["bias: [distance]", "distance:", "  max_dist: -1.0"], True, "max_dist"),
         (["bias: [distance]"], False, "dataset.spatial_key"),
         (["bias: [distance]", "distance:", "  kind: gaussian"], True, "distance.kind"),
     ],
@@ -724,6 +724,8 @@ def _bias_cfg(kind="profile", **pe):
     pe.setdefault("bias", ["distance"])
     cfg = _cfg(**pe)
     cfg.model.global_component.parameters.pe.distance.kind = kind
+    # The default 0 is derived from AnnData by the model; these tests build modules directly.
+    cfg.model.global_component.parameters.pe.distance.max_dist = 2000.0
     return cfg
 
 
@@ -990,3 +992,141 @@ def test_the_bias_trains_end_to_end(kind):
 
     assert torch.isfinite(trainer.logged_metrics["train_loss"])
     assert all(param.any() for param in bias.parameters()), "the gradient never reached the bias"
+
+
+# --------------------------------------------------------------------------- derived max_dist
+
+
+def test_point_set_diameter_is_the_farthest_pair():
+    import numpy as np
+    from scipy.spatial.distance import pdist
+
+    from interscale.tl.positional import point_set_diameter
+
+    rng = np.random.default_rng(0)
+    cloud = rng.uniform(0, 300, size=(400, 2))
+    assert point_set_diameter(cloud) == pytest.approx(pdist(cloud).max())
+    assert point_set_diameter(np.array([[0, 0], [3, 0], [0, 4], [3, 4]])) == pytest.approx(5.0)
+    # No 2D hull: collinear points and pairs fall back to the bounding-box diagonal, exact here.
+    assert point_set_diameter(np.array([[0, 0], [1, 1], [2, 2], [5, 5]])) == pytest.approx(5 * math.sqrt(2))
+    assert point_set_diameter(np.array([[1, 1], [4, 5]])) == pytest.approx(5.0)
+    assert point_set_diameter(np.array([[1, 1]])) == 0.0
+
+
+def _slides_adata(model_cls=None, unit_offset=10_000.0):
+    """Two slides far apart in obsm: a 30 x 40 rectangle (diameter 50) and a 6 x 8 one (10)."""
+    import numpy as np
+    import pandas as pd
+    from anndata import AnnData
+
+    big = [[0, 0], [30, 0], [0, 40], [30, 40], [10, 10]]
+    small = [[0, 0], [6, 0], [0, 8], [6, 8]]
+    coords = np.array(big + [[x + unit_offset, y] for x, y in small], dtype=np.float32)
+    adata = AnnData(X=np.random.default_rng(0).integers(0, 10, size=(len(coords), 6)).astype(np.float32))
+    adata.obsm["spatial"] = coords
+    adata.obs["sample"] = pd.Categorical(["s1"] * len(big) + ["s2"] * len(small))
+    adata.obs["split"] = pd.Categorical(["train"] * 6 + ["val"] * 3)
+    if model_cls is not None:
+        model_cls._setup_anndata(
+            adata=adata, layer_key=None, sample_key_list=["sample"], prediction_task="regression", view_registry=False
+        )
+    return adata
+
+
+def _derived_cfg(kind="profile", unit=1.0):
+    cfg = _cfg(bias=["distance"])
+    cfg.dataset.sample_key = ["sample"]
+    cfg.dataset.spatial_unit_um = unit
+    cfg.model.global_component.parameters.pe.distance.kind = kind
+    cfg.freeze()
+    return cfg
+
+
+def test_max_dist_zero_is_the_largest_diameter_within_one_slide():
+    """Per slide, then the max: the 10 mm gap between the two slides is not a distance any pair
+    of tokens ever has, since one graph is one slide."""
+    from interscale.module.global_modules.positional_encodings import resolve_distance_range
+
+    cfg = _derived_cfg(unit=2.0)
+    resolved = resolve_distance_range(cfg, _slides_adata())
+
+    assert resolved.model.global_component.parameters.pe.distance.max_dist == pytest.approx(100.0)
+    assert cfg.model.global_component.parameters.pe.distance.max_dist == 0.0  # caller's cfg untouched
+
+
+def test_max_dist_is_only_derived_when_asked():
+    from interscale.module.global_modules.positional_encodings import resolve_distance_range
+
+    adata = _slides_adata()
+    linear = _derived_cfg(kind="linear")
+    assert resolve_distance_range(linear, adata) is linear
+
+    fixed = _derived_cfg().clone()
+    fixed.defrost()
+    fixed.model.global_component.parameters.pe.distance.max_dist = 700.0
+    assert resolve_distance_range(fixed, adata) is fixed
+
+    off = _cfg()
+    assert resolve_distance_range(off, adata) is off  # no coordinates needed without the bias
+
+
+def test_a_module_built_without_the_data_cannot_use_max_dist_zero():
+    from interscale.module.global_modules.positional_encodings import build_attention_bias
+
+    with pytest.raises(ValueError, match="nothing derived it"):
+        build_attention_bias(_derived_cfg(), 2)
+
+
+def test_the_model_builds_its_bias_over_the_derived_range():
+    from interscale.model.combined_model import CombinedModel
+
+    model = CombinedModel(_slides_adata(CombinedModel), cfg=_derived_cfg())
+    distance = model.module.global_module.attention_bias.encoders["distance"]
+
+    assert float(distance.max_dist) == pytest.approx(50.0)
+    assert distance.profile()[0][-1].item() == pytest.approx(50.0)
+
+
+def test_the_checkpoint_keeps_the_range_the_table_was_trained_on():
+    """Loaded onto other data the model re-derives another range; the stored one must win, or
+    every learned knot is read at the wrong distance."""
+    from interscale.module.global_modules.positional_encodings import DistanceBias
+
+    trained = DistanceBias(n_heads=2, num_kernels=5, max_dist=400.0)
+    assert "max_dist" in trained.state_dict()
+
+    reloaded = DistanceBias(n_heads=2, num_kernels=5, max_dist=900.0)
+    reloaded.load_state_dict(trained.state_dict())
+    assert float(reloaded.max_dist) == 400.0
+    assert reloaded.profile()[0][-1].item() == 400.0
+
+
+def test_checkpoints_from_before_the_buffer_still_load():
+    from interscale.model.base._base_model import _OPTIONAL_STATE_PREFIXES
+
+    key = "global_module.attention_bias.encoders.distance.max_dist"
+    assert key.rsplit(".", 1)[-1].startswith(_OPTIONAL_STATE_PREFIXES)
+
+
+# --------------------------------------------------------------------------- LapPE size warning
+
+
+def _sized_graphs(*sizes):
+    return [SimpleNamespace(num_nodes=n) for n in sizes]
+
+
+def test_lap_warns_when_graph_sizes_differ_enough_to_rescale_it(caplog):
+    from interscale.module.global_modules.positional_encodings import warn_if_lap_scales_differ
+
+    lap = _cfg(["lap"])
+    with caplog.at_level("WARNING"):
+        assert warn_if_lap_scales_differ(_sized_graphs(500, 400, 450), lap) == pytest.approx(1.25)
+    assert not caplog.records
+
+    with caplog.at_level("WARNING"):
+        assert warn_if_lap_scales_differ(_sized_graphs(5000, 400, 450), lap) == pytest.approx(12.5)
+    assert "LapPE" in caplog.text and "400-5000" in caplog.text
+
+    caplog.clear()
+    assert warn_if_lap_scales_differ(_sized_graphs(5000, 40), _cfg(["rw"])) is None
+    assert not caplog.records
