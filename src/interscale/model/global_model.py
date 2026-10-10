@@ -30,7 +30,9 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
         self.global_component = True
 
         self.module = GlobalModule.from_config(
-            cfg,
+            # self._cfg, not cfg: it carries the settings BaseModel derived from the data
+            # (pe.distance.max_dist 0); cfg still holds the 0.
+            self._cfg,
             # No local component, so nothing has been mixed that the long-range mask could block.
             local_mask_hops=0,
             n_input=self.n_input,
