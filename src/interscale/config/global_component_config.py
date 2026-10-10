@@ -27,8 +27,11 @@ def get_global_component_cfg(cfg, global_component_name):
         # the list is swept through a sweep yaml's `arms:` block, never as a raw wandb list.
         pe = cfg.model.global_component.parameters.pe = CN()
         pe.node = []  # any of: naive, sinusoidal, lap, rw
-        # Attention biases, added to the logit of every pair of tokens: any of: distance.
+        # Attention biases, added to the logit of every pair of tokens: any of: distance, spectral.
         pe.bias = []
+        # The rotary encoding, which turns every query and key by its cell's position in each
+        # attention layer: [] or [rope].
+        pe.rotary = []
         # Coordinate encodings read `data.pos` (needs dataset.spatial_key), in µm
         # (dataset.spatial_unit_um), with each graph's centroid subtracted: absolute slide offsets
         # are scanner artefacts. `rotate_train` rotates each graph by a random angle in training,
@@ -71,5 +74,37 @@ def get_global_component_cfg(cfg, global_component_name):
         pe.distance.kind = "profile"
         pe.distance.num_kernels = 16
         pe.distance.max_dist = 0.0
+        # A learned filter of the neighbour graph's spectrum per head: the bias between two cells is
+        # sum_i h_h(lambda_i) * N * v_i[j] * v_i[l] over the k lowest non-trivial eigenpairs of the
+        # normalised Laplacian LapPE uses -- a learned diffusion kernel, so distances run along the
+        # tissue (around holes) rather than straight across as for `distance`. h_h is piecewise
+        # linear in log(lambda) between `num_knots` knots over [min_eigval, max_eigval], flat beyond,
+        # and starts at zero. Sign- and basis-invariant (a tied eigenspace cut by k is dropped whole).
+        # No coordinates needed. `k` sets the finest scale: on a slide of side L the shortest
+        # wavelength is about L * sqrt(pi / k), 1.6 mm on synth_spot at k = 32. Eigenvalues measured:
+        # ~1e-3 to 4e-2 on synth_spot (k = 32), ~4e-5 to 1.5e-3 on a 50k-cell kNN slide; the run logs
+        # the range it got and warns when it leaves the knots.
+        pe.spectral = CN()
+        pe.spectral.k = 32
+        pe.spectral.num_knots = 32
+        pe.spectral.min_eigval = 1e-5
+        pe.spectral.max_eigval = 2.0  # the largest eigenvalue a normalised Laplacian can have
+        # Rotary position embedding in 2D (RoPE; Su et al. 2021, Heo et al. 2024): pairs of each
+        # head's query and key dims are rotated by angles linear in the cell's coordinates, so the
+        # logit of two cells depends on their offset, weighted by what the two cells express.
+        # Needs n_embed / n_heads to be a multiple of 4. `kind`:
+        # * `axial` -- fixed frequencies; half of each head's pairs along x, half along y.
+        # * `mixed` -- learnable 2D frequencies, starting from that frame turned by 90/n_heads
+        #   degrees more for each head, so the heads' axes cover the directions evenly.
+        # Wavelengths (µm) are spaced geometrically over [min_wavelength, max_wavelength] and dealt
+        # out across heads (each head its own scales; at the default n_embed 16 and 4 heads that is
+        # one per axis per head). Below the distance between two cells a wave carries nothing for
+        # them, so `min_wavelength` is about the shortest distance attended over (the long-range
+        # mask's radius). `max_wavelength` 0 derives twice the largest slide diameter when the model
+        # is built, so the longest wave never wraps around within a slide.
+        pe.rope = CN()
+        pe.rope.kind = "axial"
+        pe.rope.min_wavelength = 50.0
+        pe.rope.max_wavelength = 0.0
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

@@ -90,11 +90,11 @@ class BaseModel(metaclass=BaseModelMeta):
         cfg: CN,
     ):
         self.id = str(uuid4())  # Used for cls._manager_store keys.
-        # Settings derived from the data rather than the config (pe.distance.max_dist 0), filled
-        # in before any module is built from self._cfg.
-        from interscale.module.global_modules.positional_encodings import resolve_distance_range
+        # Settings derived from the data rather than the config (pe.distance.max_dist 0,
+        # pe.rope.max_wavelength 0), filled in before any module is built from self._cfg.
+        from interscale.module.global_modules.positional_encodings import resolve_distance_range, resolve_rope_range
 
-        self._cfg = resolve_distance_range(cfg, adata)
+        self._cfg = resolve_rope_range(resolve_distance_range(cfg, adata), adata)
 
         self.prediction_task = cfg.dataset.prediction_task
         self.prediction_level = cfg.dataset.prediction_level

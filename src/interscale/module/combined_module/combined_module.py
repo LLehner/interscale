@@ -55,12 +55,12 @@ class CombinedModule(BaseModule):
 
         local_embedding = self.local_module.forward(local_input, batch_masked.edge_index)
 
-        padded_emb, src_padding_mask, pad_index_nodes, attention_mask = self.global_module.common_step_local_to_global(
-            batch_masked, local_embedding
+        padded_emb, src_padding_mask, pad_index_nodes, attention_mask, rotary = (
+            self.global_module.common_step_local_to_global(batch_masked, local_embedding)
         )
         assert not torch.any(torch.isnan(padded_emb)), "padded_emb contains NaN values"
         global_embedding, src_padding_mask, attn_matrix = self.global_module.forward(
-            padded_emb, src_padding_mask, attention_mask
+            padded_emb, src_padding_mask, attention_mask, rotary=rotary
         )
         assert not torch.any(torch.isnan(global_embedding)), "global_embedding contains NaN values"
 

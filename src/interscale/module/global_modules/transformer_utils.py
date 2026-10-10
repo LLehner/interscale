@@ -33,13 +33,25 @@ Tensor = torch.Tensor
 import torch.nn.functional as F
 from torch.nn.modules.activation import _arg_requires_grad, _check_arg_device, _is_make_fx_tracing
 
-__all__ = ["multi_head_attention_forward_with_gradients"]
+__all__ = ["apply_rotary", "multi_head_attention_forward_with_gradients"]
 
 """
 Vendor function for multi_head_attention_forward.
 Adjusted to allow computation graph on attention weights
 https://discuss.pytorch.org/t/multiheadattention-attention-weights-are-not-being-used-in-gradient-graph/202274
 """
+
+
+def apply_rotary(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """Rotate each pair ``(i, i + d/2)`` of ``x``'s last dimension by the angle ``cos``/``sin`` encode.
+
+    The "half" layout of RoPE: pair ``i`` is the complex number ``x[i] + 1j * x[i + d/2]``, and
+    ``cos``/``sin`` (shaped like ``x``) hold ``cos(theta_i)``/``sin(theta_i)`` in both halves, so the
+    result is that number times ``exp(1j * theta_i)``. Which dimensions form a pair does not
+    matter, since the projection in front of it is learned.
+    """
+    half = x.shape[-1] // 2
+    return x * cos + torch.cat([-x[..., half:], x[..., :half]], dim=-1) * sin
 
 
 def multi_head_attention_forward_with_gradients(
@@ -68,9 +80,14 @@ def multi_head_attention_forward_with_gradients(
     static_v: Tensor | None = None,
     average_attn_weights: bool = True,
     is_causal: bool = False,
+    rotary: tuple[Tensor, Tensor] | None = None,
 ) -> tuple[Tensor, Tensor | None]:
     r"""
     Args:
+        rotary: ``(cos, sin)``, each ``(N*num_heads, L, E/num_heads)`` -- the rotation RoPE applies
+            to every query and key (:func:`apply_rotary`) after the heads are split, before any
+            logit is formed. Self-attention only: token ``l`` of the queries and of the keys is
+            the same cell. Not part of torch's original function.
         query, key, value: map a query and a set of key-value pairs to an output.
             See "Attention Is All You Need" for more details.
         embed_dim_to_check: total dimension of the model.
@@ -173,6 +190,7 @@ def multi_head_attention_forward_with_gradients(
             static_k=static_k,
             static_v=static_v,
             average_attn_weights=average_attn_weights,
+            rotary=rotary,
         )
 
     is_batched = _mha_shape_check(query, key, value, key_padding_mask, attn_mask, num_heads)
@@ -318,6 +336,24 @@ def multi_head_attention_forward_with_gradients(
         assert static_v.size(2) == head_dim, f"expecting static_v.size(2) of {head_dim}, but got {static_v.size(2)}"
         v = static_v
 
+    if rotary is not None:
+        # Each query and key turned by its own cell's angles, so their product depends only on the
+        # difference -- the relative offset. Every key needs a position for that: static keys,
+        # bias_k and the zero-attention key have none.
+        if static_k is not None or bias_k is not None or add_zero_attn:
+            raise RuntimeError(
+                "rotary position embedding needs a position for every key; static_k, bias_k and "
+                "add_zero_attn add keys without one."
+            )
+        cos, sin = rotary
+        if cos.shape != q.shape or k.shape != q.shape:
+            raise RuntimeError(
+                f"rotary angles of shape {tuple(cos.shape)} do not match the (batch*heads, tokens, head_dim) "
+                f"queries {tuple(q.shape)} and keys {tuple(k.shape)}."
+            )
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
+
     # add zero attention along batch dimension (now first)
     if add_zero_attn:
         zero_attn_shape = (bsz * num_heads, 1, head_dim)
@@ -425,9 +461,12 @@ class MultiHeadAttentionWithEdits(torch.nn.MultiheadAttention):
         attn_mask: Tensor | None = None,
         average_attn_weights: bool = True,
         is_causal: bool = False,
+        rotary: tuple[Tensor, Tensor] | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         r"""
         Args:
+        rotary: ``(cos, sin)`` rotating every query and key by its cell's position (RoPE), see
+            :func:`multi_head_attention_forward_with_gradients`. ``None`` leaves them as projected.
         query: Query embeddings of shape :math:`(L, E_q)` for unbatched input, :math:`(L, N, E_q)` when ``batch_first=False``
             or :math:`(N, L, E_q)` when ``batch_first=True``, where :math:`L` is the target sequence length,
             :math:`N` is the batch size, and :math:`E_q` is the query embedding dimension ``embed_dim``.
@@ -490,6 +529,8 @@ class MultiHeadAttentionWithEdits(torch.nn.MultiheadAttention):
             and torch.is_floating_point(key_padding_mask)
         ):
             why_not_fast_path = "floating-point masks are not supported for fast path."
+        if rotary is not None:
+            why_not_fast_path = "the fused kernel cannot rotate queries and keys (rotary position embedding)."
 
         is_batched = query.dim() == 3
 
@@ -636,6 +677,7 @@ class MultiHeadAttentionWithEdits(torch.nn.MultiheadAttention):
                 v_proj_weight=self.v_proj_weight,
                 average_attn_weights=average_attn_weights,
                 is_causal=is_causal,
+                rotary=rotary,
             )
         else:
             attn_output, attn_output_weights = multi_head_attention_forward_with_gradients(
@@ -658,6 +700,7 @@ class MultiHeadAttentionWithEdits(torch.nn.MultiheadAttention):
                 attn_mask=attn_mask,
                 average_attn_weights=average_attn_weights,
                 is_causal=is_causal,
+                rotary=rotary,
             )
         if self.batch_first and is_batched:
             return attn_output.transpose(1, 0), attn_output_weights

@@ -183,7 +183,7 @@ def test_forward_is_finite_on_a_dense_graph(hops):
     emb = torch.tensor(rng.normal(size=(n, 8)), dtype=torch.float32)
 
     module = build_module(long_range=True, hops=hops).eval()
-    padded, padding_mask, _, attn_mask = module.common_step_local_to_global(batch, emb, eval_step=True)
+    padded, padding_mask, _, attn_mask, _ = module.common_step_local_to_global(batch, emb, eval_step=True)
     out, _, attn = module.forward(padded, padding_mask, attn_mask, register_hook=True)
 
     assert torch.isfinite(out).all(), "transformer output contains NaN or inf"
@@ -212,7 +212,7 @@ def test_training_steps_stay_finite():
 
     for _ in range(5):
         optimizer.zero_grad()
-        padded, padding_mask, _, attn_mask = module.common_step_local_to_global(batch, emb, eval_step=True)
+        padded, padding_mask, _, attn_mask, _ = module.common_step_local_to_global(batch, emb, eval_step=True)
         out, _, _ = module.forward(padded, padding_mask, attn_mask, register_hook=False)
         loss = torch.nn.functional.mse_loss(out, target)
         assert torch.isfinite(loss), "loss went non-finite under the mask"
@@ -229,7 +229,7 @@ def test_blocked_pairs_receive_no_attention():
     emb = torch.tensor(rng.normal(size=(n, 8)), dtype=torch.float32)
 
     module = build_module(long_range=True, hops=1).eval()
-    padded, padding_mask, _, attn_mask = module.common_step_local_to_global(batch, emb, eval_step=True)
+    padded, padding_mask, _, attn_mask, _ = module.common_step_local_to_global(batch, emb, eval_step=True)
     module.forward(padded, padding_mask, attn_mask, register_hook=True)
 
     weights = module.transformer_encoder.layers[0].get_attn_output_weights()  # [B, H, L, S]
@@ -247,7 +247,7 @@ def test_mask_off_leaves_everything_but_the_diagonal_open():
     emb = torch.zeros(n, 8)
 
     module = build_module(long_range=False, hops=2).eval()
-    _, _, _, attn_mask = module.common_step_local_to_global(batch, emb, eval_step=True)
+    _, _, _, attn_mask, _ = module.common_step_local_to_global(batch, emb, eval_step=True)
 
     assert torch.equal(attn_mask[0, :n, :n], torch.eye(n, dtype=torch.bool))
 
@@ -411,7 +411,7 @@ def test_a_combined_forward_blocks_the_two_hop_closure_of_a_two_layer_gcn():
     module = _combined(_component_cfg("GCN", n_layers=2))
     batch = _Batch(path_graph(n), torch.zeros(n, dtype=torch.long), n)
 
-    _, _, _, mask = module.global_module.common_step_local_to_global(batch, torch.randn(n, 8), eval_step=True)
+    _, _, _, mask, _ = module.global_module.common_step_local_to_global(batch, torch.randn(n, 8), eval_step=True)
 
     blocked = mask[0, :n, :n]
     for i in range(n):
@@ -437,7 +437,7 @@ def test_reach_zero_is_the_self_only_mask():
         module = build_module(long_range=True, hops=0).eval()
     batch = _Batch(path_graph(n), torch.zeros(n, dtype=torch.long), n)
 
-    _, _, index_nodes, mask = module.common_step_local_to_global(batch, torch.randn(n, 8), eval_step=True)
+    _, _, index_nodes, mask, _ = module.common_step_local_to_global(batch, torch.randn(n, 8), eval_step=True)
 
     assert torch.equal(mask, attn_mask_diagonal(batch.batch, index_nodes, N_HEADS, mask.device))
 

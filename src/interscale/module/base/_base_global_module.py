@@ -307,12 +307,14 @@ class GlobalModule(BaseModule):
         )
         assert not torch.any(torch.isnan(embedding)), "embedding contains NaN values"
 
-        padded_emb, src_padding_mask, pad_index_nodes, attention_mask = self.common_step_local_to_global(
+        padded_emb, src_padding_mask, pad_index_nodes, attention_mask, rotary = self.common_step_local_to_global(
             batch_masked, embedding
         )
         assert not torch.any(torch.isnan(padded_emb)), "padded_emb contains NaN values"
 
-        global_embedding, src_padding_mask, attn_matrix = self.forward(padded_emb, src_padding_mask, attention_mask)
+        global_embedding, src_padding_mask, attn_matrix = self.forward(
+            padded_emb, src_padding_mask, attention_mask, rotary=rotary
+        )
         # global_embedding, src_padding_mask = self.forward(padded_emb, src_padding_mask, attention_mask)
         assert not torch.any(torch.isnan(global_embedding)), "global_embedding contains NaN values"
 
@@ -370,10 +372,7 @@ class GlobalModule(BaseModule):
 
         if module_name == "self-attn-transformer":
             from interscale.module.global_modules import TransformerNodeEncoderHook
-            from interscale.module.global_modules.positional_encodings import (
-                build_attention_bias,
-                build_node_positional_encoding,
-            )
+            from interscale.module.global_modules.positional_encodings import build_positional_encodings
 
             return TransformerNodeEncoderHook(
                 max_seq_len=params["max_seq_len"],
@@ -384,8 +383,7 @@ class GlobalModule(BaseModule):
                 dim_feedforward=params["dim_feedforward"],
                 long_range_attention=params["long_range_attention"],
                 local_mask_hops=local_mask_hops,
-                positional_encoding=build_node_positional_encoding(cfg, kwargs.get("n_embed")),
-                attention_bias=build_attention_bias(cfg, params["n_heads"]),
+                **build_positional_encodings(cfg, n_embed=kwargs.get("n_embed"), n_heads=params["n_heads"]),
                 **kwargs,
             )
         # Add more elifs for other modules

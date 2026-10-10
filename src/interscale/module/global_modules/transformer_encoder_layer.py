@@ -50,6 +50,10 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
         self.attn_output_weights = None
         self.attn_gradients = None  # To store attention weights gradients
         self.register_hook = False
+        # ``(cos, sin)`` of the rotary position embedding for the current forward pass, or None.
+        # Set and cleared around each call by `TransformerNodeEncoderHook.forward`, because
+        # `nn.TransformerEncoder` passes nothing but the masks on to its layers.
+        self.rotary = None
 
     def save_attn_gradients(self, attn_gradients):
         self.attn_gradients = attn_gradients
@@ -89,6 +93,7 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
             need_weights=True,
             average_attn_weights=False,  # return weigths per head
             is_causal=is_causal,  # from nn.TransformerEncoderLayer
+            rotary=self.rotary,
         )
         self.save_attn_output(attn_output)
         self.save_attn_output_weights(attn_output_weights)

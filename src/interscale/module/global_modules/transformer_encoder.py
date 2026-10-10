@@ -1,4 +1,5 @@
 import warnings
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -11,6 +12,22 @@ from interscale.tl import (
     create_transformer_attention_mask_from_edges,
     pad_batch,
 )
+
+
+class GlobalInput(NamedTuple):
+    """What :meth:`TransformerNodeEncoderHook.common_step_local_to_global` hands to ``forward``.
+
+    Everything in padded order: ``S`` tokens per graph, left-padded, plus CLS appended last by
+    ``forward``. ``rotary`` is the ``(cos, sin)`` of the rotary encoding, each
+    ``[B * heads, S + 1, head_dim]``, or None when it is off; pass it on as ``forward(...,
+    rotary=...)``.
+    """
+
+    padded_emb: torch.Tensor  # [S, B, E]
+    src_padding_mask: torch.Tensor  # [B, S], True at padding
+    index_nodes: list  # per graph, the node indices pad_batch kept
+    attention_mask: torch.Tensor  # [B * heads, S + 1, S + 1]: boolean, or float with a bias merged in
+    rotary: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class TransformerNodeEncoderHook(GlobalModule):
@@ -30,6 +47,7 @@ class TransformerNodeEncoderHook(GlobalModule):
         local_mask_hops: int = 1,
         positional_encoding: nn.Module | None = None,
         attention_bias: nn.Module | None = None,
+        rotary_encoding: nn.Module | None = None,
         **base_module_kwargs,
     ):
 
@@ -79,6 +97,10 @@ class TransformerNodeEncoderHook(GlobalModule):
         # Attention biases (`positional_encodings.AttentionBias`), merged into the attention mask in
         # `common_step_local_to_global`, or None -- nothing registered, the mask stays boolean.
         self.attention_bias = attention_bias
+        # The rotary encoding (`positional_encodings.RotaryEncoding`): its rotation is computed per
+        # batch in `common_step_local_to_global` and applied to queries and keys in every layer by
+        # `forward`. None -- nothing registered, the attention is the one from before PEs.
+        self.rotary_encoding = rotary_encoding
 
     def common_step_local_to_global(self, batched_data, emb: torch.Tensor, eval_step: bool = False):
         """Convert local node embeddings ``[N, E]`` to padded local node embeddings ``[max_seq_len, E]``.
@@ -97,22 +119,25 @@ class TransformerNodeEncoderHook(GlobalModule):
 
         Returns
         -------
-        Tuple of ``(padded_emb, src_padding_mask, index_nodes)``:
+        GlobalInput
+            ``(padded_emb, src_padding_mask, index_nodes, attention_mask, rotary)``:
 
-        - ``padded_emb`` (``torch.Tensor`` of shape ``[max_seq_len, B, E]``):
-          padded local node embeddings.
-        - ``src_padding_mask`` (``torch.Tensor`` of shape ``[max_seq_len]``):
-          mask indicating padding nodes.
-        - ``index_nodes`` (``torch.Tensor`` of shape ``[N]``): indices of the
-          nodes in the original graph.
+            - ``padded_emb`` ``[S, B, E]``: padded local node embeddings, ``S <= max_seq_len``.
+            - ``src_padding_mask`` ``[B, S]``: True at padding.
+            - ``index_nodes``: per graph, the indices of the nodes ``pad_batch`` kept.
+            - ``attention_mask`` ``[B * heads, S + 1, S + 1]``: True (or ``-inf``) where blocked.
+            - ``rotary``: the rotary encoding's ``(cos, sin)``, or None; ``forward`` takes it.
         """
         # Layer normalization
         emb = self.norm_input(emb)
+        # Each positional input prepared this pass, by Data key -- the rotary encoding reads the
+        # coordinates the node encodings used, so both see the same rotation of each graph.
+        pe_inputs = {}
         if self.positional_encoding is not None:
             # Added to the flat [N, E] tokens BEFORE pad_batch: pad_batch subsamples with its own
             # randomness when a graph exceeds max_seq_len, so anything per-cell must ride along
             # here or be gathered by the index_nodes it returns -- never padded a second time.
-            emb = emb + self.positional_encoding(batched_data, dtype=emb.dtype, device=emb.device)
+            emb = emb + self.positional_encoding(batched_data, dtype=emb.dtype, device=emb.device, inputs=pe_inputs)
 
         if self.masked_nodes and not eval_step:
             keep_indices = batched_data.mask
@@ -158,9 +183,21 @@ class TransformerNodeEncoderHook(GlobalModule):
             bias = self.attention_bias(batched_data, index_nodes, src_padding_mask, dtype=emb.dtype, device=emb.device)
             attention_mask = bias.masked_fill(attention_mask, float("-inf"))
 
-        return padded_emb, src_padding_mask, index_nodes, attention_mask
+        rotary = None
+        if self.rotary_encoding is not None:
+            # Per token, laid out by this call's index_nodes like the bias: never a second pad_batch.
+            rotary = self.rotary_encoding(
+                batched_data,
+                index_nodes,
+                src_padding_mask.shape[1],
+                dtype=emb.dtype,
+                device=emb.device,
+                pos=pe_inputs.get("pos"),
+            )
 
-    def forward(self, padded_h_node, src_padding_mask, mask=None, register_hook: bool = True):
+        return GlobalInput(padded_emb, src_padding_mask, index_nodes, attention_mask, rotary)
+
+    def forward(self, padded_h_node, src_padding_mask, mask=None, register_hook: bool = True, rotary=None):
         """
         N_b_max: maximum number of nodes in the batch
         B: batch size
@@ -173,7 +210,25 @@ class TransformerNodeEncoderHook(GlobalModule):
                 Matrix indicating the size of the padding mask to be ignored during calculation.
             mask: [H_d, N_b_max x N_b_max]
                 matrix indicating the long-range connections (inverse of adjacency matrix). Default: None
+            rotary: (cos, sin), each [B * heads, N_b_max + 1, H_d / heads]
+                The rotary encoding's rotation from `common_step_local_to_global` (GlobalInput.rotary).
+                Required when the rotary encoding is enabled, and only then.
         """
+        if (rotary is None) != (self.rotary_encoding is None):
+            raise ValueError(
+                "the rotary encoding is enabled, so forward() needs the rotation common_step_local_to_global "
+                "returned (GlobalInput.rotary); without it every layer would attend without positions."
+                if rotary is None
+                else "forward() got a rotation, but this transformer has no rotary encoding enabled."
+            )
+        if rotary is not None:
+            expected = (padded_h_node.size(1) * self.n_heads, padded_h_node.size(0) + 1, self.n_embed // self.n_heads)
+            if tuple(rotary[0].shape) != expected:
+                raise ValueError(
+                    f"the rotation has shape {tuple(rotary[0].shape)}, but these tokens need {expected} "
+                    "(graphs x heads, tokens + CLS, head width): it was computed for another batch."
+                )
+
         if register_hook:
             for encoder in self.transformer_encoder.layers:
                 encoder.register_hook = True
@@ -199,9 +254,18 @@ class TransformerNodeEncoderHook(GlobalModule):
             key_padding_mask = torch.zeros_like(src_padding_mask, dtype=mask.dtype).masked_fill(
                 src_padding_mask, float("-inf")
             )
-        transformer_out = self.transformer_encoder(
-            padded_h_node, src_key_padding_mask=key_padding_mask, mask=mask
-        )  # (S, B, h_d)
+        # nn.TransformerEncoder passes its layers nothing but the masks, so the rotation reaches them
+        # as an attribute, set for this call only: cleared even if a layer raises, so a later call
+        # can never attend with a stale batch's positions.
+        for encoder in self.transformer_encoder.layers:
+            encoder.rotary = rotary
+        try:
+            transformer_out = self.transformer_encoder(
+                padded_h_node, src_key_padding_mask=key_padding_mask, mask=mask
+            )  # (S, B, h_d)
+        finally:
+            for encoder in self.transformer_encoder.layers:
+                encoder.rotary = None
 
         attn_matrices = []
         if register_hook:
@@ -235,12 +299,12 @@ class TransformerNodeEncoderHook(GlobalModule):
         """
         # evaluation on single graph
         batched_data.batch = torch.Tensor(len(batched_data.obs_names) * [0])
-        transformer_in, src_padding_mask, pad_index_nodes, attn_mask = self.common_step_local_to_global(
+        transformer_in, src_padding_mask, pad_index_nodes, attn_mask, rotary = self.common_step_local_to_global(
             batched_data, embedding, eval_step=True
         )
 
         transformer_out, src_padding_mask, _ = self.forward(
-            transformer_in, src_padding_mask, attn_mask, register_hook=True
+            transformer_in, src_padding_mask, attn_mask, register_hook=True, rotary=rotary
         )
 
         last_layer = self.transformer_encoder.layers[-1]
@@ -281,5 +345,6 @@ class TransformerNodeEncoderHook(GlobalModule):
             f"local_mask_hops: {self.local_mask_hops}, \n"
             f"positional_encoding: {sorted(self.positional_encoding.encoders) if self.positional_encoding else []}, \n"
             f"attention_bias: {sorted(self.attention_bias.encoders) if self.attention_bias else []}, \n"
+            f"rotary_encoding: {sorted(self.rotary_encoding.encoders) if self.rotary_encoding else []}, \n"
         )
         return summary

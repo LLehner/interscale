@@ -284,27 +284,33 @@ def _validate_pe(cfg):
     """
     params = cfg.model.global_component.get("parameters", None)
     pe = params.get("pe", None) if params is not None else None
-    if pe is None or not (pe.node or pe.get("bias", [])):
+    kinds = {"node": "node encodings", "bias": "attention biases", "rotary": "rotary encodings"}
+    if pe is None or not any(pe.get(kind, []) for kind in kinds):
         return
 
     from interscale.module.global_modules.positional_encodings import PE_REGISTRY
 
     names = []
-    for kind in ("node", "bias"):
+    for kind in kinds:
         listed = list(pe.get(kind, []))
         unknown = sorted(set(listed) - set(PE_REGISTRY))
         if unknown:
             raise ValueError(f"pe.{kind} names unknown positional encodings {unknown}. Known: {sorted(PE_REGISTRY)}.")
         misplaced = sorted(name for name in listed if PE_REGISTRY[name].kind != kind)
         if misplaced:
+            homes = sorted({PE_REGISTRY[name].kind for name in misplaced})
             raise ValueError(
                 f"pe.{kind} lists {misplaced}, which belong under "
-                f"pe.{'bias' if kind == 'node' else 'node'} ({'attention biases' if kind == 'node' else 'node encodings'})."
+                + " / ".join(f"pe.{home} ({kinds[home]})" for home in homes)
+                + "."
             )
         duplicates = sorted({name for name in listed if listed.count(name) > 1})
         if duplicates:
             raise ValueError(f"pe.{kind} lists {duplicates} more than once; each encoding is added once.")
         names += listed
+
+    if len(pe.get("rotary", [])) > 1:
+        raise ValueError(f"pe.rotary lists {list(pe.rotary)}; at most one rotary encoding turns the queries and keys.")
 
     for name in names:
         PE_REGISTRY[name].validate(pe)
@@ -317,6 +323,16 @@ def _validate_pe(cfg):
         )
     if needs_pos and not cfg.dataset.spatial_unit_um > 0:
         raise ValueError(f"dataset.spatial_unit_um must be > 0, got {cfg.dataset.spatial_unit_um}.")
+
+    if pe.get("rotary", []):
+        # Pairs of a head's dims are rotated, one pair per axis and wavelength.
+        n_embed, n_heads = cfg.model.n_embed, params.n_heads
+        if n_embed % n_heads or (n_embed // n_heads) % 4:
+            raise ValueError(
+                f"pe.rotary {list(pe.rotary)} rotates pairs of each head's dims, one per axis and "
+                f"wavelength, so n_embed / n_heads must be a multiple of 4; got model.n_embed {n_embed} "
+                f"and n_heads {n_heads}."
+            )
 
 
 def _validate(cfg):

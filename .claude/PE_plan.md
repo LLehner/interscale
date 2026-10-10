@@ -1,14 +1,17 @@
 # Staged plan: positional encodings for the global module
 
-Adds five positional encodings (PEs) to the transformer, selectable from config and sweepable:
-naive coordinates, 2D sinusoidal, Laplacian eigenvectors (LapPE), random-walk (RWPE), and a
-relative Euclidean-distance attention bias. Sources: SpaFormer (Wen et al., arXiv 2302.03038) for
+Adds seven positional encodings (PEs) to the transformer, selectable from config and sweepable:
+naive coordinates, 2D sinusoidal, Laplacian eigenvectors (LapPE), random-walk (RWPE), a relative
+Euclidean-distance attention bias, 2D rotary embeddings (RoPE, Stage 7) and a spectral
+(diffusion-kernel) attention bias (Stage 8). Sources: SpaFormer (Wen et al., arXiv 2302.03038) for
 the spatial variants, GraphGPS (Rampášek et al., NeurIPS 2022) for the graph ones and for the
-node-feature vs. attention-bias split. Read [`background.md`](background.md) first.
+node-feature vs. attention-bias split, RoFormer (Su et al., arXiv 2104.09864) and RoPE for ViTs
+(Heo et al., ECCV 2024) for RoPE, SignNet/BasisNet (Lim et al., ICLR 2023) for the spectral bias.
+Read [`background.md`](background.md) first.
 
 ## Status
 
-Last updated 2026-10-08. Same rules as [`contrastive_plan.md`](contrastive_plan.md): update this
+Last updated 2026-10-09. Same rules as [`contrastive_plan.md`](contrastive_plan.md): update this
 table in the same commit as the work, and a stage is `done` only when something external verified
 it. "Implemented, unverified" is a real state.
 
@@ -22,6 +25,8 @@ it. "Implemented, unverified" is a real state.
 | 4 — RWPE | **implemented, unverified** — equals the definition (full dense powers) at odd and even steps, and PyG's `AddRandomWalkPE`; isolated cells → zeros; BatchNorm keeps small late-step spreads instead of squashing them (`eps` 1e-8, see notes); each mutation-checked; harness IDENTICAL with PEs off; trains finite through `GlobalModel`, `CombinedModel`, dual decoder and long-range, alone and with lap + sinusoidal; `get_model_output` runs; precompute 9.4 s for a 50k-cell, 14-neighbour graph at 16 steps. **No real-data run yet** | 2026-10-04 |
 | 5 — distance bias | **implemented, unverified** — `pad_like` reproduces `pad_batch`'s layout incl. subsampling and kept masked nodes; bias laid out like the mask (left pad, CLS last, graph-major), zero at CLS and padding, `-inf` exactly where the mask blocks; zero table changes nothing and raises no mask-type warning; finite with rows summing to 1 on the complete-graph NaN test at hops 1–3; translation and rotation invariant; each of five layout/merge mutations caught; harness IDENTICAL with PEs off (baseline from a worktree of `e0afa60`); trains finite through `GlobalModel`, `CombinedModel`, dual decoder and long-range, alone and with node PEs, and the table moves; `get_model_output` runs. **No real-data run yet** | 2026-10-06 |
 | 6 — PE probe control + ablation sweep | **implemented, unverified** — the `pe` column holds each cell's own encoding when `pad_batch` subsamples (checked against the cell's coordinates, mutation-checked: an ungathered column fails), is the eval encoding and leaves the PE generator alone; absent without a node PE; on the same chart as local/global; default in `probe.embeddings`. Found and fixed on the way: the probe moved the global torch RNG (every `DataLoader` iterator seeds itself off it) and Python's (`pad_batch` subsampling), so probe-on trained a different model — now restored (test, mutation-checked). `max_dist: 0` derives the largest slide diameter; stored in the checkpoint; LapPE size warning. 431 tests pass; harness IDENTICAL with PEs off (baseline from a worktree of `1faf992`); a `CombinedModel` with sinusoidal + lap + distance and the probe on trains through `model.train` and logs `probe/*_pe`. **The sweep (cluster) is not run yet** | 2026-10-08 |
+| 7 — RoPE (2D rotary) | **implemented, unverified** — logits depend on the cell-to-cell offset only: translating mm-scale coordinates leaves them unchanged and moving one cell changes only its row and column, both checked through the layer's attention itself (rotating only the queries fails it); the rotation follows each token through `pad_batch`'s subsampling, CLS last and padding unrotated, rows graph-major; all-zero coordinates reproduce the RoPE-free model exactly (output and attention maps); it reuses the node encodings' coordinates, so `rotate_train` turns both by one angle, and draws nothing from the global RNG; `forward` refuses a missing or foreign rotation and clears it from the layers even when one raises; finite, rows summing to 1, on the complete-graph NaN test at hops 1–3 with a distance bias on too; wavelengths geometric and dealt out across heads, `mixed` frames over 90°; derived `max_wavelength` and its buffer. 12 mutations, each caught. 465 tests pass; harness IDENTICAL with PEs off (baseline from a worktree of `7fc1299`); trains finite and moves off the PE-free run through `GlobalModel`, `CombinedModel`, dual decoder and long-range, as `axial`, `mixed` and `mixed` + naive + distance; `get_model_output` runs. Found on the way: `GlobalModel` built its module from the un-derived cfg, so `pe.distance.max_dist: 0` (the default) raised at construction — fixed. **No real-data run yet** | 2026-10-09 |
+| 8 — spectral bias | **implemented, unverified** — `laplacian_spectrum` equals the dense eigendecomposition (compared as projectors, dense and shift-invert paths) and zero-pads; a tied eigenspace at the cut is dropped whole, so on a lattice the kernel no longer depends on how the cells are numbered (k = 1–11); the filter is piecewise linear in log λ and flat beyond its knots; the bias equals Σᵢ h(λᵢ)·vᵢvᵢᵀ and does not change under sign flips or a rotation within a tied pair (it does within an untied one); the √N scaling makes each kept mode add 1 to the mean diagonal at h = 1, at any N; laid out like the tokens with each graph's own eigenvalues, through `pad_batch`'s subsampling, CLS and padding zero; adds to the distance bias; a zero table changes nothing; finite, rows summing to 1, on the complete-graph NaN test at hops 1–3; PyG batches the eigenvalues per graph; the run reports the eigenvalue range against the knots and warns when the kept modes miss >10% of cells. 8 mutations, each caught. 486 tests pass; harness IDENTICAL with PEs off; trains finite through `GlobalModel`, `CombinedModel`, dual decoder and long-range, alone and with lap + distance + RoPE, and the table moves and the output with it; `get_model_output` runs. Measured on the data: synth_spot slides are connected, eigenvalues 1.0e-3–3.5e-2 at k = 32, all 32 kept; synth_data_0 at radius 30 is fragmented (see Open questions). **No real-data run yet** | 2026-10-09 |
 
 ## What the code already decides
 
@@ -95,6 +100,7 @@ model:
       pe:
         node: []             # any of [naive, sinusoidal, lap, rw]; summed into the token
         bias: []             # [distance]; added to the attention logits
+        rotary: []           # [rope]; rotates queries and keys in every layer (Stage 7)
         center_coords: True  # subtract each graph's centroid
         rotate_train: False  # random rotation per graph, training only
         naive:      {hidden_dim: 32, length_scale: 100.0}                   # µm
@@ -102,6 +108,7 @@ model:
         lap:        {k: 8, sign_flip: True}
         rw:         {steps: 16}
         distance:   {kind: profile, num_kernels: 16, max_dist: 2000.0}      # µm; set per dataset
+        rope:       {kind: axial, min_wavelength: 50.0, max_wavelength: 0.0} # µm; 0 = 2 x slide diameter
 ```
 
 `_validate_pe` rejects unknown or duplicate names (listing the registry), a coordinate PE without
@@ -190,7 +197,87 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
   `module/global_modules/positional_encodings.py`; `tl.pad_like` in `tl/padding.py`; the merge in
   `TransformerNodeEncoderHook.common_step_local_to_global`.
 
-## The five encodings
+### How Stage 7 (RoPE) was built
+
+Added 2026-10-09 on the user's request; no plan section preceded it.
+
+- **A third kind, `rotary`.** RoPE is neither summed into the token nor added to the logits: it
+  rotates each head's queries and keys inside every layer. Config: `pe.rotary: [rope]` (at most
+  one) and the `pe.rope` sub-block. The rotation is computed per batch in
+  `common_step_local_to_global` from coordinates laid out with `pad_like`, CLS appended last at the
+  origin, and applied in `multi_head_attention_forward_with_gradients` right after the heads are
+  split (`transformer_utils.apply_rotary`), so the attention maps the interpretability tools read
+  include it.
+- **`GlobalInput` now exists.** RoPE is the first consumer that cannot be merged into the mask, so
+  `common_step_local_to_global` returns the named tuple foreseen above, with a fifth field
+  `rotary`, and `forward(..., rotary=)` takes it; the four call sites unpack five values. `forward`
+  refuses a missing rotation when RoPE is on (and any rotation when it is off), and one shaped for
+  another batch. `nn.TransformerEncoder` passes its layers nothing but the masks, so the rotation
+  reaches them as `layer.rotary`, set for the one call and cleared in a `finally`.
+- **One `CoordinateFrame` per model.** Units, centring, `rotate_train` and the PE generator moved out
+  of `NodePositionalEncoding` into a frame the node and rotary encodings share. RoPE reuses the
+  coordinates the node encodings prepared in the same pass, so both see a graph turned by one angle.
+  With RoPE off, the draw order is unchanged.
+- **Narrow heads.** 2D RoPE needs `n_embed / n_heads` to be a multiple of 4 (checked at config
+  load). At the defaults (16 / 4) a head has 4 dims, so one wavelength per axis. The
+  `heads × head_dim/4` wavelengths are therefore spaced geometrically over the range and dealt out
+  across heads (head h takes every heads-th, ALiBi-like): each head gets its own scale instead of
+  all heads the same one.
+- **CLS sits at the origin** (identity rotation), i.e. at the centroid with `center_coords`. That is
+  the only place the origin matters; every cell-to-cell logit depends on the offset alone.
+- **Not zero at step 0.** A rotation has no zero, so RoPE is the one encoding that changes the first
+  forward. Initial weights (`axial` has no parameters; `mixed`'s are built under the RNG fork) and
+  batch order are still shared with the PE-free run at a seed.
+- **`max_wavelength: 0` is derived**, like `max_dist`: twice the largest slide diameter
+  (`resolve_rope_range`, called in `BaseModel.__init__`), so the longest wave turns by at most half
+  a cycle within a slide. The frequencies are buffers, so a checkpoint keeps the ones it was trained
+  with. `min_wavelength` is a fixed 50 µm default: between two cells much farther apart than a
+  wavelength, that wave turns by an effectively random angle and carries nothing, so it should be
+  about the shortest distance attended over — the long-range mask's radius.
+- **`mixed` learns `magnitude × direction`** with only the unit-scale `direction` trained, so an Adam
+  step moves every frequency by about the same relative amount (they span three decades in rad/µm).
+- **Angles in float64**, from the float32 coordinates; the rounding left is the coordinates' own
+  (~1e-3 µm at 5 mm).
+- **No `pe` probe column**: RoPE gives no per-cell vector, like the bias.
+- Code: `RotaryPE`, `RotaryEncoding`, `CoordinateFrame`, `build_positional_encodings` and
+  `resolve_rope_range` in `positional_encodings.py`; `apply_rotary` and the `rotary` argument in
+  `transformer_utils.py`; `GlobalInput` and the `forward` plumbing in `transformer_encoder.py`;
+  tests in the RoPE section of `tests/test_positional_encodings.py`.
+
+### How Stage 8 (spectral bias) was built
+
+Added 2026-10-09 on the user's request, after weighing SignNet/BasisNet: the transformer-native,
+sign- and basis-invariant way to use the spectrum, at the cost of the distance bias.
+
+- **The bias.** `b_h(j, l) = Σᵢ h_h(λᵢ) · N · vᵢ[j] · vᵢ[l]` over the k lowest non-trivial eigenpairs
+  of LapPE's Laplacian. Each head learns `h_h`, piecewise linear in log λ between 32 knots over
+  `[min_eigval, max_eigval]` = 1e-5–2 (2 is the largest eigenvalue `L_sym` has), flat beyond, zero
+  at the start, one table for all layers. With `h = exp(−tλ)` it is the heat kernel truncated to k
+  modes, the matrix diffusion distances are built from — the BasisNet-approximable object of Lim
+  et al., Prop. 4, without the IGN.
+- **A fixed log range, not a derived one.** Eigenvalues span ~4e-5 (a 50k-cell kNN slide) to ~5e-2
+  (synth_data_0 at k = 32); 32 knots over 5.3 decades leave 6–10 intervals inside any one dataset's
+  range, with no data pass when the model is built. The run logs the range it found
+  (`report_spectral_range`, in `prepare_geome_dataset`) and warns when it leaves the knots.
+- **Whole eigenspaces.** `tl.laplacian_spectrum` computes k + 1 eigenpairs and drops a tied group at
+  the cut (relative tie 1e-6: lattice ties come out at ~1e-13, the smallest genuine gap there is
+  6e-3). On the 50 × 50 lattice eigenspaces end at 2, 3, 5, 7, 8, …, 30, 32, 34, so k = 32 cuts none.
+- **Summed over modes, scaled by √N.** Each mode adds `O(h)` whatever N and k. Averaging over the k
+  modes was tried first: it shrank a filter that keeps only the slowest modes — the long-range case —
+  by k, about 30x slower to matter.
+- **Inputs.** Two `Data` attributes: `spectral_pe` `[N, k]` (eigenvectors times √N) and
+  `spectral_eigval` `[1, k]` (PyG stacks them to `[B, k]`); `PESpec.precompute` may now return a
+  dict, and both names are reserved fields. `AttentionBias` prepares each bias's input by what it
+  `requires` (distances for `pos`, padded eigenvectors plus eigenvalues for `spectral_pe`); the knot
+  lookup is shared with the distance profile.
+- **Precompute cost**: 32 eigenpairs of a 50k-cell kNN slide take 2.7 s (64: 4.6 s), 2500-spot
+  synth_spot slides 0.3 s. Runtime: one `[B·H, S, k] × [k, S]` product, the distance bias's memory.
+- No coordinates needed; no `pe` probe column.
+- Code: `SpectralBias`, `_spectral_inputs` and `report_spectral_range` in `positional_encodings.py`;
+  `laplacian_spectrum` in `tl/positional.py`; tests in the spectral section of
+  `tests/test_positional_encodings.py`.
+
+## The encodings
 
 | PE | kind | input | encoder | invariant to |
 |---|---|---|---|---|
@@ -199,6 +286,8 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
 | lap | node | `k` lowest non-trivial eigenvectors, sym. normalised Laplacian | Linear; random sign flip per vector per graph (training) | translation, rotation |
 | rw | node | `diag((D⁻¹A)^t)`, t = 1..steps | BatchNorm (`eps` 1e-8) → Linear (GraphGPS) | translation, rotation |
 | distance | bias | ‖pᵢ − pⱼ‖ in µm | `kind: profile`: K triangular kernels → a `[heads, K]` table, piecewise linear in d, flat beyond `max_dist`; `kind: linear`: one slope per head on d in mm (ALiBi). Zero-init, shared across layers | translation, rotation |
+| spectral | bias | k lowest non-trivial eigenpairs of the sym. normalised Laplacian (precomputed) | per head a filter `h_h(λ)`, piecewise linear in log λ over 32 knots (1e-5–2); bias `Σᵢ h_h(λᵢ)·N·vᵢ[j]·vᵢ[l]`. Zero-init, shared across layers | translation, rotation; the eigenvectors' signs and bases |
+| rope | rotary | centred pos (µm) | pair i of every head's q and k turned by ωᵢ·p, so qₘ·kₙ depends on pₙ − pₘ; wavelengths geometric over `[min_wavelength, max_wavelength]`, dealt out across heads; `kind: axial`: fixed, half the pairs along x, half along y; `kind: mixed`: learnable 2D frequencies from per-head frames turned by 90°/heads. Shared across layers | translation (cell-to-cell); not rotation |
 
 - **naive / sinusoidal**: a fixed physical scale, not SpaFormer's per-FOV min-max — graphs here
   differ in size, so min-max would encode the same distance differently per graph. Sinusoidal
@@ -232,6 +321,18 @@ A sixth PE (SignNet, Cond PE, shortest-path bias) is one entry plus one config s
   (synth_data_0 ~1400, synth_spot ~7000). Memory, measured at B=4 graphs of S=2500 tokens and H=4 heads (fp32): the bias is 0.40 GB
   and autograd keeps 0.50 GB of it for the backward pass; a Gaussian `[B, S, S, K]` feature tensor
   at K=16 would be 1.60 GB on its own.
+- **rope**: the content-dependent counterpart of the distance bias. A head can attend to one kind
+  of cell at one offset, where the bias applies one profile to every pair. RoPE sees direction
+  (MC12, MC13 on synth_spot), which LapPE, RWPE, the bias and the GCN cannot; `rotate_train` erases
+  it. On a lattice, wavelengths below twice the spacing alias: on synth_spot's 100 µm lattice the
+  default 50 µm wave turns by whole cycles between lattice points and is the identity along the
+  axes, so set `min_wavelength` to ~200 µm there (the 2-hop mask radius). Defaults on synth_data_0
+  (diameter ~1400 µm, 4 heads × 4 dims): wavelengths 50, ~190, ~740 and ~2800 µm, one per head.
+- **spectral**: a learned diffusion kernel, so distance runs along the graph and around holes;
+  synth_spot's programmes are Euclidean, which differs only near its holes. `k` sets the finest
+  scale — the shortest wavelength is about `L·√(π/k)`: 1.6 mm at k = 32 on synth_spot, 1.1 mm at
+  k = 64. On a fragmented graph it only reaches the pieces that host the lowest modes (synth_data_0,
+  see Open questions).
 
 ## Stages
 
@@ -271,9 +372,10 @@ No sweep code changes needed:
 
 - list-valued `pe.node` / `pe.bias` go through **arms**, so the lists never round-trip through
   wandb and every arm sets the same keys;
-- scalar knobs (`pe.lap.k`, `pe.rw.steps`, `pe.sinusoidal.max_wavelength`, `pe.distance.max_dist`)
-  are plain dotted parameters, but only in a sweep whose arms all enable that PE — otherwise
-  trials vary a knob nothing reads.
+- scalar knobs (`pe.lap.k`, `pe.rw.steps`, `pe.sinusoidal.max_wavelength`, `pe.distance.max_dist`,
+  `pe.rope.kind`, `pe.rope.min_wavelength`, `pe.spectral.k`) are plain dotted parameters, but only in a sweep whose
+  arms all enable that PE — otherwise trials vary a knob nothing reads;
+- `pe.rotary` is a list like the other two; an arm that does not set it keeps the default `[]`.
 
 ```yaml
 # config_files/sweeps/pe_ablation.yaml   (untracked, like every yaml)
@@ -284,10 +386,12 @@ arms:
   lap:        {model.global_component.parameters.pe.node: [lap],        model.global_component.parameters.pe.bias: []}
   rw:         {model.global_component.parameters.pe.node: [rw],         model.global_component.parameters.pe.bias: []}
   distance:   {model.global_component.parameters.pe.node: [],           model.global_component.parameters.pe.bias: [distance]}
+  spectral:   {model.global_component.parameters.pe.node: [],           model.global_component.parameters.pe.bias: [spectral]}
+  rope:       {model.global_component.parameters.pe.node: [],           model.global_component.parameters.pe.bias: [], model.global_component.parameters.pe.rotary: [rope]}
 sweep_config:
   method: grid
   parameters:
-    arm:        {values: [none, naive, sinusoidal, lap, rw, distance]}
+    arm:        {values: [none, naive, sinusoidal, lap, rw, distance, spectral, rope]}
     optim.seed: {values: [0, 1, 2]}
 ```
 
@@ -300,6 +404,10 @@ effect differs (see above). The base config must set `dataset.spatial_key`.
   second `pad_batch`.
 - Bias: left-padded, CLS last, graph-major; CLS row/column and padding finite; merged by
   `masked_fill`.
+- Rotation: laid out like the tokens (left-padded, CLS last, graph-major heads), CLS and padding
+  unrotated; on the layers for one `forward` call only.
+- Spectral bias: whole eigenspaces only (a tied group at the cut is dropped), so it depends on the
+  eigenvectors through their projectors alone.
 - PEs off ⇒ same parameters, same RNG draws, same checkpoint name as today.
 - PE randomness only in training, and only from the PE generator.
 - Lengths in µm via `dataset.spatial_unit_um`; no dataset constant in code.
@@ -312,6 +420,11 @@ effect differs (see above). The base config must set `dataset.spatial_key`.
 - **A distance bias adds a proximity prior to every attention map**, and so to net attention
   flow. Co-located non-interacting types (the `medulla` control) gain flow from proximity alone —
   rerun the flow control's null pairs before reading flow from a bias model.
+- **The spectral bias adds a diffusion-geometry prior**, the distance bias's caveat along the
+  graph instead of straight across: rerun the flow control's null pairs before reading flow.
+- **RoPE shapes attention by offset**, weighted by what the two cells express. Like the bias it
+  moves attention flow with geometry, so rerun the flow control's null pairs before reading flow
+  from a RoPE model; it has no `pe` probe column.
 - **LapPE/RWPE come from the GCN's own graph.** That does not break the long-range separation: the
   mask governs what the transformer attends to, not what its inputs encode.
 
@@ -404,7 +517,7 @@ gives the 4-neighbourhood the short-range rules use); `spatial_key: spatial`,
   differently oriented encodings for the same layout.
 - **Only coordinate PEs see direction.** MC12 runs along x and MC13 points along ±y. LapPE, RWPE,
   the distance bias and the isotropic 4-neighbour GCN are all blind to orientation, and
-  `rotate_train` erases it.
+  `rotate_train` erases it. RoPE sees it as the direction between two cells.
 - **Centring moves with a crop.** Losing one border line shifts a slide's centroid by 50 µm, so a
   centred coordinate PE sees intact and cropped slides 50 µm apart.
 
@@ -480,3 +593,21 @@ while those thresholds sit at 2.5 mm. It is not a property of the data.
   the distance bias (already rotation-invariant), LapPE or RWPE.
 - LapPE `sqrt(N)` scaling: accepted as is (2026-10-08); a warning is logged when graph sizes in a
   run differ more than 4x.
+- RoPE at the default width: 4 dims per head leave one wavelength per axis per head (4 scales over
+  the model). `n_embed: 32`, or 2 heads, would give each head two; not decided.
+- `pe.rope.min_wavelength` defaults to 50 µm, which suits cells; synth_spot wants ~200 µm (see the
+  rope notes above).
+- **synth_data_0's radius-30 graph is fragmented** (measured 2026-10-09 on six slides): mean degree
+  4.3, at the percolation threshold, 75–93 components per slide, the largest holding 50–67% of the
+  cells. Eigenvectors live on single components, so **31% of cells get an all-zero LapPE at k = 8**
+  and 22% are in no spectral-bias mode at k = 32 — read the running sweep's `lap` arm with that in
+  mind. At radius 40: 2% and 2%; at 50: 0%. Why: the generator draws cells as independent random
+  points (an inhomogeneous Poisson process, `_sample_positions`), with no minimum spacing, so they
+  clump and leave gaps (nearest neighbour 13 µm on average, under 5 µm for a tenth of cells); a
+  radius graph of such points falls apart below a mean degree of ~4.5, the continuum-percolation
+  threshold, and radius 30 gives 4.3. A **kNN-6 graph** (what the user intends to use) is connected
+  on all 24 slides: every cell gets 6 edges whatever its local density. There LapPE and the spectral
+  bias reach every cell, eigenvalues 1.3e-3 to 5.0e-2 at k = 32, and the 6th neighbour is 36 µm away
+  on average. Map of one slide under both graphs: `/home/lehnerl/Arbeit/data/synth_data_0_graph_components.png`.
+- `pe.spectral.k` defaults to 32 (shortest wavelength ~1.6 mm on synth_spot); the 1 mm bands of the
+  sparse programmes may want 64.

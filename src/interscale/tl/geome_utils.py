@@ -9,7 +9,7 @@ from yacs.config import CfgNode as CN
 #: Names the pipeline builds itself. An ``extra_obs_keys`` entry may not shadow one of these:
 #: attaching an obs column called ``mask`` would replace the corruption mask with a label and the
 #: run would train against its own annotation without failing.
-# `lap_pe` and `rw_pe` are precomputed onto the graphs by `attach_positional_inputs` when enabled.
+# `lap_pe`, `rw_pe` and `spectral_*` are precomputed onto the graphs by `attach_positional_inputs`.
 RESERVED_FIELD_NAMES = {
     "x",
     "y",
@@ -21,6 +21,8 @@ RESERVED_FIELD_NAMES = {
     "gene_mask",
     "lap_pe",
     "rw_pe",
+    "spectral_pe",
+    "spectral_eigval",
 }
 
 #: Optional annotations attached to every PyG ``Data``: attribute name -> (config key, source).
@@ -451,12 +453,14 @@ def prepare_geome_dataset(adata, cfg: CN):
     # unless an enabled encoding needs one. Imported here: the module side imports `tl`.
     from interscale.module.global_modules.positional_encodings import (
         attach_positional_inputs,
+        report_spectral_range,
         warn_if_lap_scales_differ,
     )
 
     for datas in (datas_train, datas_val, datas_test):
         attach_positional_inputs(datas, cfg)
     warn_if_lap_scales_differ([*datas_train, *datas_val, *datas_test], cfg)
+    report_spectral_range([*datas_train, *datas_val, *datas_test], cfg)
 
     if "test" in np.unique(adata.obs[split_key]):
         # datas_test, adata_test = list(a2d(adata[adata.obs[split_key] == "test"]))

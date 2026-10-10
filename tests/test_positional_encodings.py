@@ -1,9 +1,10 @@
-"""Node positional encodings: naive and 2D sinusoidal (PE_plan.md, Stages 0-2).
+"""Positional encodings of the global transformer (PE_plan.md, Stages 0-8).
 
 Pinned here: off is the model from before PEs; on changes neither the other initial weights nor
-the first forward; each cell's encoding travels with its token through pad_batch's subsampling;
-the coordinate handling (units, centring, rotation) does what the config says; and the config,
-checkpoint name and sweep arms carry the choice.
+(except RoPE) the first forward; each cell's encoding travels with its token through pad_batch's
+subsampling; the coordinate handling (units, centring, rotation) does what the config says; each
+encoding computes what its definition says; and the config, checkpoint name and sweep arms carry
+the choice.
 """
 
 import math
@@ -131,7 +132,7 @@ def test_each_kept_token_carries_its_own_cells_encoding_when_pad_batch_subsample
     batch = _batch(g)
     expected = module.positional_encoding(batch, dtype=torch.float32, device=torch.device("cpu"))
 
-    padded, _, index_nodes, _ = module.common_step_local_to_global(batch, torch.zeros(10, N_EMBED), eval_step=True)
+    padded, _, index_nodes, _, _ = module.common_step_local_to_global(batch, torch.zeros(10, N_EMBED), eval_step=True)
 
     # LayerNorm maps the zero embedding to its bias, so token - bias is the encoding alone.
     tokens = padded[:, 0] - module.norm_input.bias.detach()
@@ -270,7 +271,7 @@ def test_invalid_pe_configs_fail_at_load(tmp_path, lines, spatial, match):
         load_config(_write(tmp_path, lines, spatial=spatial))
 
 
-def test_the_registry_holds_the_node_encodings_built_so_far():
+def test_the_registry_holds_the_encodings_built_so_far():
     """What each encoding reads, and which precompute: a new entry has to be added here on purpose."""
     assert {name: (spec.kind, spec.requires, spec.precompute is not None) for name, spec in PE_REGISTRY.items()} == {
         "naive": ("node", "pos", False),
@@ -278,6 +279,8 @@ def test_the_registry_holds_the_node_encodings_built_so_far():
         "lap": ("node", "lap_pe", True),
         "rw": ("node", "rw_pe", True),
         "distance": ("bias", "pos", False),
+        "spectral": ("bias", "spectral_pe", True),
+        "rope": ("rotary", "pos", False),
     }
 
 
@@ -807,7 +810,7 @@ def test_the_bias_is_translation_and_rotation_invariant(kind):
     assert torch.allclose(run(a), run(a @ rot.t() + torch.tensor([300.0, -200.0])), atol=1e-3)
 
 
-def _hook(cfg, *, long_range, hops, bias=None):
+def _hook(cfg, *, long_range, hops, bias=None, rotary=None):
     from interscale.module.global_modules import TransformerNodeEncoderHook
 
     return TransformerNodeEncoderHook(
@@ -820,6 +823,7 @@ def _hook(cfg, *, long_range, hops, bias=None):
         long_range_attention=long_range,
         local_mask_hops=hops,
         attention_bias=bias,
+        rotary_encoding=rotary,
         n_input=N_EMBED,
         n_output=N_EMBED,
         n_embed=N_EMBED,
@@ -869,7 +873,7 @@ def test_a_zero_bias_changes_nothing_and_raises_no_mask_type_warning(kind):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         for module in (plain, biased):
-            padded, padding, _, mask = module.common_step_local_to_global(_batch(g), emb, eval_step=True)
+            padded, padding, _, mask, _ = module.common_step_local_to_global(_batch(g), emb, eval_step=True)
             outs.append(module(padded, padding, mask, register_hook=False)[0])
 
     assert torch.allclose(outs[0], outs[1], atol=1e-6)
@@ -890,7 +894,7 @@ def test_a_biased_dense_graph_stays_finite_and_blocked_pairs_get_no_attention(ho
     batch.edge_index = full[:, full[0] != full[1]]
     emb = torch.randn(n, N_EMBED, requires_grad=True)
 
-    padded, padding, _, mask = module.common_step_local_to_global(batch, emb, eval_step=True)
+    padded, padding, _, mask, _ = module.common_step_local_to_global(batch, emb, eval_step=True)
     out, _, attn = module(padded, padding, mask, register_hook=True)
     out.sum().backward()
 
@@ -1087,6 +1091,22 @@ def test_the_model_builds_its_bias_over_the_derived_range():
     assert distance.profile()[0][-1].item() == pytest.approx(50.0)
 
 
+def test_the_global_model_builds_from_the_derived_range_too():
+    """GlobalModel used to build its module from the cfg it was given rather than the one with the
+    derived range, so the default max_dist 0 raised at construction."""
+    from interscale.model.global_model import GlobalModel
+
+    cfg = _derived_cfg().clone()
+    cfg.defrost()
+    cfg.model.global_component.parameters.type_gex_embedding = "PCA"
+    cfg.model.global_component.parameters.pe.rotary = ["rope"]
+    cfg.freeze()
+    model = GlobalModel(_slides_adata(GlobalModel), cfg=cfg)
+
+    assert float(model.module.attention_bias.encoders["distance"].max_dist) == pytest.approx(50.0)
+    assert model.module.rotary_encoding.encoders["rope"].wavelengths().max().item() == pytest.approx(100.0, rel=1e-5)
+
+
 def test_the_checkpoint_keeps_the_range_the_table_was_trained_on():
     """Loaded onto other data the model re-derives another range; the stored one must win, or
     every learned knot is read at the wrong distance."""
@@ -1130,3 +1150,880 @@ def test_lap_warns_when_graph_sizes_differ_enough_to_rescale_it(caplog):
     caplog.clear()
     assert warn_if_lap_scales_differ(_sized_graphs(5000, 40), _cfg(["rw"])) is None
     assert not caplog.records
+
+
+# --------------------------------------------------------------------------- rotary (RoPE)
+
+
+def _rope_cfg(kind="axial", *, node=(), max_wavelength=4000.0, **pe):
+    """RoPE on, with two heads so the test width N_EMBED (8) gives the 4-dim heads 2D RoPE needs."""
+    cfg = _cfg(node, **pe)
+    cfg.model.global_component.parameters.n_heads = 2
+    cfg.model.global_component.parameters.pe.rotary = ["rope"]
+    cfg.model.global_component.parameters.pe.rope.kind = kind
+    # The default 0 is derived from AnnData by the model; these tests build modules directly.
+    cfg.model.global_component.parameters.pe.rope.max_wavelength = max_wavelength
+    return cfg
+
+
+def _plain_cfg():
+    """The RoPE-free twin of `_rope_cfg`: the same two heads."""
+    cfg = _cfg()
+    cfg.model.global_component.parameters.n_heads = 2
+    return cfg
+
+
+def _rope(kind="axial", n_heads=2, head_dim=8, max_wavelength=4000.0):
+    from interscale.module.global_modules.positional_encodings import RotaryPE
+
+    return RotaryPE(n_heads, head_dim, kind, 50.0, max_wavelength)
+
+
+def _rotated_logits(rope, pos, q, k):
+    from interscale.module.global_modules.transformer_utils import apply_rotary
+
+    cos, sin = rope(pos, torch.float32)
+    return apply_rotary(q, cos, sin) @ apply_rotary(k, cos, sin).transpose(-1, -2)
+
+
+def test_apply_rotary_multiplies_each_pair_by_its_phase():
+    """Pair i is the complex number x[i] + 1j * x[i + d/2], turned by exp(1j * theta_i)."""
+    from interscale.module.global_modules.transformer_utils import apply_rotary
+
+    x = torch.randn(3, 5, 8)
+    theta = torch.randn(3, 5, 4)
+    out = apply_rotary(x, theta.cos().repeat(1, 1, 2), theta.sin().repeat(1, 1, 2))
+
+    z = torch.complex(x[..., :4], x[..., 4:]) * torch.polar(torch.ones_like(theta), theta)
+    assert torch.allclose(out, torch.cat([z.real, z.imag], dim=-1), atol=1e-6)
+
+
+def test_rope_deals_geometric_wavelengths_across_heads_and_sets_each_kinds_axes():
+    from interscale.module.global_modules.positional_encodings import RotaryPE
+
+    axial = RotaryPE(n_heads=2, head_dim=8, kind="axial", min_wavelength=10.0, max_wavelength=10000.0)
+    # 2 heads x 2 wavelengths per axis, geometric over the range, head h taking every 2nd from h.
+    expected = torch.tensor([[10.0, 1000.0, 10.0, 1000.0], [100.0, 10000.0, 100.0, 10000.0]])
+    assert torch.allclose(axial.wavelengths(), expected, rtol=1e-5)
+    freqs = axial.frequencies()
+    assert not freqs[:, :2, 1].any() and not freqs[:, 2:, 0].any(), "axial: first half x, second half y, exactly"
+
+    mixed = RotaryPE(n_heads=2, head_dim=8, kind="mixed", min_wavelength=10.0, max_wavelength=10000.0)
+    assert [name for name, _ in mixed.named_parameters()] == ["direction"]
+    assert not list(axial.parameters()), "axial has nothing to learn"
+    assert torch.allclose(mixed.wavelengths(), expected, rtol=1e-5)
+    f = mixed.frequencies()
+    degrees = torch.rad2deg(torch.atan2(f[..., 1], f[..., 0]))
+    # Head h's frame turned by h * 90 / n_heads degrees: the heads' axes spread over 0, 45, 90, 135.
+    assert torch.allclose(degrees, torch.tensor([[0.0, 0.0, 90.0, 90.0], [45.0, 45.0, 135.0, 135.0]]), atol=1e-4)
+
+
+@pytest.mark.parametrize("kind", ["axial", "mixed"])
+def test_rope_logits_depend_only_on_the_offset_between_two_cells(kind):
+    """The defining property: translate the slide and no logit moves; move one cell and only the
+    logits that involve it do. Coordinates of several mm, on a quarter-µm grid so that the
+    translated ones are exact in float32 -- otherwise their own rounding (~1e-3 µm) is what shows."""
+    gen = torch.Generator().manual_seed(0)
+    rope = _rope(kind)
+    if kind == "mixed":
+        with torch.no_grad():  # away from the init, as after training
+            rope.direction.add_(0.3 * torch.randn(rope.direction.shape, generator=gen))
+    pos = torch.randint(0, 12000, (1, 6, 2), generator=gen).float() * 0.25
+    q, k = torch.randn(2, 6, 8, generator=gen), torch.randn(2, 6, 8, generator=gen)  # [graphs x heads, tokens, dim]
+
+    base = _rotated_logits(rope, pos, q, k)
+    assert torch.allclose(base, _rotated_logits(rope, pos + torch.tensor([5000.0, -2500.0]), q, k), atol=1e-4)
+    assert not torch.allclose(base, q @ k.transpose(-1, -2), atol=1e-2), "the rotation acts at all"
+
+    moved = pos.clone()
+    moved[0, 0] += torch.tensor([300.0, 0.0])
+    changed = (_rotated_logits(rope, moved, q, k) - base).abs() > 1e-4
+    assert changed[:, 0].any() and changed[:, :, 0].any()
+    assert not changed[:, 1:, 1:].any(), "pairs not involving the moved cell keep their logit"
+
+
+def test_the_attention_rotates_queries_and_keys_so_it_sees_offsets_only():
+    """Through the layer's attention itself: translated cells give the same output and weights.
+    That only holds if queries and keys are both rotated -- rotating one leaves absolute angles."""
+    from interscale.module.global_modules.transformer_utils import MultiHeadAttentionWithEdits
+
+    gen = torch.Generator().manual_seed(0)
+    torch.manual_seed(0)
+    attention = MultiHeadAttentionWithEdits(8, 2, dropout=0.0).eval()
+    rope = _rope("mixed", n_heads=2, head_dim=4)
+    x = torch.randn(6, 1, 8, generator=gen)  # [tokens, graphs, width], every token a cell
+    pos = torch.randint(0, 12000, (1, 6, 2), generator=gen).float() * 0.25
+
+    def attend(p):
+        return attention(x, x, x, need_weights=True, average_attn_weights=False, rotary=rope(p, torch.float32))
+
+    out, weights = attend(pos)
+    out_moved, weights_moved = attend(pos + torch.tensor([4000.0, 1500.0]))
+    assert torch.allclose(out, out_moved, atol=1e-5) and torch.allclose(weights, weights_moved, atol=1e-5)
+    plain_out, _ = attention(x, x, x, need_weights=True)
+    assert not torch.allclose(out, plain_out, atol=1e-3), "the rotation acts at all"
+
+
+def test_axial_rope_sees_direction():
+    """Unlike LapPE, RWPE and the distance bias: turning the slide by 90 degrees changes the logits."""
+    rope = _rope("axial")
+    pos = torch.rand(1, 6, 2) * 3000
+    q, k = torch.randn(2, 6, 8), torch.randn(2, 6, 8)
+    turned = torch.stack([-pos[..., 1], pos[..., 0]], dim=-1)
+
+    assert not torch.allclose(_rotated_logits(rope, pos, q, k), _rotated_logits(rope, turned, q, k), atol=1e-2)
+
+
+def test_the_rotation_follows_each_token_through_pad_batch_with_cls_and_padding_unrotated():
+    """Row b * heads + h, token j: the rotation of the cell pad_batch put at token j of graph b.
+    Graph a is subsampled (9 cells, 5 tokens), graph b padded (3 cells); CLS is the last token."""
+    import random
+
+    cfg = _rope_cfg(center_coords=False)
+    cfg.model.global_component.parameters.max_seq_len = 5
+    module = _combined(cfg).global_module.eval()
+    rope = module.rotary_encoding.encoders["rope"]
+    a, b = torch.rand(9, 2) * 2000, torch.rand(3, 2) * 2000
+
+    random.seed(0)
+    _, _, index_nodes, _, (cos, sin) = module.common_step_local_to_global(
+        _batch(a, b), torch.zeros(12, N_EMBED), eval_step=True
+    )
+
+    assert cos.shape == sin.shape == (2 * 2, 6, 4)
+    assert len(index_nodes[0]) == 5 and index_nodes[0] != list(range(5)), "a subsample that tells orders apart"
+    for g, coords in ((0, a), (1, b)):
+        kept = index_nodes[g]
+        exp_cos, exp_sin = rope(coords[kept].unsqueeze(0), torch.float32)  # [heads, kept, head_dim]
+        lo = 5 - len(kept)
+        for h in range(2):
+            row = g * 2 + h
+            assert torch.allclose(cos[row, lo:5], exp_cos[h], atol=1e-6), (g, h)
+            assert torch.allclose(sin[row, lo:5], exp_sin[h], atol=1e-6), (g, h)
+            assert (cos[row, :lo] == 1).all() and not sin[row, :lo].any(), "padding is not rotated"
+            assert (cos[row, 5] == 1).all() and not sin[row, 5].any(), "CLS, last, is not rotated"
+
+
+def test_rope_off_builds_nothing():
+    module = _combined(_plain_cfg())
+
+    assert module.global_module.rotary_encoding is None
+    assert not [k for k in module.state_dict() if "rotary" in k]
+
+
+@pytest.mark.parametrize("kind", ["axial", "mixed"])
+def test_rope_adds_its_frequencies_and_changes_no_other_initial_weight(kind):
+    torch.manual_seed(0)
+    off = _combined(_plain_cfg())
+    torch.manual_seed(0)
+    on = _combined(_rope_cfg(kind))
+
+    off_state, on_state = off.state_dict(), on.state_dict()
+    for key, value in off_state.items():
+        assert torch.equal(value, on_state[key]), key
+    prefix = "global_module.rotary_encoding.encoders.rope."
+    assert sorted(set(on_state) - set(off_state)) == [prefix + "direction", prefix + "magnitude"]
+    learned = sorted(set(dict(on.named_parameters())) - set(dict(off.named_parameters())))
+    assert learned == ([prefix + "direction"] if kind == "mixed" else [])
+
+
+def test_rope_rotates_with_the_node_encodings_and_draws_only_from_the_pe_generator():
+    """rotate_train turns each graph once per pass: the rotary encoding must see the coordinates the
+    node encodings saw, not a second draw, and nothing may come from the global torch RNG."""
+    module = _combined(_rope_cfg(node=["naive"], rotate_train=True)).global_module.train()
+    assert module.rotary_encoding.frame is module.positional_encoding.frame
+
+    seen = {}
+    encoders = {"node": module.positional_encoding.encoders["naive"], "rope": module.rotary_encoding.encoders["rope"]}
+    for name, encoder in encoders.items():
+        original = encoder.forward
+
+        def spy(pos, *args, _name=name, _original=original):
+            seen[_name] = pos.detach().clone()
+            return _original(pos, *args)
+
+        encoder.forward = spy
+    g = torch.rand(6, 2) * 1000
+    emb = torch.randn(6, N_EMBED)
+    state = torch.get_rng_state()
+    module.common_step_local_to_global(_batch(g), emb)
+
+    assert torch.equal(state, torch.get_rng_state()), "drew from the global torch RNG"
+    assert torch.allclose(seen["rope"][0, :6], seen["node"], atol=1e-6), "the same rotated coordinates"
+    centred = (g - g.mean(0)).float()
+    assert not torch.allclose(seen["node"], centred, atol=1e-2), "a rotation was applied"
+    assert torch.allclose(seen["node"].norm(dim=1), centred.norm(dim=1), atol=1e-3)
+
+
+def test_forward_needs_the_rotation_of_its_own_batch_and_leaves_none_behind():
+    module = _combined(_rope_cfg()).global_module.eval()
+    padded, padding, _, mask, rotary = module.common_step_local_to_global(
+        _batch(torch.rand(6, 2) * 1000), torch.randn(6, N_EMBED), eval_step=True
+    )
+    layers = module.transformer_encoder.layers
+
+    with pytest.raises(ValueError, match="needs the rotation"):
+        module(padded, padding, mask)
+    other = module.common_step_local_to_global(
+        _batch(torch.rand(4, 2) * 1000), torch.randn(4, N_EMBED), eval_step=True
+    ).rotary
+    with pytest.raises(ValueError, match="another batch"):
+        module(padded, padding, mask, rotary=other)
+    with pytest.raises(ValueError, match="no rotary encoding"):
+        _combined(_plain_cfg()).global_module.eval()(padded, padding, mask, rotary=rotary)
+
+    module(padded, padding, mask, rotary=rotary)
+    assert all(layer.rotary is None for layer in layers)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    layers[1].self_attn.forward = boom
+    with pytest.raises(RuntimeError, match="boom"):
+        module(padded, padding, mask, rotary=rotary)
+    assert all(layer.rotary is None for layer in layers), "cleared even when a layer raises"
+
+
+def test_rope_at_the_origin_is_the_plain_attention_and_anywhere_else_changes_it():
+    """Same weights, one model with RoPE: at all-zero coordinates every angle is 0 and output and
+    attention maps equal the plain model's exactly, so the rotation touches q and k and nothing
+    else. Anywhere else the attention maps -- what the interpretability tools read -- change."""
+    plain = _combined(_plain_cfg()).global_module.eval()
+    rope = _combined(_rope_cfg(center_coords=False)).global_module.eval()
+    missing, unexpected = rope.load_state_dict(plain.state_dict(), strict=False)
+    assert not unexpected and all("rotary_encoding" in key for key in missing)
+    emb = torch.randn(6, N_EMBED)
+
+    def run(module, coords):
+        gi = module.common_step_local_to_global(_batch(coords), emb, eval_step=True)
+        out, _, attn = module(gi.padded_emb, gi.src_padding_mask, gi.attention_mask, rotary=gi.rotary)
+        return out, attn
+
+    out_plain, attn_plain = run(plain, torch.zeros(6, 2))
+    out_origin, attn_origin = run(rope, torch.zeros(6, 2))
+    assert torch.allclose(out_plain, out_origin, atol=1e-6) and torch.allclose(attn_plain, attn_origin, atol=1e-6)
+
+    _, attn_placed = run(rope, torch.rand(6, 2) * 2000)
+    assert not torch.allclose(attn_plain, attn_placed, atol=1e-3)
+
+
+@pytest.mark.parametrize("hops", [1, 2, 3])
+def test_rope_with_a_bias_on_a_dense_graph_stays_finite_and_blocked_pairs_get_no_attention(hops):
+    """The long-range mask's NaN guarantee with both relative encodings on: every cell-to-cell
+    pair of a complete graph is blocked, each row keeps only CLS, and the gradient is finite."""
+    from interscale.module.global_modules.positional_encodings import build_rotary_encoding
+
+    n = 10
+    cfg = _rope_cfg(bias=["distance"], kind="mixed")
+    cfg.model.global_component.parameters.pe.distance.max_dist = 2000.0
+    rotary = build_rotary_encoding(cfg, 2, N_EMBED)
+    module = _hook(cfg, long_range=True, hops=hops, bias=_random_bias(cfg, 2), rotary=rotary).train()
+    batch = _batch(torch.rand(n, 2) * 300)
+    full = torch.ones(n, n, dtype=torch.bool).nonzero().t()
+    batch.edge_index = full[:, full[0] != full[1]]
+    emb = torch.randn(n, N_EMBED, requires_grad=True)
+
+    padded, padding, _, mask, rot = module.common_step_local_to_global(batch, emb, eval_step=True)
+    out, _, attn = module(padded, padding, mask, register_hook=True, rotary=rot)
+    out.sum().backward()
+
+    assert torch.isfinite(out).all() and torch.isfinite(emb.grad).all()
+    assert torch.isfinite(rotary.encoders["rope"].direction.grad).all()
+    weights = attn[0]
+    assert torch.allclose(weights.sum(-1), torch.ones_like(weights.sum(-1)), atol=1e-5)
+    assert not weights[:, :n, :n].any()
+
+
+def test_a_valid_rope_config_loads(tmp_path):
+    cfg = load_config(_write(tmp_path, ["rotary: [rope]", "rope:", "  kind: mixed"]))
+
+    assert list(cfg.model.global_component.parameters.pe.rotary) == ["rope"]
+
+
+@pytest.mark.parametrize(
+    ("lines", "spatial", "overrides", "match"),
+    [
+        (["rotary: [rope]", "rope:", "  kind: polar"], True, None, "rope.kind"),
+        (["rotary: [rope]", "rope:", "  min_wavelength: 0.0"], True, None, "rope.min_wavelength"),
+        (["rotary: [rope]", "rope:", "  max_wavelength: 10.0"], True, None, "max_wavelength"),
+        (["rotary: [rope]", "rope:", "  max_wavelength: -1.0"], True, None, "max_wavelength"),
+        (["rotary: [rope]"], False, None, "dataset.spatial_key"),
+        (["node: [rope]"], True, None, "belong under pe.rotary"),
+        (["rotary: [naive]"], True, None, "belong under pe.node"),
+        (["rotary: [rope, rope]"], True, None, "more than once"),
+        (["rotary: [rope]"], True, ["model.global_component.parameters.n_heads", 8], "multiple of 4"),
+        (["rotary: [rope]"], True, ["model.n_embed", 24], "multiple of 4"),
+    ],
+)
+def test_invalid_rope_configs_fail_at_load(tmp_path, lines, spatial, overrides, match):
+    with pytest.raises(ValueError, match=match):
+        load_config(_write(tmp_path, lines, spatial=spatial), overrides=overrides)
+
+
+def test_the_checkpoint_name_and_a_sweep_arm_carry_rope():
+    from interscale.config.sweep import apply_sweep_config
+    from interscale.tl.utils import get_model_filename_prefix
+
+    assert get_model_filename_prefix(_rope_cfg(), True, True).endswith("pe-rope_")
+    assert get_model_filename_prefix(_rope_cfg("mixed"), True, True).endswith("pe-rope-mixed_"), (
+        "the two kinds must not share a checkpoint name"
+    )
+    both = _rope_cfg(node=["naive"], bias=["distance"])
+    assert get_model_filename_prefix(both, True, True).endswith("pe-naive+distance+rope_")
+
+    rotary = "model.global_component.parameters.pe.rotary"
+    arms = {"none": {rotary: []}, "rope": {rotary: ["rope"]}}
+    cfg = _cfg()
+    cfg.freeze()
+    cfg, _ = apply_sweep_config(cfg, "hyperparmeter", {"arm": "rope"}, sweep_params=["arm"], arms=arms)
+    assert list(cfg.model.global_component.parameters.pe.rotary) == ["rope"]
+
+
+def _derived_rope_cfg(unit=1.0, min_wavelength=50.0):
+    cfg = _cfg()
+    cfg.model.global_component.parameters.pe.rotary = ["rope"]
+    cfg.model.global_component.parameters.pe.rope.min_wavelength = min_wavelength
+    cfg.dataset.sample_key = ["sample"]
+    cfg.dataset.spatial_unit_um = unit
+    cfg.freeze()
+    return cfg
+
+
+def test_max_wavelength_zero_is_twice_the_largest_slide_diameter():
+    from interscale.module.global_modules.positional_encodings import resolve_rope_range
+
+    cfg = _derived_rope_cfg(unit=2.0)
+    resolved = resolve_rope_range(cfg, _slides_adata())
+
+    assert resolved.model.global_component.parameters.pe.rope.max_wavelength == pytest.approx(200.0)
+    assert cfg.model.global_component.parameters.pe.rope.max_wavelength == 0.0  # caller's cfg untouched
+
+    fixed = cfg.clone()
+    fixed.defrost()
+    fixed.model.global_component.parameters.pe.rope.max_wavelength = 700.0
+    assert resolve_rope_range(fixed, _slides_adata()) is fixed
+    off = _cfg()
+    assert resolve_rope_range(off, _slides_adata()) is off
+
+    with pytest.raises(ValueError, match="below pe.rope.min_wavelength"):
+        resolve_rope_range(_derived_rope_cfg(min_wavelength=500.0), _slides_adata())
+
+
+def test_a_module_built_without_the_data_cannot_use_max_wavelength_zero():
+    from interscale.module.global_modules.positional_encodings import build_rotary_encoding
+
+    with pytest.raises(ValueError, match="nothing derived it"):
+        build_rotary_encoding(_derived_rope_cfg(), 4, 16)
+
+
+def test_the_model_builds_rope_over_the_derived_range_and_the_checkpoint_keeps_it():
+    from interscale.model.combined_model import CombinedModel
+    from interscale.module.global_modules.positional_encodings import RotaryPE
+
+    model = CombinedModel(_slides_adata(CombinedModel), cfg=_derived_rope_cfg())
+    rope = model.module.global_module.rotary_encoding.encoders["rope"]
+    assert rope.wavelengths().max().item() == pytest.approx(100.0, rel=1e-5)  # 2 x the 50 um slide
+
+    reloaded = RotaryPE(4, 4, "axial", 50.0, 9000.0)
+    reloaded.load_state_dict(rope.state_dict())
+    assert torch.equal(reloaded.wavelengths(), rope.wavelengths()), "the trained frequencies win"
+
+
+@pytest.mark.parametrize("kind", ["axial", "mixed"])
+def test_rope_trains_end_to_end(kind):
+    """Through the training plan with the long-range mask on: the loss stays finite, and the mixed
+    kind's frequencies move, so the gradient reaches them through every layer."""
+    import lightning.pytorch as pl
+    from torch_geometric.data import Data
+
+    from interscale.geome_dataloader import GraphAnnDataModule
+    from interscale.module.global_modules import TransformerNodeEncoderHook
+    from interscale.module.global_modules.positional_encodings import build_rotary_encoding
+    from interscale.train._trainingplans import TrainingPlan
+
+    def graph(n, seed):
+        g = torch.Generator().manual_seed(seed)
+        src = list(range(n - 1)) + list(range(1, n))
+        d = Data(
+            x=torch.randn(n, 6, generator=g),
+            edge_index=torch.tensor([src, list(range(1, n)) + list(range(n - 1))], dtype=torch.long),
+            pos=torch.rand(n, 2, generator=g) * 2000,
+        )
+        d.embeddings = torch.randn(n, 8, generator=g)
+        return d
+
+    dm = GraphAnnDataModule(
+        datas=[[graph(7, 0), graph(9, 1)], [graph(8, 2)], [graph(8, 3)]],
+        batch_size=2,
+        num_workers=0,
+        mask_percentage=0.3,
+        mask_strategy="node",
+        learning_type="node",
+    )
+    rotary = build_rotary_encoding(_rope_cfg(kind, local=False), 2, 8)
+    initial = rotary.encoders["rope"].direction.detach().clone()
+    module = TransformerNodeEncoderHook(
+        max_seq_len=16,
+        n_heads=2,
+        dropout_global=0.0,
+        act_func="relu",
+        num_layers=2,
+        dim_feedforward=8,
+        long_range_attention=True,
+        local_mask_hops=1,
+        rotary_encoding=rotary,
+        n_input=6,
+        n_output=6,
+        n_embed=8,
+        decoder_type="linear",
+        dropout_decoder=0.0,
+        decoder_hidden_dims=[8],
+        mask_percentage=0.3,
+        mask_strategy="node",
+        type_gex_embedding=None,
+    )
+    plan = TrainingPlan(
+        module,
+        "regression",
+        "node",
+        "MSELoss",
+        "cell",
+        batch_size=2,
+        lr_scheduler="CosineWarmupScheduler",
+        lr_warmup=1,
+        lr_max_epochs=2,
+    )
+    trainer = pl.Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+    dm.setup(stage="fit")
+    trainer.fit(plan, datamodule=dm)
+
+    assert torch.isfinite(trainer.logged_metrics["train_loss"])
+    moved = not torch.equal(rotary.encoders["rope"].direction.detach(), initial)
+    assert moved == (kind == "mixed")
+
+
+# --------------------------------------------------------------------------- spectral bias
+
+
+def _lattice_edges(side):
+    """A side x side 4-neighbour lattice, both directions."""
+    idx = torch.arange(side * side).reshape(side, side)
+    src = torch.cat([idx[:, :-1].reshape(-1), idx[:-1, :].reshape(-1)])
+    dst = torch.cat([idx[:, 1:].reshape(-1), idx[1:, :].reshape(-1)])
+    return torch.stack([torch.cat([src, dst]), torch.cat([dst, src])])
+
+
+def _random_edges(n, extra, seed):
+    """A path through n cells plus `extra` random chords: connected, and no two eigenvalues tie."""
+    gen = torch.Generator().manual_seed(seed)
+    src = list(range(n - 1)) + torch.randint(0, n, (extra,), generator=gen).tolist()
+    dst = list(range(1, n)) + torch.randint(0, n, (extra,), generator=gen).tolist()
+    return torch.tensor([src + dst, dst + src])
+
+
+def _dense_spectrum(edge_index, n):
+    from interscale.tl.positional import _adjacency, _normalised
+
+    lap = torch.eye(n, dtype=torch.float64) - torch.from_numpy(_normalised(_adjacency(edge_index, n)).toarray())
+    return torch.linalg.eigh(lap)
+
+
+def _spectral_cfg(k=6, **pe):
+    pe.setdefault("bias", ["spectral"])
+    cfg = _cfg(**pe)
+    cfg.model.global_component.parameters.pe.spectral.k = k
+    return cfg
+
+
+def _spectral_batch(cfg, *sizes, seed=0):
+    """Real PyG graphs of the given sizes with the spectral inputs attached, batched by PyG."""
+    from torch_geometric.data import Batch, Data
+
+    from interscale.module.global_modules.positional_encodings import attach_positional_inputs
+
+    datas = []
+    for i, n in enumerate(sizes):
+        gen = torch.Generator().manual_seed(seed + i)
+        datas.append(
+            Data(edge_index=_random_edges(n, n // 2, seed + i), num_nodes=n, pos=torch.rand(n, 2, generator=gen) * 1000)
+        )
+    attach_positional_inputs(datas, cfg)
+    batch = Batch.from_data_list(datas)
+    batch.mask = torch.zeros(batch.num_nodes, dtype=torch.bool)
+    return batch, datas
+
+
+def test_laplacian_spectrum_is_the_lowest_non_trivial_eigenpairs():
+    from interscale.tl.positional import laplacian_spectrum
+
+    n, k = 40, 6
+    edges = _random_edges(n, 15, seed=0)
+    vals, vecs = _dense_spectrum(edges, n)
+    got_vecs, got_vals = laplacian_spectrum(edges, n, k)
+
+    assert torch.allclose(got_vals.double(), vals[1 : k + 1], atol=1e-6)
+    # Compared as projectors: the comparison must not depend on the solver's signs.
+    expected = vecs[:, 1 : k + 1] @ vecs[:, 1 : k + 1].T
+    assert torch.allclose(got_vecs.double() @ got_vecs.double().T, expected, atol=1e-5)
+
+    sparse_vecs, sparse_vals = laplacian_spectrum(edges, n, k, dense_max_nodes=10)  # shift-invert eigsh
+    assert torch.allclose(sparse_vals, got_vals, atol=1e-6)
+    assert torch.allclose(sparse_vecs @ sparse_vecs.T, got_vecs @ got_vecs.T, atol=1e-5)
+
+    tiny_vecs, tiny_vals = laplacian_spectrum(_random_edges(4, 0, seed=1), 4, k)  # 3 non-trivial
+    assert not tiny_vecs[:, 3:].any() and not tiny_vals[3:].any(), "zero-padded beyond what the graph has"
+
+
+def test_a_tied_eigenspace_at_the_cut_is_dropped_whole():
+    """On a square lattice modes come in tied pairs (an x and a y mode). Cutting a pair would keep
+    one direction at the solver's whim; it is dropped instead, so the kernel built from what is kept
+    does not depend on how the graph's cells happen to be numbered."""
+    from interscale.tl.positional import laplacian_spectrum
+
+    side = 6
+    n = side * side
+    edges = _lattice_edges(side)
+    vals = _dense_spectrum(edges, n)[0][1:]
+    # Whole eigenspaces end where the next eigenvalue differs.
+    ends = [i + 1 for i in range(len(vals) - 1) if vals[i + 1] - vals[i] > 1e-6 * vals[i + 1]]
+    assert ends[:4] == [2, 3, 5, 7], "the lattice's tied pairs, as on synth_spot's"
+
+    perm = torch.randperm(n, generator=torch.Generator().manual_seed(0))
+    inverse = torch.argsort(perm)
+    renumbered = inverse[edges]  # cell perm[i] of the original is cell i of the renumbered graph
+    for k in range(1, 12):
+        v, lam = laplacian_spectrum(edges, n, k)
+        kept = int((lam > 0).sum())
+        assert kept == max([e for e in ends if e <= k], default=0), k
+        kernel = (v * torch.exp(-50 * lam)) @ v.T
+        v2, lam2 = laplacian_spectrum(renumbered, n, k)
+        kernel2 = ((v2 * torch.exp(-50 * lam2)) @ v2.T)[inverse][:, inverse]
+        assert torch.allclose(kernel, kernel2, atol=1e-5), f"k={k}: the kernel depends on the numbering"
+
+
+def test_the_spectral_filter_is_piecewise_linear_in_log_eigenvalue_and_flat_beyond():
+    from interscale.module.global_modules.positional_encodings import SpectralBias
+
+    bias = SpectralBias(n_heads=2, num_knots=3, min_eigval=1e-4, max_eigval=1e-2)  # knots 1e-4, 1e-3, 1e-2
+    assert not bias.table.any(), "starts at zero"
+    with torch.no_grad():
+        bias.table.copy_(torch.tensor([[0.0, 1.0, 3.0], [2.0, 2.0, -1.0]]))
+
+    lam = torch.tensor([1e-4, 10**-3.5, 1e-3, 1e-2, 1e-6, 1.0, 0.0])
+    out = bias.filter(lam)
+
+    expected = torch.tensor([[0.0, 2.0], [0.5, 2.0], [1.0, 2.0], [3.0, -1.0], [0.0, 2.0], [3.0, -1.0], [0.0, 2.0]])
+    assert torch.allclose(out, expected, atol=1e-5)
+    knots, values = bias.profile()
+    assert torch.allclose(knots, torch.tensor([1e-4, 1e-3, 1e-2]), rtol=1e-5)
+    assert torch.equal(values, bias.table.detach())
+
+
+def test_the_spectral_bias_is_the_filtered_projector_and_free_of_signs_and_bases():
+    from interscale.module.global_modules.positional_encodings import SpectralBias
+
+    gen = torch.Generator().manual_seed(0)
+    bias = SpectralBias(n_heads=2, num_knots=8, min_eigval=1e-4, max_eigval=1.0)
+    with torch.no_grad():
+        bias.table.copy_(torch.randn(bias.table.shape, generator=gen))
+    k = 4
+    vecs = torch.randn(1, 7, k, generator=gen)
+    vals = torch.tensor([[2e-3, 1e-2, 1e-2, 5e-2]])  # columns 1 and 2 share an eigenvalue
+
+    out = bias(vecs, vals)
+
+    h = bias.filter(vals)[0]  # [k, heads]
+    for head in range(2):
+        expected = sum(h[i, head] * torch.outer(vecs[0, :, i], vecs[0, :, i]) for i in range(k))
+        assert torch.allclose(out[0, head], expected, atol=1e-5)
+
+    flipped = vecs * torch.tensor([1.0, -1.0, 1.0, -1.0])
+    assert torch.allclose(bias(flipped, vals), out, atol=1e-5), "signs"
+
+    def turn(v, i, j, angle):
+        c, s_ = math.cos(angle), math.sin(angle)
+        v = v.clone()
+        v[..., i], v[..., j] = c * vecs[..., i] - s_ * vecs[..., j], s_ * vecs[..., i] + c * vecs[..., j]
+        return v
+
+    assert torch.allclose(bias(turn(vecs, 1, 2, 0.7), vals), out, atol=1e-5), "basis within a tied pair"
+    assert not torch.allclose(bias(turn(vecs, 0, 1, 0.7), vals), out, atol=1e-3), "control: untied columns"
+
+
+def test_the_spectral_inputs_are_scaled_per_cell_and_batched_per_graph():
+    """sqrt(N)-scaled eigenvectors: at a flat filter of 1 each kept mode adds 1 to the bias's mean
+    diagonal, whatever the graph's size -- here all k of them."""
+    from interscale.module.global_modules.positional_encodings import SpectralBias
+
+    k = 5
+    batch, datas = _spectral_batch(_spectral_cfg(k), 30, 60)
+    for d in datas:
+        assert d.spectral_pe.shape == (d.num_nodes, k) and d.spectral_eigval.shape == (1, k)
+        norms = d.spectral_pe.norm(dim=0)
+        assert torch.allclose(norms, torch.full((k,), math.sqrt(d.num_nodes)), rtol=1e-4)
+    assert batch.spectral_eigval.shape == (2, k)
+
+    flat = SpectralBias(n_heads=1, num_knots=2, min_eigval=1e-6, max_eigval=2.0)
+    with torch.no_grad():
+        flat.table.fill_(1.0)
+    for d in datas:
+        diag = flat(d.spectral_pe.unsqueeze(0), d.spectral_eigval)[0, 0].diagonal()
+        assert diag.mean().item() == pytest.approx(k, rel=1e-4)
+
+
+def test_the_spectral_bias_is_laid_out_like_the_tokens():
+    """Entry (b * heads + h, i, j): head h's bias between the cells at tokens i and j of graph b,
+    with each graph's own eigenvalues. Graph 0 is subsampled (30 cells, 8 tokens), graph 1 padded."""
+    import random
+
+    from interscale.module.global_modules.positional_encodings import build_attention_bias
+
+    n_heads, seq_len = 3, 8
+    cfg = _spectral_cfg(5)
+    bias_module = build_attention_bias(cfg, n_heads)
+    with torch.no_grad():
+        bias_module.encoders["spectral"].table.copy_(
+            torch.randn(n_heads, 32, generator=torch.Generator().manual_seed(3))
+        )
+    batch, datas = _spectral_batch(cfg, 30, 6)
+    random.seed(0)
+    index_nodes = [sorted(random.sample(range(30), seq_len)), list(range(6))]
+    padding = torch.tensor([[False] * seq_len, [True, True] + [False] * 6])
+
+    out = bias_module(batch, index_nodes, padding, torch.float32, torch.device("cpu"))
+
+    assert out.shape == (2 * n_heads, seq_len + 1, seq_len + 1)
+    spectral = bias_module.encoders["spectral"]
+    for g, (d, kept) in enumerate(zip(datas, index_nodes, strict=True)):
+        expected = spectral(d.spectral_pe[kept].unsqueeze(0), d.spectral_eigval)[0]  # [heads, kept, kept]
+        lo = seq_len - len(kept)
+        for h in range(n_heads):
+            block = out[g * n_heads + h]
+            assert torch.allclose(block[lo:seq_len, lo:seq_len], expected[h], atol=1e-5), (g, h)
+            assert not block[:lo].any() and not block[:, :lo].any(), "padding carries no bias"
+            assert not block[seq_len].any() and not block[:, seq_len].any(), "CLS carries no bias"
+
+
+def test_spectral_and_distance_biases_add_up():
+    from interscale.module.global_modules.positional_encodings import build_attention_bias
+
+    cfg = _spectral_cfg(5, bias=["distance", "spectral"])
+    cfg.model.global_component.parameters.pe.distance.max_dist = 2000.0
+    both = build_attention_bias(cfg, 2)
+    gen = torch.Generator().manual_seed(4)
+    with torch.no_grad():
+        for param in both.parameters():
+            param.copy_(torch.randn(param.shape, generator=gen))
+    batch, _ = _spectral_batch(cfg, 9)
+    padding = torch.zeros(1, 9, dtype=torch.bool)
+    out = both(batch, [list(range(9))], padding, torch.float32, torch.device("cpu"))
+
+    parts = []
+    for name in ("distance", "spectral"):
+        only = cfg.clone()
+        only.model.global_component.parameters.pe.bias = [name]
+        single = build_attention_bias(only, 2)
+        single.encoders[name].load_state_dict(both.encoders[name].state_dict())
+        parts.append(single(batch, [list(range(9))], padding, torch.float32, torch.device("cpu")))
+    assert torch.allclose(out, parts[0] + parts[1], atol=1e-5)
+
+
+def test_a_zero_spectral_bias_changes_nothing():
+    from interscale.module.global_modules.positional_encodings import build_attention_bias
+
+    cfg = _spectral_cfg(5)
+    torch.manual_seed(0)
+    plain = _hook(cfg, long_range=True, hops=1).eval()
+    torch.manual_seed(0)
+    biased = _hook(cfg, long_range=True, hops=1, bias=build_attention_bias(cfg, 2)).eval()
+    batch, _ = _spectral_batch(cfg, 12)
+    emb = torch.randn(12, N_EMBED)
+
+    outs = []
+    for module in (plain, biased):
+        padded, padding, _, mask, _ = module.common_step_local_to_global(batch, emb, eval_step=True)
+        outs.append(module(padded, padding, mask, register_hook=False)[0])
+    assert torch.allclose(outs[0], outs[1], atol=1e-6)
+
+
+@pytest.mark.parametrize("hops", [1, 2, 3])
+def test_a_spectrally_biased_dense_graph_stays_finite_and_blocked_pairs_get_no_attention(hops):
+    """The NaN guarantee with both biases on. On a complete graph every non-trivial eigenvalue ties,
+    so the cut drops them all and the spectral bias is zero -- still a valid path to run."""
+    n = 10
+    cfg = _spectral_cfg(4, bias=["distance", "spectral"])
+    cfg.model.global_component.parameters.pe.distance.max_dist = 2000.0
+    module = _hook(cfg, long_range=True, hops=hops, bias=_random_bias(cfg, 2)).train()
+    batch, _ = _spectral_batch(cfg, n)
+    full = torch.ones(n, n, dtype=torch.bool).nonzero().t()
+    batch.edge_index = full[:, full[0] != full[1]]
+    from interscale.module.global_modules.positional_encodings import attach_positional_inputs
+
+    attach_positional_inputs([batch], cfg)  # recompute on the complete graph
+    assert not batch.spectral_pe.any()
+    emb = torch.randn(n, N_EMBED, requires_grad=True)
+
+    padded, padding, _, mask, _ = module.common_step_local_to_global(batch, emb, eval_step=True)
+    out, _, attn = module(padded, padding, mask, register_hook=True)
+    out.sum().backward()
+
+    assert torch.isfinite(out).all() and torch.isfinite(emb.grad).all()
+    weights = attn[0]
+    assert torch.allclose(weights.sum(-1), torch.ones_like(weights.sum(-1)), atol=1e-5)
+    assert not weights[:, :n, :n].any()
+
+
+def test_spectral_configs_load_without_coordinates(tmp_path):
+    cfg = load_config(
+        _write(tmp_path, ["bias: [spectral]", "spectral:", "  k: 16", "  min_eigval: 1.0e-6"], spatial=False)
+    )
+
+    assert list(cfg.model.global_component.parameters.pe.bias) == ["spectral"]
+    assert cfg.model.global_component.parameters.pe.spectral.min_eigval == 1e-6
+
+
+@pytest.mark.parametrize(
+    ("lines", "match"),
+    [
+        (["bias: [spectral]", "spectral:", "  k: 0"], "spectral.k"),
+        (["bias: [spectral]", "spectral:", "  num_knots: 1"], "num_knots"),
+        (["bias: [spectral]", "spectral:", "  min_eigval: 0.0"], "min_eigval"),
+        (["bias: [spectral]", "spectral:", "  max_eigval: 1.0e-6"], "max_eigval"),
+        (["node: [spectral]"], "belong under pe.bias"),
+    ],
+)
+def test_invalid_spectral_configs_fail_at_load(tmp_path, lines, match):
+    with pytest.raises(ValueError, match=match):
+        load_config(_write(tmp_path, lines))
+
+
+def test_the_checkpoint_name_and_the_reserved_fields_carry_the_spectral_bias():
+    from interscale.tl.geome_utils import RESERVED_FIELD_NAMES
+    from interscale.tl.utils import get_model_filename_prefix
+
+    assert get_model_filename_prefix(_spectral_cfg(), True, True).endswith("pe-spectral_")
+    both = _spectral_cfg(bias=["distance", "spectral"])
+    assert get_model_filename_prefix(both, True, True).endswith("pe-distance+spectral_")
+    assert {"spectral_pe", "spectral_eigval"} <= RESERVED_FIELD_NAMES
+
+
+def test_the_run_reports_the_eigenvalues_against_the_knots(caplog):
+    from interscale.module.global_modules.positional_encodings import report_spectral_range
+
+    cfg = _spectral_cfg(5)
+    _, datas = _spectral_batch(cfg, 30, 4)  # the 4-cell graph has only 3 non-trivial eigenpairs
+    found = torch.cat([d.spectral_eigval.reshape(-1) for d in datas])
+    found = found[found > 0]
+    with caplog.at_level("INFO"):
+        lo, hi = report_spectral_range(datas, cfg)
+    assert (lo, hi) == (found.min().item(), found.max().item())
+    assert hi == pytest.approx(2.0), "the 4-cell graph is a 4-cycle: bipartite, so its top eigenvalue is 2"
+    assert "1 graph(s) keep fewer than k = 5" in caplog.text
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    narrow = cfg.clone()
+    narrow.model.global_component.parameters.pe.spectral.min_eigval = hi / 2
+    narrow.model.global_component.parameters.pe.spectral.max_eigval = hi * 2
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        report_spectral_range(datas, narrow)
+    assert "reach beyond the filter's knots" in caplog.text
+    assert report_spectral_range(datas, _cfg()) is None
+
+
+def test_the_run_warns_when_the_kept_modes_miss_part_of_a_fragmented_graph(caplog):
+    """A 20-cell path beside a separate 6-cell one: the 2 lowest modes both live on the long path
+    (eigenvalues ~0.014 and ~0.05 against the short one's ~0.19), so 6 of 26 cells get no mode."""
+    from torch_geometric.data import Data
+
+    from interscale.module.global_modules.positional_encodings import attach_positional_inputs, report_spectral_range
+
+    cfg = _spectral_cfg(2)
+    path = list(range(19)) + list(range(20, 25))
+    edges = torch.tensor([path + [p + 1 for p in path], [p + 1 for p in path] + path])
+    data = Data(edge_index=edges, num_nodes=26)
+    attach_positional_inputs([data], cfg)
+    assert not data.spectral_pe[20:].abs().amax() > 1e-4, "the short path is in no kept mode"
+
+    with caplog.at_level("INFO"):
+        report_spectral_range([data], cfg)
+    assert "23.1% of cells are in no kept mode" in caplog.text
+    assert "fragmented" in caplog.text
+
+
+def test_the_spectral_bias_trains_end_to_end():
+    """Through the training plan with the long-range mask on: the zero table moves."""
+    import lightning.pytorch as pl
+    from torch_geometric.data import Data
+
+    from interscale.geome_dataloader import GraphAnnDataModule
+    from interscale.module.global_modules import TransformerNodeEncoderHook
+    from interscale.module.global_modules.positional_encodings import attach_positional_inputs, build_attention_bias
+    from interscale.train._trainingplans import TrainingPlan
+
+    cfg = _spectral_cfg(4, local=False)
+
+    def graph(n, seed):
+        g = torch.Generator().manual_seed(seed)
+        d = Data(x=torch.randn(n, 6, generator=g), edge_index=_random_edges(n, n // 2, seed), num_nodes=n)
+        d.embeddings = torch.randn(n, 4, generator=g)
+        return d
+
+    splits = [[graph(12, 0), graph(14, 1)], [graph(13, 2)], [graph(13, 3)]]
+    for split in splits:
+        attach_positional_inputs(split, cfg)
+    dm = GraphAnnDataModule(
+        datas=splits, batch_size=2, num_workers=0, mask_percentage=0.3, mask_strategy="node", learning_type="node"
+    )
+    bias = build_attention_bias(cfg, 2)
+    module = TransformerNodeEncoderHook(
+        max_seq_len=16,
+        n_heads=2,
+        dropout_global=0.0,
+        act_func="relu",
+        num_layers=1,
+        dim_feedforward=8,
+        long_range_attention=True,
+        local_mask_hops=1,
+        attention_bias=bias,
+        n_input=6,
+        n_output=6,
+        n_embed=4,
+        decoder_type="linear",
+        dropout_decoder=0.0,
+        decoder_hidden_dims=[8],
+        mask_percentage=0.3,
+        mask_strategy="node",
+        type_gex_embedding=None,
+    )
+    plan = TrainingPlan(
+        module,
+        "regression",
+        "node",
+        "MSELoss",
+        "cell",
+        batch_size=2,
+        lr_scheduler="CosineWarmupScheduler",
+        lr_warmup=1,
+        lr_max_epochs=2,
+    )
+    trainer = pl.Trainer(
+        max_epochs=1,
+        accelerator="cpu",
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+    dm.setup(stage="fit")
+    trainer.fit(plan, datamodule=dm)
+
+    assert torch.isfinite(trainer.logged_metrics["train_loss"])
+    assert bias.encoders["spectral"].table.any(), "the gradient never reached the filter"

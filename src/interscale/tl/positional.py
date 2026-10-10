@@ -23,6 +23,28 @@ def _normalised(adj: sp.csr_matrix) -> sp.csr_matrix:
     return (sp.diags(inv_sqrt) @ adj @ sp.diags(inv_sqrt)).tocsr()
 
 
+def _lowest_eigenpairs(edge_index: torch.Tensor, n: int, k: int, dense_max_nodes: int):
+    """``(vals [m], vecs [n, m])``: the ``m <= k`` lowest non-trivial eigenpairs of ``L_sym``, by eigenvalue.
+
+    Shared by :func:`laplacian_pe` and :func:`laplacian_spectrum`; its docstring is
+    :func:`laplacian_pe`'s (one trivial eigenvector dropped per component with an edge, dense
+    below ``dense_max_nodes``, shift-invert ``eigsh`` above).
+    """
+    adj = _adjacency(edge_index, n)
+    lap = sp.identity(n, format="csr") - _normalised(adj)
+
+    n_components, labels = connected_components(adj, directed=False)
+    n_trivial = int((np.bincount(labels, minlength=n_components) > 1).sum())
+    n_wanted = min(n, n_trivial + k)
+
+    if n <= dense_max_nodes or n_wanted >= n - 1:
+        vals, vecs = np.linalg.eigh(lap.toarray())
+    else:
+        vals, vecs = eigsh(lap.tocsc(), k=n_wanted, sigma=-1e-3, which="LM", v0=np.ones(n))
+    keep = np.argsort(vals)[n_trivial : n_trivial + k]
+    return vals[keep], vecs[:, keep]
+
+
 def laplacian_pe(edge_index: torch.Tensor, num_nodes: int, k: int, *, dense_max_nodes: int = 500) -> torch.Tensor:
     """``[num_nodes, k]`` lowest non-trivial eigenvectors of the symmetric normalised Laplacian.
 
@@ -55,19 +77,7 @@ def laplacian_pe(edge_index: torch.Tensor, num_nodes: int, k: int, *, dense_max_
     if n == 0:
         return torch.from_numpy(out)
 
-    adj = _adjacency(edge_index, n)
-    lap = sp.identity(n, format="csr") - _normalised(adj)
-
-    n_components, labels = connected_components(adj, directed=False)
-    n_trivial = int((np.bincount(labels, minlength=n_components) > 1).sum())
-    n_wanted = min(n, n_trivial + k)
-
-    if n <= dense_max_nodes or n_wanted >= n - 1:
-        vals, vecs = np.linalg.eigh(lap.toarray())
-    else:
-        vals, vecs = eigsh(lap.tocsc(), k=n_wanted, sigma=-1e-3, which="LM", v0=np.ones(n))
-    order = np.argsort(vals)
-    vecs = vecs[:, order][:, n_trivial : n_trivial + k]
+    _, vecs = _lowest_eigenpairs(edge_index, n, k, dense_max_nodes)
 
     if vecs.shape[1]:
         peak = np.abs(vecs).argmax(axis=0)
@@ -76,6 +86,37 @@ def laplacian_pe(edge_index: torch.Tensor, num_nodes: int, k: int, *, dense_max_
         vecs = vecs * signs
     out[:, : vecs.shape[1]] = vecs
     return torch.from_numpy(out)
+
+
+def laplacian_spectrum(
+    edge_index: torch.Tensor, num_nodes: int, k: int, *, dense_max_nodes: int = 500, tie_rtol: float = 1e-6
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(eigvecs [num_nodes, k], eigvals [k])``: the lowest non-trivial eigenpairs, whole eigenspaces only.
+
+    The eigenpairs of :func:`laplacian_pe` (same Laplacian, trivial ones dropped per component),
+    unit-norm, zero-padded when there are fewer than ``k``. For anything built as
+    ``sum_i h(lambda_i) v_i v_i^T`` -- which only sees each eigenspace through its projector, so
+    is free of the solver's choice of signs and of basis within an eigenspace -- one more
+    condition: an eigenspace must be kept whole or not at all. If the ``k``-th eigenvalue ties
+    with the next, cutting at ``k`` would keep an arbitrary part of it (on a square lattice, a
+    mode with an arbitrary orientation), so the tied group at the cut is dropped and its columns
+    are zero. A tie is a relative difference below ``tie_rtol``: on a 50 x 50 lattice exact
+    degeneracies come out at ~1e-13 and the smallest genuine gap is ~6e-3.
+    """
+    n = int(num_nodes)
+    vec_out = np.zeros((n, k), dtype=np.float32)
+    val_out = np.zeros(k, dtype=np.float32)
+    if n == 0 or k == 0:
+        return torch.from_numpy(vec_out), torch.from_numpy(val_out)
+
+    vals, vecs = _lowest_eigenpairs(edge_index, n, k + 1, dense_max_nodes)
+    kept = min(k, len(vals))
+    if len(vals) > k:
+        # Sorted, so the eigenvalues tied with the first one beyond the cut are the last few kept.
+        kept -= int((np.abs(vals[:k] - vals[k]) <= tie_rtol * abs(vals[k])).sum())
+    vec_out[:, :kept] = vecs[:, :kept]
+    val_out[:kept] = vals[:kept]
+    return torch.from_numpy(vec_out), torch.from_numpy(val_out)
 
 
 def random_walk_pe(edge_index: torch.Tensor, num_nodes: int, steps: int) -> torch.Tensor:
