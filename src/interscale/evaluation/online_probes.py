@@ -59,6 +59,7 @@ from sklearn.preprocessing import StandardScaler
 from torch_geometric.loader import DataLoader
 
 from interscale.tl.geome_utils import label_codes
+from interscale.tl.masking import MASK_VALUE
 
 #: The representations a probe can read a target out of. ``local`` and ``global`` are the
 #: ``ViewOutput`` fields; ``pe`` is a control column, the summed node positional encoding exactly
@@ -66,6 +67,10 @@ from interscale.tl.geome_utils import label_codes
 #: lacking a component -- or a node PE -- contributes no columns for it rather than erroring, so
 #: one probe block works unchanged for LocalModel, GlobalModel, CombinedModel and every PE arm.
 EMBEDDINGS = ("local", "global", "pe")
+#: Model-free baselines :func:`collect_features` adds with ``input_baselines=True``: the cell's own
+#: input as the model saw it (hidden entries at ``MASK_VALUE``), and the mean of its graph
+#: neighbours' inputs. They say how much of a target the input already gives away without a model.
+INPUT_BASELINES = ("expression", "neighbours")
 
 #: Metrics reported per (target, embedding), by task. Precision and recall are macro-averaged:
 #: the synthetic cell types are not equally frequent (``stroma`` is 20-60% of a niche), and a
@@ -214,6 +219,7 @@ def collect_features(
     batch_size: int,
     device,
     corrupt: bool = True,
+    input_baselines: bool = False,
 ) -> ProbeBatchFeatures:
     """Run ``module`` over ``data_list`` and gather embeddings and probe targets.
 
@@ -252,6 +258,10 @@ def collect_features(
         gene targets, whose value would otherwise be sitting in the encoder's input. False
         blanks nothing, giving every cell an uncorrupted embedding, which is what a label probe
         wants: the label is not an input, so there is no leak and masking only destroys signal.
+    input_baselines
+        Also gather :data:`INPUT_BASELINES` as extra entries of ``embeddings``, in the same cell
+        order: ``expression``, each cell's input with its hidden entries at ``MASK_VALUE``, and
+        ``neighbours``, the mean of that input over the cell's in-neighbours in ``edge_index``.
 
     Returns
     -------
@@ -309,6 +319,18 @@ def collect_features(
                     pe = node_positional_encoding(module, batch)
                     if pe is not None:
                         batch_emb["pe"] = pe[idx].detach().cpu().numpy()
+                if input_baselines:
+                    hidden = batch.mask.bool()[:, None].expand_as(x_true)
+                    if mask_strategy == "gene" and getattr(batch, "gene_mask", None) is not None:
+                        hidden = batch.gene_mask.bool()
+                    x_input = x_true.masked_fill(hidden, MASK_VALUE)
+                    src, dst = batch.edge_index
+                    total = torch.zeros_like(x_input).index_add_(0, dst, x_input[src])
+                    count = torch.zeros(x_input.shape[0], device=device).index_add_(
+                        0, dst, torch.ones_like(dst, dtype=torch.float)
+                    )
+                    batch_emb["expression"] = x_input[idx].detach().cpu().numpy()
+                    batch_emb["neighbours"] = (total / count.clamp(min=1)[:, None])[idx].detach().cpu().numpy()
 
                 if not batch_emb:
                     raise RuntimeError(

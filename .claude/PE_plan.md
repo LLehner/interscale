@@ -27,6 +27,7 @@ it. "Implemented, unverified" is a real state.
 | 6 — PE probe control + ablation sweep | **implemented, unverified** — the `pe` column holds each cell's own encoding when `pad_batch` subsamples (checked against the cell's coordinates, mutation-checked: an ungathered column fails), is the eval encoding and leaves the PE generator alone; absent without a node PE; on the same chart as local/global; default in `probe.embeddings`. Found and fixed on the way: the probe moved the global torch RNG (every `DataLoader` iterator seeds itself off it) and Python's (`pad_batch` subsampling), so probe-on trained a different model — now restored (test, mutation-checked). `max_dist: 0` derives the largest slide diameter; stored in the checkpoint; LapPE size warning. 431 tests pass; harness IDENTICAL with PEs off (baseline from a worktree of `1faf992`); a `CombinedModel` with sinusoidal + lap + distance and the probe on trains through `model.train` and logs `probe/*_pe`. **The sweep (cluster) is not run yet** | 2026-10-08 |
 | 7 — RoPE (2D rotary) | **implemented, unverified** — logits depend on the cell-to-cell offset only: translating mm-scale coordinates leaves them unchanged and moving one cell changes only its row and column, both checked through the layer's attention itself (rotating only the queries fails it); the rotation follows each token through `pad_batch`'s subsampling, CLS last and padding unrotated, rows graph-major; all-zero coordinates reproduce the RoPE-free model exactly (output and attention maps); it reuses the node encodings' coordinates, so `rotate_train` turns both by one angle, and draws nothing from the global RNG; `forward` refuses a missing or foreign rotation and clears it from the layers even when one raises; finite, rows summing to 1, on the complete-graph NaN test at hops 1–3 with a distance bias on too; wavelengths geometric and dealt out across heads, `mixed` frames over 90°; derived `max_wavelength` and its buffer. 12 mutations, each caught. 465 tests pass; harness IDENTICAL with PEs off (baseline from a worktree of `7fc1299`); trains finite and moves off the PE-free run through `GlobalModel`, `CombinedModel`, dual decoder and long-range, as `axial`, `mixed` and `mixed` + naive + distance; `get_model_output` runs. Found on the way: `GlobalModel` built its module from the un-derived cfg, so `pe.distance.max_dist: 0` (the default) raised at construction — fixed. **No real-data run yet** | 2026-10-09 |
 | 8 — spectral bias | **implemented, unverified** — `laplacian_spectrum` equals the dense eigendecomposition (compared as projectors, dense and shift-invert paths) and zero-pads; a tied eigenspace at the cut is dropped whole, so on a lattice the kernel no longer depends on how the cells are numbered (k = 1–11); the filter is piecewise linear in log λ and flat beyond its knots; the bias equals Σᵢ h(λᵢ)·vᵢvᵢᵀ and does not change under sign flips or a rotation within a tied pair (it does within an untied one); the √N scaling makes each kept mode add 1 to the mean diagonal at h = 1, at any N; laid out like the tokens with each graph's own eigenvalues, through `pad_batch`'s subsampling, CLS and padding zero; adds to the distance bias; a zero table changes nothing; finite, rows summing to 1, on the complete-graph NaN test at hops 1–3; PyG batches the eigenvalues per graph; the run reports the eigenvalue range against the knots and warns when the kept modes miss >10% of cells. 8 mutations, each caught. 486 tests pass; harness IDENTICAL with PEs off; trains finite through `GlobalModel`, `CombinedModel`, dual decoder and long-range, alone and with lap + distance + RoPE, and the table moves and the output with it; `get_model_output` runs. Measured on the data: synth_spot slides are connected, eigenvalues 1.0e-3–3.5e-2 at k = 32, all 32 kept; synth_data_0 at radius 30 is fragmented (see Open questions). **No real-data run yet** | 2026-10-09 |
+| 9 — post-hoc evaluation (synth_spot) | **implemented, not run** — unit tests only: the gene-vector probe reads planted structure (centred cosine >0.9) and nothing from noise, the background genes stay at ~0 from every representation including the masked input (nothing hidden leaks), the raw cosine sits above its mean-profile floor, the one-fit and per-gene paths agree, labels and covariates are read from hidden spots only, `draw_masks` uses its own generator, the input baselines are the masked input and its neighbour mean in probe row order, and edges renumber to a subset and score the same there. 2 mutations, each caught. 498 tests pass. The script's gene-loadings step was checked on synthetic decoder weights: the planted dims are kept, the planted genes rank top, and each programme loads on the decoder that writes it. **Never run on a trained model** (no local model runs, by the user's rule); the evaluate mode is unexercised | 2026-10-10 |
 
 ## What the code already decides
 
@@ -276,6 +277,64 @@ sign- and basis-invariant way to use the spectrum, at the cost of the distance b
 - Code: `SpectralBias`, `_spectral_inputs` and `report_spectral_range` in `positional_encodings.py`;
   `laplacian_spectrum` in `tl/positional.py`; tests in the spectral section of
   `tests/test_positional_encodings.py`.
+
+### How Stage 9 (post-hoc evaluation on synth_spot) was built
+
+Added 2026-10-10 on the user's request, to replace synth_data_0's probes and attention regression
+in the run script; `MODE = "evaluate"` in `pe_test_2.py` reloads every arm's checkpoint
+(`<prefix>model.pt` in `model.save`) and probes it, fit on the train slides, scored on the test
+slides.
+
+- **Every probe reads a masked pass.** `get_model_output` embeds each spot from its own unmasked
+  expression, so predicting that expression from it inverts the encoder (the online probe's
+  finding, R2 0.33 on a noise gene). `evaluation.masked_probing.draw_masks` hides, with a private
+  seed, either entries at the training rate or whole spots, and `online_probes.collect_features`
+  embeds that pass. `input_baselines=True` adds the spot's own masked input and the mean of its
+  neighbours' masked input as feature sets, next to local, global, local+global and `pe`.
+- **Regression by cosine, over the whole gene vector** (the user's choice, replacing MSE and R2):
+  a ridge per gene, fit on the train spots where that gene was hidden, gives each test spot a
+  predicted gene vector; it is compared with the true vector over the spot's hidden entries. Raw
+  cosine as asked, beside the `mean` floor -- every spot's log1p vector has cosine 0.907 with the
+  mean profile -- and the cosine of deviations from the training mean (0 for predicting the mean).
+  Per programme (`var['program']`) the centred cosine is pooled over the programme's hidden
+  entries; the background programmes are the negative control.
+- **Two passes.** Entries hidden: the receptor is often visible while the response is hidden, so
+  the sparse programmes are testable. Whole spots hidden: what the context alone says -- the gene
+  vector, the context labels (region, R3/R4 sender state, M9 stripe, M10 cone; balanced logistic
+  regression) and the vector of distances to every source on every slide (z-scored, cosine).
+- **Attention** on the test slides from `get_model_output`: ROC AUC against the planted edges per
+  range class (`subset_edges` renumbers them to the subset), mean attention per distance bin, and
+  the attention regression with distance, region and counts as blocks. Short-range edges sit
+  inside the long-range mask; read them accordingly.
+- **Gene ranks** per arm (added 2026-10-10 at the user's request, as in the earlier scripts and
+  `3_downstream_tasks.ipynb`): `calculate_gene_ranks` on the test slides' `get_model_output`, the
+  rank plot and the mean ranks per programme. It scores against `adata.X`, which holds raw counts
+  in the preprocessed file, so the training layer (`dataset.layer_key`, sparse) becomes `X` first. A
+  higher rank is a better R2. The old pipeline's "lower = better" label was wrong. The predictions
+  come from unmasked input; see the open question.
+- **Gene loadings** per arm (added 2026-10-10, next to the ranks). These read the decoder weights,
+  not the predictions. `gene_loadings` gives S_gk = W_gk·std(z_k)/std(x_g) for both linear
+  decoders, using the test slides' embeddings. `calculate_dim_importance` (`mode="full"`, cutoff
+  0.60) keeps dims, and `get_genes_dim` gives the top 20 genes per kept dim. The settings are
+  copied from `plot_ranking.py`. Outputs: `gene_loadings_{local,global}.csv`, `dim_importance.csv`
+  with the elbow plot, `top_genes_dim_{local,global}` heatmap and CSV, and
+  `loadings_by_program.csv`. The last holds the mean ||S_g|| per programme for each decoder; with
+  uncorrelated dims ||S_g||² is the share of the gene's variance that decoder reproduces. Both
+  decoders reconstruct the whole vector, so these are two readouts, not a split. Skipped unless
+  `dual_decoder` is on with a `linear` decoder. Checked on synthetic weights with planted dims and
+  programmes; not yet run on a checkpoint.
+- **When it runs:** in `MODE = "sweep"` right after each trial trained (`EVALUATE_AFTER_TRAINING`),
+  while its W&B run is still open, so the headline numbers land in that run's summary under
+  `eval/`, and the rank and elbow plots are logged along with the number of kept dims per decoder. A failed evaluation is printed and does not fail the
+  trained run. `MODE = "evaluate"` redoes it from the checkpoints.
+- Library code takes every name as an argument; the synth_spot names live in the script's config
+  block (`CONTEXT_LABELS`, `COVARIATE_PREFIX`, `GENE_GROUP_KEY`, `ATTENTION_OBS`, `DISTANCE_BINS`).
+  Output: everything of one run in `RESULTS_DIR/<arm>/` (one CSV per analysis, the gene-rank and
+  loading plots), `RESULTS_DIR/all_arms.csv` combined from disk, and a printed headline per analysis.
+- Code: `evaluation/masked_probing.py`; `input_baselines` in `online_probes.collect_features`;
+  `subset_edges`, `attention_distance_profile` and the `edges` argument of `score_against_truth`
+  in `evaluation/downstream_regression.py`; tests in `tests/test_masked_probing.py` and
+  `tests/test_online_probes.py`.
 
 ## The encodings
 
@@ -626,3 +685,7 @@ while those thresholds sit at 2.5 mm. It is not a property of the data.
   on average. Map of one slide under both graphs: `/home/lehnerl/Arbeit/data/synth_data_0_graph_components.png`.
 - `pe.spectral.k` defaults to 32 (shortest wavelength ~1.6 mm on synth_spot); the 1 mm bands of the
   sparse programmes may want 64.
+- **Gene ranks from unmasked input (deferred by the user, 2026-10-10).** `calculate_gene_ranks`
+  scores `get_model_output` predictions, which see every entry. A gene-masking model was only
+  trained on hidden entries, so these ranks compare decoders on input they were never trained on.
+  The user wants the variant that ranks genes on hidden entries only, later.

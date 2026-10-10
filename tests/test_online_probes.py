@@ -749,3 +749,54 @@ def test_collecting_leaves_every_global_generator_where_it_was():
     assert torch.equal(torch.random.get_rng_state(), torch_state)
     assert random.getstate() == py_state
     assert np.array_equal(np.random.get_state()[1], np_state[1])
+
+
+# --------------------------------------------------------------------------- input baselines
+
+
+@pytest.mark.parametrize("mask_strategy", ["node", "gene"])
+def test_input_baselines_are_the_masked_input_and_its_neighbour_mean(mask_strategy):
+    """`expression` is the input as the model saw it -- hidden entries at MASK_VALUE, so a hidden
+    value never reaches a probe -- and `neighbours` the mean of that over each cell's in-neighbours,
+    both in the probe's row order. Graph 2 exceeds max_seq_len, so that order is not batch order."""
+    from interscale.tl.masking import MASK_VALUE
+
+    datas = make_data_list(sizes=(6, 9), mask_strategy=mask_strategy)
+    module = build_module(max_seq_len=8, mask_strategy=mask_strategy)
+    feats = collect_features(
+        module,
+        datas,
+        prediction_task="regression",
+        prediction_level="node",
+        embeddings=("local", "global"),
+        gene_index={f"g{j}": j for j in range(N_GENES)},
+        categorical_targets=(),
+        obs_targets=(),
+        mask_strategy=mask_strategy,
+        batch_size=2,
+        device=torch.device("cpu"),
+        input_baselines=True,
+    )
+    # Rebuild the expected blocks from the targets and masks the probe collected for the same rows.
+    x_true = np.stack([feats.continuous[f"g{j}"] for j in range(N_GENES)], axis=1)
+    hidden = np.stack([feats.gene_masked[f"g{j}"] for j in range(N_GENES)], axis=1)
+    np.testing.assert_allclose(feats.embeddings["expression"], np.where(hidden, MASK_VALUE, x_true), atol=1e-6)
+    assert hidden.any() and (feats.embeddings["expression"][hidden] == MASK_VALUE).all()
+
+    # Neighbour means, per graph, from the source Data objects (path graphs: one or two neighbours).
+    # Keyed by each cell's uncorrupted expression, which is what matches a probe row to its cell.
+    expected_by_row = {}
+    for d in datas:
+        x_in = d.x.masked_fill(d.gene_mask if mask_strategy == "gene" else d.mask[:, None].expand_as(d.x), MASK_VALUE)
+        n = d.num_nodes
+        for i in range(n):
+            neighbours = x_in[[k for k in (i - 1, i + 1) if 0 <= k < n]].mean(0).numpy()
+            expected_by_row[tuple(np.round(d.x[i].numpy(), 5))] = neighbours
+    assert len(feats.embeddings["neighbours"]) == len(x_true)
+    for row, nb in zip(x_true, feats.embeddings["neighbours"], strict=True):
+        np.testing.assert_allclose(nb, expected_by_row[tuple(np.round(row, 5))], atol=1e-5)
+
+
+def test_input_baselines_are_off_by_default():
+    feats = collect(make_data_list())
+    assert not set(feats.embeddings) & {"expression", "neighbours"}

@@ -222,9 +222,7 @@ def default_blocks(pairs: pd.DataFrame, batch_features: tuple[str, ...] = ("cond
     if niche:
         blocks["niche"] = niche
     qc = [
-        c
-        for c in pairs.columns
-        if c.startswith(("total_counts_", "n_genes_by_counts_", "lib_factor_", "pct_counts_"))
+        c for c in pairs.columns if c.startswith(("total_counts_", "n_genes_by_counts_", "lib_factor_", "pct_counts_"))
     ]
     if qc:
         blocks["qc"] = qc
@@ -359,11 +357,41 @@ def residual_flow(pairs: pd.DataFrame, by: str = "cell_type", value: str = "resi
     return df
 
 
+def subset_edges(edges: pd.DataFrame, keep: np.ndarray) -> pd.DataFrame:
+    """Ground-truth edges among the cells ``keep`` selects, renumbered to positions in that subset.
+
+    ``edges`` refer to cells by position in the full object (``sender``, ``receiver``); running
+    inference on a subset -- the test slides -- moves every position. Edges with an endpoint
+    outside the subset are dropped.
+    """
+    keep = np.asarray(keep, dtype=bool)
+    new_position = np.full(len(keep), -1, dtype=np.int64)
+    new_position[keep] = np.arange(int(keep.sum()))
+    out = edges.copy()
+    out["sender"] = new_position[out["sender"].to_numpy().astype(np.int64)]
+    out["receiver"] = new_position[out["receiver"].to_numpy().astype(np.int64)]
+    return out[(out["sender"] >= 0) & (out["receiver"] >= 0)].reset_index(drop=True)
+
+
+def attention_distance_profile(pairs: pd.DataFrame, bins, value: str = "attn") -> pd.DataFrame:
+    """Mean attention of the sampled pairs per distance bin: the geometry the attention prefers.
+
+    Reads ``dist`` and ``value`` from :func:`attention_pairs`, so it is in that table's units and
+    normalisation.
+    """
+    binned = pd.cut(pairs["dist"], bins=bins, include_lowest=True)
+    out = pairs.groupby(binned, observed=False)[value].agg(["mean", "count"])
+    out.index = out.index.astype(str)
+    out.index.name = "distance_bin"
+    return out.reset_index()
+
+
 def score_against_truth(
     adata: AnnData,
     pairs: pd.DataFrame,
     *,
     score_columns: tuple[str, ...] = ("attn", "resid"),
+    edges: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """ROC AUC of attention, and of its residual, against the simulated interaction edges.
 
@@ -374,11 +402,14 @@ def score_against_truth(
     residual AUC is normally the lower of the two; what it answers is whether anything survives
     that a distance kernel plus cell-type identity could not have produced. A residual AUC at 0.5
     means the attention was the spatial prior and nothing more.
-    """
-    if "synthetic" not in adata.uns or "interaction_edges" not in adata.uns["synthetic"]:
-        raise KeyError("no ground truth in adata.uns['synthetic']; this scoring only applies to the simulated data")
 
-    edges = pd.DataFrame(adata.uns["synthetic"]["interaction_edges"])
+    ``edges`` overrides ``adata.uns['synthetic']['interaction_edges']`` -- needed when ``adata`` is
+    a subset, whose positions :func:`subset_edges` renumbers to.
+    """
+    if edges is None:
+        if "synthetic" not in adata.uns or "interaction_edges" not in adata.uns["synthetic"]:
+            raise KeyError("no ground truth in adata.uns['synthetic']; this scoring only applies to the simulated data")
+        edges = pd.DataFrame(adata.uns["synthetic"]["interaction_edges"])
     n = adata.n_obs
     truth: dict[str, set] = {}
     for rc, sub in edges.groupby("range_class", observed=True):
@@ -420,8 +451,9 @@ def main() -> None:
     parser.add_argument("--h5ad", type=Path, required=True, help="output of CombinedModel.get_model_output")
     parser.add_argument("--prefix", type=str, default="combined")
     parser.add_argument("--sample-key", type=str, default="slide")
-    parser.add_argument("--obs-features", type=str, nargs="*",
-                        default=["cell_type", "niche", "total_counts", "n_genes_by_counts"])
+    parser.add_argument(
+        "--obs-features", type=str, nargs="*", default=["cell_type", "niche", "total_counts", "n_genes_by_counts"]
+    )
     parser.add_argument("--normalize", choices=NORMALIZATIONS, default="graph_z")
     parser.add_argument("--max-pairs", type=int, default=200_000)
     parser.add_argument("--estimator", choices=sorted(ESTIMATORS), default="ridge")
@@ -442,9 +474,7 @@ def main() -> None:
         max_pairs=args.max_pairs,
         random_state=args.seed,
     )
-    result = regress_attention(
-        pairs, estimator=args.estimator, cv_folds=args.cv_folds, random_state=args.seed
-    )
+    result = regress_attention(pairs, estimator=args.estimator, cv_folds=args.cv_folds, random_state=args.seed)
     adata.uns["downstream_attention_regression"] = result.variance
 
     print(f"pairs: {len(pairs)}  normalize: {args.normalize}")
