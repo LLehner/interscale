@@ -441,7 +441,7 @@ Extended 2026-10-06 with the sparse-response programme (item 18) and twice the b
 **Layout.** Conditions A and B, 20 slides each. A slide is a 50 x 50 square lattice, 100 µm centre
 to centre, centred on the origin with no spot on an axis (±50 … ±2450 µm). 5 slides per condition
 lose one border row or column (50 x 49), 10 get 1–5 interior holes (2x2, 3x3, 3x5). 99,090 spots
-(2427–2500 per slide) x 253 genes. Split per slide, 14/3/3 per condition; val and test each hold
+(2427–2500 per slide) x 253 genes. Split per slide, 12/4/4 per condition (60/20/20; was 14/3/3 until 2026-10-10); val and test each hold
 both values of every slide-level factor (M4, M5, crop, holes).
 
 **Levels.** `0` is a structural zero, `down` 1, `up` and `medium` 5, `high` 10. Structured genes
@@ -506,6 +506,13 @@ The Gaussian programmes M1–M8 have no discrete sender, so no edges.
 gives the 4-neighbourhood the short-range rules use); `spatial_key: spatial`,
 `spatial_unit_um: 1.0`; `sample_key: [slide]`; `layer_key: log1p_norm`.
 
+**Run scripts (2026-10-10):** `notebooks_and_scripts/pe_test_2.{py,yaml}` + `pe_sweep_2.yaml`.
+They preprocess as the legnini tutorial does (raw counts in `X`/`layers['raw']`,
+`normalize_total(1e4)` + log1p into `log1p_norm`, written to `synth_spot_pp.h5ad`), set
+`max_seq_len` to the largest slide, train 100 epochs under gene masking, and sweep ten arms. The
+user chose a k-NN graph instead of the radius-110 one: k = 8 (`radius: null`, `n_neighs: 8`), after
+k = 6 turned out to pick tied diagonals (below).
+
 ### What the lattice does to the encodings (measured on the data)
 
 - **RWPE barely sees position.** On an intact slide the 16-step RWPE takes 40 distinct values over
@@ -520,6 +527,14 @@ gives the 4-neighbourhood the short-range rules use); `spatial_key: spatial`,
   `rotate_train` erases it. RoPE sees it as the direction between two cells.
 - **Centring moves with a crop.** Losing one border line shifts a slide's centroid by 50 µm, so a
   centred coordinate PE sees intact and cropped slides 50 µm apart.
+- **k-NN with k = 6 is directed and picks tied diagonals.** Every spot has 4 lattice neighbours at
+  100 µm and 4 diagonals tied at 141 µm, so k = 6 keeps 2 of the 4 diagonals by tie-break. On
+  slide A_01 (squidpy, measured 2026-10-10) the (−,−) diagonal is picked 1544 times and the
+  (+,+) 890 times. The adjacency is not symmetric, and the symmetrised degree runs 6–10. **k = 8**
+  (used since 2026-10-10) has no interior ties: every interior spot gets its 4 neighbours and 4
+  diagonals, each diagonal direction equally often. Spots at a border or a hole reach out to
+  200–283 µm (3% of edges). The symmetrised degree is 8 for 92% of spots and up to 13 at corners.
+  The 2-layer GCN's reach, and so the long-range mask, is the 5 x 5 block (≤ 283 µm).
 
 ### What is local and what is not
 
