@@ -302,6 +302,95 @@ def _local_reach(edge_index: torch.Tensor, num_nodes: int, n_hops: int) -> torch
     return dense
 
 
+def _local_reach_pairs(edge_index: torch.Tensor, num_nodes: int, n_hops: int) -> torch.Tensor:
+    """``[2, P]`` pairs ``(i, j)`` of :func:`_local_reach`'s closure, never densified.
+
+    The same set as the True entries of ``_local_reach(edge_index, num_nodes, n_hops)``: the
+    ``n_hops`` closure, symmetrised, with the diagonal. Memory tracks the number of pairs rather
+    than ``num_nodes ** 2``, which is what lets a backend that never forms the attention matrix
+    keep the long-range mask on a whole slide.
+    """
+    device = edge_index.device
+    if n_hops <= 1 or edge_index.numel() == 0:
+        pairs = edge_index
+    else:
+        values = torch.ones(edge_index.shape[1], device=device)
+        adj = torch.sparse_coo_tensor(edge_index, values, (num_nodes, num_nodes)).coalesce()
+        reach, frontier = adj, adj
+        for _ in range(n_hops - 1):
+            frontier = torch.sparse.mm(frontier, adj).coalesce()
+            reach = (reach + frontier).coalesce()
+        pairs = reach.indices()
+    diagonal = torch.arange(num_nodes, device=device).expand(2, -1)
+    pairs = torch.cat([pairs, pairs.flip(0), diagonal], dim=1)
+    return torch.unique(pairs, dim=1)
+
+
+def blocked_pairs(
+    edge_index: torch.Tensor,
+    batch: torch.Tensor,
+    index_nodes: list,
+    *,
+    n_hops: int,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """``[3, P]`` ``(graph, query, key)`` positions of every pair the attention may not use.
+
+    The same pairs as the boolean masks, as a list: for ``n_hops >= 1`` the True entries of
+    :func:`create_transformer_attention_mask_from_edges` (one head's worth), for ``n_hops`` 0 those
+    of :func:`attn_mask_diagonal`. Positions are in the padded layout -- ``pad_batch`` left-pads, so
+    graph ``b``'s kept tokens are the last ``len(index_nodes[b])`` before the CLS slot -- and the
+    CLS slot never appears. The closure is taken on the whole graph and then restricted to the kept
+    nodes, so a path through a node ``pad_batch`` dropped still blocks its two ends. Nothing here is
+    ``S x S``.
+
+    Parameters
+    ----------
+    edge_index
+        ``[2, num_edges]`` edge index of the whole batch, with PyG's per-graph node offsets.
+    batch
+        ``[num_nodes]`` graph assignment per node.
+    index_nodes
+        Per graph, the node indices ``pad_batch`` kept, relative to that graph's own node order.
+    n_hops
+        Radius of the blocked neighbourhood in message-passing steps; 0 blocks each token's
+        attention to itself only (every position, padding included, as ``attn_mask_diagonal``).
+    device
+        Device for the returned tensor. Defaults to ``edge_index``'s.
+    """
+    device = edge_index.device if device is None else device
+    if n_hops < 0:
+        raise ValueError(f"n_hops must be >= 0, got {n_hops}.")
+    seq_len = max(len(nodes) for nodes in index_nodes)
+    if n_hops == 0:
+        positions = torch.arange(seq_len, device=device)
+        graphs = torch.arange(len(index_nodes), device=device).repeat_interleave(seq_len)
+        return torch.stack([graphs, positions.repeat(len(index_nodes)), positions.repeat(len(index_nodes))])
+
+    batch = batch.to(torch.long)
+    out = []
+    for b, kept_nodes in enumerate(index_nodes):
+        nodes_b = torch.nonzero(batch == b, as_tuple=False).flatten()
+        n_b = int(nodes_b.numel())
+        if n_b == 0:
+            continue
+        # PyG batches graphs by concatenation: a graph's local indices are the global ones minus
+        # the offset of its first node.
+        offset = int(nodes_b[0].item())
+        in_graph = (batch[edge_index[0]] == b) & (batch[edge_index[1]] == b)
+        pairs = _local_reach_pairs(edge_index[:, in_graph] - offset, n_b, n_hops)
+
+        kept = torch.as_tensor(kept_nodes, dtype=torch.long, device=pairs.device)
+        position = torch.full((n_b,), -1, dtype=torch.long, device=pairs.device)
+        position[kept] = seq_len - len(kept) + torch.arange(len(kept), device=pairs.device)
+        query, key = position[pairs[0]], position[pairs[1]]
+        keep = (query >= 0) & (key >= 0)
+        out.append(torch.stack([torch.full_like(query[keep], b), query[keep], key[keep]]))
+    if not out:
+        return torch.zeros((3, 0), dtype=torch.long, device=device)
+    return torch.cat(out, dim=1).to(device)
+
+
 def create_transformer_attention_mask_from_edges(
     edge_index: torch.Tensor,
     num_nodes: int,

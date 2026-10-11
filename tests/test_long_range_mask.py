@@ -521,3 +521,47 @@ def test_a_global_model_has_nothing_to_mask_and_says_so():
         model = GlobalModel(_setup_adata(GlobalModel), cfg=cfg)
 
     assert model.module.local_mask_hops == 0
+
+
+# --------------------------------------------------------------------------- the same mask as a list
+
+
+def _dense_from_pairs(pairs, n_graphs, seq_len):
+    dense = torch.zeros(n_graphs, seq_len + 1, seq_len + 1, dtype=torch.bool)
+    dense[pairs[0], pairs[1], pairs[2]] = True
+    return dense
+
+
+@pytest.mark.parametrize("hops", [1, 2, 3])
+def test_the_blocked_pair_list_is_the_dense_mask(hops):
+    """Backends that never form the attention matrix take the mask as a list of pairs. It has to be
+    exactly the dense mask: two graphs of different size (padding), one subsampled by pad_batch, so
+    paths through dropped nodes, the left-padded layout and the open CLS slot are all exercised."""
+    from interscale.tl.masking import blocked_pairs
+
+    sizes = (14, 9)
+    edges = [random_geometric_graph(sizes[0], 0.4, seed=3), random_geometric_graph(sizes[1], 0.5, seed=4)]
+    edge_index = torch.cat([edges[0], edges[1] + sizes[0]], dim=1)
+    batch = torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(sizes)])
+    index_nodes = [sorted(np.random.default_rng(0).choice(sizes[0], 11, replace=False).tolist()), list(range(9))]
+
+    dense = create_transformer_attention_mask_from_edges(
+        edge_index, batch.numel(), batch, index_nodes, N_HEADS, n_hops=hops
+    )[::N_HEADS]
+    pairs = blocked_pairs(edge_index, batch, index_nodes, n_hops=hops)
+
+    assert torch.equal(_dense_from_pairs(pairs, 2, 11), dense)
+    assert pairs.shape[1] == int(dense.sum())  # no duplicates
+
+
+def test_the_self_only_pair_list_is_the_diagonal_mask():
+    from interscale.tl.masking import blocked_pairs
+
+    batch = torch.cat([torch.zeros(5, dtype=torch.long), torch.ones(3, dtype=torch.long)])
+    index_nodes = [list(range(5)), list(range(3))]
+    edge_index = torch.cat([path_graph(5), path_graph(3) + 5], dim=1)
+
+    dense = attn_mask_diagonal(batch, index_nodes, N_HEADS, torch.device("cpu"))[::N_HEADS]
+    pairs = blocked_pairs(edge_index, batch, index_nodes, n_hops=0)
+
+    assert torch.equal(_dense_from_pairs(pairs, 2, 5), dense)

@@ -25,7 +25,7 @@ a real state.
 |---|---|---|---|
 | 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | **done** | 517 tests pass; harness IDENTICAL across 5 cases / 15 epochs after each of the two commits; training steps keep no map and hook nothing unless the loss reads attention; the skeleton's dense core reproduces torch's attention (outputs and maps, with mask, padding and RoPE) and draws its initial weights; a non-default backend leaves every weight built after it unchanged (mutation-checked: without the replayed draws it fails); every validator rejection tested | 2026-10-11 |
 | 1 — attention diagnostics (span in µm, sink mass, effective keys) | not started | | |
-| 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | not started | | |
+| 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | **in progress** — `tl.blocked_pairs` done: equals the dense mask at hops 0–3 on two graphs of different size, one subsampled (mutation-checked: without the left-pad offset it fails) | | 2026-10-11 |
 | 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | not started | | |
 | 4 — global tokens and a null key | not started | | |
 | 5 — Exphormer-style sparse attention | not started | | |
