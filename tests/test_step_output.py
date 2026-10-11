@@ -87,7 +87,9 @@ def test_global_module_fills_the_fields_a_contrastive_loss_needs():
     assert v.global_embedding is not None
     assert v.src_padding_mask is not None
     assert v.padded_node_idx is not None
-    assert v.attn is not None
+    # Attention maps are kept only for a loss that reads them (the attention entropy loss); no
+    # contrastive loss does, so a step does not hold them.
+    assert v.attn is None
     # No local component in a GlobalModule.
     assert v.local_embedding is None
 

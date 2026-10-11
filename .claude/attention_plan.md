@@ -23,7 +23,7 @@ a real state.
 
 | stage | state | verified by | date |
 |---|---|---|---|
-| 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | not started | | |
+| 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | **in progress** — maps only when consumed: done (503 tests pass, harness IDENTICAL across 5 cases / 15 epochs; training steps keep no map and hook nothing unless the loss reads attention) | | 2026-10-11 |
 | 1 — attention diagnostics (span in µm, sink mass, effective keys) | not started | | |
 | 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | not started | | |
 | 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | not started | | |

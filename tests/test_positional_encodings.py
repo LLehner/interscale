@@ -1396,7 +1396,9 @@ def test_rope_at_the_origin_is_the_plain_attention_and_anywhere_else_changes_it(
 
     def run(module, coords):
         gi = module.common_step_local_to_global(_batch(coords), emb, eval_step=True)
-        out, _, attn = module(gi.padded_emb, gi.src_padding_mask, gi.attention_mask, rotary=gi.rotary)
+        out, _, attn = module(
+            gi.padded_emb, gi.src_padding_mask, gi.attention_mask, register_hook=True, rotary=gi.rotary
+        )
         return out, attn
 
     out_plain, attn_plain = run(plain, torch.zeros(6, 2))

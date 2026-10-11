@@ -48,6 +48,7 @@ class TransformerNodeEncoderHook(GlobalModule):
         positional_encoding: nn.Module | None = None,
         attention_bias: nn.Module | None = None,
         rotary_encoding: nn.Module | None = None,
+        return_attention_maps: bool = False,
         **base_module_kwargs,
     ):
 
@@ -101,6 +102,9 @@ class TransformerNodeEncoderHook(GlobalModule):
         # batch in `common_step_local_to_global` and applied to queries and keys in every layer by
         # `forward`. None -- nothing registered, the attention is the one from before PEs.
         self.rotary_encoding = rotary_encoding
+        # Whether a training step hands every layer's attention map to its loss (the attention
+        # entropy loss reads them). Off, `forward` keeps no map unless asked for relevance.
+        self.return_attention_maps = bool(return_attention_maps)
 
     def common_step_local_to_global(self, batched_data, emb: torch.Tensor, eval_step: bool = False):
         """Convert local node embeddings ``[N, E]`` to padded local node embeddings ``[max_seq_len, E]``.
@@ -197,7 +201,7 @@ class TransformerNodeEncoderHook(GlobalModule):
 
         return GlobalInput(padded_emb, src_padding_mask, index_nodes, attention_mask, rotary)
 
-    def forward(self, padded_h_node, src_padding_mask, mask=None, register_hook: bool = True, rotary=None):
+    def forward(self, padded_h_node, src_padding_mask, mask=None, register_hook: bool | None = None, rotary=None):
         """
         N_b_max: maximum number of nodes in the batch
         B: batch size
@@ -213,6 +217,11 @@ class TransformerNodeEncoderHook(GlobalModule):
             rotary: (cos, sin), each [B * heads, N_b_max + 1, H_d / heads]
                 The rotary encoding's rotation from `common_step_local_to_global` (GlobalInput.rotary).
                 Required when the rotary encoding is enabled, and only then.
+            register_hook: bool or None
+                True: keep every layer's attention map, return them stacked, and hook them for their
+                gradient (what relevance needs; `evaluate` passes it). False: none of that. None
+                (training steps): return the stacked maps only when the loss reads them
+                (`return_attention_maps`), and hook nothing.
         """
         if (rotary is None) != (self.rotary_encoding is None):
             raise ValueError(
@@ -229,9 +238,11 @@ class TransformerNodeEncoderHook(GlobalModule):
                     "(graphs x heads, tokens + CLS, head width): it was computed for another batch."
                 )
 
-        if register_hook:
-            for encoder in self.transformer_encoder.layers:
-                encoder.register_hook = True
+        relevance = bool(register_hook)
+        keep_maps = relevance or (register_hook is None and self.return_attention_maps)
+        for encoder in self.transformer_encoder.layers:
+            encoder.register_hook = relevance
+            encoder.keep_maps = keep_maps
 
         # append cls embedding
         expand_cls_embedding = self.cls_embedding.expand(
@@ -268,16 +279,12 @@ class TransformerNodeEncoderHook(GlobalModule):
                 encoder.rotary = None
 
         attn_matrices = []
-        if register_hook:
-            for i, encoder in enumerate(self.transformer_encoder.layers):
-                if hasattr(encoder, "get_attn_output_weights"):
-                    attn_matrices.append(encoder.get_attn_output_weights())
-                elif hasattr(encoder, "attention_map"):
-                    attn_matrices.append(encoder.attention_map)
-                elif hasattr(encoder, "attn"):
-                    attn_matrices.append(encoder.attn)
-
-                encoder.register_hook = False
+        for encoder in self.transformer_encoder.layers:
+            if keep_maps:
+                attn_matrices.append(encoder.get_attn_output_weights())
+            # The maps stay readable on the layers (`get_attn_output_weights`) until the next call.
+            encoder.register_hook = False
+            encoder.keep_maps = False
 
         if len(attn_matrices) > 0:
             final_attn = torch.stack(attn_matrices)

@@ -180,6 +180,12 @@ class SCELoss(torch.nn.Module):
         return scaled_cosine_error(x, y, self.gamma).mean()
 
 
+#: ``optim.loss`` values whose criterion reads the transformer's attention maps in training. Only
+#: these make the global module stack every layer's maps into the step output; otherwise the maps
+#: are not kept between the attention computation and the end of the step.
+LOSSES_READING_ATTENTION = frozenset({"SCE_EntropyATT_Loss"})
+
+
 class SCE_EntropyATT_Loss(torch.nn.Module):
     """SCE loss with entropy of attention weights."""
 

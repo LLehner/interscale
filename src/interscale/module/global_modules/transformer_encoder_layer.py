@@ -49,7 +49,11 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
         self.attn_output = None  # To store attention output
         self.attn_output_weights = None
         self.attn_gradients = None  # To store attention weights gradients
+        # Whether to hook the attention map for its gradient (relevance), and whether to keep the
+        # map at all. Both set per call by `TransformerNodeEncoderHook.forward`; off, a training
+        # step neither stores a gradient nor keeps a map alive past the step.
         self.register_hook = False
+        self.keep_maps = False
         # ``(cos, sin)`` of the rotary position embedding for the current forward pass, or None.
         # Set and cleared around each call by `TransformerNodeEncoderHook.forward`, because
         # `nn.TransformerEncoder` passes nothing but the masks on to its layers.
@@ -96,7 +100,9 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
             rotary=self.rotary,
         )
         self.save_attn_output(attn_output)
-        self.save_attn_output_weights(attn_output_weights)
+        # The map is computed either way (the explicit path is what keeps the numbers unchanged),
+        # but only kept when something reads it.
+        self.save_attn_output_weights(attn_output_weights if self.keep_maps else None)
         if self.register_hook and attn_output_weights.requires_grad:
             attn_output_weights.register_hook(self.save_attn_gradients)
         # if self.register_hook:
