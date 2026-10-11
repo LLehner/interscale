@@ -160,6 +160,11 @@ Results are logged as flat
 sweep — plus, under wandb, one custom chart per target carrying both embeddings as two lines. The
 `probe/` prefix is load-bearing: wandb sections split on the text before the first `/`, so it keeps
 these out of the default panel section where InterScale's own `train_`/`val_` metrics live.
+`probe.attention_diagnostics: true` adds per-layer, per-head attention diagnostics from a clean pass
+over the first `probe.attention_graphs` val graphs: span in µm, the share beyond each of
+`probe.attention_radii_um`, CLS mass, effective keys, and the Performer's TV distance to softmax, as
+`probe/attn_<metric>_l<layer>_h<head>` (`evaluation/attention_diagnostics.py`; Stage 1 of
+`.claude/attention_plan.md`).
 
 Numeric `obs` targets reach the graphs as an **obsm matrix** (`dataset.probe_obsm_key`), because
 geome cannot attach a numeric obs column — it returns a pandas Series and dies in `torch.cat`.

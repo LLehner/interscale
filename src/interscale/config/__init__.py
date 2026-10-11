@@ -232,12 +232,24 @@ def _validate_probe(cfg):
         or cfg.probe.regression_genes
         or cfg.probe.regression_obs
         or cfg.probe.get("gene_vector", False)
+        or cfg.probe.get("attention_diagnostics", False)
     ):
         raise ValueError(
             "probe.use is True but no probe target is named (classification_targets, "
-            "regression_genes, regression_obs, gene_vector). The probe would pay for a full extra pass over "
-            "train and val and log nothing."
+            "regression_genes, regression_obs, gene_vector, attention_diagnostics). The probe would pay for a "
+            "full extra pass over train and val and log nothing."
         )
+
+    if cfg.probe.get("attention_diagnostics", False):
+        if cfg.probe.attention_graphs < 0:
+            raise ValueError(
+                f"probe.attention_graphs must be >= 0 (0 reads every val graph), got {cfg.probe.attention_graphs}."
+            )
+        radii = list(cfg.probe.attention_radii_um)
+        if any(not float(r) > 0 for r in radii):
+            raise ValueError(f"probe.attention_radii_um must all be > 0 (µm), got {radii}.")
+        if len(set(map(float, radii))) != len(radii):
+            raise ValueError(f"probe.attention_radii_um names a radius twice: {radii}.")
 
     # Numeric obs targets reach the graphs through an obsm matrix, because geome cannot attach a
     # numeric obs column. Without the key the graphs carry no probe_targets and the probe raises

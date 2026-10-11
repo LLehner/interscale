@@ -282,6 +282,18 @@ def orthogonal_gaussian(num_features: int, dim: int, generator: torch.Generator)
     return (torch.cat(blocks) * norms).float()
 
 
+def head_pairs(pairs: torch.Tensor, num_heads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(graph, query, key)`` pairs ``[3, P]`` as ``(rows, query, key)`` for every head, pair-major.
+
+    ``rows`` index the ``B * heads`` rows of the split heads, graph-major: entry ``p * heads + h``
+    is pair ``p`` in head ``h``.
+    """
+    graph, query, key = pairs
+    heads = torch.arange(num_heads, device=pairs.device)
+    rows = (graph[:, None] * num_heads + heads).reshape(-1)
+    return rows, query.repeat_interleave(num_heads), key.repeat_interleave(num_heads)
+
+
 class KernelAttention(ProjectedAttention):
     """Attention whose similarity factorises, ``phi(q) . phi(k)`` with positive features, never forming ``S x S``.
 
@@ -324,11 +336,8 @@ class KernelAttention(ProjectedAttention):
         phi_q, phi_k = self._feature_maps(q, k, valid, context)
         phi_q, phi_k, v64 = phi_q.double(), phi_k.double(), v.double()
 
-        # Each blocked (graph, query, key) for every head: rows graph * heads + h, graph-major.
-        graph, query, key = context.blocked
-        heads = torch.arange(self.num_heads, device=q.device)
-        rows = (graph[:, None] * self.num_heads + heads).reshape(-1)
-        query, key = query.repeat_interleave(self.num_heads), key.repeat_interleave(self.num_heads)
+        # Each blocked (graph, query, key) for every head.
+        rows, query, key = head_pairs(context.blocked, self.num_heads)
         if rows.numel() and int(rows.max()) >= n_graphs * self.num_heads:
             raise ValueError("blocked pairs name a graph beyond this batch.")
 
@@ -386,6 +395,10 @@ class PerformerAttention(KernelAttention):
         self.num_features, self.bias_factor_dim = int(num_features), int(bias_factor_dim)
         self.redraw_interval = int(redraw_interval)
         self.feature_generator = torch.Generator().manual_seed(0)  # replaced by the transformer's
+        # Set by `TransformerNodeEncoderHook.recording_attention`: the explicit path then also forms
+        # the exact softmax this layer estimates, for the diagnostics' total-variation distance.
+        self.record_reference = False
+        self.reference_weights = None
         self.register_buffer(
             "favor_projection",
             orthogonal_gaussian(self.num_features, self.head_dim + self.bias_factor_dim, self.feature_generator),
@@ -439,7 +452,22 @@ class PerformerAttention(KernelAttention):
                     f"bias factors of shape {tuple(u.shape)} do not match ({n_rows}, {seq_len}, {self.bias_factor_dim})."
                 )
             x, y = torch.cat([x, u.to(x.dtype)], dim=-1), torch.cat([y, w.to(y.dtype)], dim=-1)
+        if self.record_reference:
+            self.reference_weights = self._exact_softmax(x, y, valid, context).to(q.dtype)
         return self._features(x, None), self._features(y, valid)
+
+    @torch.no_grad()
+    def _exact_softmax(self, x, y, valid, context) -> torch.Tensor:
+        """``[N, L, L]``: the softmax attention this layer estimates, ``softmax(x . y)`` with the mask.
+
+        ``x . y = q . k / sqrt(d) + bias``, the exponent FAVOR+ estimates ``exp`` of; blocked pairs
+        and padded keys are excluded, as in the estimate. Float64, so a sharp row stays exact.
+        """
+        logits = x.double() @ y.double().transpose(1, 2)
+        rows, query, key = head_pairs(context.blocked, self.num_heads)
+        logits = logits.index_put((rows, query, key), logits.new_full((rows.numel(),), float("-inf")))
+        logits = logits.masked_fill(~valid[:, None, :], float("-inf"))
+        return torch.softmax(logits, dim=-1)
 
 
 class LinearAttention(KernelAttention):

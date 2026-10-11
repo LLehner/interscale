@@ -503,6 +503,7 @@ class OnlineProbeCallback(Callback):
         self._gene_vector = bool(cfg.probe.get("gene_vector", False))
         self._vector_genes = var_names if self._gene_vector else []
         self._collect_index = {g: i for i, g in enumerate(var_names)} if self._gene_vector else self._gene_index
+        self._attention = bool(cfg.probe.get("attention_diagnostics", False))
 
         # Per-metric history, {chart_key: {series_name: [(epoch, value), ...]}}. Kept so each
         # wandb chart can be re-rendered with the full curve every time it is refreshed.
@@ -545,7 +546,8 @@ class OnlineProbeCallback(Callback):
         Runs up to two passes per split, because the two kinds of target need opposite inputs:
         a CLEAN pass for labels (never model inputs, so masking only deletes signal) and a
         CORRUPTED pass for genes (model inputs, so an unmasked probe measures invertibility).
-        A pass is skipped entirely when no target needs it.
+        A pass is skipped entirely when no target needs it. With ``probe.attention_diagnostics``,
+        a clean pass over a few val graphs adds the attention diagnostics.
 
         Separated from the hook so it can be called directly in a test, with no trainer.
         """
@@ -584,6 +586,23 @@ class OnlineProbeCallback(Callback):
             results.update(self._score_genes(train, val))
             if self._gene_vector:
                 results.update(self._score_gene_vector(train, val))
+
+        if self._attention:
+            # Imported here: attention_diagnostics imports this module's prefix and RNG guard.
+            from interscale.evaluation.attention_diagnostics import attention_diagnostics
+
+            results.update(
+                attention_diagnostics(
+                    module,
+                    datamodule.val_data,
+                    prediction_task=self._cfg.dataset.prediction_task,
+                    prediction_level=self._cfg.dataset.prediction_level,
+                    device=device,
+                    spatial_unit_um=float(self._cfg.dataset.spatial_unit_um),
+                    radii_um=tuple(float(r) for r in self._probe_cfg.attention_radii_um),
+                    max_graphs=int(self._probe_cfg.attention_graphs),
+                )
+            )
 
         return results
 

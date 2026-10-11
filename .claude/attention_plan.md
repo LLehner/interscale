@@ -24,7 +24,7 @@ a real state.
 | stage | state | verified by | date |
 |---|---|---|---|
 | 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | **done** | 517 tests pass; harness IDENTICAL across 5 cases / 15 epochs after each of the two commits; training steps keep no map and hook nothing unless the loss reads attention; the skeleton's dense core reproduces torch's attention (outputs and maps, with mask, padding and RoPE) and draws its initial weights; a non-default backend leaves every weight built after it unchanged (mutation-checked: without the replayed draws it fails); every validator rejection tested | 2026-10-11 |
-| 1 — attention diagnostics (span in µm, sink mass, effective keys) | not started | | |
+| 1 — attention diagnostics (span in µm, sink mass, effective keys) | **implemented, unverified** — planted maps read their values (a query attending to a cell 300 µm away reads 300; mass beyond radii; CLS mass; effective keys 1 and 3); left padding and graph-major heads pinned on two graphs of different size; a real pass's numbers are those of the maps the step returns, each token's coordinates placed by the step's own token-to-cell index; the Performer's reference equals the dense model's first-layer map at one seed, and its TV falls with the feature count (0.19, 0.041, 0.014 at m = 8, 512, 8192); no TV for dense, linear or Exphormer; a pass leaves every global generator, the training flag and the module's flags as they were, and dense numbers unchanged while recording. Six mutations (CLS as a key, right padding, head-major rows, a reference without the mask, flags not restored, no RNG guard), each caught. 623 tests pass; harness IDENTICAL. **Not yet run in training** | 2026-10-11 |
 | 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | **Performer and linear implemented, unverified** — `tl.blocked_pairs` equals the dense mask at hops 0–3 (two graphs of different size, one subsampled). Performer: the orthogonal features estimate exp(x·y) without bias (found biased by ~7% before the Haar sign fix); the map's error against softmax falls with the feature count (TV 0.10 at m = 16, 0.009 at 4096); the float64 subtraction stays exact where blocked keys hold 99.7% of a query's mass (float32: ~1e-5 off); shares every initial weight with the dense model at one seed; per-layer features from their own seeded generator, redrawn only in training and only when asked. Linear: equals its definition; each head's map has rank exactly `head_dim` before the mask (dense softmax at the same width: near full rank); adds no state, so a dense checkpoint loads strictly; refuses RoPE and biases, and the validator says why; warns below a head width of 32. Both: factorised and explicit paths agree to 1e-5 with mask and padding; block exactly the dense mask's pairs; finite on the complete-graph test at hops 1–3 and through 5 training steps; relevance runs; train through `_common_step`. Five mutations, each caught. 570 tests pass; harness IDENTICAL. **No real-data run yet. Generated arms not built** | 2026-10-11 |
 | 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | **implemented, unverified** — spectral: `U Wᵀ` equals the dense bias (two graphs of different size, one subsampled; CLS and padding zero); a zero bias leaves one side 0 and the other small (mutation-checked); a Performer's map converges to dense softmax with the same bias (TV 0.047 → 0.014 from m = 1024 to 16384 at a bias of ±1.2). Fourier (`pe.bias: [fourier]`): zero at init; each entry is the learned function of `p_key − p_query` (mutation-checked: a flipped sine sign fails); translation-invariant; isotropic is symmetric and invariant to a turn by 180°/directions, anisotropic is not; the default grid fits a ring at 1 mm with R² > 0.9; derived `max_wavelength`; through Performer and dense attention end to end, gradient reaching the coefficients. 555 tests pass; harness IDENTICAL. **No real-data run yet** | 2026-10-11 |
 | 4 — global tokens and a null key | not started | | |
@@ -290,6 +290,35 @@ dataset-agnostic.
 - Planted maps read their known values: a query attending only to a cell 300 µm away reads 300.
 - Mutations are caught: CLS counted as a key, the wrong padding side, the wrong head order.
 - The global RNG states are unchanged after a pass.
+
+#### How Stage 1 was built
+
+- **`TransformerNodeEncoderHook.recording_attention(reference=False)`** is a context manager. Inside
+  it every pass keeps its maps and records `{index_nodes, src_padding_mask, maps, reference}`. Kernel
+  backends then take their explicit path, as `evaluate()` does: same function, rounding apart. Its
+  flags are restored on exit, even if a pass raises.
+- **The Performer's reference** is the exact softmax of the inputs its features see,
+  `x · y = q · k / √d + bias` after RoPE, with blocked pairs and padding excluded, in float64. It is
+  formed in `_feature_maps` while `record_reference` is set, and feeds nothing.
+- **`evaluation/attention_diagnostics.py`**: `head_statistics` turns one pass's maps into per-cell
+  values, `summarize` into scalars, and `attention_diagnostics(module, data_list, ...)` runs the first
+  `max_graphs` graphs one at a time: clean (nothing masked), in eval, under `_rng_untouched`.
+  Coordinates are `pos × dataset.spatial_unit_um`, laid out with `pad_like` from the recorded
+  `index_nodes`.
+- **Definitions.** Every statistic is over cell queries; CLS and padding rows are left out. Span,
+  radii and effective keys renormalise each row over its cell keys and skip a row whose cell mass is
+  below `MIN_CELL_MASS` (1e-6). CLS mass and TV read every cell row, TV over the whole row. A head's
+  value is the mean over every cell read; `_l<layer>_mean` averages a layer's heads and `_mean` all
+  heads.
+- **Names**: `probe/attn_<metric>_l<layer>_h<head>`, metrics `span_um`, `span_um_q25` / `q50` /
+  `q75`, `beyond_<r>um` (a dot becomes `p`), `cls_mass`, `effective_keys`, and `tv_softmax` for the
+  Performer only. The callback's charts put a layer's heads on one plot.
+- **Config**: `probe.attention_diagnostics` (counts as a probe target), `probe.attention_graphs` (4;
+  0 reads every val graph), `probe.attention_radii_um` (`[]`).
+- **Measured on an untrained toy model** at head width 4: the Performer's TV to softmax is 0.19 at
+  m = 8, 0.041 at 512, 0.020 at 4096 and 0.010 at 16384, about 1/√m.
+- Code: the recorder in `transformer_encoder.py`, the reference in `attention.py`, the callback hook
+  in `online_probes.py`, `_validate_probe`; tests in `tests/test_attention_diagnostics.py`.
 
 ### 2 — kernel attention: Performer and linear
 

@@ -1,4 +1,5 @@
 import warnings
+from contextlib import contextmanager
 from typing import NamedTuple
 
 import torch
@@ -149,6 +150,8 @@ class TransformerNodeEncoderHook(GlobalModule):
         # Whether a training step hands every layer's attention map to its loss (the attention
         # entropy loss reads them). Off, `forward` keeps no map unless asked for relevance.
         self.return_attention_maps = bool(return_attention_maps)
+        # Set only inside `recording_attention`: the list each pass appends its maps and layout to.
+        self._attention_record = None
 
     def common_step_local_to_global(self, batched_data, emb: torch.Tensor, eval_step: bool = False):
         """Convert local node embeddings ``[N, E]`` to padded local node embeddings ``[max_seq_len, E]``.
@@ -275,7 +278,40 @@ class TransformerNodeEncoderHook(GlobalModule):
                 pos=pe_inputs.get("pos"),
             )
 
+        if self._attention_record is not None:
+            self._attention_record.append({"index_nodes": index_nodes, "src_padding_mask": src_padding_mask.detach()})
         return GlobalInput(padded_emb, src_padding_mask, index_nodes, attention_mask, rotary)
+
+    @contextmanager
+    def recording_attention(self, reference: bool = False):
+        """Record every pass made inside: each layer's attention map and the layout of its tokens.
+
+        Yields a list. Each pass through :meth:`common_step_local_to_global` and :meth:`forward`
+        appends ``{"index_nodes", "src_padding_mask", "maps", "reference"}``: ``maps`` is
+        ``[layers, B * heads, S + 1, S + 1]``, every layer's map from its explicit path, detached;
+        with ``reference``, ``"reference"`` holds the same for the attention a backend estimates
+        (the Performer's exact softmax on the same queries, keys and biases), or None where a
+        backend estimates nothing. What the diagnostics read (``evaluation.attention_diagnostics``).
+
+        The passes inside take each backend's explicit path, as ``evaluate()`` does: dense
+        attention takes it anyway, so its numbers are unchanged; a kernel backend's explicit path
+        computes the same function as its factorised one, agreeing to rounding (~1e-5). The
+        reference is computed beside the attention and feeds nothing. Flags are restored on exit,
+        even if a pass raises.
+        """
+        record, saved = [], self.return_attention_maps
+        estimators = [
+            layer.self_attn for layer in self.transformer_encoder.layers if hasattr(layer.self_attn, "record_reference")
+        ]
+        self._attention_record, self.return_attention_maps = record, True
+        for attention in estimators:
+            attention.record_reference = bool(reference)
+        try:
+            yield record
+        finally:
+            self._attention_record, self.return_attention_maps = None, saved
+            for attention in estimators:
+                attention.record_reference, attention.reference_weights = False, None
 
     def forward(self, padded_h_node, src_padding_mask, mask=None, register_hook: bool | None = None, rotary=None):
         """
@@ -377,6 +413,14 @@ class TransformerNodeEncoderHook(GlobalModule):
             final_attn = torch.stack(attn_matrices)
         else:
             final_attn = None
+
+        if self._attention_record:
+            entry = self._attention_record[-1]
+            entry["maps"] = final_attn.detach() if final_attn is not None else None
+            references = [
+                getattr(layer.self_attn, "reference_weights", None) for layer in self.transformer_encoder.layers
+            ]
+            entry["reference"] = torch.stack(references) if all(r is not None for r in references) else None
 
         return transformer_out, src_padding_mask, final_attn
 

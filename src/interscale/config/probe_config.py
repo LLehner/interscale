@@ -110,6 +110,22 @@ def get_probe_cfg(cfg):
     # end-of-run chart is complete whatever it is set to.
     cfg.probe.chart_every_n_epochs = 10
 
+    # ------------------------------------------------------------------ attention diagnostics
+    # Per layer and head: how far attention reaches (span in µm, the share beyond each radius), how
+    # much of it sinks into CLS, how many cells it effectively spreads over, and -- for the
+    # Performer -- its total-variation distance to the exact softmax it estimates. Read from the
+    # explicit maps of a clean pass over the first `attention_graphs` val graphs and logged as
+    # probe/attn_<metric>_l<layer>_h<head>, with _l<layer>_mean and _mean beside them
+    # (`evaluation.attention_diagnostics`, attention_plan.md Stage 1). Counts as a probe target, so
+    # it can be the only one.
+    cfg.probe.attention_diagnostics = False
+    # How many val graphs (the first, in order) the diagnostics read; 0 reads every one. Each costs
+    # a pass that keeps every layer's S x S maps.
+    cfg.probe.attention_graphs = 4
+    # Radii (µm) for the share of each cell's attention beyond them; [] logs none. Span and radii
+    # need the graphs' coordinates (dataset.spatial_key) and are skipped with a warning without them.
+    cfg.probe.attention_radii_um = []
+
     # ------------------------------------------------------------------ attention-flow control
     # Read POST-HOC by `interscale.evaluation.flow_control`, not by the online callback: getting
     # attention out costs an S x S matrix per head per layer, which is not something to pay every
