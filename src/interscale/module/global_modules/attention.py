@@ -30,6 +30,7 @@ sub-block in ``get_global_component_cfg``.
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -42,6 +43,23 @@ from interscale.module.global_modules.transformer_utils import apply_rotary
 #: float mask it is merged into today; ``factors``, low-rank ``U, W`` with ``bias = U W^T``, which a
 #: backend folds into its queries and keys.
 BIAS_FORMS = ("dense", "factors")
+
+
+class StructuredMask(NamedTuple):
+    """The attention mask for a backend that never forms the ``S x S`` matrix.
+
+    It stands where the dense mask stands -- ``GlobalInput.attention_mask``, handed on to ``forward``
+    unchanged by every caller -- and ``forward`` passes it to the layers as their per-batch context.
+
+    ``blocked`` is ``[3, P]``: the ``(graph, query, key)`` positions of every blocked pair, exactly
+    the True entries of the dense boolean mask (:func:`~interscale.tl.masking.blocked_pairs`); the
+    CLS slot never appears. ``bias_factors``, when attention biases are on, are ``(U, W)``, each
+    ``[B * heads, S + 1, r]`` and graph-major like the dense mask, with ``bias = U W^T`` -- zero
+    rows at CLS and padding, so their bias is 0 there.
+    """
+
+    blocked: torch.Tensor
+    bias_factors: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -221,6 +239,164 @@ class DenseAttention(ProjectedAttention):
         return torch.bmm(weights, v), (weights if need_weights else None)
 
 
+def orthogonal_gaussian(num_features: int, dim: int, generator: torch.Generator) -> torch.Tensor:
+    """``[num_features, dim]`` Gaussian rows, orthogonal within each block of ``dim`` (Performer's ORF).
+
+    Blocks of ``dim`` exactly orthogonal unit directions, each row then scaled by the norm of an
+    independent ``dim``-dimensional Gaussian, so every row is still marginally ``N(0, I)`` -- which
+    keeps the positive-feature estimator unbiased -- while the rows of a block cover the directions
+    evenly, lowering its variance (Choromanski et al., ICLR 2021).
+    """
+    blocks = []
+    for start in range(0, num_features, dim):
+        q, r = torch.linalg.qr(torch.randn(dim, dim, generator=generator, dtype=torch.float64))
+        # QR alone is not uniformly distributed over the orthogonal group: fixing the signs of R's
+        # diagonal makes it so (Mezzadri 2007). Without it the rows' directions are not uniform and
+        # the estimate is biased -- measured ~7% too high on exp(x . y) at |x|, |y| ~ 1.
+        q = q * torch.sign(torch.diagonal(r))
+        blocks.append(q.T[: min(dim, num_features - start)])
+    norms = torch.randn(num_features, dim, generator=generator, dtype=torch.float64).norm(dim=1, keepdim=True)
+    return (torch.cat(blocks) * norms).float()
+
+
+class PerformerAttention(ProjectedAttention):
+    """Softmax attention estimated with positive orthogonal random features (Performer's FAVOR+).
+
+    With ``x = q / d^(1/4)`` and ``y = k / d^(1/4)`` (``d`` the head width) and ``m`` random rows
+    ``w_r``, ``phi(x) = exp(w_r . x - |x|^2 / 2) / sqrt(m)`` gives ``E[phi(x) . phi(y)] = exp(q . k / sqrt(d))``
+    -- the softmax kernel, estimated without bias and with positive terms. Attention is then
+    ``D^-1 phi(Q) (phi(K)^T V)``, ``D = diag(phi(Q) phi(K)^T 1)``: O(S * m * d) and no ``S x S``
+    tensor. Each head's map has rank ``m`` whatever the head width.
+
+    * **The long-range mask, by subtraction.** Every blocked pair's term is removed from both sums,
+      ``num_i -= phi(q_i) . phi(k_j) v_j`` and ``den_i`` likewise, over the pairs of a
+      :class:`StructuredMask`. That is exact with respect to the estimated kernel: the features are
+      positive, so what remains is a sum of positive terms over the open keys, and CLS is always
+      open. The sums and the subtraction run in float64, so a query whose mass sits almost entirely
+      on its blocked neighbourhood loses no precision to the cancellation.
+    * **RoPE** turns q and k before the feature map, so the estimate is of ``exp(q . R_(n-m) k / sqrt(d))``,
+      the RoPE softmax kernel, with positive, normalised weights.
+    * **Attention biases** arrive as low-rank factors ``U, W`` (``bias = U W^T``) and extend the
+      feature map's input, ``x = [q / d^(1/4), U]``, ``y = [k / d^(1/4), W]``, so the estimate is of
+      ``exp(q . k / sqrt(d) + bias)``. ``bias_factor_dim`` is their width.
+    * **Maps.** Asked for weights, it takes the explicit path -- ``phi(Q) phi(K)^T`` with the blocked
+      entries zeroed, normalised -- which gives the same numbers as the factorised path.
+    * **Features** are a buffer ``favor_projection`` (in the checkpoint), drawn from a generator the
+      transformer seeds from ``optim.seed``, never from the global RNG. ``redraw_interval`` > 0 draws
+      new ones every that many training forward passes; 0 keeps the first draw.
+    * No attention dropout: there is no map to drop entries of in the factorised path.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        head_dim: int,
+        *,
+        num_features: int,
+        bias_factor_dim: int = 0,
+        redraw_interval: int = 0,
+        bias: bool = True,
+    ):
+        super().__init__(embed_dim, num_heads, head_dim, dropout=0.0, bias=bias)
+        self.num_features, self.bias_factor_dim = int(num_features), int(bias_factor_dim)
+        self.redraw_interval = int(redraw_interval)
+        self.feature_generator = torch.Generator().manual_seed(0)  # replaced by the transformer's
+        self.register_buffer(
+            "favor_projection",
+            orthogonal_gaussian(self.num_features, self.head_dim + self.bias_factor_dim, self.feature_generator),
+        )
+        self._training_calls = 0
+
+    def extra_repr(self) -> str:
+        return (
+            super().extra_repr()
+            + f", num_features={self.num_features}, bias_factor_dim={self.bias_factor_dim}"
+            + f", redraw_interval={self.redraw_interval}"
+        )
+
+    def draw_features(self, generator: torch.Generator | None = None) -> None:
+        """Draw new random features, from ``generator`` (and keep it for later redraws) or the stored one."""
+        if generator is not None:
+            self.feature_generator = generator
+        fresh = orthogonal_gaussian(self.num_features, self.head_dim + self.bias_factor_dim, self.feature_generator)
+        with torch.no_grad():
+            self.favor_projection.copy_(fresh.to(self.favor_projection.device))
+
+    def _features(self, x: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:
+        """``[N, L, m]`` positive features of ``[N, L, d']`` inputs; ``valid`` marks the keys (None: queries).
+
+        A query's stabiliser is its own largest exponent, a key's the largest over a row's valid
+        keys: both are constant within one query's normalisation, so they cancel exactly.
+        """
+        logits = x @ self.favor_projection.to(x.dtype).T - 0.5 * (x * x).sum(-1, keepdim=True)
+        if valid is None:
+            stab = logits.amax(dim=-1, keepdim=True)
+        else:
+            stab = logits.masked_fill(~valid[..., None], float("-inf")).amax(dim=(-2, -1), keepdim=True)
+        features = torch.exp(logits - stab.detach()) / math.sqrt(self.num_features)
+        return features if valid is None else features * valid[..., None]
+
+    def _attend(self, q, k, v, padding, attn_mask, need_weights, context):
+        if attn_mask is not None or not isinstance(context, StructuredMask):
+            raise ValueError(
+                "the performer takes its mask as a StructuredMask (blocked pairs), never as a dense "
+                "attention mask; common_step_local_to_global builds it."
+            )
+        if self.training and self.redraw_interval > 0:
+            if self._training_calls and self._training_calls % self.redraw_interval == 0:
+                self.draw_features()
+            self._training_calls += 1
+
+        n_rows, seq_len, head_dim = q.shape
+        scale = head_dim**-0.25
+        x, y = q * scale, k * scale
+        if self.bias_factor_dim:
+            if context.bias_factors is None:
+                raise ValueError(f"this performer was built for {self.bias_factor_dim} bias dims but got no factors.")
+            u, w = context.bias_factors
+            if u.shape != (n_rows, seq_len, self.bias_factor_dim):
+                raise ValueError(
+                    f"bias factors of shape {tuple(u.shape)} do not match ({n_rows}, {seq_len}, {self.bias_factor_dim})."
+                )
+            x, y = torch.cat([x, u.to(x.dtype)], dim=-1), torch.cat([y, w.to(y.dtype)], dim=-1)
+
+        n_graphs = n_rows // self.num_heads
+        valid = torch.ones(n_rows, seq_len, dtype=torch.bool, device=q.device)
+        if padding is not None:
+            valid = (~padding).repeat_interleave(self.num_heads, dim=0)
+        phi_q = self._features(x, None).double()
+        phi_k = self._features(y, valid).double()
+        v64 = v.double()
+
+        # Each blocked (graph, query, key) for every head: rows graph * heads + h, graph-major.
+        graph, query, key = context.blocked
+        heads = torch.arange(self.num_heads, device=q.device)
+        rows = (graph[:, None] * self.num_heads + heads).reshape(-1)
+        query, key = query.repeat_interleave(self.num_heads), key.repeat_interleave(self.num_heads)
+        if rows.numel() and int(rows.max()) >= n_graphs * self.num_heads:
+            raise ValueError("blocked pairs name a graph beyond this batch.")
+
+        tiny = torch.finfo(torch.float64).tiny
+        if need_weights:
+            kernel = phi_q @ phi_k.transpose(1, 2)
+            kernel = kernel.index_put((rows, query, key), kernel.new_zeros(rows.numel()))
+            # The output is computed from the very tensor returned, so a gradient hook on the map
+            # (relevance) sees the gradient that flows through it.
+            weights = (kernel / kernel.sum(-1, keepdim=True).clamp_min(tiny)).to(q.dtype)
+            return weights @ v, weights
+
+        num = phi_q @ (phi_k.transpose(1, 2) @ v64)  # [N, L, d]
+        den = phi_q @ phi_k.sum(dim=1).unsqueeze(-1)  # [N, L, 1]
+        term = (phi_q[rows, query] * phi_k[rows, key]).sum(-1, keepdim=True)  # [P * heads, 1]
+        num = num.index_put((rows, query), -term * v64[rows, key], accumulate=True)
+        den = den.index_put((rows, query), -term, accumulate=True)
+        # A row with no open key left (impossible with CLS in the sequence) reads 0, as on the
+        # explicit path, rather than dividing a rounding residue by nothing.
+        out = torch.where(den > tiny, num / den.clamp_min(tiny), torch.zeros_like(num))
+        return out.to(q.dtype), None
+
+
 # --------------------------------------------------------------------------- registry entries
 
 
@@ -240,6 +416,38 @@ def _build_dense(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias
     if head_dim * num_heads == embed_dim:
         return None  # torch's vendored attention, exactly as before backends existed
     return DenseAttention(embed_dim, num_heads, head_dim, dropout=dropout)
+
+
+def _validate_performer(attention_cfg):
+    performer = attention_cfg.get("performer", None)
+    if performer is None:
+        raise ValueError("attention.kind 'performer' needs the attention.performer block.")
+    if not performer.num_features > 0:
+        raise ValueError(f"attention.performer.num_features must be > 0, got {performer.num_features}.")
+    if not performer.redraw_interval >= 0:
+        raise ValueError(
+            f"attention.performer.redraw_interval must be >= 0 (0 keeps one draw), got {performer.redraw_interval}."
+        )
+
+
+@register_attention(
+    "performer",
+    validate=_validate_performer,
+    mask="pairs",
+    bias_forms=frozenset({"factors"}),
+    rotary=True,
+    training_maps=False,
+)
+def _build_performer(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
+    performer = attention_cfg.performer
+    return PerformerAttention(
+        embed_dim,
+        num_heads,
+        head_dim,
+        num_features=int(performer.num_features),
+        bias_factor_dim=bias_factor_dim,
+        redraw_interval=int(performer.redraw_interval),
+    )
 
 
 def build_attention_factory(attention_cfg, *, embed_dim: int, num_heads: int, dropout: float, bias_factor_dim: int):

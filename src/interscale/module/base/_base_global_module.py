@@ -390,6 +390,7 @@ class GlobalModule(BaseModule):
                 local_mask_hops=local_mask_hops,
                 return_attention_maps=cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION,
                 attention=attention,
+                attention_seed=int(cfg.optim.get("seed", 0) or 0),
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,
             )

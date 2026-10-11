@@ -5,11 +5,18 @@ import torch
 from torch import nn
 
 from interscale.module.base import GlobalModule
-from interscale.module.global_modules.attention import attention_head_dim, attention_kind, build_attention_factory
+from interscale.module.global_modules.attention import (
+    ATTENTION_REGISTRY,
+    StructuredMask,
+    attention_head_dim,
+    attention_kind,
+    build_attention_factory,
+)
 from interscale.module.global_modules.transformer_encoder_layer import CustomTransformerEncoderLayer
 from interscale.tl import (
     SelfAttentionRelevance,
     attn_mask_diagonal,
+    blocked_pairs,
     create_transformer_attention_mask_from_edges,
     pad_batch,
 )
@@ -27,7 +34,9 @@ class GlobalInput(NamedTuple):
     padded_emb: torch.Tensor  # [S, B, E]
     src_padding_mask: torch.Tensor  # [B, S], True at padding
     index_nodes: list  # per graph, the node indices pad_batch kept
-    attention_mask: torch.Tensor  # [B * heads, S + 1, S + 1]: boolean, or float with a bias merged in
+    # [B * heads, S + 1, S + 1]: boolean, or float with a bias merged in -- or, for a backend that
+    # never forms the S x S matrix, an `attention.StructuredMask` (blocked pairs, bias factors).
+    attention_mask: torch.Tensor | StructuredMask
     rotary: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
@@ -51,6 +60,7 @@ class TransformerNodeEncoderHook(GlobalModule):
         rotary_encoding: nn.Module | None = None,
         return_attention_maps: bool = False,
         attention=None,
+        attention_seed: int = 0,
         **base_module_kwargs,
     ):
 
@@ -111,6 +121,16 @@ class TransformerNodeEncoderHook(GlobalModule):
 
         # Register self-attention relevance hook
         self.self_attn_relevance = SelfAttentionRelevance(self.transformer_encoder)
+
+        # What the backend can carry, and its randomness: the layers are clones of one, so each
+        # draws its own random features (Performer) here, in layer order, from one generator seeded
+        # from `attention_seed` (optim.seed) -- never from the global RNG, so enabling a backend
+        # shifts neither another weight's initialisation nor the batch order.
+        self.attention_spec = ATTENTION_REGISTRY[self.attention_kind]
+        generator = torch.Generator().manual_seed(int(attention_seed))
+        for layer in self.transformer_encoder.layers:
+            if hasattr(layer.self_attn, "draw_features"):
+                layer.self_attn.draw_features(generator)
 
         # Node positional encodings (`positional_encodings.py`), or None when the config enables
         # none -- in which case nothing is registered and the module is the one from before PEs.
@@ -179,7 +199,24 @@ class TransformerNodeEncoderHook(GlobalModule):
             else keep_indices,  # Add parameter to ensure masked nodes are kept (not during evaluation)
         )
 
-        if self.long_range_attention and self.local_mask_hops > 0:
+        if self.attention_spec.mask == "pairs":
+            # The same blocked set as the dense masks below, as a list of pairs: a backend that never
+            # forms the S x S matrix (Performer) takes it this way.
+            if self.attention_bias is not None:
+                raise ValueError(
+                    f"attention.kind {self.attention_kind!r} takes attention biases only as low-rank "
+                    "factors, and no enabled bias carries that form."
+                )
+            hops = self.local_mask_hops if self.long_range_attention else 0
+            blocked = blocked_pairs(
+                getattr(batched_data, "edge_index", None),
+                batched_data.batch,
+                index_nodes,
+                n_hops=hops,
+                device=emb.device,
+            )
+            attention_mask = StructuredMask(blocked, None)
+        elif self.long_range_attention and self.local_mask_hops > 0:
             # Block everything the local component has already seen, so the transformer can only
             # contribute what the GNN could not.
             attention_mask = create_transformer_attention_mask_from_edges(
@@ -195,11 +232,12 @@ class TransformerNodeEncoderHook(GlobalModule):
             # default: no attention to self, everything else open
             attention_mask = attn_mask_diagonal(batched_data.batch, index_nodes, self.n_heads, emb.device)
 
-        # Boolean throughout: True is blocked. Keeping it out of float space is what stops the
-        # 0 * -inf that an "inverse adjacency" built by arithmetic would produce.
-        attention_mask = attention_mask.to(dtype=torch.bool)
+        if not isinstance(attention_mask, StructuredMask):
+            # Boolean throughout: True is blocked. Keeping it out of float space is what stops the
+            # 0 * -inf that an "inverse adjacency" built by arithmetic would produce.
+            attention_mask = attention_mask.to(dtype=torch.bool)
 
-        if self.attention_bias is not None:
+        if self.attention_bias is not None and not isinstance(attention_mask, StructuredMask):
             # Merged by indexing, never by arithmetic: blocked pairs become -inf, every other pair
             # keeps its finite bias. The bias is laid out from this call's index_nodes, and its CLS
             # row and column are 0, so CLS stays attendable for every query and no row goes NaN.
@@ -278,7 +316,16 @@ class TransformerNodeEncoderHook(GlobalModule):
         zeros = src_padding_mask.data.new(src_padding_mask.size(0), 1).fill_(0)
         src_padding_mask = torch.cat([src_padding_mask, zeros], dim=1)
         key_padding_mask = src_padding_mask
-        if mask is not None and mask.is_floating_point():
+        # A StructuredMask (blocked pairs) is not a tensor the encoder could merge: it reaches the
+        # layers as their per-batch context, and the encoder gets no dense mask.
+        structured = isinstance(mask, StructuredMask)
+        if structured != (self.attention_spec.mask == "pairs"):
+            raise ValueError(
+                f"attention.kind {self.attention_kind!r} takes its mask as "
+                + ("blocked pairs (a StructuredMask)" if self.attention_spec.mask == "pairs" else "a dense tensor")
+                + ", the form common_step_local_to_global builds for it."
+            )
+        if mask is not None and not structured and mask.is_floating_point():
             # A float mask (an attention bias merged in) needs a float key-padding mask, or torch
             # warns on every layer that mixing the two types is deprecated. The boolean one is
             # still what this method returns, for the callers that drop padding by it.
@@ -290,13 +337,15 @@ class TransformerNodeEncoderHook(GlobalModule):
         # can never attend with a stale batch's positions.
         for encoder in self.transformer_encoder.layers:
             encoder.rotary = rotary
+            encoder.attention_context = mask if structured else None
         try:
             transformer_out = self.transformer_encoder(
-                padded_h_node, src_key_padding_mask=key_padding_mask, mask=mask
+                padded_h_node, src_key_padding_mask=key_padding_mask, mask=None if structured else mask
             )  # (S, B, h_d)
         finally:
             for encoder in self.transformer_encoder.layers:
                 encoder.rotary = None
+                encoder.attention_context = None
 
         attn_matrices = []
         for encoder in self.transformer_encoder.layers:

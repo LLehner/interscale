@@ -25,7 +25,7 @@ a real state.
 |---|---|---|---|
 | 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | **done** | 517 tests pass; harness IDENTICAL across 5 cases / 15 epochs after each of the two commits; training steps keep no map and hook nothing unless the loss reads attention; the skeleton's dense core reproduces torch's attention (outputs and maps, with mask, padding and RoPE) and draws its initial weights; a non-default backend leaves every weight built after it unchanged (mutation-checked: without the replayed draws it fails); every validator rejection tested | 2026-10-11 |
 | 1 — attention diagnostics (span in µm, sink mass, effective keys) | not started | | |
-| 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | **in progress** — `tl.blocked_pairs` done: equals the dense mask at hops 0–3 on two graphs of different size, one subsampled (mutation-checked: without the left-pad offset it fails) | | 2026-10-11 |
+| 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | **Performer implemented, unverified** — `tl.blocked_pairs` equals the dense mask at hops 0–3 (two graphs of different size, one subsampled); the orthogonal features estimate exp(x·y) without bias (found biased by ~7% before the Haar sign fix); the map's error against softmax falls with the feature count (TV 0.10 at m = 16, 0.009 at 4096); factorised and explicit paths agree to 1e-5 with mask and padding; the float64 subtraction stays exact where blocked keys hold 99.7% of a query's mass (float32: ~1e-5 off); blocks exactly the dense mask's pairs; finite on the complete-graph test at hops 1–3 and through 5 training steps; relevance runs; a performer model shares every initial weight with the dense one at one seed and moves the global RNG as dense does; per-layer features from their own seeded generator, redrawn only in training and only when asked; trains through `_common_step`. Three mutations, each caught. 538 tests pass; harness IDENTICAL. **No real-data run yet. Linear (elu+1) and the generated arms not built** | 2026-10-11 |
 | 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | not started | | |
 | 4 — global tokens and a null key | not started | | |
 | 5 — Exphormer-style sparse attention | not started | | |
@@ -210,7 +210,7 @@ attention:
   fused: false         # dense only (Stage 6)
   global_tokens: 0     # Stage 4
   null_key: false      # Stage 4
-  performer: {num_features: 64, redraw_interval: 0}    # 0 = draw once
+  performer: {num_features: 128, redraw_interval: 0}   # 0 = draw once
   linear:    {feature_map: elu}
   exphormer: {degree: 8, sampling: expander, graph_edges: true, resample: false, edge_type: bias}
   inducing:  {num_latents: 16}
@@ -351,6 +351,32 @@ as an `arms:` file, logging each rejected combination with its reason.
 - **Cross-evaluation** (cluster): a dense checkpoint evaluated with Performer attention, and the
   reverse, measures the approximation on trained weights. Register the feature buffer under
   `_OPTIONAL_STATE_PREFIXES` so either direction loads.
+
+#### How Stage 2 was built (Performer only)
+
+- **The mask slot carries a `StructuredMask`.** It holds the blocked pairs plus the bias factors
+  (Stage 3), and stands in `GlobalInput.attention_mask` where the dense mask stands; every caller
+  only passes that slot on, so no signature changed. `forward` hands it to the layers as
+  `attention_context` and gives `nn.TransformerEncoder` no mask. A mismatch between the backend's
+  declared mask form and what arrives raises.
+- **The sums are float64.** The features, the full sums and the subtracted blocked terms are float64,
+  and only the result is cast back. With 35 of 40 keys blocked and aligned with the query, float32
+  cancellation was off by ~1e-5 and float64 by ~1e-14 (the precision test, mutation-checked). The
+  extra memory is the `[B·H, S, m]` features and `[P·H, m]` gathered pairs.
+- **The orthogonal features needed the Haar sign fix.** Plain `torch.linalg.qr` of a Gaussian
+  matrix is not uniform over the orthogonal group; without multiplying Q by the signs of R's
+  diagonal, the estimate of exp(x·y) came out ~7% high.
+- **No attention dropout.** The factorised path has no map to drop entries from; dropout elsewhere
+  (FFN, residual) is unchanged.
+- **Features** are the buffer `favor_projection`, drawn per layer in layer order from one generator
+  seeded with `optim.seed` (`attention_seed`). The layers are deep copies of one, so without the
+  per-layer draw every layer would hold the same features.
+- **Cross-evaluation** (dense checkpoint, Performer attention) loads with `allow_partial_load=True`.
+  `_OPTIONAL_STATE_PREFIXES` stays narrow on purpose (`test_gene_masking.py`): a Performer
+  checkpoint that lost its features must not load silently with new ones.
+- **Default `num_features` 128.** It is a knob; the error measurements above say 128 leaves a mean
+  TV distance of a few percent on unit-scale queries.
+- **Biases are rejected until Stage 3**, by the validator and again at the forward pass.
 
 ### 3 — low-rank biases
 

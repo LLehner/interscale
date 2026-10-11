@@ -114,5 +114,13 @@ def get_global_component_cfg(cfg, global_component_name):
         att = cfg.model.global_component.parameters.attention = CN()
         att.kind = "dense"
         att.head_dim = 0
+        # `performer`: softmax attention estimated with `num_features` positive orthogonal random
+        # features per layer (FAVOR+), O(S) in memory and time; each head's map has rank
+        # num_features whatever its width. The long-range mask is kept exactly; attention biases
+        # only in their low-rank form. `redraw_interval` > 0 draws new features every that many
+        # training steps; 0 keeps the first draw (seeded from optim.seed).
+        att.performer = CN()
+        att.performer.num_features = 128
+        att.performer.redraw_interval = 0
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg
