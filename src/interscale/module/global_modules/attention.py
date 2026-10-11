@@ -133,6 +133,8 @@ class ProjectedAttention(nn.Module):
     #: Every backend but torch's vendored attention takes a per-batch ``context`` and computes its
     #: maps only when asked; the layer reads this to tell them apart.
     is_backend = True
+    #: Whether RoPE's rotation of queries and keys keeps its meaning in this backend's similarity.
+    supports_rotary = True
 
     def __init__(self, embed_dim: int, num_heads: int, head_dim: int, dropout: float = 0.0, bias: bool = True):
         super().__init__()
@@ -180,6 +182,8 @@ class ProjectedAttention(nn.Module):
         q, k, v = F.linear(query, self.in_proj_weight, self.in_proj_bias).chunk(3, dim=-1)
         q, k, v = (t.reshape(seq_len, n_graphs * self.num_heads, self.head_dim).transpose(0, 1) for t in (q, k, v))
         if rotary is not None:
+            if not self.supports_rotary:
+                raise ValueError(f"{type(self).__name__} does not apply RoPE (see its docstring).")
             cos, sin = rotary
             if cos.shape != q.shape:
                 raise RuntimeError(
@@ -259,32 +263,92 @@ def orthogonal_gaussian(num_features: int, dim: int, generator: torch.Generator)
     return (torch.cat(blocks) * norms).float()
 
 
-class PerformerAttention(ProjectedAttention):
+class KernelAttention(ProjectedAttention):
+    """Attention whose similarity factorises, ``phi(q) . phi(k)`` with positive features, never forming ``S x S``.
+
+    Attention is ``D^-1 phi(Q) (phi(K)^T V)``, ``D = diag(phi(Q) phi(K)^T 1)``: O(S * F * d) for ``F``
+    features per token. Subclasses supply the feature map (:meth:`_feature_maps`); everything else
+    is shared here.
+
+    * **The long-range mask, by subtraction.** Every blocked pair's term is removed from both sums,
+      ``num_i -= phi(q_i) . phi(k_j) v_j`` and ``den_i`` likewise, over the pairs of a
+      :class:`StructuredMask`. That is exact with respect to the kernel: the features are positive,
+      so what remains is a sum of positive terms over the open keys, and CLS is always open. The
+      sums and the subtraction run in float64, so a query whose mass sits almost entirely on its
+      blocked neighbourhood loses no precision to the cancellation.
+    * **Padded keys** have their features zeroed.
+    * **Maps.** Asked for weights, it takes the explicit path -- ``phi(Q) phi(K)^T`` with the blocked
+      entries zeroed, normalised -- which gives the same numbers as the factorised path. Each head's
+      map has rank at most ``F``.
+    * No attention dropout: there is no map to drop entries of in the factorised path.
+    """
+
+    def _feature_maps(self, q, k, valid, context) -> tuple[torch.Tensor, torch.Tensor]:
+        """``[N, L, head_dim]`` queries and keys to positive features ``([N, L, F], [N, L, F])``.
+
+        ``valid`` ``[N, L]`` marks the keys that are not padding; their features must be zero.
+        """
+        raise NotImplementedError
+
+    def _attend(self, q, k, v, padding, attn_mask, need_weights, context):
+        if attn_mask is not None or not isinstance(context, StructuredMask):
+            raise ValueError(
+                f"{type(self).__name__} takes its mask as a StructuredMask (blocked pairs), never as a "
+                "dense attention mask; common_step_local_to_global builds it."
+            )
+        n_rows, seq_len, _ = q.shape
+        n_graphs = n_rows // self.num_heads
+        valid = torch.ones(n_rows, seq_len, dtype=torch.bool, device=q.device)
+        if padding is not None:
+            valid = (~padding).repeat_interleave(self.num_heads, dim=0)
+        phi_q, phi_k = self._feature_maps(q, k, valid, context)
+        phi_q, phi_k, v64 = phi_q.double(), phi_k.double(), v.double()
+
+        # Each blocked (graph, query, key) for every head: rows graph * heads + h, graph-major.
+        graph, query, key = context.blocked
+        heads = torch.arange(self.num_heads, device=q.device)
+        rows = (graph[:, None] * self.num_heads + heads).reshape(-1)
+        query, key = query.repeat_interleave(self.num_heads), key.repeat_interleave(self.num_heads)
+        if rows.numel() and int(rows.max()) >= n_graphs * self.num_heads:
+            raise ValueError("blocked pairs name a graph beyond this batch.")
+
+        tiny = torch.finfo(torch.float64).tiny
+        if need_weights:
+            kernel = phi_q @ phi_k.transpose(1, 2)
+            kernel = kernel.index_put((rows, query, key), kernel.new_zeros(rows.numel()))
+            # The output is computed from the very tensor returned, so a gradient hook on the map
+            # (relevance) sees the gradient that flows through it.
+            weights = (kernel / kernel.sum(-1, keepdim=True).clamp_min(tiny)).to(q.dtype)
+            return weights @ v, weights
+
+        num = phi_q @ (phi_k.transpose(1, 2) @ v64)  # [N, L, d]
+        den = phi_q @ phi_k.sum(dim=1).unsqueeze(-1)  # [N, L, 1]
+        term = (phi_q[rows, query] * phi_k[rows, key]).sum(-1, keepdim=True)  # [P * heads, 1]
+        num = num.index_put((rows, query), -term * v64[rows, key], accumulate=True)
+        den = den.index_put((rows, query), -term, accumulate=True)
+        # A row with no open key left (impossible with CLS in the sequence) reads 0, as on the
+        # explicit path, rather than dividing a rounding residue by nothing.
+        out = torch.where(den > tiny, num / den.clamp_min(tiny), torch.zeros_like(num))
+        return out.to(q.dtype), None
+
+
+class PerformerAttention(KernelAttention):
     """Softmax attention estimated with positive orthogonal random features (Performer's FAVOR+).
 
     With ``x = q / d^(1/4)`` and ``y = k / d^(1/4)`` (``d`` the head width) and ``m`` random rows
     ``w_r``, ``phi(x) = exp(w_r . x - |x|^2 / 2) / sqrt(m)`` gives ``E[phi(x) . phi(y)] = exp(q . k / sqrt(d))``
-    -- the softmax kernel, estimated without bias and with positive terms. Attention is then
-    ``D^-1 phi(Q) (phi(K)^T V)``, ``D = diag(phi(Q) phi(K)^T 1)``: O(S * m * d) and no ``S x S``
-    tensor. Each head's map has rank ``m`` whatever the head width.
+    -- the softmax kernel, estimated without bias and with positive terms. The mask, the float64
+    sums, padding and the explicit path are :class:`KernelAttention`'s. Each head's map has rank
+    ``m`` whatever the head width.
 
-    * **The long-range mask, by subtraction.** Every blocked pair's term is removed from both sums,
-      ``num_i -= phi(q_i) . phi(k_j) v_j`` and ``den_i`` likewise, over the pairs of a
-      :class:`StructuredMask`. That is exact with respect to the estimated kernel: the features are
-      positive, so what remains is a sum of positive terms over the open keys, and CLS is always
-      open. The sums and the subtraction run in float64, so a query whose mass sits almost entirely
-      on its blocked neighbourhood loses no precision to the cancellation.
     * **RoPE** turns q and k before the feature map, so the estimate is of ``exp(q . R_(n-m) k / sqrt(d))``,
       the RoPE softmax kernel, with positive, normalised weights.
     * **Attention biases** arrive as low-rank factors ``U, W`` (``bias = U W^T``) and extend the
       feature map's input, ``x = [q / d^(1/4), U]``, ``y = [k / d^(1/4), W]``, so the estimate is of
       ``exp(q . k / sqrt(d) + bias)``. ``bias_factor_dim`` is their width.
-    * **Maps.** Asked for weights, it takes the explicit path -- ``phi(Q) phi(K)^T`` with the blocked
-      entries zeroed, normalised -- which gives the same numbers as the factorised path.
     * **Features** are a buffer ``favor_projection`` (in the checkpoint), drawn from a generator the
       transformer seeds from ``optim.seed``, never from the global RNG. ``redraw_interval`` > 0 draws
       new ones every that many training forward passes; 0 keeps the first draw.
-    * No attention dropout: there is no map to drop entries of in the factorised path.
     """
 
     def __init__(
@@ -337,12 +401,7 @@ class PerformerAttention(ProjectedAttention):
         features = torch.exp(logits - stab.detach()) / math.sqrt(self.num_features)
         return features if valid is None else features * valid[..., None]
 
-    def _attend(self, q, k, v, padding, attn_mask, need_weights, context):
-        if attn_mask is not None or not isinstance(context, StructuredMask):
-            raise ValueError(
-                "the performer takes its mask as a StructuredMask (blocked pairs), never as a dense "
-                "attention mask; common_step_local_to_global builds it."
-            )
+    def _feature_maps(self, q, k, valid, context):
         if self.training and self.redraw_interval > 0:
             if self._training_calls and self._training_calls % self.redraw_interval == 0:
                 self.draw_features()
@@ -360,41 +419,7 @@ class PerformerAttention(ProjectedAttention):
                     f"bias factors of shape {tuple(u.shape)} do not match ({n_rows}, {seq_len}, {self.bias_factor_dim})."
                 )
             x, y = torch.cat([x, u.to(x.dtype)], dim=-1), torch.cat([y, w.to(y.dtype)], dim=-1)
-
-        n_graphs = n_rows // self.num_heads
-        valid = torch.ones(n_rows, seq_len, dtype=torch.bool, device=q.device)
-        if padding is not None:
-            valid = (~padding).repeat_interleave(self.num_heads, dim=0)
-        phi_q = self._features(x, None).double()
-        phi_k = self._features(y, valid).double()
-        v64 = v.double()
-
-        # Each blocked (graph, query, key) for every head: rows graph * heads + h, graph-major.
-        graph, query, key = context.blocked
-        heads = torch.arange(self.num_heads, device=q.device)
-        rows = (graph[:, None] * self.num_heads + heads).reshape(-1)
-        query, key = query.repeat_interleave(self.num_heads), key.repeat_interleave(self.num_heads)
-        if rows.numel() and int(rows.max()) >= n_graphs * self.num_heads:
-            raise ValueError("blocked pairs name a graph beyond this batch.")
-
-        tiny = torch.finfo(torch.float64).tiny
-        if need_weights:
-            kernel = phi_q @ phi_k.transpose(1, 2)
-            kernel = kernel.index_put((rows, query, key), kernel.new_zeros(rows.numel()))
-            # The output is computed from the very tensor returned, so a gradient hook on the map
-            # (relevance) sees the gradient that flows through it.
-            weights = (kernel / kernel.sum(-1, keepdim=True).clamp_min(tiny)).to(q.dtype)
-            return weights @ v, weights
-
-        num = phi_q @ (phi_k.transpose(1, 2) @ v64)  # [N, L, d]
-        den = phi_q @ phi_k.sum(dim=1).unsqueeze(-1)  # [N, L, 1]
-        term = (phi_q[rows, query] * phi_k[rows, key]).sum(-1, keepdim=True)  # [P * heads, 1]
-        num = num.index_put((rows, query), -term * v64[rows, key], accumulate=True)
-        den = den.index_put((rows, query), -term, accumulate=True)
-        # A row with no open key left (impossible with CLS in the sequence) reads 0, as on the
-        # explicit path, rather than dividing a rounding residue by nothing.
-        out = torch.where(den > tiny, num / den.clamp_min(tiny), torch.zeros_like(num))
-        return out.to(q.dtype), None
+        return self._features(x, None), self._features(y, valid)
 
 
 # --------------------------------------------------------------------------- registry entries
