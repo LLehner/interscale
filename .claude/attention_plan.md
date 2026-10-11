@@ -37,8 +37,8 @@ a real state.
 
 - **Two new attention types come first: Performer (Stage 2) and Exphormer-style sparse attention
   (Stage 5).** Linear attention rides along with the Performer because they share all of their
-  machinery. Global tokens (Stage 4) come before Exphormer because its virtual nodes are global
-  tokens.
+  machinery. Exphormer was built before global tokens (Stage 4), with CLS as its one virtual node;
+  global tokens join its attention graph once they exist.
 - **Everything else is a component that combines freely.** That covers node encodings, attention
   biases, RoPE, global tokens, the null key, the long-range mask, and the model's width
   (`n_embed`, `n_heads`, `head_dim`, `num_layers`).
