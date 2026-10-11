@@ -57,8 +57,9 @@ class PESpec:
     when set, returns the ``requires`` attribute for one graph -- or a dict of attributes by name,
     for an encoding that needs several -- and :func:`attach_positional_inputs` stores it. ``forms``,
     for a bias, are the forms it can be handed to an attention backend in
-    (``attention.BIAS_FORMS``): ``dense`` (the ``[B * heads, S, S]`` float mask) and, for a low-rank
-    bias, ``factors`` (``U, W`` with ``bias = U W^T``, via the encoder's ``factors`` method).
+    (``attention.BIAS_FORMS``): ``dense`` (the ``[B * heads, S, S]`` float mask); for a low-rank
+    bias, ``factors`` (``U, W`` with ``bias = U W^T``, via the encoder's ``factors`` method); and
+    ``pairs`` (the bias of each pair of a list, via the encoder's ``pairs`` method).
     """
 
     kind: str
@@ -222,6 +223,15 @@ def _knot_lookup(table: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return lo + frac * (hi - lo)
 
 
+def _pair_distance(pos_um: torch.Tensor, graph, query, key) -> torch.Tensor:
+    """``[P]`` distances (µm) between the tokens of ``P`` pairs, from ``[B, S, 2]`` padded positions.
+
+    The same arithmetic as the exact ``cdist`` the dense form uses (a difference, then its norm), so
+    the two forms agree to rounding.
+    """
+    return (pos_um[graph, key] - pos_um[graph, query]).norm(dim=-1)
+
+
 class DistanceBias(nn.Module):
     """A learned function of the distance between two cells, one per head, added to their logit.
 
@@ -251,9 +261,17 @@ class DistanceBias(nn.Module):
 
     def forward(self, dist: torch.Tensor) -> torch.Tensor:
         """``[B, S, S]`` distances in µm to ``[B, heads, S, S]`` biases."""
+        return self._lookup(dist).permute(0, 3, 1, 2)
+
+    def _lookup(self, dist: torch.Tensor) -> torch.Tensor:
+        """Distances of any shape (µm) to their biases, ``[*shape, heads]``."""
         last = self.num_kernels - 1
         t = (dist * (last / self.max_dist)).clamp(max=last)
-        return _knot_lookup(self.table, t).permute(0, 3, 1, 2)
+        return _knot_lookup(self.table, t)
+
+    def pairs(self, pos_um: torch.Tensor, graph, query, key) -> torch.Tensor:
+        """``[B, S, 2]`` positions (µm) and ``P`` token pairs to their biases, ``[P, heads]``."""
+        return self._lookup(_pair_distance(pos_um, graph, query, key))
 
     def profile(self) -> tuple[torch.Tensor, torch.Tensor]:
         """``(knots [K] in µm, values [heads, K])`` -- each head's bias at each knot."""
@@ -278,6 +296,10 @@ class LinearDistanceBias(nn.Module):
     def forward(self, dist: torch.Tensor) -> torch.Tensor:
         """``[B, S, S]`` distances in µm to ``[B, heads, S, S]`` biases."""
         return (dist / 1000.0).unsqueeze(1) * self.slope.view(1, -1, 1, 1)
+
+    def pairs(self, pos_um: torch.Tensor, graph, query, key) -> torch.Tensor:
+        """``[B, S, 2]`` positions (µm) and ``P`` token pairs to their biases, ``[P, heads]``."""
+        return (_pair_distance(pos_um, graph, query, key) / 1000.0).unsqueeze(-1) * self.slope
 
     def profile(self, max_dist: float = 1000.0) -> tuple[torch.Tensor, torch.Tensor]:
         """``(knots [2] in µm, values [heads, 2])`` -- the line at 0 and ``max_dist``, as for ``profile``."""
@@ -376,6 +398,11 @@ class SpectralBias(nn.Module):
         weights = self.filter(eigvals).transpose(1, 2).unsqueeze(2)  # [B, heads, 1, k]
         vecs = eigvecs.unsqueeze(1)  # [B, 1, S, k]
         return balanced_factors(vecs, vecs, weights, weights.abs())
+
+    def pairs(self, eigvecs: torch.Tensor, eigvals: torch.Tensor, graph, query, key) -> torch.Tensor:
+        """The bias of ``P`` token pairs, ``[P, heads]``: :meth:`forward`'s entries, one per pair."""
+        weights = self.filter(eigvals)  # [B, k, heads]
+        return torch.einsum("pk,pkh->ph", eigvecs[graph, query] * eigvecs[graph, key], weights[graph])
 
     def profile(self) -> tuple[torch.Tensor, torch.Tensor]:
         """``(knots [K] as eigenvalues, values [heads, K])`` -- each head's filter at each knot."""
@@ -482,6 +509,13 @@ class FourierBias(nn.Module):
         """``[B, S, 2]`` positions in µm to ``[B, heads, S, S]`` biases -- the product of :meth:`factors`."""
         left, right = self.factors(pos_um)
         return left @ right.transpose(-1, -2)
+
+    def pairs(self, pos_um: torch.Tensor, graph, query, key) -> torch.Tensor:
+        """``[B, S, 2]`` positions (µm) and ``P`` token pairs to their biases, ``[P, heads]``."""
+        offsets = pos_um[graph, key] - pos_um[graph, query]
+        phase = offsets.double() @ self.frequencies.double().T  # [P, R]
+        a, c = self.coefficients()
+        return phase.cos().to(pos_um.dtype) @ a.T + phase.sin().to(pos_um.dtype) @ c.T
 
     def bias_at(self, offsets_um: torch.Tensor) -> torch.Tensor:
         """``[n, 2]`` offsets ``p_key - p_query`` (µm) to each head's bias, ``[heads, n]``: the learned function, readable."""
@@ -717,7 +751,7 @@ def _build_rw(pe, n_embed):
     return RWPE(n_embed, int(pe.rw.steps))
 
 
-@register_pe("distance", kind="bias", requires="pos", validate=_validate_distance)
+@register_pe("distance", kind="bias", requires="pos", validate=_validate_distance, forms=frozenset({"dense", "pairs"}))
 def _build_distance(pe, n_heads):
     if pe.distance.kind == "linear":
         return LinearDistanceBias(n_heads)
@@ -736,14 +770,16 @@ def _build_distance(pe, n_heads):
     requires="spectral_pe",
     validate=_validate_spectral,
     precompute=_spectral_inputs,
-    forms=frozenset({"dense", "factors"}),
+    forms=frozenset({"dense", "factors", "pairs"}),
 )
 def _build_spectral(pe, n_heads):
     s = pe.spectral
     return SpectralBias(n_heads, int(s.num_knots), float(s.min_eigval), float(s.max_eigval), k=int(s.k))
 
 
-@register_pe("fourier", kind="bias", requires="pos", validate=_validate_fourier, forms=frozenset({"dense", "factors"}))
+@register_pe(
+    "fourier", kind="bias", requires="pos", validate=_validate_fourier, forms=frozenset({"dense", "factors", "pairs"})
+)
 def _build_fourier(pe, n_heads):
     f = pe.fourier
     if not f.max_wavelength > 0:
@@ -921,6 +957,40 @@ class AttentionBias(nn.Module):
             vecs = pad_like(vecs.to(device=device, dtype=dtype), batch, index_nodes, seq_len)  # [B, S, k]
             return vecs, vals.to(device=device, dtype=dtype).reshape(len(index_nodes), -1)  # [B, k]
         raise ValueError(f"no attention bias input is prepared from `{key}`.")
+
+    def pairs(self, batched_data, index_nodes, src_padding_mask, pairs, dtype, device) -> torch.Tensor:
+        """The enabled biases on a list of token pairs: ``[P, heads]`` for ``pairs`` ``[3, P]``.
+
+        ``pairs`` are ``(graph, query, key)`` positions in the padded layout -- left-padded, the CLS
+        slot last at ``S`` -- and each row of the result is that pair's entry of :meth:`forward`'s
+        bias: a pair with CLS or with a padding token reads 0, like the dense form's CLS and
+        padding rows and columns. Nothing ``S x S`` is formed: the ``distance`` bias takes each
+        pair's distance from the padded coordinates. For a backend that attends along a list of
+        pairs (Exphormer).
+        """
+        batch = batched_data.batch.to(device=device, dtype=torch.long)
+        n_graphs, seq_len = src_padding_mask.shape
+        graph, query, key = pairs
+        pad = src_padding_mask.to(device=device, dtype=torch.bool)
+        inside = (query < seq_len) & (key < seq_len)
+        inside &= ~(pad[graph, query.clamp(max=seq_len - 1)] | pad[graph, key.clamp(max=seq_len - 1)])
+        rows = inside.nonzero().squeeze(1)
+        out = torch.zeros(pairs.shape[1], self.n_heads, dtype=dtype, device=device)
+        if not rows.numel():
+            return out
+
+        inputs, total = {}, 0
+        for name, encoder in self.encoders.items():
+            if not hasattr(encoder, "pairs"):
+                raise ValueError(
+                    f"the attention bias '{name}' has no pair form; it cannot be read off a list of pairs."
+                )
+            # Coordinates rather than the pairwise distances the dense distance bias takes.
+            key_name = "pos_coords" if self.requires[name] in ("pos", "pos_coords") else self.requires[name]
+            if key_name not in inputs:
+                inputs[key_name] = self._inputs(key_name, batched_data, batch, index_nodes, seq_len, dtype, device)
+            total = total + encoder.pairs(*inputs[key_name], graph[rows], query[rows], key[rows])
+        return out.index_put((rows,), total)
 
     def factors(self, batched_data, index_nodes, src_padding_mask, dtype, device):
         """The enabled biases in low-rank form: ``(U, W)``, each ``[B * heads, S + 1, r]``.

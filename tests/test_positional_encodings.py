@@ -285,9 +285,9 @@ def test_the_registry_holds_the_encodings_built_so_far():
     }
     # The forms each bias can be handed to an attention backend in (attention_plan.md).
     assert {name: sorted(spec.forms) for name, spec in PE_REGISTRY.items() if spec.kind == "bias"} == {
-        "distance": ["dense"],
-        "spectral": ["dense", "factors"],
-        "fourier": ["dense", "factors"],
+        "distance": ["dense", "pairs"],
+        "spectral": ["dense", "factors", "pairs"],
+        "fourier": ["dense", "factors", "pairs"],
     }
 
 

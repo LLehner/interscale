@@ -1226,3 +1226,73 @@ def test_the_checkpoint_name_carries_linear_attention():
 
     assert _attention_tag(_cfg(kind="linear")) == "attn-linear_"
     assert _attention_tag(_cfg(kind="linear", head_dim=32)) == "attn-linear-hd32_"
+
+
+# --------------------------------------------------------------------------- the pair form of the biases
+
+
+def _every_pair(n_graphs, seq_len):
+    """``[3, P]`` every (graph, query, key) of the padded layout, the CLS slot included."""
+    g, q, k = torch.meshgrid(
+        torch.arange(n_graphs), torch.arange(seq_len + 1), torch.arange(seq_len + 1), indexing="ij"
+    )
+    return torch.stack([g.reshape(-1), q.reshape(-1), k.reshape(-1)])
+
+
+def _bias_encoders():
+    from interscale.module.global_modules.positional_encodings import (
+        DistanceBias,
+        LinearDistanceBias,
+        SpectralBias,
+    )
+
+    gen = torch.Generator().manual_seed(4)
+    encoders = {
+        "distance": DistanceBias(N_HEADS, 8, 1500.0),
+        "linear": LinearDistanceBias(N_HEADS),
+        "spectral": SpectralBias(N_HEADS, 8, 1e-3, 2.0, k=4),
+        "fourier": _fourier(isotropic=False, scale=0.0),
+    }
+    for encoder in encoders.values():
+        with torch.no_grad():
+            for p in encoder.parameters():
+                p.copy_(torch.randn(p.shape, generator=gen))
+    return encoders
+
+
+@pytest.mark.parametrize("name", ["distance", "linear", "spectral", "fourier"])
+def test_the_pair_form_is_the_dense_bias_at_every_pair(name):
+    """Each bias read off a list of pairs equals the dense bias at those pairs -- CLS and padding
+    included (both 0) -- on two graphs of different size, one subsampled by pad_batch."""
+    from interscale.module.global_modules.positional_encodings import AttentionBias
+
+    registry_name = {"linear": "distance"}.get(name, name)
+    bias = AttentionBias({registry_name: _bias_encoders()[name]}, n_heads=N_HEADS, spatial_unit_um=1.0)
+    batch = _spectral_batch()
+    padding, index_nodes = _padded_layout(batch, max_seq_len=7)
+    dense = bias(batch, index_nodes, padding, dtype=torch.float32, device=torch.device("cpu"))
+    pairs = _every_pair(2, 7)
+    values = bias.pairs(batch, index_nodes, padding, pairs, dtype=torch.float32, device=torch.device("cpu"))
+
+    expected = dense.reshape(2, N_HEADS, 8, 8)[pairs[0], :, pairs[1], pairs[2]]  # [P, heads]
+    assert values.shape == (pairs.shape[1], N_HEADS)
+    assert torch.allclose(values, expected, atol=1e-4)
+    assert values.abs().sum() > 0  # the comparison is not between two zero tensors
+
+
+def test_the_pair_form_carries_the_gradient():
+    from interscale.module.global_modules.positional_encodings import AttentionBias
+
+    encoders = _bias_encoders()
+    bias = AttentionBias(
+        {"distance": encoders["distance"], "spectral": encoders["spectral"], "fourier": encoders["fourier"]},
+        n_heads=N_HEADS,
+        spatial_unit_um=1.0,
+    )
+    batch = _spectral_batch()
+    padding, index_nodes = _padded_layout(batch, max_seq_len=16)
+    values = bias.pairs(batch, index_nodes, padding, _every_pair(2, 9), dtype=torch.float32, device=torch.device("cpu"))
+    values.sum().backward()
+    for name in ("distance", "spectral"):
+        assert bias.encoders[name].table.grad.abs().sum() > 0
+    assert bias.encoders["fourier"].cos_coef.grad.abs().sum() > 0

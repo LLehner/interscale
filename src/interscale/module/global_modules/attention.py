@@ -42,8 +42,9 @@ from interscale.module.global_modules.transformer_utils import apply_rotary
 
 #: Forms in which an attention bias can be handed to a backend: ``dense``, the ``[B * heads, S, S]``
 #: float mask it is merged into today; ``factors``, low-rank ``U, W`` with ``bias = U W^T``, which a
-#: backend folds into its queries and keys.
-BIAS_FORMS = ("dense", "factors")
+#: backend folds into its queries and keys; ``pairs``, the bias of each pair of a list, for a backend
+#: that attends along one.
+BIAS_FORMS = ("dense", "factors", "pairs")
 
 
 class StructuredMask(NamedTuple):
