@@ -1006,3 +1006,223 @@ def test_the_checkpoint_name_carries_the_fourier_bias():
     cfg = _cfg(kind="performer", bias=["fourier"])
     cfg.dataset.name = "d"
     assert get_model_filename_prefix(cfg, False, True).endswith("pe-fourier_attn-performer_")
+
+
+# --------------------------------------------------------------------------- linear attention
+
+
+def _linear_cfg(head_dim=0):
+    return _Att(kind="linear", head_dim=head_dim)
+
+
+def _linear(head_dim=N_EMBED // N_HEADS, seed=0):
+    from interscale.module.global_modules.attention import LinearAttention
+
+    torch.manual_seed(seed)
+    return LinearAttention(N_EMBED, N_HEADS, head_dim)
+
+
+def _no_pairs():
+    return torch.zeros(3, 0, dtype=torch.long)
+
+
+def test_linear_attention_is_its_definition():
+    """weights_ij = phi(q_i) . phi(k_j) / sum_l phi(q_i) . phi(k_l) with phi = elu + 1, blocked pairs zero."""
+    q, k, v = _qkv(seq_len=9)
+    blocked = _diagonal_pairs(2, 8)
+    out, weights = _linear()._attend(q, k, v, None, None, True, StructuredMask(blocked))
+
+    kernel = (torch.nn.functional.elu(q) + 1) @ (torch.nn.functional.elu(k) + 1).transpose(1, 2)
+    graph, query, key = blocked
+    rows = (graph[:, None] * N_HEADS + torch.arange(N_HEADS)).reshape(-1)
+    kernel[rows, query.repeat_interleave(N_HEADS), key.repeat_interleave(N_HEADS)] = 0
+    expected = kernel / kernel.sum(-1, keepdim=True)
+    assert torch.allclose(weights, expected, atol=1e-6)
+    assert torch.allclose(out, expected @ v, atol=1e-5)
+
+
+def test_linear_attention_maps_have_rank_at_most_the_head_width():
+    """The bound behind the head-width warning: with phi as wide as the head, each head's map is a
+    mix of head_dim key profiles. (The mask's zeroed pairs are a separate, sparse correction; this
+    is the map before it.) The maps are float32, so the rank counts singular values above 1e-5 of
+    the largest: the linear map has head_dim of them at ~3e-2 or more and the rest at ~1e-8."""
+    seq_len = 40
+    for head_dim in (4, 8):
+        q, k, v = _qkv(n_graphs=1, seq_len=seq_len, head_dim=head_dim)
+        _, weights = _linear(head_dim)._attend(q, k, v, None, None, True, StructuredMask(_no_pairs()))
+        ranks = [int(torch.linalg.matrix_rank(weights[row].double(), rtol=1e-5)) for row in range(N_HEADS)]
+        assert ranks == [head_dim] * N_HEADS
+
+    # Dense softmax at the same width is not bound: exp of a rank-4 logit matrix is (near) full rank.
+    q, k, _ = _qkv(n_graphs=1, seq_len=seq_len, head_dim=4)
+    dense = torch.softmax(q @ k.transpose(1, 2) / 2, dim=-1)
+    assert int(torch.linalg.matrix_rank(dense[0].double(), rtol=1e-5)) > 30
+
+
+def test_linear_attention_factorised_and_explicit_paths_agree_with_mask_and_padding():
+    from interscale.tl.masking import blocked_pairs
+
+    q, k, v = _qkv(n_graphs=2, seq_len=9)
+    padding = torch.zeros(2, 9, dtype=torch.bool)
+    padding[1, :3] = True
+    edge_index = torch.cat([_path_graph(8), _path_graph(5, offset=8)], dim=1)
+    batch = torch.cat([torch.zeros(8, dtype=torch.long), torch.ones(5, dtype=torch.long)])
+    blocked = blocked_pairs(edge_index, batch, [list(range(8)), list(range(5))], n_hops=2)
+    module = _linear()
+    out_fact, none = module._attend(q, k, v, padding, None, False, StructuredMask(blocked))
+    out_expl, weights = module._attend(q, k, v, padding, None, True, StructuredMask(blocked))
+    assert none is None
+    assert torch.allclose(out_fact, out_expl, atol=1e-5)
+    assert torch.all(weights[N_HEADS:][:, :, :3] == 0)  # padded keys of the second graph
+
+
+def test_linear_attention_blocks_exactly_what_the_dense_mask_blocks():
+    n = 9
+    batch = _Batch(_path_graph(n), torch.zeros(n, dtype=torch.long), n)
+    emb = torch.randn(n, N_EMBED)
+    dense = _module(long_range=True, hops=2).eval()
+    linear = _module_with(_linear_cfg(), long_range=True, hops=2).eval()
+    _, _, _, dense_mask, _ = dense.common_step_local_to_global(batch, emb, eval_step=True)
+    padded, padding, _, mask, rotary = linear.common_step_local_to_global(batch, emb, eval_step=True)
+    linear.forward(padded, padding, mask, register_hook=True, rotary=rotary)
+
+    weights = linear.transformer_encoder.layers[0].get_attn_output_weights()[0]
+    assert torch.equal(weights == 0, dense_mask[0])
+    assert torch.allclose(weights.sum(-1), torch.ones(n + 1), atol=1e-5)
+
+
+@pytest.mark.parametrize("hops", [1, 2, 3])
+def test_linear_attention_is_finite_on_a_dense_graph_under_the_long_range_mask(hops):
+    n = 12
+    edge_index = torch.tensor([[i, j] for i in range(n) for j in range(n) if i != j], dtype=torch.long).T
+    batch = _Batch(edge_index, torch.zeros(n, dtype=torch.long), n)
+    module = _module_with(_linear_cfg(), long_range=True, hops=hops).eval()
+    padded, padding, _, mask, rotary = module.common_step_local_to_global(batch, torch.randn(n, N_EMBED), True)
+    out, _, attn = module.forward(padded, padding, mask, register_hook=True, rotary=rotary)
+    out.sum().backward()
+
+    assert torch.isfinite(out).all() and torch.isfinite(attn).all()
+    assert torch.allclose(attn[0, :, :n, -1], torch.ones(N_HEADS, n), atol=1e-5)  # CLS alone is open
+    assert all(torch.isfinite(p.grad).all() for p in module.parameters() if p.grad is not None)
+
+
+def test_linear_attention_trains_and_feeds_relevance():
+    n = 10
+    edge_index = torch.tensor([[i, j] for i in range(n) for j in range(n) if i != j], dtype=torch.long).T
+    batch = _Batch(edge_index, torch.zeros(n, dtype=torch.long), n)
+    emb = torch.randn(n, N_EMBED)
+    target = torch.randn(n + 1, 1, N_EMBED)
+    module = _module_with(_linear_cfg(), long_range=True, hops=2)
+    optimizer = torch.optim.Adam(module.parameters(), lr=1e-2)
+    for _ in range(5):
+        optimizer.zero_grad()
+        padded, padding, _, mask, rotary = module.common_step_local_to_global(batch, emb, eval_step=True)
+        loss = torch.nn.functional.mse_loss(module.forward(padded, padding, mask, rotary=rotary)[0], target)
+        assert torch.isfinite(loss)
+        loss.backward()
+        optimizer.step()
+
+    module.eval()
+    path = _Batch(_path_graph(7), torch.zeros(7, dtype=torch.long), 7)
+    _, _, _, _, relevance = module.evaluate(path, torch.randn(7, N_EMBED))
+    assert relevance.shape == (8, 8) and torch.isfinite(relevance).all()
+
+
+def test_linear_attention_trains_through_a_full_step():
+    module = TransformerNodeEncoderHook(
+        max_seq_len=32,
+        n_heads=2,
+        dropout_global=0.0,
+        act_func="relu",
+        num_layers=1,
+        dim_feedforward=16,
+        long_range_attention=False,
+        local_mask_hops=0,
+        n_input=8,
+        n_output=8,
+        n_embed=8,
+        decoder_type="linear",
+        dropout_decoder=0.0,
+        decoder_hidden_dims=[16],
+        mask_percentage=0.3,
+        mask_strategy="node",
+        type_gex_embedding=None,
+        attention=_linear_cfg(),
+    )
+    out = module._common_step(_data_batch(), "regression", "node")
+    loss = torch.nn.functional.mse_loss(out.y_pred, out.y_true)
+    loss.backward()
+    assert torch.isfinite(loss) and out.attn is None
+
+
+def test_linear_attention_adds_no_state_and_starts_from_the_dense_weights():
+    """No features, no buffers: the state dict is the dense model's, weight for weight at one seed,
+    and the global RNG moves as for dense -- a dense checkpoint loads into it strictly."""
+    torch.manual_seed(0)
+    dense = _from_config(_cfg())
+    rng_dense = torch.get_rng_state()
+    torch.manual_seed(0)
+    linear = _from_config(_cfg(kind="linear"))
+    assert torch.equal(rng_dense, torch.get_rng_state())
+
+    dense_state, linear_state = dense.state_dict(), linear.state_dict()
+    assert dense_state.keys() == linear_state.keys()
+    for key, value in dense_state.items():
+        assert torch.equal(value, linear_state[key]), key
+    linear.load_state_dict(dense_state, strict=True)
+
+
+def test_linear_attention_refuses_a_rotation_and_a_bias():
+    q, k, v = _qkv(n_graphs=1, seq_len=5)
+    module = _linear()
+    x = torch.randn(5, 1, N_EMBED)
+    cos, sin = torch.ones(N_HEADS, 5, N_EMBED // N_HEADS), torch.zeros(N_HEADS, 5, N_EMBED // N_HEADS)
+    with pytest.raises(ValueError, match="does not apply RoPE"):
+        module(x, x, x, rotary=(cos, sin), context=StructuredMask(_no_pairs()))
+    factors = (torch.zeros(N_HEADS, 5, 2), torch.zeros(N_HEADS, 5, 2))
+    with pytest.raises(ValueError, match="carries no attention bias"):
+        module._attend(q, k, v, None, None, False, StructuredMask(_no_pairs(), factors))
+
+
+def test_the_validator_explains_what_linear_attention_cannot_carry():
+    from interscale.config import _validate_attention
+
+    _validate_attention(_cfg(kind="linear"))
+    for bias in ("distance", "spectral", "fourier"):
+        with pytest.raises(ValueError, match="has no exponential") as err:
+            _validate_attention(_cfg(kind="linear", bias=[bias]))
+        assert "performer" in str(err.value)
+    with pytest.raises(ValueError, match="cannot apply pe.rotary") as err:
+        _validate_attention(_cfg(kind="linear", rotary=["rope"]))
+    assert "has no exponential" in str(err.value)
+    with pytest.raises(ValueError, match="reads the attention maps in training"):
+        _validate_attention(_cfg(kind="linear", loss="SCE_EntropyATT_Loss"))
+
+
+def test_narrow_linear_heads_warn_and_wide_ones_do_not():
+    import warnings
+
+    with pytest.warns(UserWarning, match="rank <= 4"):
+        _module_with(_linear_cfg())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _module_with(_linear_cfg(head_dim=32))
+    assert not [w for w in caught if "rank <=" in str(w.message)]
+
+
+def test_wide_linear_heads_run_under_the_long_range_mask():
+    n = 9
+    batch = _Batch(_path_graph(n), torch.zeros(n, dtype=torch.long), n)
+    module = _module_with(_linear_cfg(head_dim=32), long_range=True, hops=2).eval()
+    padded, padding, _, mask, rotary = module.common_step_local_to_global(batch, torch.randn(n, N_EMBED), True)
+    fast = module.forward(padded, padding, mask, rotary=rotary)[0]
+    explicit, _, attn = module.forward(padded, padding, mask, register_hook=True, rotary=rotary)
+    assert module.transformer_encoder.layers[0].self_attn.head_dim == 32
+    assert torch.allclose(fast, explicit, atol=1e-5) and torch.isfinite(attn).all()
+
+
+def test_the_checkpoint_name_carries_linear_attention():
+    from interscale.tl.utils import _attention_tag
+
+    assert _attention_tag(_cfg(kind="linear")) == "attn-linear_"
+    assert _attention_tag(_cfg(kind="linear", head_dim=32)) == "attn-linear-hd32_"

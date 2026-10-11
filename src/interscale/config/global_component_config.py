@@ -128,6 +128,11 @@ def get_global_component_cfg(cfg, global_component_name):
         att = cfg.model.global_component.parameters.attention = CN()
         att.kind = "dense"
         att.head_dim = 0
+        # `linear`: elu+1 linear attention, O(S) like the performer but with a fixed, deterministic
+        # feature map instead of random features -- not an estimate of softmax. Each head's map has
+        # rank <= head_dim, so it wants wide heads (head_dim >= 32; it warns below). It carries
+        # node encodings and the long-range mask, but no attention bias and no RoPE (no exponential
+        # for either to act through). No settings of its own.
         # `performer`: softmax attention estimated with `num_features` positive orthogonal random
         # features per layer (FAVOR+), O(S) in memory and time; each head's map has rank
         # num_features whatever its width. The long-range mask is kept exactly; attention biases

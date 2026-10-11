@@ -25,7 +25,7 @@ a real state.
 |---|---|---|---|
 | 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | **done** | 517 tests pass; harness IDENTICAL across 5 cases / 15 epochs after each of the two commits; training steps keep no map and hook nothing unless the loss reads attention; the skeleton's dense core reproduces torch's attention (outputs and maps, with mask, padding and RoPE) and draws its initial weights; a non-default backend leaves every weight built after it unchanged (mutation-checked: without the replayed draws it fails); every validator rejection tested | 2026-10-11 |
 | 1 — attention diagnostics (span in µm, sink mass, effective keys) | not started | | |
-| 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | **Performer implemented, unverified** — `tl.blocked_pairs` equals the dense mask at hops 0–3 (two graphs of different size, one subsampled); the orthogonal features estimate exp(x·y) without bias (found biased by ~7% before the Haar sign fix); the map's error against softmax falls with the feature count (TV 0.10 at m = 16, 0.009 at 4096); factorised and explicit paths agree to 1e-5 with mask and padding; the float64 subtraction stays exact where blocked keys hold 99.7% of a query's mass (float32: ~1e-5 off); blocks exactly the dense mask's pairs; finite on the complete-graph test at hops 1–3 and through 5 training steps; relevance runs; a performer model shares every initial weight with the dense one at one seed and moves the global RNG as dense does; per-layer features from their own seeded generator, redrawn only in training and only when asked; trains through `_common_step`. Three mutations, each caught. 538 tests pass; harness IDENTICAL. **No real-data run yet. Linear (elu+1) and the generated arms not built** | 2026-10-11 |
+| 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | **Performer and linear implemented, unverified** — `tl.blocked_pairs` equals the dense mask at hops 0–3 (two graphs of different size, one subsampled). Performer: the orthogonal features estimate exp(x·y) without bias (found biased by ~7% before the Haar sign fix); the map's error against softmax falls with the feature count (TV 0.10 at m = 16, 0.009 at 4096); the float64 subtraction stays exact where blocked keys hold 99.7% of a query's mass (float32: ~1e-5 off); shares every initial weight with the dense model at one seed; per-layer features from their own seeded generator, redrawn only in training and only when asked. Linear: equals its definition; each head's map has rank exactly `head_dim` before the mask (dense softmax at the same width: near full rank); adds no state, so a dense checkpoint loads strictly; refuses RoPE and biases, and the validator says why; warns below a head width of 32. Both: factorised and explicit paths agree to 1e-5 with mask and padding; block exactly the dense mask's pairs; finite on the complete-graph test at hops 1–3 and through 5 training steps; relevance runs; train through `_common_step`. Five mutations, each caught. 570 tests pass; harness IDENTICAL. **No real-data run yet. Generated arms not built** | 2026-10-11 |
 | 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | **implemented, unverified** — spectral: `U Wᵀ` equals the dense bias (two graphs of different size, one subsampled; CLS and padding zero); a zero bias leaves one side 0 and the other small (mutation-checked); a Performer's map converges to dense softmax with the same bias (TV 0.047 → 0.014 from m = 1024 to 16384 at a bias of ±1.2). Fourier (`pe.bias: [fourier]`): zero at init; each entry is the learned function of `p_key − p_query` (mutation-checked: a flipped sine sign fails); translation-invariant; isotropic is symmetric and invariant to a turn by 180°/directions, anisotropic is not; the default grid fits a ring at 1 mm with R² > 0.9; derived `max_wavelength`; through Performer and dense attention end to end, gradient reaching the coefficients. 555 tests pass; harness IDENTICAL. **No real-data run yet** | 2026-10-11 |
 | 4 — global tokens and a null key | not started | | |
 | 5 — Exphormer-style sparse attention | not started | | |
@@ -115,14 +115,16 @@ means "from that stage on".
 | backend | node PE / SE | rope | distance (profile, linear) | fourier | spectral | SPD bias (future) | long-range mask | maps + relevance at eval | `SCE_EntropyATT_Loss` |
 |---|---|---|---|---|---|---|---|---|---|
 | dense | ✓ | ✓ | ✓ | ✓ 3 | ✓ | ✓ | ✓ | ✓ exact | ✓ |
-| performer, linear (2) | ✓ | ✓ | ✗ | ✓ 3 | ✓ 3 | ✗ | ✓ by subtraction | ✓ implied map | ✗ |
+| performer (2) | ✓ | ✓ rotate, then feature map | ✗ | ✓ 3 | ✓ 3 | ✗ | ✓ by subtraction | ✓ implied map | ✗ |
+| linear (2) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ by subtraction | ✓ explicit map | ✗ |
 | exphormer (5) | ✓ | ✓ | ✓ on edges | ✓ | ✓ on edges | ✓ with an SPD table | ✓ removed from the edges | ~ zero off the edges | ✗ |
 | dense, fused (6) | ✓ | ✓ | ✓ float mask | ✓ | ✓ | ✓ | ✓ | ✓ explicit path | ✗ |
 | inducing (7) | ✓ | ~ latents need positions | ✗ | ✗ | ✗ | ✗ | ✗ | ~ rank-m surrogate | ✗ |
 
 - **Global tokens and the null key (Stage 4)** combine with every row except inducing points.
 - **Head width, head count, depth and `n_embed`** combine with every row.
-- **Linear attention needs `head_dim` well above 4** to be worth running; see Stage 2.
+- **Linear attention needs `head_dim` well above 4** to be worth running, and carries neither biases nor
+  RoPE: both act through an exponential that elu+1 does not have (Stage 2).
 
 **Bias forms.** These are the extension point that makes the table derived rather than maintained:
 
@@ -131,8 +133,9 @@ means "from that stage on".
   Exphormer (its edges) and FlexAttention (`score_mod`).
 - `factors(ctx) → U, W [B, H, S, r]` with `bias = U·Wᵀ`, moved into the queries and keys:
   `q̃ = [q/√d, U]`, `k̃ = [k, W]`, logit `q̃ᵀk̃` at scale 1. This works in every backend that sees q
-  and k: for Performer, FAVOR+ estimates `exp(q̃ᵀk̃) = exp(qᵀk/√d + b)`; for linear attention, the
-  bias enters before the feature map.
+  and k through an exponential: for Performer, FAVOR+ estimates `exp(q̃ᵀk̃) = exp(qᵀk/√d + b)`.
+  Linear attention has no exponential, so a bias has no `exp(b)` factor to become there, and it
+  takes none.
 
 | encoding | dense | pairs | factors |
 |---|---|---|---|
@@ -211,7 +214,6 @@ attention:
   global_tokens: 0     # Stage 4
   null_key: false      # Stage 4
   performer: {num_features: 128, redraw_interval: 0}   # 0 = draw once
-  linear:    {feature_map: elu}
   exphormer: {degree: 8, sampling: expander, graph_edges: true, resample: false, edge_type: bias}
   inducing:  {num_latents: 16}
 ```
@@ -321,12 +323,13 @@ What both share:
   - Risk: cancellation when a query's mass sits almost entirely on its blocked neighbourhood. Test
     that case.
 - **Padding:** φ(k) is zeroed at padded keys.
-- **RoPE:** rotate q and k, then apply the feature map. For Performer this estimates
-  `exp(qᵀR_{n−m}k)`, the RoPE softmax kernel, with positive, normalised weights. For linear
-  attention the rotation keeps weights positive but is only approximately relative. RoFormer's
-  alternative, rotating only the numerator, gives weights that can be negative, which the flow
-  pipeline cannot use.
-- **Biases** arrive with Stage 3 (`factors`).
+- **RoPE** (Performer only): rotate q and k, then apply the feature map. That estimates
+  `exp(qᵀR_{n−m}k)`, the RoPE softmax kernel, with positive, normalised weights. Linear attention
+  does not take RoPE: turned before elu+1, the similarity depends on absolute positions, not
+  offsets. RoFormer's alternative, rotating the features after φ in the numerator only, keeps the
+  offset but gives weights that can be negative and do not sum to 1, which the flow pipeline cannot
+  use.
+- **Biases** (Performer only) arrive with Stage 3 (`factors`).
 - **Performer features** are buffers, so they are in the checkpoint. They are drawn from the backend
   generator and fixed at eval.
 - **Maps:** the explicit path normalises `φ(Q)φ(K)ᵀ` with the blocked entries set to 0, which gives
@@ -352,7 +355,7 @@ as an `arms:` file, logging each rejected combination with its reason.
   reverse, measures the approximation on trained weights. Register the feature buffer under
   `_OPTIONAL_STATE_PREFIXES` so either direction loads.
 
-#### How Stage 2 was built (Performer only)
+#### How Stage 2 was built
 
 - **The mask slot carries a `StructuredMask`.** It holds the blocked pairs plus the bias factors
   (Stage 3), and stands in `GlobalInput.attention_mask` where the dense mask stands; every caller
@@ -376,7 +379,27 @@ as an `arms:` file, logging each rejected combination with its reason.
   checkpoint that lost its features must not load silently with new ones.
 - **Default `num_features` 128.** It is a knob; the error measurements above say 128 leaves a mean
   TV distance of a few percent on unit-scale queries.
-- **Biases are rejected until Stage 3**, by the validator and again at the forward pass.
+- **Biases** came with Stage 3, through the `factors` form.
+- **One kernel base.** `KernelAttention` holds everything the two share: the mask as blocked
+  pairs, the float64 sums and subtraction, padding and the explicit path. `PerformerAttention` and
+  `LinearAttention` only supply their feature map (`_feature_maps`). The Performer was moved onto it
+  in its own commit, with its tests unchanged.
+- **Linear attention** (`attention.kind: linear`) is `φ(x) = elu(x) + 1` on the raw queries and keys,
+  as in Katharopoulos et al. It has no settings, buffers or randomness: its state dict is the dense
+  model's, so a dense checkpoint loads into it strictly (as a different kernel, not an estimate).
+  `supports_rotary = False` makes it refuse a rotation even when built by hand. Its registry entry
+  carries a `note` that the validator appends to every rejection (no exponential for a bias or RoPE
+  to act through; the Performer carries both), and it warns below a head width of 32
+  (`LINEAR_RANK_WARNING`).
+- **Rank, measured.** At head width 4 and 8 a linear head's map (before the mask) has exactly that
+  many singular values above ~3e-2 of the largest; the rest sit at ~1e-8, float32 noise. Dense
+  softmax at width 4 on the same 40 tokens has rank 37 at a relative tolerance of 1e-4. The mask's
+  zeroed pairs are a sparse correction on top, so a masked map's numerical rank is higher without
+  carrying more long-range structure.
+- **What linear attention is for:** a control for the Performer (the same O(S) structure without
+  the softmax kernel or random features; compare at `num_features` = `head_dim` for equal rank), a
+  probe of how much attention rank a task needs (sweep `attention.head_dim`), and the cheapest
+  backend.
 
 ### 3 — low-rank biases
 

@@ -386,11 +386,15 @@ def _validate_attention(cfg):
             f"attention.kind {kind!r} cannot carry the attention bias {name!r}: the bias comes in the forms "
             f"{sorted(PE_REGISTRY[name].forms)}, the backend takes {sorted(spec.bias_forms) or 'none'}. "
             f"Backends that carry it: {carriers}. Biases this backend carries: {carried or 'none'}."
+            + (f" {spec.note}" if spec.note else "")
         )
     rotary = list(pe.get("rotary", [])) if pe is not None else []
     if rotary and not spec.rotary:
         carriers = sorted(k for k, s in ATTENTION_REGISTRY.items() if s.rotary)
-        raise ValueError(f"attention.kind {kind!r} cannot apply pe.rotary {rotary}. Backends that can: {carriers}.")
+        raise ValueError(
+            f"attention.kind {kind!r} cannot apply pe.rotary {rotary}. Backends that can: {carriers}."
+            + (f" {spec.note}" if spec.note else "")
+        )
     loss = cfg.optim.get("loss", None)
     if loss in LOSSES_READING_ATTENTION and not spec.training_maps:
         carriers = sorted(k for k, s in ATTENTION_REGISTRY.items() if s.training_maps)

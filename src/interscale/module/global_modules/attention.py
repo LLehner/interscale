@@ -28,6 +28,7 @@ sub-block in ``get_global_component_cfg``.
 """
 
 import math
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -73,6 +74,8 @@ class AttentionSpec:
     ``"pairs"`` (a list of ``(graph, query, key)`` positions). ``bias_forms`` are the attention-bias
     forms it can carry (:data:`BIAS_FORMS`); ``rotary`` whether it applies RoPE;
     ``training_maps`` whether its training forward passes form the maps a loss could read.
+    ``note``, when set, says in a sentence what it cannot carry and why; the validator appends it to
+    its rejections.
     """
 
     build: Callable
@@ -81,6 +84,7 @@ class AttentionSpec:
     bias_forms: frozenset = field(default_factory=frozenset)
     rotary: bool = True
     training_maps: bool = False
+    note: str = ""
 
 
 ATTENTION_REGISTRY: dict[str, AttentionSpec] = {}
@@ -278,8 +282,9 @@ class KernelAttention(ProjectedAttention):
       blocked neighbourhood loses no precision to the cancellation.
     * **Padded keys** have their features zeroed.
     * **Maps.** Asked for weights, it takes the explicit path -- ``phi(Q) phi(K)^T`` with the blocked
-      entries zeroed, normalised -- which gives the same numbers as the factorised path. Each head's
-      map has rank at most ``F``.
+      entries zeroed, normalised -- which gives the same numbers as the factorised path.
+    * **Rank.** ``phi(Q) phi(K)^T`` has rank at most ``F``, so each head's map does too, apart from
+      the blocked pairs the mask zeroes (a sparse, local correction).
     * No attention dropout: there is no map to drop entries of in the factorised path.
     """
 
@@ -338,8 +343,8 @@ class PerformerAttention(KernelAttention):
     With ``x = q / d^(1/4)`` and ``y = k / d^(1/4)`` (``d`` the head width) and ``m`` random rows
     ``w_r``, ``phi(x) = exp(w_r . x - |x|^2 / 2) / sqrt(m)`` gives ``E[phi(x) . phi(y)] = exp(q . k / sqrt(d))``
     -- the softmax kernel, estimated without bias and with positive terms. The mask, the float64
-    sums, padding and the explicit path are :class:`KernelAttention`'s. Each head's map has rank
-    ``m`` whatever the head width.
+    sums, padding and the explicit path are :class:`KernelAttention`'s. Each head's map has rank at
+    most ``m`` (apart from the blocked pairs) whatever the head width.
 
     * **RoPE** turns q and k before the feature map, so the estimate is of ``exp(q . R_(n-m) k / sqrt(d))``,
       the RoPE softmax kernel, with positive, normalised weights.
@@ -422,16 +427,57 @@ class PerformerAttention(KernelAttention):
         return self._features(x, None), self._features(y, valid)
 
 
+class LinearAttention(KernelAttention):
+    """Linear attention (Katharopoulos et al., ICML 2020): the similarity ``phi(q) . phi(k)``, ``phi(x) = elu(x) + 1``.
+
+    A fixed, deterministic positive feature map: not an estimate of softmax but a different
+    similarity -- linear in the inputs above zero (``elu(x) + 1 = x + 1``), exponential below. No
+    random features, no buffers and no parameters beyond the projections, so its outputs and maps
+    are deterministic and a dense checkpoint loads into it as it is. The mask, the float64 sums,
+    padding and the explicit path are :class:`KernelAttention`'s. What it is for, next to dense and
+    the Performer: a control with the same O(S) structure but neither the softmax kernel nor random
+    features; a probe of how much attention rank a task needs; the cheapest backend.
+
+    **Rank.** ``phi`` has as many features as the head has dims, so each head's map has rank at
+    most ``head_dim`` (apart from the blocked pairs): every query's attention is a mix of the same
+    ``head_dim`` key profiles, and the whole sequence reaches a query through ``head_dim`` summary
+    vectors, the rows of ``phi(K)^T V``. Softmax escapes the bound because the exponential of a
+    low-rank logit matrix is generally full rank. The head width (``attention.head_dim``) is
+    therefore this backend's main knob.
+
+    **What it does not carry**, both because it lacks the exponential softmax has:
+
+    * attention biases -- in softmax a bias ``b`` multiplies a pair's weight by ``exp(b)``; folding a
+      bias's factors into ``phi``'s input would be some other modulation, not that factor;
+    * RoPE -- turned before ``elu + 1``, the similarity depends on the two cells' absolute positions,
+      not on their offset. RoFormer's linear form (rotating the features after ``phi``, in the
+      numerator only) keeps the offset but gives weights that can be negative and do not sum to 1,
+      which relevance and net flow cannot read.
+
+    The Performer carries both.
+    """
+
+    supports_rotary = False
+
+    def __init__(self, embed_dim: int, num_heads: int, head_dim: int, bias: bool = True):
+        super().__init__(embed_dim, num_heads, head_dim, dropout=0.0, bias=bias)
+
+    def _feature_maps(self, q, k, valid, context):
+        if context.bias_factors is not None:
+            raise ValueError("linear attention carries no attention bias (see LinearAttention); the performer does.")
+        return F.elu(q) + 1.0, (F.elu(k) + 1.0) * valid[..., None]
+
+
 # --------------------------------------------------------------------------- registry entries
 
 
-def _validate_dense(attention_cfg):
-    pass
+def _no_settings(attention_cfg):
+    """A backend with no settings of its own: nothing to check."""
 
 
 @register_attention(
     "dense",
-    validate=_validate_dense,
+    validate=_no_settings,
     mask="dense",
     bias_forms=frozenset({"dense"}),
     rotary=True,
@@ -473,6 +519,36 @@ def _build_performer(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, 
         bias_factor_dim=bias_factor_dim,
         redraw_interval=int(performer.redraw_interval),
     )
+
+
+#: Below this head width, linear attention's rank bound is tight enough to warn about.
+LINEAR_RANK_WARNING = 32
+
+
+@register_attention(
+    "linear",
+    validate=_no_settings,
+    mask="pairs",
+    bias_forms=frozenset(),
+    rotary=False,
+    training_maps=False,
+    note=(
+        "elu+1 linear attention has no exponential: a softmax bias (a factor exp(b) on a pair's weight) "
+        "has nothing to act on, and RoPE turned before elu+1 no longer depends on offsets alone. "
+        "The performer carries both."
+    ),
+)
+def _build_linear(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
+    if head_dim < LINEAR_RANK_WARNING:
+        warnings.warn(
+            f"attention.kind 'linear' at a head width of {head_dim}: elu+1 has as many features as the head "
+            f"has dims, so every head's attention map has rank <= {head_dim} -- each query mixes the same "
+            f"{head_dim} key profiles. Set attention.head_dim (>= {LINEAR_RANK_WARNING}) unless that bound "
+            "is what you are measuring.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return LinearAttention(embed_dim, num_heads, head_dim)
 
 
 def build_attention_factory(attention_cfg, *, embed_dim: int, num_heads: int, dropout: float, bias_factor_dim: int):
