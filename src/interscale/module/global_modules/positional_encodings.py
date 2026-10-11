@@ -285,6 +285,24 @@ class LinearDistanceBias(nn.Module):
         return knots, self.slope.detach().cpu()[:, None] * (knots / 1000.0)
 
 
+#: Floor of the balancing scale of low-rank bias factors (:func:`balanced_factors`).
+FACTOR_BALANCE_EPS = 1e-3
+
+
+def balanced_factors(left: torch.Tensor, right: torch.Tensor, weight: torch.Tensor, magnitude: torch.Tensor):
+    """``(left * weight / s, right * s)``: factors whose product is ``left * weight * right``, norms balanced.
+
+    A backend that folds a bias into its queries and keys (Performer) estimates ``exp(q . k + U . W)``
+    with a variance that grows with the norms of both sides, so the bias's size is split evenly
+    between them: ``s = sqrt(magnitude + eps)``, ``magnitude`` being the size of ``weight``. ``s`` is
+    detached -- it cancels in the product, so the bias and its gradient are exactly those of the
+    unsplit form, and at a zero weight (every bias starts at zero) one side is 0 and the other
+    small, which is what keeps the estimator's variance low from the first step.
+    """
+    scale = (magnitude + FACTOR_BALANCE_EPS).sqrt().detach()
+    return left * (weight / scale), right * scale
+
+
 class SpectralBias(nn.Module):
     """A learned filter of the neighbour graph's spectrum per head -- a diffusion-like kernel as bias.
 
@@ -314,8 +332,10 @@ class SpectralBias(nn.Module):
     layer, as for ``distance``.
     """
 
-    def __init__(self, n_heads: int, num_knots: int, min_eigval: float, max_eigval: float):
+    def __init__(self, n_heads: int, num_knots: int, min_eigval: float, max_eigval: float, k: int = 0):
         super().__init__()
+        # Width of the low-rank form (`factors`): one dimension per kept mode.
+        self.factor_dim = int(k)
         if num_knots < 2:
             raise ValueError(f"the spectral filter needs >= 2 knots (the two ends), got {num_knots}.")
         if not 0 < min_eigval < max_eigval:
@@ -345,6 +365,17 @@ class SpectralBias(nn.Module):
         weights = self.filter(eigvals)  # [B, k, heads]
         weighted = torch.einsum("bsk,bkh->bhsk", eigvecs, weights)
         return weighted @ eigvecs.transpose(-1, -2).unsqueeze(1)
+
+    def factors(self, eigvecs: torch.Tensor, eigvals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The same bias as ``U W^T``: ``U, W`` each ``[B, heads, S, k]``, one dimension per mode.
+
+        ``U[j] . W[l] = sum_i h_h(lambda_i) * v_i[j] * v_i[l]`` (with the sqrt(N) scaling of the
+        inputs), exactly :meth:`forward`'s entry; the filter's weight is split between the two by
+        :func:`balanced_factors`.
+        """
+        weights = self.filter(eigvals).transpose(1, 2).unsqueeze(2)  # [B, heads, 1, k]
+        vecs = eigvecs.unsqueeze(1)  # [B, 1, S, k]
+        return balanced_factors(vecs, vecs, weights, weights.abs())
 
     def profile(self) -> tuple[torch.Tensor, torch.Tensor]:
         """``(knots [K] as eigenvalues, values [heads, K])`` -- each head's filter at each knot."""
@@ -577,10 +608,17 @@ def _build_distance(pe, n_heads):
     return DistanceBias(n_heads, int(pe.distance.num_kernels), float(pe.distance.max_dist))
 
 
-@register_pe("spectral", kind="bias", requires="spectral_pe", validate=_validate_spectral, precompute=_spectral_inputs)
+@register_pe(
+    "spectral",
+    kind="bias",
+    requires="spectral_pe",
+    validate=_validate_spectral,
+    precompute=_spectral_inputs,
+    forms=frozenset({"dense", "factors"}),
+)
 def _build_spectral(pe, n_heads):
     s = pe.spectral
-    return SpectralBias(n_heads, int(s.num_knots), float(s.min_eigval), float(s.max_eigval))
+    return SpectralBias(n_heads, int(s.num_knots), float(s.min_eigval), float(s.max_eigval), k=int(s.k))
 
 
 @register_pe("rope", kind="rotary", requires="pos", validate=_validate_rope)
@@ -734,6 +772,37 @@ class AttentionBias(nn.Module):
             vecs = pad_like(vecs.to(device=device, dtype=dtype), batch, index_nodes, seq_len)  # [B, S, k]
             return vecs, vals.to(device=device, dtype=dtype).reshape(len(index_nodes), -1)  # [B, k]
         raise ValueError(f"no attention bias input is prepared from `{key}`.")
+
+    def factors(self, batched_data, index_nodes, src_padding_mask, dtype, device):
+        """The enabled biases in low-rank form: ``(U, W)``, each ``[B * heads, S + 1, r]``.
+
+        ``U W^T`` is :meth:`forward`'s bias (the sum over the enabled biases, concatenated along
+        ``r``), laid out like it -- left-padded, CLS last, graph-major over heads -- with zero rows
+        at CLS and padding, so their bias is 0. For a backend that folds the bias into its queries
+        and keys instead of adding an ``S x S`` matrix (Performer).
+        """
+        batch = batched_data.batch.to(device=device, dtype=torch.long)
+        n_graphs, seq_len = src_padding_mask.shape
+
+        inputs, lefts, rights = {}, [], []
+        for name, encoder in self.encoders.items():
+            if not hasattr(encoder, "factors"):
+                raise ValueError(f"the attention bias '{name}' has no low-rank form; only a dense attention takes it.")
+            key = self.requires[name]
+            if key not in inputs:
+                inputs[key] = self._inputs(key, batched_data, batch, index_nodes, seq_len, dtype, device)
+            left, right = encoder.factors(*inputs[key])
+            lefts.append(left.expand(n_graphs, self.n_heads, seq_len, -1))
+            rights.append(right.expand(n_graphs, self.n_heads, seq_len, -1))
+
+        pad = src_padding_mask.to(device=device, dtype=torch.bool)[:, None, :, None]
+
+        def lay_out(parts):
+            t = torch.cat(parts, dim=-1).masked_fill(pad, 0.0)
+            t = torch.cat([t, t.new_zeros(n_graphs, self.n_heads, 1, t.shape[-1])], dim=2)  # CLS last
+            return t.reshape(n_graphs * self.n_heads, seq_len + 1, t.shape[-1])
+
+        return lay_out(lefts), lay_out(rights)
 
     def forward(self, batched_data, index_nodes, src_padding_mask, dtype, device) -> torch.Tensor:
         batch = batched_data.batch.to(device=device, dtype=torch.long)

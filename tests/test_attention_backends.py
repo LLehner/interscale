@@ -697,10 +697,9 @@ def test_the_validator_takes_rope_and_rejects_dense_only_biases_and_the_entropy_
     from interscale.config import _validate_attention
 
     _validate_attention(_cfg(kind="performer", rotary=["rope"]))
+    _validate_attention(_cfg(kind="performer", bias=["spectral"]))  # low rank: folded into q and k
     with pytest.raises(ValueError, match="cannot carry the attention bias 'distance'"):
         _validate_attention(_cfg(kind="performer", bias=["distance"]))
-    with pytest.raises(ValueError, match="cannot carry the attention bias 'spectral'"):
-        _validate_attention(_cfg(kind="performer", bias=["spectral"]))
     with pytest.raises(ValueError, match="reads the attention maps in training"):
         _validate_attention(_cfg(kind="performer", loss="SCE_EntropyATT_Loss"))
     cfg = _cfg(kind="performer")
@@ -713,3 +712,130 @@ def test_the_checkpoint_name_carries_the_performer():
     from interscale.tl.utils import _attention_tag
 
     assert _attention_tag(_cfg(kind="performer")) == "attn-performer_"
+
+
+# --------------------------------------------------------------------------- low-rank biases
+
+
+def _spectral_batch(sizes=(9, 6), k=4, seed=0):
+    """Two path graphs with precomputed spectral inputs, as attach_positional_inputs leaves them."""
+    from interscale.tl.positional import laplacian_spectrum
+
+    vecs, vals, edges, offset = [], [], [], 0
+    for n in sizes:
+        edge_index = _path_graph(n)
+        v, lam = laplacian_spectrum(edge_index, n, k)
+        vecs.append(v * math.sqrt(n))
+        vals.append(lam.unsqueeze(0))
+        edges.append(edge_index + offset)
+        offset += n
+    n_total = sum(sizes)
+    batch = _Batch(
+        torch.cat(edges, dim=1),
+        torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(sizes)]),
+        n_total,
+        pos=torch.rand(n_total, 2, generator=torch.Generator().manual_seed(seed)) * 1000,
+    )
+    batch.spectral_pe = torch.cat(vecs).float()
+    batch.spectral_eigval = torch.cat(vals).float()
+    return batch
+
+
+def _spectral_bias(k=4, seed=1, n_heads=N_HEADS, scale=1.0):
+    from interscale.module.global_modules.positional_encodings import AttentionBias, SpectralBias
+
+    encoder = SpectralBias(n_heads, 8, 1e-3, 2.0, k=k)
+    with torch.no_grad():
+        encoder.table.copy_(torch.randn(encoder.table.shape, generator=torch.Generator().manual_seed(seed)) * scale)
+    return AttentionBias({"spectral": encoder}, n_heads=n_heads, spatial_unit_um=1.0)
+
+
+def _padded_layout(batch, max_seq_len):
+    from interscale.tl.padding import pad_batch
+
+    _, padding, index_nodes, *_ = pad_batch(torch.zeros(batch.num_nodes, 1), batch.batch, max_seq_len)
+    return padding, index_nodes
+
+
+def test_the_spectral_bias_in_factors_is_the_dense_bias():
+    """U W^T equals the dense bias entry for entry -- CLS and padding included (both zero) -- on two
+    graphs of different size, one of them subsampled by pad_batch."""
+    batch = _spectral_batch()
+    bias = _spectral_bias()
+    padding, index_nodes = _padded_layout(batch, max_seq_len=7)
+    dense = bias(batch, index_nodes, padding, dtype=torch.float32, device=torch.device("cpu"))
+    left, right = bias.factors(batch, index_nodes, padding, dtype=torch.float32, device=torch.device("cpu"))
+
+    assert left.shape == (2 * N_HEADS, 8, 4)
+    assert torch.allclose(left @ right.transpose(1, 2), dense, atol=1e-5)
+    assert torch.all(left[:, -1] == 0) and torch.all(right[:, -1] == 0)  # CLS
+    assert torch.all(left[N_HEADS:, :1] == 0)  # the second graph's padding
+
+
+def test_a_zero_bias_has_a_zero_side_and_a_small_one():
+    """Every bias starts at zero; split by balanced_factors, one side is 0 and the other small, so
+    folding it into a Performer's queries and keys adds almost no variance at the first step."""
+    batch = _spectral_batch()
+    bias = _spectral_bias(scale=0.0)
+    padding, index_nodes = _padded_layout(batch, max_seq_len=16)
+    left, right = bias.factors(batch, index_nodes, padding, dtype=torch.float32, device=torch.device("cpu"))
+    assert torch.all(left == 0)
+    assert right.norm(dim=-1).max() < 0.5
+
+
+def test_the_performer_folds_the_spectral_bias_into_the_kernel_it_estimates():
+    """A performer's map converges to dense softmax attention with the same bias as the features
+    grow -- the bias reached the kernel, not just the shapes. (Its error falls like 1/sqrt(m); a
+    bias of a few units inflates the estimator's variance, so it needs more features: measured
+    TV 0.014 at bias +-1.2 and 0.05 at +-3, both at m = 16384.)"""
+    from interscale.module.global_modules.attention import PerformerAttention
+
+    batch = _spectral_batch(sizes=(9,))
+    bias = _spectral_bias(scale=0.3)
+    padding, index_nodes = _padded_layout(batch, max_seq_len=16)
+    dense_bias = bias(batch, index_nodes, padding, dtype=torch.float32, device=torch.device("cpu"))
+    factors = bias.factors(batch, index_nodes, padding, dtype=torch.float32, device=torch.device("cpu"))
+    q, k, v = _qkv(n_graphs=1, seq_len=10, scale=0.6)
+    blocked = _diagonal_pairs(1, 9)
+
+    graph, query, key = blocked
+    logits = q @ k.transpose(1, 2) / math.sqrt(q.shape[-1]) + dense_bias
+    rows = (graph[:, None] * N_HEADS + torch.arange(N_HEADS)).reshape(-1)
+    logits[rows, query.repeat_interleave(N_HEADS), key.repeat_interleave(N_HEADS)] = float("-inf")
+    exact = torch.softmax(logits, dim=-1)
+
+    def error(m):
+        errs = []
+        for seed in range(4):
+            module = PerformerAttention(N_EMBED, N_HEADS, q.shape[-1], num_features=m, bias_factor_dim=4)
+            module.draw_features(torch.Generator().manual_seed(seed))
+            _, weights = module._attend(q, k, v, None, None, True, StructuredMask(blocked, factors))
+            errs.append((weights - exact).abs().sum(-1).mean().item() / 2)
+        return np.mean(errs)
+
+    without = torch.softmax(logits - dense_bias, dim=-1)  # the same attention without the bias
+    few, many = error(1024), error(16384)
+    assert many < 0.025
+    assert many < few / 2
+    assert many < (without - exact).abs().sum(-1).mean().item() / 2 / 3
+
+
+def test_a_performer_with_the_spectral_bias_runs_end_to_end():
+    from interscale.module.global_modules.positional_encodings import AttentionBias, SpectralBias
+
+    batch = _spectral_batch()
+    encoder = SpectralBias(N_HEADS, 8, 1e-3, 2.0, k=4)
+    module = _module_with(
+        _performer_cfg(),
+        long_range=True,
+        hops=1,
+        attention_bias=AttentionBias({"spectral": encoder}, n_heads=N_HEADS, spatial_unit_um=1.0),
+    ).eval()
+    emb = torch.randn(batch.num_nodes, N_EMBED)
+    padded, padding, _, mask, rotary = module.common_step_local_to_global(batch, emb, eval_step=True)
+    assert mask.bias_factors is not None and mask.bias_factors[0].shape[-1] == 4
+    fast = module.forward(padded, padding, mask, rotary=rotary)[0]
+    out, _, attn = module.forward(padded, padding, mask, register_hook=True, rotary=rotary)
+    out.sum().backward()
+    assert torch.allclose(fast, out, atol=1e-5)
+    assert torch.isfinite(attn).all() and encoder.table.grad is not None

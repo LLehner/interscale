@@ -26,7 +26,7 @@ a real state.
 | 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | **done** | 517 tests pass; harness IDENTICAL across 5 cases / 15 epochs after each of the two commits; training steps keep no map and hook nothing unless the loss reads attention; the skeleton's dense core reproduces torch's attention (outputs and maps, with mask, padding and RoPE) and draws its initial weights; a non-default backend leaves every weight built after it unchanged (mutation-checked: without the replayed draws it fails); every validator rejection tested | 2026-10-11 |
 | 1 — attention diagnostics (span in µm, sink mass, effective keys) | not started | | |
 | 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | **Performer implemented, unverified** — `tl.blocked_pairs` equals the dense mask at hops 0–3 (two graphs of different size, one subsampled); the orthogonal features estimate exp(x·y) without bias (found biased by ~7% before the Haar sign fix); the map's error against softmax falls with the feature count (TV 0.10 at m = 16, 0.009 at 4096); factorised and explicit paths agree to 1e-5 with mask and padding; the float64 subtraction stays exact where blocked keys hold 99.7% of a query's mass (float32: ~1e-5 off); blocks exactly the dense mask's pairs; finite on the complete-graph test at hops 1–3 and through 5 training steps; relevance runs; a performer model shares every initial weight with the dense one at one seed and moves the global RNG as dense does; per-layer features from their own seeded generator, redrawn only in training and only when asked; trains through `_common_step`. Three mutations, each caught. 538 tests pass; harness IDENTICAL. **No real-data run yet. Linear (elu+1) and the generated arms not built** | 2026-10-11 |
-| 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | not started | | |
+| 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | **in progress** — spectral factors implemented, unverified: `U Wᵀ` equals the dense spectral bias on two graphs of different size, one subsampled, CLS and padding zero; a zero bias leaves one side 0 and the other small (mutation-checked: an unbalanced split fails it); a Performer's map converges to dense softmax with the same bias (TV 0.047 → 0.014 from m = 1024 to 16384 at a bias of ±1.2); end to end through the transformer, gradient reaching the filter. 542 tests pass; harness IDENTICAL. Fourier bias not yet | 2026-10-11 |
 | 4 — global tokens and a null key | not started | | |
 | 5 — Exphormer-style sparse attention | not started | | |
 | 6 — fused exact attention (SDPA) | not started | | |
@@ -397,6 +397,19 @@ as an `arms:` file, logging each rejected combination with its reason.
   - `fourier` is zero at init and translation-invariant, and an isotropic fit reproduces a target
     radial profile within its band limit.
   - Performer plus spectral is unbiased as in Stage 2.
+
+#### How Stage 3 was built (so far)
+
+- **`AttentionBias.factors`** returns `(U, W)`, each `[B·H, S+1, r]`, laid out like the dense
+  bias. An encoder brings its low-rank form as a `factors` method; the spectral bias's has width k
+  (`SpectralBias(k=)`), declared as `factor_dim`.
+- **Balanced split.** `balanced_factors` splits each weight between the two sides with a detached
+  scale `sqrt(|w| + 1e-3)`: exact in the product and its gradient, and at the zero init one side is
+  0 and the other small, so the Performer's estimator starts with almost no extra variance.
+- **A bias's size costs Performer accuracy.** The estimator's variance grows with `exp(|x + y|²)`, and
+  folded biases add to those norms. Measured at m = 16384: TV 0.014 against dense with the same bias
+  at a bias range of ±1.2, and 0.05 at ±3. Large learned biases want more features; watch the TV
+  diagnostic (Stage 1) on Performer arms with biases.
 
 ### 4 — global tokens and a null key
 

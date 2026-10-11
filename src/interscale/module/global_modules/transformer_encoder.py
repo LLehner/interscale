@@ -200,12 +200,13 @@ class TransformerNodeEncoderHook(GlobalModule):
         )
 
         if self.attention_spec.mask == "pairs":
-            # The same blocked set as the dense masks below, as a list of pairs: a backend that never
-            # forms the S x S matrix (Performer) takes it this way.
+            # The same blocked set as the dense masks below, as a list of pairs, and the attention
+            # biases as low-rank factors: a backend that never forms the S x S matrix (Performer)
+            # folds them into its queries and keys. Both laid out from this call's index_nodes.
+            factors = None
             if self.attention_bias is not None:
-                raise ValueError(
-                    f"attention.kind {self.attention_kind!r} takes attention biases only as low-rank "
-                    "factors, and no enabled bias carries that form."
+                factors = self.attention_bias.factors(
+                    batched_data, index_nodes, src_padding_mask, dtype=emb.dtype, device=emb.device
                 )
             hops = self.local_mask_hops if self.long_range_attention else 0
             blocked = blocked_pairs(
@@ -215,7 +216,7 @@ class TransformerNodeEncoderHook(GlobalModule):
                 n_hops=hops,
                 device=emb.device,
             )
-            attention_mask = StructuredMask(blocked, None)
+            attention_mask = StructuredMask(blocked, factors)
         elif self.long_range_attention and self.local_mask_hops > 0:
             # Block everything the local component has already seen, so the transformer can only
             # contribute what the GNN could not.
