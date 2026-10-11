@@ -37,8 +37,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
+from torch_geometric.utils import softmax as scatter_softmax
 
 from interscale.module.global_modules.transformer_utils import apply_rotary
+from interscale.tl.masking import PATTERN_EDGE_TYPES, attention_pattern
 
 #: Forms in which an attention bias can be handed to a backend: ``dense``, the ``[B * heads, S, S]``
 #: float mask it is merged into today; ``factors``, low-rank ``U, W`` with ``bias = U W^T``, which a
@@ -58,10 +60,18 @@ class StructuredMask(NamedTuple):
     CLS slot never appears. ``bias_factors``, when attention biases are on, are ``(U, W)``, each
     ``[B * heads, S + 1, r]`` and graph-major like the dense mask, with ``bias = U W^T`` -- zero
     rows at CLS and padding, so their bias is 0 there.
+
+    For a backend that attends along a sparse pattern (Exphormer): ``pairs`` ``[3, E]`` are the
+    ``(graph, query, key)`` positions it attends along (blocked pairs already removed), ``pair_types``
+    ``[E]`` their edge types (``tl.masking.PATTERN_EDGE_TYPES``), and ``pair_bias`` ``[E, heads]``
+    the attention biases on them (``AttentionBias.pairs``), or None.
     """
 
     blocked: torch.Tensor
     bias_factors: tuple[torch.Tensor, torch.Tensor] | None = None
+    pairs: torch.Tensor | None = None
+    pair_types: torch.Tensor | None = None
+    pair_bias: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -71,12 +81,15 @@ class AttentionSpec:
     ``build(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim)`` returns
     the module a layer uses as ``self_attn``, or None for torch's vendored multi-head attention.
     ``validate(attention_cfg)`` raises on settings that would fail mid-run. ``mask`` is the form in
-    which it takes the blocked pairs: ``"dense"`` (a boolean ``[B * heads, S+1, S+1]`` mask) or
-    ``"pairs"`` (a list of ``(graph, query, key)`` positions). ``bias_forms`` are the attention-bias
+    which it takes the blocked pairs: ``"dense"`` (a boolean ``[B * heads, S+1, S+1]`` mask),
+    ``"pairs"`` (a list of ``(graph, query, key)`` positions), or ``"pattern"`` (that list, and the
+    sparse pattern it attends along, built by ``pattern``). ``bias_forms`` are the attention-bias
     forms it can carry (:data:`BIAS_FORMS`); ``rotary`` whether it applies RoPE;
     ``training_maps`` whether its training forward passes form the maps a loss could read.
     ``note``, when set, says in a sentence what it cannot carry and why; the validator appends it to
-    its rejections.
+    its rejections. ``pattern``, for ``mask="pattern"``, builds the pairs the backend attends along:
+    ``pattern(attention_cfg, *, edge_index, batch, index_nodes, blocked, seed, generator, training,
+    device) -> (pairs [3, E], pair_types [E])``.
     """
 
     build: Callable
@@ -86,6 +99,7 @@ class AttentionSpec:
     rotary: bool = True
     training_maps: bool = False
     note: str = ""
+    pattern: Callable | None = None
 
 
 ATTENTION_REGISTRY: dict[str, AttentionSpec] = {}
@@ -469,6 +483,82 @@ class LinearAttention(KernelAttention):
         return F.elu(q) + 1.0, (F.elu(k) + 1.0) * valid[..., None]
 
 
+#: How an Exphormer layer tells its edge types apart: a learned bias per type and head on the logit,
+#: or Exphormer's own per-type scaling of each key dimension.
+EXPHORMER_EDGE_TYPES = ("bias", "key")
+
+
+class ExphormerAttention(ProjectedAttention):
+    """Softmax attention along a sparse attention graph (Exphormer; Shirzad et al., ICML 2023).
+
+    Each query attends only to its pairs in the pattern (:func:`~interscale.tl.masking.attention_pattern`):
+    the neighbour graph's edges, a random expander and the virtual node, CLS, linked to every cell --
+    minus every pair the long-range mask blocks. The softmax is exact, over each query's pairs: no
+    approximation, and O(E) memory and time for ``E`` pairs instead of ``S x S``.
+
+    * **Edge types.** ``edge_type="bias"`` adds a learned bias per type and head to the logit
+      (``edge_type_bias``, zero at the start); ``"key"`` scales each key dimension per type and head,
+      as Exphormer's edge embeddings do (``edge_type_scale``, one at the start). Either way the
+      layer starts as plain attention along the pattern.
+    * **Attention biases** come per pair (``AttentionBias.pairs``), so every bias with a pair form
+      works -- the distance profile included.
+    * **RoPE** turns queries and keys before the pairs are gathered, as in dense attention.
+    * **Dropout** drops attention weights, as in dense attention.
+    * **Maps.** Asked for weights, it scatters each pair's weight into the ``[B * heads, S, S]`` map
+      (zero off the pattern) and computes the output from it, so a gradient hook on the map sees the
+      gradient through it; otherwise the output is a scatter-add over the pairs.
+
+    With the pattern of every open pair it is dense attention, which is how it is tested.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int, head_dim: int, *, dropout: float = 0.0, edge_type: str = "bias"):
+        super().__init__(embed_dim, num_heads, head_dim, dropout=dropout)
+        if edge_type not in EXPHORMER_EDGE_TYPES:
+            raise ValueError(f"edge_type must be one of {EXPHORMER_EDGE_TYPES}, got {edge_type!r}.")
+        self.edge_type = edge_type
+        if edge_type == "bias":
+            self.edge_type_bias = nn.Parameter(torch.zeros(len(PATTERN_EDGE_TYPES), self.num_heads))
+        else:
+            self.edge_type_scale = nn.Parameter(torch.ones(len(PATTERN_EDGE_TYPES), self.num_heads, self.head_dim))
+
+    def extra_repr(self) -> str:
+        return super().extra_repr() + f", edge_type={self.edge_type}"
+
+    def _attend(self, q, k, v, padding, attn_mask, need_weights, context):
+        if attn_mask is not None or not isinstance(context, StructuredMask) or context.pairs is None:
+            raise ValueError(
+                "the Exphormer attention attends along a pattern, a StructuredMask with pairs; "
+                "common_step_local_to_global builds it."
+            )
+        n_rows, seq_len, head_dim = q.shape
+        graph, query, key = context.pairs
+        n_pairs = graph.numel()
+        # Each pair for every head, pair-major: entry e * heads + h is pair e in head h.
+        heads = torch.arange(self.num_heads, device=q.device).repeat(n_pairs)
+        rows = graph.repeat_interleave(self.num_heads) * self.num_heads + heads
+        query, key = query.repeat_interleave(self.num_heads), key.repeat_interleave(self.num_heads)
+        types = context.pair_types.repeat_interleave(self.num_heads)
+
+        keys = k[rows, key]
+        if self.edge_type == "key":
+            keys = keys * self.edge_type_scale[types, heads]
+        score = (q[rows, query] * keys).sum(-1) / math.sqrt(head_dim)
+        if self.edge_type == "bias":
+            score = score + self.edge_type_bias[types, heads]
+        if context.pair_bias is not None:
+            score = score + context.pair_bias.reshape(-1).to(score.dtype)
+
+        target = rows * seq_len + query  # the (row, query) each pair belongs to
+        weights = scatter_softmax(score, target, num_nodes=n_rows * seq_len)
+        if self.training and self.dropout > 0.0:
+            weights = F.dropout(weights, p=self.dropout)
+        if need_weights:
+            full = q.new_zeros(n_rows, seq_len, seq_len).index_put((rows, query, key), weights)
+            return full @ v, full
+        out = q.new_zeros(n_rows * seq_len, head_dim).index_add(0, target, weights[:, None] * v[rows, key])
+        return out.view(n_rows, seq_len, head_dim), None
+
+
 # --------------------------------------------------------------------------- registry entries
 
 
@@ -550,6 +640,52 @@ def _build_linear(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bia
             stacklevel=2,
         )
     return LinearAttention(embed_dim, num_heads, head_dim)
+
+
+def _validate_exphormer(attention_cfg):
+    exphormer = attention_cfg.get("exphormer", None)
+    if exphormer is None:
+        raise ValueError("attention.kind 'exphormer' needs the attention.exphormer block.")
+    if exphormer.degree < 0 or exphormer.degree % 2:
+        raise ValueError(
+            "attention.exphormer.degree must be an even number >= 0 (the expander is built from degree / 2 "
+            f"permutations; 0 means none), got {exphormer.degree}."
+        )
+    if exphormer.edge_type not in EXPHORMER_EDGE_TYPES:
+        raise ValueError(
+            f"attention.exphormer.edge_type must be one of {EXPHORMER_EDGE_TYPES}, got {exphormer.edge_type!r}."
+        )
+
+
+def _exphormer_pattern(attention_cfg, *, edge_index, batch, index_nodes, blocked, seed, generator, training, device):
+    """The Exphormer attention graph of a batch: fixed per graph, or redrawn per training step if ``resample``."""
+    exphormer = attention_cfg.exphormer
+    return attention_pattern(
+        edge_index,
+        batch,
+        index_nodes,
+        blocked,
+        graph_edges=bool(exphormer.graph_edges),
+        degree=int(exphormer.degree),
+        seed=seed,
+        generator=generator if training and bool(exphormer.resample) else None,
+        device=device,
+    )
+
+
+@register_attention(
+    "exphormer",
+    validate=_validate_exphormer,
+    mask="pattern",
+    bias_forms=frozenset({"pairs"}),
+    rotary=True,
+    training_maps=False,
+    pattern=_exphormer_pattern,
+)
+def _build_exphormer(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
+    return ExphormerAttention(
+        embed_dim, num_heads, head_dim, dropout=dropout, edge_type=str(attention_cfg.exphormer.edge_type)
+    )
 
 
 def build_attention_factory(attention_cfg, *, embed_dim: int, num_heads: int, dropout: float, bias_factor_dim: int):

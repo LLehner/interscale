@@ -127,6 +127,10 @@ class TransformerNodeEncoderHook(GlobalModule):
         # from `attention_seed` (optim.seed) -- never from the global RNG, so enabling a backend
         # shifts neither another weight's initialisation nor the batch order.
         self.attention_spec = ATTENTION_REGISTRY[self.attention_kind]
+        self.attention_cfg = attention
+        self.attention_seed = int(attention_seed)
+        # Draws a sparse backend's pattern when it is resampled in training (Exphormer's `resample`).
+        self.attention_generator = torch.Generator().manual_seed(self.attention_seed)
         generator = torch.Generator().manual_seed(int(attention_seed))
         for layer in self.transformer_encoder.layers:
             if hasattr(layer.self_attn, "draw_features"):
@@ -199,24 +203,37 @@ class TransformerNodeEncoderHook(GlobalModule):
             else keep_indices,  # Add parameter to ensure masked nodes are kept (not during evaluation)
         )
 
-        if self.attention_spec.mask == "pairs":
-            # The same blocked set as the dense masks below, as a list of pairs, and the attention
-            # biases as low-rank factors: a backend that never forms the S x S matrix (Performer)
-            # folds them into its queries and keys. Both laid out from this call's index_nodes.
-            factors = None
-            if self.attention_bias is not None:
+        if self.attention_spec.mask in ("pairs", "pattern"):
+            # The same blocked set as the dense masks below, as a list of pairs. A backend that never
+            # forms the S x S matrix takes it this way, with the attention biases in the form it
+            # carries: low-rank factors it folds into its queries and keys (Performer), or the bias
+            # of each pair of the sparse pattern it attends along (Exphormer). All of it laid out
+            # from this call's index_nodes.
+            hops = self.local_mask_hops if self.long_range_attention else 0
+            edge_index = getattr(batched_data, "edge_index", None)
+            blocked = blocked_pairs(edge_index, batched_data.batch, index_nodes, n_hops=hops, device=emb.device)
+            factors = pattern = pattern_types = pair_bias = None
+            if self.attention_spec.mask == "pattern":
+                pattern, pattern_types = self.attention_spec.pattern(
+                    self.attention_cfg,
+                    edge_index=edge_index,
+                    batch=batched_data.batch,
+                    index_nodes=index_nodes,
+                    blocked=blocked,
+                    seed=self.attention_seed,
+                    generator=self.attention_generator,
+                    training=self.training,
+                    device=emb.device,
+                )
+                if self.attention_bias is not None:
+                    pair_bias = self.attention_bias.pairs(
+                        batched_data, index_nodes, src_padding_mask, pattern, dtype=emb.dtype, device=emb.device
+                    )
+            elif self.attention_bias is not None:
                 factors = self.attention_bias.factors(
                     batched_data, index_nodes, src_padding_mask, dtype=emb.dtype, device=emb.device
                 )
-            hops = self.local_mask_hops if self.long_range_attention else 0
-            blocked = blocked_pairs(
-                getattr(batched_data, "edge_index", None),
-                batched_data.batch,
-                index_nodes,
-                n_hops=hops,
-                device=emb.device,
-            )
-            attention_mask = StructuredMask(blocked, factors)
+            attention_mask = StructuredMask(blocked, factors, pattern, pattern_types, pair_bias)
         elif self.long_range_attention and self.local_mask_hops > 0:
             # Block everything the local component has already seen, so the transformer can only
             # contribute what the GNN could not.
@@ -320,10 +337,10 @@ class TransformerNodeEncoderHook(GlobalModule):
         # A StructuredMask (blocked pairs) is not a tensor the encoder could merge: it reaches the
         # layers as their per-batch context, and the encoder gets no dense mask.
         structured = isinstance(mask, StructuredMask)
-        if structured != (self.attention_spec.mask == "pairs"):
+        if structured != (self.attention_spec.mask in ("pairs", "pattern")):
             raise ValueError(
                 f"attention.kind {self.attention_kind!r} takes its mask as "
-                + ("blocked pairs (a StructuredMask)" if self.attention_spec.mask == "pairs" else "a dense tensor")
+                + ("a dense tensor" if self.attention_spec.mask == "dense" else "a StructuredMask")
                 + ", the form common_step_local_to_global builds for it."
             )
         if mask is not None and not structured and mask.is_floating_point():

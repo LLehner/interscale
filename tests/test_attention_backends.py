@@ -1431,3 +1431,296 @@ def test_a_graph_edge_is_its_target_attending_to_its_source():
     pairs, types = attention_pattern(edge_index, batch, [list(range(4))], blocked, graph_edges=True, degree=0)
     graph = pairs[:, types == 0]
     assert graph.tolist() == [[0], [2], [0]]
+
+
+# --------------------------------------------------------------------------- Exphormer attention
+
+
+def _exphormer_cfg(degree=4, graph_edges=True, resample=False, edge_type="bias", head_dim=0):
+    return _Att(
+        kind="exphormer",
+        head_dim=head_dim,
+        exphormer=_Att(degree=degree, graph_edges=graph_edges, resample=resample, edge_type=edge_type),
+    )
+
+
+def _attention_pair(edge_type="bias", seed=0):
+    """A dense skeleton and an Exphormer layer with the same projections (one seed, torch's draws)."""
+    from interscale.module.global_modules.attention import DenseAttention, ExphormerAttention
+
+    torch.manual_seed(seed)
+    dense = DenseAttention(N_EMBED, N_HEADS, N_EMBED // N_HEADS)
+    torch.manual_seed(seed)
+    exphormer = ExphormerAttention(N_EMBED, N_HEADS, N_EMBED // N_HEADS, edge_type=edge_type)
+    return dense, exphormer
+
+
+def _layout(max_seq_len=7, hops=1):
+    """Two graphs (9 and 6 cells; the first subsampled to 7) with their blocked pairs, padding and dense mask."""
+    from interscale.tl.masking import blocked_pairs
+
+    batch = _spectral_batch()
+    padding, index_nodes = _padded_layout(batch, max_seq_len=max_seq_len)
+    seq_len = padding.shape[1]
+    blocked = blocked_pairs(batch.edge_index, batch.batch, index_nodes, n_hops=hops)
+    dense = torch.zeros(2, seq_len + 1, seq_len + 1, dtype=torch.bool)
+    dense[blocked[0], blocked[1], blocked[2]] = True
+    padding_cls = torch.cat([padding, torch.zeros(2, 1, dtype=torch.bool)], dim=1)
+    return batch, index_nodes, padding, padding_cls, blocked, dense.repeat_interleave(N_HEADS, dim=0)
+
+
+def _complete_pattern(blocked, padding_cls):
+    """Every pair whose key is not padding, minus the blocked ones: dense attention, as a pattern."""
+    n_graphs, width = padding_cls.shape
+    pairs = _every_pair(n_graphs, width - 1)
+    open_key = ~padding_cls[pairs[0], pairs[2]]
+    codes = (pairs[0] * width + pairs[1]) * width + pairs[2]
+    blocked_codes = (blocked[0] * width + blocked[1]) * width + blocked[2]
+    pairs = pairs[:, open_key & ~torch.isin(codes, blocked_codes)]
+    return pairs, torch.zeros(pairs.shape[1], dtype=torch.long)
+
+
+def test_exphormer_along_every_open_pair_is_dense_attention():
+    """The definition, pinned: with the pattern of every open pair, Exphormer's softmax over each
+    query's pairs is dense attention -- outputs and maps, with the long-range mask, padding, a
+    subsampled graph, every attention bias (per pair against dense) and RoPE."""
+    from interscale.module.global_modules.positional_encodings import AttentionBias
+
+    batch, index_nodes, padding, padding_cls, blocked, dense_mask = _layout()
+    encoders = _bias_encoders()
+    bias = AttentionBias(
+        {"distance": encoders["distance"], "spectral": encoders["spectral"], "fourier": encoders["fourier"]},
+        n_heads=N_HEADS,
+        spatial_unit_um=1.0,
+    )
+    cpu = torch.device("cpu")
+    dense_bias = bias(batch, index_nodes, padding, dtype=torch.float32, device=cpu)
+    pairs, types = _complete_pattern(blocked, padding_cls)
+    pair_bias = bias.pairs(batch, index_nodes, padding, pairs, dtype=torch.float32, device=cpu)
+
+    seq_len = padding_cls.shape[1]
+    x = torch.randn(seq_len, 2, N_EMBED)
+    angles = torch.rand(2 * N_HEADS, seq_len, N_EMBED // N_HEADS // 2) * 6
+    rotary = (angles.cos().repeat(1, 1, 2), angles.sin().repeat(1, 1, 2))
+    dense, exphormer = _attention_pair()
+    for with_bias in (False, True):
+        mask = dense_bias.masked_fill(dense_mask, float("-inf")) if with_bias else dense_mask
+        context = StructuredMask(blocked, None, pairs, types, pair_bias if with_bias else None)
+        out_dense, w_dense = dense(x, x, x, key_padding_mask=padding_cls, attn_mask=mask, rotary=rotary)
+        out_ex, w_ex = exphormer(x, x, x, key_padding_mask=padding_cls, rotary=rotary, context=context)
+        assert torch.allclose(out_ex, out_dense, atol=1e-5)
+        assert torch.allclose(w_ex, w_dense, atol=1e-5)
+
+
+def test_exphormer_paths_agree_and_attend_only_along_the_pattern():
+    from interscale.tl.masking import attention_pattern
+
+    batch, index_nodes, padding, padding_cls, blocked, _ = _layout()
+    pairs, types = attention_pattern(
+        batch.edge_index, batch.batch, index_nodes, blocked, graph_edges=True, degree=2, seed=0
+    )
+    seq_len = padding_cls.shape[1]
+    q, k, v = _qkv(n_graphs=2, seq_len=seq_len)
+    _, exphormer = _attention_pair()
+    context = StructuredMask(blocked, None, pairs, types, None)
+    out_fast, none = exphormer._attend(q, k, v, padding_cls, None, False, context)
+    out_full, weights = exphormer._attend(q, k, v, padding_cls, None, True, context)
+
+    assert none is None and torch.allclose(out_fast, out_full, atol=1e-5)
+    allowed = torch.zeros_like(weights, dtype=torch.bool)
+    rows = pairs[0].repeat_interleave(N_HEADS) * N_HEADS + torch.arange(N_HEADS).repeat(pairs.shape[1])
+    allowed[rows, pairs[1].repeat_interleave(N_HEADS), pairs[2].repeat_interleave(N_HEADS)] = True
+    assert torch.all(weights[~allowed] == 0)
+    assert torch.allclose(weights.sum(-1), torch.ones(weights.shape[:2]), atol=1e-5)  # every row has a key
+
+
+@pytest.mark.parametrize("edge_type", ["bias", "key"])
+def test_exphormer_edge_types_start_neutral_and_then_steer(edge_type):
+    from interscale.tl.masking import attention_pattern
+
+    batch, index_nodes, padding, padding_cls, blocked, _ = _layout()
+    pairs, types = attention_pattern(
+        batch.edge_index, batch.batch, index_nodes, blocked, graph_edges=True, degree=2, seed=0
+    )
+    q, k, v = _qkv(n_graphs=2, seq_len=padding_cls.shape[1])
+    _, typed = _attention_pair(edge_type=edge_type)
+    plain = StructuredMask(blocked, None, pairs, torch.zeros_like(types), None)
+    context = StructuredMask(blocked, None, pairs, types, None)
+    _, w_plain = typed._attend(q, k, v, padding_cls, None, True, plain)
+    _, w_typed = typed._attend(q, k, v, padding_cls, None, True, context)
+    assert torch.allclose(w_plain, w_typed, atol=1e-6)  # neutral at the start, whatever the types
+
+    with torch.no_grad():
+        if edge_type == "bias":
+            typed.edge_type_bias[2] = 10.0  # the virtual edges
+        else:
+            typed.edge_type_scale[2] = 0.0  # virtual keys silenced: their logit is 0
+    _, w_steered = typed._attend(q, k, v, padding_cls, None, True, context)
+    assert not torch.allclose(w_steered, w_typed, atol=1e-3)
+    if edge_type == "bias":
+        # Every cell row now attends to CLS. (CLS's own row is all virtual edges, raised alike.)
+        assert (w_steered[:, :-1, -1] > 0.95).all()
+
+
+def _complete_batch(n=9, seed=0):
+    edge_index = torch.tensor([[i, j] for i in range(n) for j in range(n) if i != j], dtype=torch.long).T
+    pos = torch.rand(n, 2, generator=torch.Generator().manual_seed(seed)) * 1000
+    return _Batch(edge_index, torch.zeros(n, dtype=torch.long), n, pos=pos)
+
+
+def _distance_bias(seed=3):
+    from interscale.module.global_modules.positional_encodings import AttentionBias, DistanceBias
+
+    encoder = DistanceBias(N_HEADS, 8, 1500.0)
+    with torch.no_grad():
+        encoder.table.copy_(torch.randn(encoder.table.shape, generator=torch.Generator().manual_seed(seed)))
+    return AttentionBias({"distance": encoder}, n_heads=N_HEADS, spatial_unit_um=1.0)
+
+
+def test_an_exphormer_model_on_a_complete_graph_is_the_dense_model():
+    """End to end: without the long-range mask the pattern of a complete graph is every pair, so an
+    Exphormer model computes what the dense model does at the same seed -- distance bias included."""
+    batch = _complete_batch()
+    emb = torch.randn(batch.num_nodes, N_EMBED)
+
+    def run(attention):
+        torch.manual_seed(0)
+        module = _module(attention=attention, attention_bias=_distance_bias()).eval()
+        padded, padding, _, mask, rotary = module.common_step_local_to_global(batch, emb, eval_step=True)
+        return module.forward(padded, padding, mask, register_hook=True, rotary=rotary)
+
+    out_dense, _, attn_dense = run(None)
+    out_ex, _, attn_ex = run(_exphormer_cfg())
+    assert torch.allclose(out_ex, out_dense, atol=1e-5)
+    assert torch.allclose(attn_ex, attn_dense, atol=1e-5)
+
+
+def test_exphormer_blocks_what_the_long_range_mask_blocks():
+    n = 9
+    batch = _Batch(_path_graph(n), torch.zeros(n, dtype=torch.long), n)
+    emb = torch.randn(n, N_EMBED)
+    dense = _module(long_range=True, hops=2).eval()
+    exphormer = _module_with(_exphormer_cfg(), long_range=True, hops=2).eval()
+    _, _, _, dense_mask, _ = dense.common_step_local_to_global(batch, emb, eval_step=True)
+    padded, padding, _, mask, rotary = exphormer.common_step_local_to_global(batch, emb, eval_step=True)
+    exphormer.forward(padded, padding, mask, register_hook=True, rotary=rotary)
+
+    weights = exphormer.transformer_encoder.layers[0].get_attn_output_weights()[0]
+    assert torch.all(weights[dense_mask[0]] == 0)
+    assert not (mask.pair_types == 0).any()  # under the mask the graph edges are gone
+    assert torch.allclose(weights.sum(-1), torch.ones(n + 1), atol=1e-5)
+
+
+@pytest.mark.parametrize("hops", [1, 2, 3])
+def test_exphormer_is_finite_on_a_dense_graph_under_the_long_range_mask(hops):
+    batch = _complete_batch(12)
+    module = _module_with(_exphormer_cfg(), long_range=True, hops=hops).eval()
+    padded, padding, _, mask, rotary = module.common_step_local_to_global(batch, torch.randn(12, N_EMBED), True)
+    out, _, attn = module.forward(padded, padding, mask, register_hook=True, rotary=rotary)
+    out.sum().backward()
+    assert torch.isfinite(out).all() and torch.isfinite(attn).all()
+    assert torch.allclose(attn[0, :, :12, -1], torch.ones(N_HEADS, 12), atol=1e-5)  # CLS alone is open
+    assert all(torch.isfinite(p.grad).all() for p in module.parameters() if p.grad is not None)
+
+
+def test_exphormer_trains_feeds_relevance_and_runs_a_full_step():
+    batch = _complete_batch(10)
+    emb = torch.randn(10, N_EMBED)
+    target = torch.randn(11, 1, N_EMBED)
+    module = _module_with(_exphormer_cfg(), long_range=True, hops=2)
+    optimizer = torch.optim.Adam(module.parameters(), lr=1e-2)
+    for _ in range(5):
+        optimizer.zero_grad()
+        padded, padding, _, mask, rotary = module.common_step_local_to_global(batch, emb, eval_step=True)
+        loss = torch.nn.functional.mse_loss(module.forward(padded, padding, mask, rotary=rotary)[0], target)
+        assert torch.isfinite(loss)
+        loss.backward()
+        optimizer.step()
+
+    module.eval()
+    path = _Batch(_path_graph(7), torch.zeros(7, dtype=torch.long), 7)
+    _, _, _, _, relevance = module.evaluate(path, torch.randn(7, N_EMBED))
+    assert relevance.shape == (8, 8) and torch.isfinite(relevance).all()
+
+    full = TransformerNodeEncoderHook(
+        max_seq_len=32,
+        n_heads=2,
+        dropout_global=0.0,
+        act_func="relu",
+        num_layers=1,
+        dim_feedforward=16,
+        long_range_attention=False,
+        local_mask_hops=0,
+        n_input=8,
+        n_output=8,
+        n_embed=8,
+        decoder_type="linear",
+        dropout_decoder=0.0,
+        decoder_hidden_dims=[16],
+        mask_percentage=0.3,
+        mask_strategy="node",
+        type_gex_embedding=None,
+        attention=_exphormer_cfg(),
+    )
+    out = full._common_step(_data_batch(), "regression", "node")
+    step_loss = torch.nn.functional.mse_loss(out.y_pred, out.y_true)
+    step_loss.backward()
+    assert torch.isfinite(step_loss) and out.attn is None
+
+
+def test_exphormer_adds_only_its_edge_type_weights_and_moves_the_rng_as_dense():
+    torch.manual_seed(0)
+    dense = _from_config(_cfg())
+    rng_dense = torch.get_rng_state()
+    torch.manual_seed(0)
+    exphormer = _from_config(_cfg(kind="exphormer"))
+    assert torch.equal(rng_dense, torch.get_rng_state())
+    ex_state = exphormer.state_dict()
+    for key, value in dense.state_dict().items():
+        assert torch.equal(value, ex_state[key]), key
+    assert {k for k in ex_state if k not in dense.state_dict()} == {
+        f"transformer_encoder.layers.{i}.self_attn.edge_type_bias" for i in range(2)
+    }
+
+
+def test_the_pattern_is_redrawn_only_in_training_with_resample_and_never_from_the_global_rng():
+    batch = _Batch(_rgg(16, 0.4, seed=2), torch.zeros(16, dtype=torch.long), 16)
+    emb = torch.randn(16, N_EMBED)
+
+    def patterns(module, calls=2):
+        out = []
+        for _ in range(calls):
+            rng = torch.get_rng_state()
+            mask = module.common_step_local_to_global(batch, emb, eval_step=True)[3]
+            assert torch.equal(rng, torch.get_rng_state())
+            out.append(mask.pairs)
+        return out
+
+    first, second = patterns(_module_with(_exphormer_cfg(resample=True)).train())
+    assert not torch.equal(first, second)
+    first, second = patterns(_module_with(_exphormer_cfg(resample=True)).eval())
+    assert torch.equal(first, second)
+    first, second = patterns(_module_with(_exphormer_cfg(resample=False)).train())
+    assert torch.equal(first, second)
+
+
+def test_the_validator_takes_every_bias_and_rope_for_exphormer():
+    from interscale.config import _validate_attention
+
+    _validate_attention(_cfg(kind="exphormer", bias=["distance", "spectral", "fourier"], rotary=["rope"]))
+    with pytest.raises(ValueError, match="reads the attention maps in training"):
+        _validate_attention(_cfg(kind="exphormer", loss="SCE_EntropyATT_Loss"))
+    cfg = _cfg(kind="exphormer")
+    cfg.model.global_component.parameters.attention.exphormer.degree = 3
+    with pytest.raises(ValueError, match="degree must be an even number"):
+        _validate_attention(cfg)
+    cfg = _cfg(kind="exphormer")
+    cfg.model.global_component.parameters.attention.exphormer.edge_type = "embedding"
+    with pytest.raises(ValueError, match="edge_type must be one of"):
+        _validate_attention(cfg)
+
+
+def test_the_checkpoint_name_carries_exphormer():
+    from interscale.tl.utils import _attention_tag
+
+    assert _attention_tag(_cfg(kind="exphormer")) == "attn-exphormer_"

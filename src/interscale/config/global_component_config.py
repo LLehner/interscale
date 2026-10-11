@@ -141,5 +141,18 @@ def get_global_component_cfg(cfg, global_component_name):
         att.performer = CN()
         att.performer.num_features = 128
         att.performer.redraw_interval = 0
+        # `exphormer`: exact softmax attention along a sparse attention graph (Shirzad et al. 2023):
+        # the neighbour graph's edges (`graph_edges`), a random expander of `degree` (even; built
+        # from degree / 2 random permutations, fixed per graph unless `resample` redraws it every
+        # training step) and CLS as the virtual node linked to every cell -- minus every pair the
+        # long-range mask blocks, so under the mask the graph edges drop out by themselves.
+        # `edge_type`: `bias` learns a bias per edge type and head; `key` scales each key dimension
+        # per type and head, as Exphormer's edge embeddings do. Carries every bias (as per-pair
+        # values) and RoPE. O(pairs) instead of S x S.
+        att.exphormer = CN()
+        att.exphormer.degree = 8
+        att.exphormer.graph_edges = True
+        att.exphormer.resample = False
+        att.exphormer.edge_type = "bias"
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

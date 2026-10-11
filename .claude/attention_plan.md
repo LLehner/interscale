@@ -28,7 +28,7 @@ a real state.
 | 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | **Performer and linear implemented, unverified** — `tl.blocked_pairs` equals the dense mask at hops 0–3 (two graphs of different size, one subsampled). Performer: the orthogonal features estimate exp(x·y) without bias (found biased by ~7% before the Haar sign fix); the map's error against softmax falls with the feature count (TV 0.10 at m = 16, 0.009 at 4096); the float64 subtraction stays exact where blocked keys hold 99.7% of a query's mass (float32: ~1e-5 off); shares every initial weight with the dense model at one seed; per-layer features from their own seeded generator, redrawn only in training and only when asked. Linear: equals its definition; each head's map has rank exactly `head_dim` before the mask (dense softmax at the same width: near full rank); adds no state, so a dense checkpoint loads strictly; refuses RoPE and biases, and the validator says why; warns below a head width of 32. Both: factorised and explicit paths agree to 1e-5 with mask and padding; block exactly the dense mask's pairs; finite on the complete-graph test at hops 1–3 and through 5 training steps; relevance runs; train through `_common_step`. Five mutations, each caught. 570 tests pass; harness IDENTICAL. **No real-data run yet. Generated arms not built** | 2026-10-11 |
 | 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | **implemented, unverified** — spectral: `U Wᵀ` equals the dense bias (two graphs of different size, one subsampled; CLS and padding zero); a zero bias leaves one side 0 and the other small (mutation-checked); a Performer's map converges to dense softmax with the same bias (TV 0.047 → 0.014 from m = 1024 to 16384 at a bias of ±1.2). Fourier (`pe.bias: [fourier]`): zero at init; each entry is the learned function of `p_key − p_query` (mutation-checked: a flipped sine sign fails); translation-invariant; isotropic is symmetric and invariant to a turn by 180°/directions, anisotropic is not; the default grid fits a ring at 1 mm with R² > 0.9; derived `max_wavelength`; through Performer and dense attention end to end, gradient reaching the coefficients. 555 tests pass; harness IDENTICAL. **No real-data run yet** | 2026-10-11 |
 | 4 — global tokens and a null key | not started | | |
-| 5 — Exphormer-style sparse attention | **in progress** — the `pairs` form of the biases: each bias read off a list of pairs equals the dense bias at those pairs, CLS and padding included (mutation-checked). The attention pattern (`tl.attention_pattern`): graph edges (query = target), a random ~d-regular expander from a seed the graph determines, CLS both ways; blocked pairs, padding keys and duplicates removed; every row keeps a key; a pair found twice keeps the graph type; fixed per graph, redrawn only from a generator. Three mutations, each caught | | 2026-10-11 |
+| 5 — Exphormer-style sparse attention | **implemented, unverified** — with the pattern of every open pair it equals dense attention (outputs and maps; long-range mask, padding, a subsampled graph, distance + spectral + Fourier biases per pair, RoPE), and an Exphormer model on a complete graph equals the dense model at one seed, distance bias included; factorised and explicit paths agree; weights only along the pattern, every row with a key; edge types neutral at init, then steering; blocks exactly the long-range mask's pairs, the graph edges gone under it; finite on the complete-graph test at hops 1–3 and through 5 training steps; relevance runs; trains through `_common_step`; adds only its edge-type weights and moves the global RNG as dense does; the pattern is redrawn only in training with `resample`, never from the global RNG. The bias pair form and the pattern builder (earlier commits) checked against the dense bias and mask. Nine mutations across the three commits, each caught. 596 tests pass; harness IDENTICAL. **No real-data run yet** | 2026-10-11 |
 | 6 — fused exact attention (SDPA) | not started | | |
 | 7 — inducing points (optional) | not started | | |
 | 8 — beyond the window (whole slides; FlexAttention) | not planned in detail | | |
@@ -214,7 +214,7 @@ attention:
   global_tokens: 0     # Stage 4
   null_key: false      # Stage 4
   performer: {num_features: 128, redraw_interval: 0}   # 0 = draw once
-  exphormer: {degree: 8, sampling: expander, graph_edges: true, resample: false, edge_type: bias}
+  exphormer: {degree: 8, graph_edges: true, resample: false, edge_type: bias}
   inducing:  {num_latents: 16}
 ```
 
@@ -484,10 +484,11 @@ Each token attends only along an attention graph built from three edge sets (Shi
 2023):
 
 - **graph edges:** the neighbour graph the GNN uses (`graph_edges`);
-- **expander edges:** a random d-regular graph (`sampling: expander`, `degree: d`). Two
-  alternatives that are not in Exphormer can also be selected: `uniform` (d sampled keys per query)
-  and `distance` (keys stratified in log distance so far cells are not crowded out);
-- **virtual nodes:** CLS plus Stage 4's global tokens, linked both ways to every cell.
+- **expander edges:** a random ~d-regular graph (`degree: d`, even). Two alternatives that are not
+  in Exphormer are not built yet: `uniform` (d sampled keys per query) and `distance` (keys
+  stratified in log distance so far cells are not crowded out);
+- **virtual nodes:** CLS (and Stage 4's global tokens once they exist), linked both ways to every
+  cell.
 
 The long-range mask removes its blocked set from this graph, whatever an edge's source. Under
 `CombinedModel` with the mask on, the graph edges therefore vanish by themselves and the attention
@@ -498,10 +499,10 @@ is purely long range; under `GlobalModel` they stay, as in Exphormer.
 - **Edge types:** each edge carries its type (graph, expander, virtual). With `edge_type: bias` that
   is a learned per-head bias, zero at init. With `edge_type: key`, the keys are scaled by a
   per-type embedding, as Exphormer does.
-- **Fixed or resampled edges:** `resample: false` precomputes the expander once per graph on the
-  full graph, as LapPE is precomputed, and restricts it to the kept tokens. `resample: true` draws a
-  fresh one each training step from the backend generator, over the kept tokens. Eval always uses
-  the precomputed one, so maps reproduce.
+- **Fixed or resampled edges:** `resample: false` draws the expander on the full graph from a seed
+  the graph itself determines, so it is the same every time the graph is seen, and restricts it to
+  the kept tokens. `resample: true` draws a fresh one each training step from the backend
+  generator. Eval always uses the fixed one, so maps reproduce.
 - **Encodings:** biases through `pairs` (distance per edge, spectral per edge, SPD from a table);
   RoPE rotates before the gather; node PEs as usual.
 - **Maps:** scattered to dense at eval, zero off the attention graph.
@@ -516,6 +517,39 @@ is purely long range; under `GlobalModel` they stay, as in Exphormer.
     epochs; resampling uses only the backend generator.
   - `pairs` biases equal the dense bias on the edges.
   - The edge-type bias is zero at init.
+
+#### How Stage 5 was built
+
+- **Before Stage 4, with CLS as the only virtual node.** The plan put global tokens first because
+  Exphormer's virtual nodes are global tokens; CLS already is one, linked both ways to every cell,
+  so Exphormer runs with one virtual node now. Global tokens join the pattern when Stage 4 adds
+  them.
+- **The expander is not precomputed.** Instead of an attribute on each `Data`, it is drawn on the
+  fly from `tl.graph_seed`, a SplitMix64 mix of `optim.seed`, the graph's size and its edges. The
+  same graph -- in training, in evaluation, rebuilt by `get_model_output` -- gets the same expander
+  whatever batch it lands in, with no dataset hook. Python's `hash` was avoided because its tuple
+  hashing may change between versions. `tl.random_expander` builds it from `degree / 2` random
+  permutations in both directions (so `degree` is even), dropping self-loops and repeats, so a few
+  nodes end up with fewer than `degree` edges.
+- **`tl.attention_pattern` builds the attention graph** as `(graph, query, key)` positions with edge
+  types `("graph", "expander", "virtual")`. A graph edge `src -> dst` is the query `dst` attending to
+  `src` (PyG's message direction). Every row, padding rows included, attends to CLS, so no softmax
+  is ever empty. Blocked pairs are removed by code, and a pair found twice keeps the graph type.
+- **A third bias form, `pairs`.** Distance (profile and linear), spectral and Fourier read off any
+  list of pairs, so Exphormer carries every bias. The distance biases take each pair's distance
+  from the padded coordinates, with no `cdist` and nothing `S x S`.
+- **The backend** (`ExphormerAttention`) scatters a softmax over each query's pairs
+  (`torch_geometric.utils.softmax`). Its edge types act as a per-type, per-head bias
+  (`edge_type: bias`, zero at init) or as a per-type scaling of each key dimension (`edge_type: key`,
+  ones at init), Exphormer's form; both start as plain attention along the pattern. Attention
+  dropout is applied to the pair weights, as dense attention applies it to its map.
+- **`AttentionSpec.pattern`** holds the pattern builder, so the transformer stays backend-agnostic:
+  for `mask="pattern"` it builds the blocked pairs, asks the spec for the pattern, and computes the
+  biases on it.
+- **Verified by reduction to dense.** With every open pair as the pattern it is dense attention,
+  to 1e-5 at the attention level (mask, padding, subsampling, all three biases, RoPE). End to end, an
+  Exphormer model on a complete graph without the long-range mask equals the dense model at one
+  seed, distance bias included.
 
 ### 6 — fused exact attention
 
