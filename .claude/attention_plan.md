@@ -1,0 +1,564 @@
+# Staged plan: attention mechanisms for the global module
+
+Adds alternative attention mechanisms ("backends") to the transformer, selectable from config, so
+that many combinations of attention, encodings and model widths can be tested on several datasets.
+The papers below were inspiration, not specifications: a combination one paper happened to use is
+not a constraint, and anything that can be combined should be combinable.
+
+- Efficient-transformer survey (Tay et al., arXiv 2009.06732v3): the taxonomy.
+- Long Range Arena (LRA; Tay et al., ICLR 2021): how to compare mechanisms fairly, and the
+  "required attention span" measure.
+- Dimitrov (arXiv 2508.17175): dense vs. sparse graph transformers (Graphormer, SAN, GraphGPS,
+  Exphormer).
+- SpaFormer (Wen et al., arXiv 2302.03038): a Performer over cells as tokens.
+
+Read [`background.md`](background.md) and [`PE_plan.md`](PE_plan.md) first: this plan builds on PE
+Stages 5–8 and keeps every invariant listed there. Code paths are relative to `src/interscale/`.
+
+## Status
+
+Last updated 2026-10-11. Same rules as the other plans: update this table in the same commit as the
+work, and a stage is `done` only when something external verified it. "Implemented, unverified" is
+a real state.
+
+| stage | state | verified by | date |
+|---|---|---|---|
+| 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | not started | | |
+| 1 — attention diagnostics (span in µm, sink mass, effective keys) | not started | | |
+| 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | not started | | |
+| 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | not started | | |
+| 4 — global tokens and a null key | not started | | |
+| 5 — Exphormer-style sparse attention | not started | | |
+| 6 — fused exact attention (SDPA) | not started | | |
+| 7 — inducing points (optional) | not started | | |
+| 8 — beyond the window (whole slides; FlexAttention) | not planned in detail | | |
+
+## In short
+
+- **Two new attention types come first: Performer (Stage 2) and Exphormer-style sparse attention
+  (Stage 5).** Linear attention rides along with the Performer because they share all of their
+  machinery. Global tokens (Stage 4) come before Exphormer because its virtual nodes are global
+  tokens.
+- **Everything else is a component that combines freely.** That covers node encodings, attention
+  biases, RoPE, global tokens, the null key, the long-range mask, and the model's width
+  (`n_embed`, `n_heads`, `head_dim`, `num_layers`).
+- **Compatibility is declared, not discovered.** Each backend lists what it can carry, and each
+  bias lists the forms it can be evaluated in. The validator rejects a combination that cannot work
+  when the config loads, and a generated arms file keeps only the combinations that pass.
+- **Dense attention stays the default and the reference.** Every backend is also run at a size
+  where dense still runs, so a difference is the mechanism and not the length. That is LRA's method.
+- **Interpretation needs per-layer maps with gradients at evaluation.** Every backend therefore has
+  an explicit path that computes the same function and materialises its map. Training may use the
+  cheap path; `evaluate()` uses the explicit one.
+
+## What the code already decides
+
+- **Every layer materialises its attention, in training too.** `_sa_block` calls the vendored MHA
+  with `need_weights=True, average_attn_weights=False`
+  (`module/global_modules/transformer_encoder_layer.py:87-97`). The explicit branch
+  (`transformer_utils.py:391-423`) therefore always runs, and the fused SDPA branch (`:425-447`)
+  never does. Each layer holds several `[B·H, S+1, S+1]` fp32 tensors (softmax and dropout outputs
+  kept for backward, plus a float mask built per layer at `:234-241, 381`). One such tensor at
+  B = 4 graphs and H = 4 heads is 0.4 GB at S = 2.5k, 6.4 GB at 10k and 160 GB at 50k. Its size
+  depends on the head count, not the head width.
+- **Training hooks, stacks and keeps maps that nothing reads.** `forward`'s `register_hook`
+  defaults to True (`transformer_encoder.py:200, 232`). Every training step therefore hooks every
+  layer's map for its gradient and stacks all layers into `final_attn` (`:283`). Each layer also
+  keeps its last map between steps. The only training consumer of the maps is
+  `SCE_EntropyATT_Loss` (`train/losses.py:183`); the gradients are only read in `evaluate()`.
+- **Interpretation reads dense maps with gradients.** `evaluate()` runs one graph, then
+  `SelfAttentionRelevance.generate_relevance` backpropagates and rolls out `I += Ā·I` over the
+  layers (`tl/self_attn_relevance.py:62-95`): dense `S × S`, O(L·S³). `get_model_output` stores `I`
+  as a dense `[n_cells, max_seq_len]` obsm (`model/combined_model.py:131-149`), which net flow and
+  the flow control read.
+- **Biases are merged into one dense float mask.** `AttentionBias` returns `[B·H, S+1, S+1]`
+  (`positional_encodings.py:735`), and `common_step_local_to_global` merges the boolean mask in
+  with `masked_fill` (`transformer_encoder.py:184`). That is right for dense attention and the wrong
+  shape for anything else.
+- **The spectral bias is already low rank.** `SpectralBias.forward` is `(V·diag(h_h))·Vᵀ`
+  (`positional_encodings.py:333`), so it can move into the queries and keys (Stage 3). The distance
+  bias is a function of `cdist` and is not low rank.
+- **RoPE is applied to q and k before the explicit/fused split** (`transformer_utils.py:339-355`).
+- **Head width is tied to model width.** torch's MHA fixes `head_dim = n_embed / n_heads`, and
+  `n_embed` (`config/model_config.py:10`) is shared with the local module, the decoders and the
+  probes. Widening the heads today widens the whole model; Stage 0 decouples the two.
+- **The k-hop closure is densified per full graph** (`tl/masking.py:296`): `N × N` booleans before
+  `pad_batch` subsamples. The sparse product just before it already holds the closure as pairs.
+- **Init order is load-bearing.** `CustomTransformerEncoderLayer` lets
+  `TransformerEncoderLayer.__init__` build and initialise a stock MHA, then replaces it
+  (`transformer_encoder_layer.py:46`), so the init RNG is drawn twice. A refactor that drops the
+  first draw or moves the second changes every later initial weight.
+- **`batch_first=False` keeps torch's encoder fast path off.** That path would otherwise bypass
+  `_sa_block`, and RoPE with it, in no-grad eval. Keep it.
+
+## Triage
+
+| family | examples | verdict | why |
+|---|---|---|---|
+| kernels | Performer (FAVOR+), linear (elu+1) | **yes** (2) | O(S); every pair stays reachable; SpaFormer's backbone, LRA's best on Pathfinder. Linear attention needs wide heads, see Stage 2 |
+| graph-sparse | Exphormer (graph ∪ expander ∪ virtual nodes), BigBird random + global | **yes** (5) | the sparse side of Dimitrov's comparison, and carries per-pair biases |
+| global tokens | ETC/Longformer global tokens, Exphormer virtual nodes, registers | **yes** (4) | CLS is already one; more can absorb attention sinks; Exphormer needs them |
+| exact, memory-efficient | SDPA, FlashAttention, FlexAttention | **yes** (6, 8) | same function, no approximation |
+| latent bottleneck | Set Transformer ISAB, Luna, Perceiver IO | optional (7) | tissue-wide latents as a summary |
+| local patterns | local window, blockwise, Image Transformer, Swin | no | the GNN already does local; the long-range mask forbids it |
+| strided / axial | Sparse Transformer, Longformer dilation, Axial, CCNet | no | need a 1D order or a grid, and token order here is arbitrary node order |
+| low-rank length projection | Linformer, Synthesizer | no | weights indexed by token position: not permutation-equivariant, and N varies per graph |
+| learnable patterns | Reformer, Routing, Sinkhorn | not now | fallback if kernels and Exphormer both fail sharp long-range attention |
+| recurrence, sparse MoE | Transformer-XL; Switch, GShard | no | sequence recurrence; FFN-level, not attention |
+| MPNN in every layer | GraphGPS | out of scope | an architecture change, not an attention mechanism; it would also mix local message passing into the global stream |
+
+## Components and how they combine
+
+✓ works; ✗ cannot work (the validator rejects it); ~ works with the caveat noted. A stage number
+means "from that stage on".
+
+| backend | node PE / SE | rope | distance (profile, linear) | distance (fourier) | spectral | SPD bias (future) | long-range mask | maps + relevance at eval | `SCE_EntropyATT_Loss` |
+|---|---|---|---|---|---|---|---|---|---|
+| dense | ✓ | ✓ | ✓ | ✓ 3 | ✓ | ✓ | ✓ | ✓ exact | ✓ |
+| performer, linear (2) | ✓ | ✓ | ✗ | ✓ 3 | ✓ 3 | ✗ | ✓ by subtraction | ✓ implied map | ✗ |
+| exphormer (5) | ✓ | ✓ | ✓ on edges | ✓ | ✓ on edges | ✓ with an SPD table | ✓ removed from the edges | ~ zero off the edges | ✗ |
+| dense, fused (6) | ✓ | ✓ | ✓ float mask | ✓ | ✓ | ✓ | ✓ | ✓ explicit path | ✗ |
+| inducing (7) | ✓ | ~ latents need positions | ✗ | ✗ | ✗ | ✗ | ✗ | ~ rank-m surrogate | ✗ |
+
+- **Global tokens and the null key (Stage 4)** combine with every row except inducing points.
+- **Head width, head count, depth and `n_embed`** combine with every row.
+- **Linear attention needs `head_dim` well above 4** to be worth running; see Stage 2.
+
+**Bias forms.** These are the extension point that makes the table derived rather than maintained:
+
+- `dense(ctx) → [B, H, S, S]`: today's form.
+- `pairs(ctx, b, i, j) → [H, P]` on any list of pairs: used by the dense backend (all pairs),
+  Exphormer (its edges) and FlexAttention (`score_mod`).
+- `factors(ctx) → U, W [B, H, S, r]` with `bias = U·Wᵀ`, moved into the queries and keys:
+  `q̃ = [q/√d, U]`, `k̃ = [k, W]`, logit `q̃ᵀk̃` at scale 1. This works in every backend that sees q
+  and k: for Performer, FAVOR+ estimates `exp(q̃ᵀk̃) = exp(qᵀk/√d + b)`; for linear attention, the
+  bias enters before the feature map.
+
+| encoding | dense | pairs | factors |
+|---|---|---|---|
+| distance, `profile` / `linear` | ✓ | ✓ per-pair norm | ✗ |
+| distance, `fourier` (3) | ✓ | ✓ | ✓, 2R dims |
+| spectral | ✓ | ✓, `Σᵢ h(λᵢ)·N·vᵢ[j]·vᵢ[l]` per pair | ✓, k dims |
+| SPD (Graphormer; future) | ✓ | ✓ from an SPD table (uint8, S² bytes) | ✗ |
+| RRWP (relative random-walk probabilities; future) | ✓ | ~ local only | ✗ |
+
+Node-level encodings enter the token before any attention, so they work with every backend. That
+covers the four node PEs and any future node SE: degree, SignNet, SAN's learned LPE, local density,
+niche composition.
+
+Under the long-range mask, local pair encodings carry nothing. RRWP, SPD within k hops and the
+distance bias below the mask radius only ever touch blocked pairs.
+
+## Design
+
+**Registry.** `module/global_modules/attention.py` holds
+`ATTENTION_REGISTRY[name] = AttentionSpec(build, validate, mask_forms, bias_forms, rotary, training_maps, eval_maps)`.
+Bias `PESpec`s gain `forms` (today both are `{"dense"}`). `_validate_attention` joins the folded
+validator list from PE Stage P. It checks that:
+
+- every enabled bias shares a form with the backend;
+- `pe.rotary` has a backend that rotates;
+- `long_range_attention` has a mask form;
+- `SCE_EntropyATT_Loss` gets `training_maps`.
+
+Each rejection names the backends or encodings that would fit.
+
+**One skeleton for every new backend.** Each new backend runs the same steps:
+
+1. Project `n_embed → H × head_dim` for q, k and v.
+2. Rotate q and k (RoPE).
+3. Run the core: dense, kernel, edge-list or latent.
+4. Merge the heads.
+5. Project `H × head_dim → n_embed`.
+
+The default dense path keeps today's `MultiHeadAttentionWithEdits`, so the harness stays
+IDENTICAL. The skeleton's dense core, with weights copied from that module, must reproduce its
+outputs and maps.
+
+**Free head width.** `attention.head_dim` (0 = `n_embed / n_heads`, today) sets the attention width
+without touching the local module, the decoders or the probes. `model.n_embed` stays free too, for
+when the whole model should be wider.
+
+- Head width is cheap: q, k and v are `O(S·H·head_dim)`.
+- Head count is not: every map is `[B·H, S, S]`.
+- RoPE's multiple-of-4 check moves to the attention head width, and so do the RoPE shape checks in
+  `forward` (`transformer_encoder.py:225`).
+
+**Per-batch context.** Inputs other than the masks reach the layers the way RoPE's do today: set on
+each layer for one `forward` call and cleared in a `finally` (`transformer_encoder.py:260-268`).
+`layer.rotary` becomes a general `layer.context` when the second consumer arrives (Stage 2's blocked
+pairs).
+
+**Explicit path.** On request, every backend materialises `[B·H, S', S']` maps with autograd, where
+S' = S + 1 + global tokens. `evaluate()`, relevance, Stage 1's diagnostics and the equivalence tests
+all use it. Maps are requested only where something consumes them.
+
+**Randomness.** Performer's features and Exphormer's resampled edges draw from a backend generator
+seeded from `optim.seed` and built under `fork_rng`, and only in training forward passes. Eval is
+deterministic per graph, and an off backend draws nothing.
+
+**Checkpoint tag.** `attn-<kind>[-hd<d>][-fused][-g<R>][-null]_` after the PE tag, only when not
+default. Without it, a sweep's arms overwrite each other's checkpoints.
+
+**Config.** `model.global_component.parameters.attention`, beside `pe`. Each stage adds its own
+sub-block together with its registry entry, so no key exists before something reads it:
+
+```yaml
+attention:
+  kind: dense          # dense | performer | linear | exphormer | inducing
+  head_dim: 0          # 0 = n_embed / n_heads
+  fused: false         # dense only (Stage 6)
+  global_tokens: 0     # Stage 4
+  null_key: false      # Stage 4
+  performer: {num_features: 64, redraw_interval: 0}    # 0 = draw once
+  linear:    {feature_map: elu}
+  exphormer: {degree: 8, sampling: expander, graph_edges: true, resample: false, edge_type: bias}
+  inducing:  {num_latents: 16}
+```
+
+Most of what the previous version left as questions are knobs here: `redraw_interval`, `head_dim`,
+and the row normalisation of net flow (both variants are reported). The sweep decides.
+
+## Stages
+
+Every stage: the tests pass; it runs end to end through `GlobalModel`, `CombinedModel`, the dual
+decoder and long-range masking, at more than one width; `get_model_output` runs; and the
+equivalence harness stays IDENTICAL with the new option off. Model runs happen on the cluster. New
+tests go in `tests/test_attention_backends.py`, and the existing long-range mask tests get
+parametrised over backends.
+
+### 0 — plumbing, free head width
+
+- **Registry** with `dense` = today's `MultiHeadAttentionWithEdits`, built at the same point in the
+  init order.
+- **The skeleton**, with a dense core and `attention.head_dim`. A non-default `head_dim` takes the
+  skeleton; the default keeps today's module.
+- **Maps only when consumed.** `register_hook` splits into `return_maps` and `relevance_hooks`.
+  `return_maps` stacks the per-layer maps and is on only when the loss consumes them;
+  `relevance_hooks` is on only in `evaluate()`. Numbers cannot move, and each training step stops
+  holding a stacked copy and a stored gradient per layer.
+- `forms` on bias specs, `_validate_attention`, checkpoint tag.
+- **Verify:**
+  - Harness IDENTICAL on all five cases. `global_sce_entropy_node` proves the entropy loss still
+    gets its maps; `combined_longrange_mse_node` covers the mask path.
+  - The skeleton's dense core, with weights copied from MHA, equals it in outputs and maps.
+  - Every validator rejection has a test, using test-registered backends that lack a form.
+  - Checkpoint names are unchanged by default.
+
+### 1 — attention diagnostics
+
+Per layer and head, from explicit maps on a fixed set of val graphs, with CLS and padding left out
+of the keys:
+
+- **Span (µm)**: `Σⱼ Aᵢⱼ‖pᵢ − pⱼ‖ / Σⱼ Aᵢⱼ`, the mean and quartiles over cells. This is LRA's
+  required attention span in physical units.
+- **Mass beyond radii** from config (`probe.attention_radii_um`).
+- **Mass on CLS**, and on global tokens and the null key after Stage 4: the attention sinks.
+- **Effective number of keys** `exp(H(Aᵢ))`: how peaked a head is.
+- **For approximate backends**, the row-wise total-variation distance to exact attention on the
+  same weights.
+
+These are logged as `probe/attn_*` through the probe callback when `probe.attention_diagnostics` is
+set, under its RNG rules, and are callable post hoc on any checkpoint. Coordinates come from
+`dataset.spatial_key`; without them span and radii are skipped with a warning. Everything is
+dataset-agnostic.
+
+**Verify:**
+
+- Planted maps read their known values: a query attending only to a cell 300 µm away reads 300.
+- Mutations are caught: CLS counted as a key, the wrong padding side, the wrong head order.
+- The global RNG states are unchanged after a pass.
+
+### 2 — kernel attention: Performer and linear
+
+Both compute `out = D⁻¹·φ(Q)(φ(K)ᵀV)` with `D = diag(φ(Q)φ(K)ᵀ1)`, at O(S·r·head_dim), where r is
+the feature count. They differ only in the feature map φ:
+
+- **Performer (FAVOR+, Choromanski et al., ICLR 2021):** positive orthogonal random features,
+  `φ(x) = exp(Wx − ‖x‖²/2)/√m` with `x = q/head_dim^{1/4}`, so that
+  `E[φ(q)ᵀφ(k)] = exp(qᵀk/√head_dim)`. That is an unbiased estimate of the softmax kernel, and each
+  head's map has rank m whatever the head width. Knobs: `num_features` m and `redraw_interval`.
+- **Linear (Katharopoulos et al., 2020):** `φ(x) = elu(x) + 1`. It is deterministic, with no
+  features to draw, but it is a different kernel, not an approximation of softmax.
+  - φ has as many features as the head has dims, so each head's map has rank ≤ `head_dim`.
+  - Every query's attention is then a mixture of the same `head_dim` key profiles, and the whole
+    sequence reaches a query through `head_dim` summary vectors. At 4 dims per head that is a
+    4-slot bottleneck per head.
+  - Softmax escapes the bound because exp of a low-rank logit matrix is generally full rank: a
+    query can still single out its best-aligned key.
+  - So linear attention is only run with `head_dim` ≥ 32 or so, and the width sweep shows how much
+    the bound costs.
+
+What both share:
+
+- **Long-range mask by subtraction.** Every blocked pair's term comes out of both sums:
+  `numᵢ −= Σ_{j∈B(i)} φ(qᵢ)ᵀφ(kⱼ)·vⱼ`, and `denᵢ` likewise.
+  - The pairs come from a new `tl.blocked_pairs`: the sparse k-hop closure mapped through
+    `index_nodes` to padded positions and never densified. It is checked equal to the dense mask,
+    including subsampled graphs and paths through dropped nodes.
+  - The subtraction is exact with respect to the kernel: both feature maps are positive, so what
+    remains is a sum of positive terms over the open keys, and CLS is always open.
+  - Risk: cancellation when a query's mass sits almost entirely on its blocked neighbourhood. Test
+    that case.
+- **Padding:** φ(k) is zeroed at padded keys.
+- **RoPE:** rotate q and k, then apply the feature map. For Performer this estimates
+  `exp(qᵀR_{n−m}k)`, the RoPE softmax kernel, with positive, normalised weights. For linear
+  attention the rotation keeps weights positive but is only approximately relative. RoFormer's
+  alternative, rotating only the numerator, gives weights that can be negative, which the flow
+  pipeline cannot use.
+- **Biases** arrive with Stage 3 (`factors`).
+- **Performer features** are buffers, so they are in the checkpoint. They are drawn from the backend
+  generator and fixed at eval.
+- **Maps:** the explicit path normalises `φ(Q)φ(K)ᵀ` with the blocked entries set to 0, which gives
+  the same numbers as the factorised path.
+
+**Generated sweep arms** (built with this stage, the first second backend).
+`scripts/make_attention_arms.py` takes lists of backends, node PEs, biases, rotary options and
+widths. It runs every combination through `load_config` and writes the ones the validator accepts
+as an `arms:` file, logging each rejected combination with its reason.
+
+**Verify:**
+
+- Performer: `φ(q)ᵀφ(k)` averaged over draws matches `exp(qᵀk/√d)` within its standard error, and
+  the error against exact attention falls like 1/√m.
+- Explicit and factorised paths agree to 1e-5.
+- The subtraction equals the explicit masked computation, including nearly fully blocked rows, CLS
+  rows and padding.
+- The long-range mask tests pass for both backends: `test_blocked_pairs_receive_no_attention`,
+  `test_paths_through_dropped_nodes_are_still_blocked` and the complete-graph NaN test.
+- Under RoPE with Performer, translating the coordinates leaves the expected attention unchanged.
+- Enabling either backend leaves the other initial weights and the batch order unchanged.
+- **Cross-evaluation** (cluster): a dense checkpoint evaluated with Performer attention, and the
+  reverse, measures the approximation on trained weights. Register the feature buffer under
+  `_OPTIONAL_STATE_PREFIXES` so either direction loads.
+
+### 3 — low-rank biases
+
+- **The `factors` form**, starting with the spectral bias: `U = √N·V·diag(h_h(λ))` and `W = √N·V`,
+  zero at CLS and padding. That is exactly today's bias as k extra q/k dims per head.
+- **`distance.kind: fourier`** (new): `b_h(Δ) = Σ_r a_{h,r}·cos(ω_rᵀΔ)`, optionally plus
+  `c_{h,r}·sin(ω_rᵀΔ)` for a directional prior.
+  - The frequencies sit on a polar grid: directions over 180°, radii geometric over
+    `[1/max_wavelength, 1/min_wavelength]`.
+  - `isotropic: true` ties the coefficients across directions, giving a near-radial bias.
+  - It costs 2R dims, starts at zero, and is also usable by dense and Exphormer as an alternative
+    to `profile`.
+- **Payoff:** the kernel backends get the spectral bias and a distance-like one, and fused attention
+  stops materialising a float bias.
+- **Verify:**
+  - The augmented logits equal the dense spectral-bias logits to 1e-5.
+  - CLS and padding stay zero.
+  - `fourier` is zero at init and translation-invariant, and an isotropic fit reproduces a target
+    radial profile within its band limit.
+  - Performer plus spectral is unbiased as in Stage 2.
+
+### 4 — global tokens and a null key
+
+- **`global_tokens: R`**: R learned tokens built like CLS, placed between the cells and CLS inside
+  `forward` only.
+  - They are never blocked, get zero bias rows and columns, and sit at the origin for RoPE.
+  - They are stripped from everything `forward` returns (outputs, maps, relevance), so the `[S+1]`
+    layout outside `forward` is unchanged. Relevance is rolled out over the full internal maps, then
+    stripped.
+  - These are Exphormer's virtual nodes, ETC's global tokens and ViT registers (Darcet et al., ICLR
+    2024).
+- **`null_key: true`**: torch's `add_zero_attn`, a zero key (logit 0) with a zero value, i.e.
+  softmax "off by one".
+  - Relax the RoPE guard at `transformer_utils.py:343`: the zero key is appended after the rotation
+    (`:358`).
+  - Delete `evaluate()`'s unused diagonal statistics (`transformer_encoder.py:314-325`), which would
+    raise on the wider map.
+- **New per-cell readouts:** mass on the global tokens, and null mass, i.e. how much a cell draws
+  from long-range context at all, as a map.
+- **Why:** background.md names attention sinks as a reason raw attention is not interpreted, and
+  CLS is the only sink today.
+- **Backends:** works with dense, kernel (where `φ(0)` estimates `exp(0) = 1`) and Exphormer.
+- **Verify:**
+  - R = 0 with the null key off is IDENTICAL.
+  - Stripped rows sum to 1 minus the global-token and null mass.
+  - CLS is never blocked, and the long-range mask tests pass with R > 0.
+  - RoPE with the null key runs, and relevance keeps its shapes.
+
+### 5 — Exphormer-style sparse attention
+
+Each token attends only along an attention graph built from three edge sets (Shirzad et al., ICML
+2023):
+
+- **graph edges:** the neighbour graph the GNN uses (`graph_edges`);
+- **expander edges:** a random d-regular graph (`sampling: expander`, `degree: d`). Two
+  alternatives that are not in Exphormer can also be selected: `uniform` (d sampled keys per query)
+  and `distance` (keys stratified in log distance so far cells are not crowded out);
+- **virtual nodes:** CLS plus Stage 4's global tokens, linked both ways to every cell.
+
+The long-range mask removes its blocked set from this graph, whatever an edge's source. Under
+`CombinedModel` with the mask on, the graph edges therefore vanish by themselves and the attention
+is purely long range; under `GlobalModel` they stay, as in Exphormer.
+
+- **Mechanics:** an edge list in padded positions, built from `index_nodes`, with a per-head scatter
+  softmax over each query's incoming edges (`torch_geometric.utils.softmax`). O(E·head_dim).
+- **Edge types:** each edge carries its type (graph, expander, virtual). With `edge_type: bias` that
+  is a learned per-head bias, zero at init. With `edge_type: key`, the keys are scaled by a
+  per-type embedding, as Exphormer does.
+- **Fixed or resampled edges:** `resample: false` precomputes the expander once per graph on the
+  full graph, as LapPE is precomputed, and restricts it to the kept tokens. `resample: true` draws a
+  fresh one each training step from the backend generator, over the kept tokens. Eval always uses
+  the precomputed one, so maps reproduce.
+- **Encodings:** biases through `pairs` (distance per edge, spectral per edge, SPD from a table);
+  RoPE rotates before the gather; node PEs as usual.
+- **Maps:** scattered to dense at eval, zero off the attention graph.
+- **Reach:** one layer reaches d + G keys per cell, and information travels further through the
+  virtual nodes and through more layers (expanders mix in O(log S) hops). Direct pairwise attention
+  between two given distant cells is mostly unobserved at small d. `degree` and `num_layers` are the
+  knobs.
+- **Verify:**
+  - The complete graph (every open pair an edge) reproduces dense to 1e-5.
+  - Blocked and padded keys are never attended, whatever the edge source.
+  - The precomputed expander is d-regular before restriction and identical across calls and
+    epochs; resampling uses only the backend generator.
+  - `pairs` biases equal the dense bias on the edges.
+  - The edge-type bias is zero at init.
+
+### 6 — fused exact attention
+
+`attention.fused: true` (dense only): training and validation steps take SDPA (`need_weights=False`),
+and `evaluate()` keeps the explicit path. Key padding is merged into the mask once per batch rather
+than once per layer.
+
+- **Kernel eligibility.** In fp32 only the memory-efficient kernel can be chosen (FlashAttention
+  needs fp16/bf16). If it refuses the head width, SDPA silently falls back to the math kernel and
+  saves nothing. Check it in a GPU test with `sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION])`, and
+  zero-pad the heads if needed (logits unchanged, pass `scale`).
+- **SDPA's boolean mask means "attend"**, the opposite of MHA's. A test hands it the MHA-convention
+  mask and must fail.
+- **Dropout:** the fused kernel has its own RNG stream, so fused runs are paired with explicit runs
+  by seed, not identical.
+- **Verify:**
+  - Outputs and gradients equal the explicit path to 1e-5 at dropout 0, with the mask, both biases,
+    RoPE, padding and a subsampled graph.
+  - The validator rejects fused together with the entropy loss.
+  - On the cluster: memory and steps/s against the explicit path over a range of S.
+
+### 7 — inducing points (optional)
+
+Each layer runs two cross-attentions (ISAB, Luna's pack/unpack): m learned latents attend over the
+cells, then the cells attend over the latents. O(S·m).
+
+- **Maps:** the product of the two maps is a row-stochastic, rank-m cell × cell surrogate.
+  Chefer et al. give relevance rules for cross-attention.
+- **The long-range mask cannot hold:** a latent pools the neighbourhood and hands it back, so the
+  validator rejects the combination.
+- **Positions:** biases and RoPE need latents with positions. A learned or gridded set of anchors
+  would enable both, as a follow-up.
+- **Verify:**
+  - Permutation equivariance.
+  - The composed map is row-stochastic.
+  - The validator rejections have tests.
+  - It trains finite.
+
+### 8 — beyond the window (not planned in detail)
+
+Larger windows or whole slides, so interactions are no longer cut at window boundaries. Three
+blockers sit outside the attention code:
+
+- **Evaluation is S² by design.** The dense `_attn_matrix` obsm and the O(L·S³) relevance rollout
+  need their own plan: top-k pairs, cell-type flow, or CLS-only relevance.
+- **The k-hop closure is densified.** Stage 2's `blocked_pairs` replaces it.
+- **Exact attention at 10k–50k tokens** needs FlexAttention, with `score_mod` biases and a
+  block-sparse mask, plus torch ≥ 2.5 on the cluster and `torch.compile` with dynamic shapes. A
+  Euclidean-radius mask would be simpler but contradicts the 2026-10-03 decision that the mask
+  covers exactly what the GNN mixed.
+
+## Test matrix
+
+The axes, all independent:
+
+| axis | values |
+|---|---|
+| backend | dense, performer, linear, exphormer, (fused), (inducing) |
+| add-ons | `global_tokens` 0 / 1 / 4, `null_key` |
+| node encodings | none, naive, sinusoidal, lap, rw, and combinations |
+| biases | none, distance (`profile`, `linear`, `fourier`), spectral |
+| rotary | none, rope (`axial`, `mixed`) |
+| width | `model.n_embed`, `n_heads`, `attention.head_dim`, `num_layers`, plus `performer.num_features` and `exphormer.degree` |
+| model | `GlobalModel`, `CombinedModel` (single or dual decoder), long-range mask on / off |
+| dataset | each with its own base config |
+
+**Datasets.** Each dataset brings one base config: data path, `spatial_key`, `sample_key`, graph,
+masking, `max_seq_len` or windows, and its probe targets. The arms files are shared across datasets.
+Nothing in the arms names a dataset, and evaluation reads its targets from config.
+
+**Protocol for a matrix this large:**
+
+1. **Screen** with the generated arms at one seed per combination.
+2. **Confirm** the promising combinations at ≥ 3 seeds, compared paired by seed.
+3. **Compare efficient backends with dense at a size where dense still runs**, then take the
+   survivors to sizes where it does not.
+
+Width axes (`n_embed`, `head_dim`, `n_heads`, `num_layers`, `num_features`, `degree`) are plain
+dotted sweep parameters. List-valued and backend-dependent choices go through arms.
+
+**What to read**, the same on every dataset:
+
+- masked reconstruction;
+- the configured probe targets (local vs. global vs. `pe`);
+- Stage 1's span, sink mass and effective keys;
+- steps/s, peak memory and the largest S that fits;
+- the flow control's null pairs where configured;
+- ground-truth scoring where the dataset has it (planted edges on the synthetic ones).
+
+A probe gap alone settles nothing about range (the contrastive plan's finding); the ablation is the
+instrument.
+
+## Predictions to check, not assume
+
+1. **Kernel attention matches dense where the long-range signal is smooth, and loses where a few
+   distant cells set a response.** synth_spot's sparse programmes are one designed instance.
+   - Performer's relative variance is `(exp(‖x + y‖²) − 1)/m`, largest for exactly the high-logit
+     pairs a sharp attention needs.
+   - Linear attention loses more than Performer at equal width.
+   - Both close part of the gap with width: `head_dim` for linear, `num_features` for Performer.
+2. **Head width matters little for dense attention and a lot for linear attention**, because exp
+   already makes dense maps full rank.
+3. **Exphormer with virtual nodes matches dense on prediction, but loses planted-edge AUC as
+   `degree` falls**, because most pairs are unobserved in any one layer. Extra layers buy back reach
+   but not pairwise interpretability.
+4. **Global tokens or a null key take mass off CLS without costing reconstruction.** If Stage 1
+   finds CLS mass small, they are cosmetic.
+
+## Invariants
+
+- **One mask in every backend.** The blocked set is the k-hop closure the local module mixed,
+  computed on the full graph and then restricted to the kept tokens. CLS is never blocked, and
+  padding contributes nothing.
+- **Booleans:** MHA's True means blocked; SDPA's and FlexAttention's True means attend. Convert in
+  exactly one place per backend, by indexing.
+- **Biases:** the same additive logit on every open pair in every backend. CLS and padding rows and
+  columns are zero. The dense layout is left-padded, CLS last, graph-major.
+- **Rotation** is applied to q and k before any kernel, feature map or gather. CLS, padding and
+  global tokens sit at the origin.
+- **Explicit path:** every backend has one, computing the same function and its `[B·H, S', S']`
+  maps, and `evaluate()` uses it.
+- **Global tokens and the null key never leave `forward`.**
+- **Backend randomness** happens only in training forward passes and only from the backend
+  generator.
+- **Defaults** (dense, default `head_dim`, not fused, no global tokens, no null key) give the same
+  parameters, init order, RNG draws, checkpoint names and numbers as today.
+
+## What the backends change about the measurements
+
+- **Kernel** maps are smoother than softmax maps: Performer's are an estimate, linear's a different
+  kernel altogether. Read a flow difference against dense together with Stage 1's TV distance and
+  the flow control's null pairs.
+- **Exphormer** reads 0 off its attention graph. Score planted edges over the pairs the graph
+  contained, and report coverage alongside.
+- **Global tokens and the null key** leave cell rows summing to less than 1. Net flow is reported
+  from the raw rows and from rows renormalised over cells.
+- **Fused** changes nothing.
+- **Inducing** flow comes from a rank-m surrogate.
+
+## Open questions
+
+- **Whole-slide evaluation format** (Stage 8): top-k pairs, cell-type flow, or CLS-only relevance?
+- **Inducing points:** free latents, or spatial anchors?
+- **Exphormer's edge-type handling:** additive bias or Exphormer's key scaling? Both are knobs; keep
+  both only if they differ.
