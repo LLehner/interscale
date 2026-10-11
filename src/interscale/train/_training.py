@@ -12,7 +12,7 @@ from lightning.pytorch.trainer import seed_everything
 from interscale.evaluation.online_probes import build_probe_callback
 from interscale.tl.utils import get_model_filename_prefix
 from interscale.train._trainingplans import TrainingPlan
-from interscale.train._utils import MetricsHistory, NodeMaskResampleCallback
+from interscale.train._utils import MetricsHistory, NodeMaskResampleCallback, build_efficiency_monitor
 
 # from interscale.model.base._trainer import TrainRunner
 
@@ -137,6 +137,8 @@ class NodeMaskingTrainingPlan:
                 f"genes={list(self._cfg.probe.regression_genes)}, "
                 f"gene_vector={bool(self._cfg.probe.get('gene_vector', False))}"
             )
+        # None unless cfg.optim.log_efficiency: steps/s, cells/s and peak GPU memory per epoch.
+        efficiency_callback = build_efficiency_monitor(self._cfg)
         checkpoint_callback = None
         loss_callback = None
         performance_callback = None
@@ -228,6 +230,7 @@ class NodeMaskingTrainingPlan:
                 mask_resample_callback,
                 checkpoint_callback,
                 probe_callback,
+                efficiency_callback,
             ]
             if callback is not None
         ]

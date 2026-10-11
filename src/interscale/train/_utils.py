@@ -1,6 +1,12 @@
+import time
+
 import matplotlib.pyplot as plt
 import pandas as pd
+import torch
 from lightning.pytorch.callbacks import Callback
+
+#: wandb section of the efficiency scalars (it splits panels on the text before the first "/").
+EFFICIENCY_PREFIX = "efficiency"
 
 
 class NodeMaskResampleCallback(Callback):
@@ -14,6 +20,85 @@ class NodeMaskResampleCallback(Callback):
 
     def on_train_epoch_start(self, trainer, pl_module):
         trainer.datamodule.resample_train_mask()
+
+
+class EfficiencyMonitor(Callback):
+    """What a training epoch costs: throughput and peak GPU memory, for comparing attention backends.
+
+    Logged at the end of every training epoch, under ``efficiency/``:
+
+    - ``train_steps_per_s`` and ``train_cells_per_s``: training steps (forward, backward, optimizer
+      step) and graph nodes per second of step time. Data loading between steps is left out, so
+      these measure the model.
+    - ``train_epoch_s``: from the epoch's start to its last training step, data loading included and
+      validation (and the probes it runs) left out.
+    - ``peak_gpu_mem_gib``: the most memory allocated on the module's GPU during the epoch's training
+      steps. Absent on CPU.
+
+    Every boundary synchronises the GPU, so a step's queued work is counted in that step; the price
+    is that the CPU no longer runs ahead between steps. Built only when ``optim.log_efficiency`` is
+    set (:func:`build_efficiency_monitor`).
+    """
+
+    def __init__(self, clock=time.perf_counter):
+        super().__init__()
+        self._clock = clock
+        self._epoch_start = self._step_start = self._last_step_end = None
+        self._step_seconds, self._steps, self._cells = 0.0, 0, 0
+
+    @staticmethod
+    def _cuda(pl_module):
+        device = pl_module.device
+        return device if device.type == "cuda" else None
+
+    def _now(self, pl_module) -> float:
+        device = self._cuda(pl_module)
+        if device is not None:
+            torch.cuda.synchronize(device)
+        return self._clock()
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._step_start = self._last_step_end = None
+        self._step_seconds, self._steps, self._cells = 0.0, 0, 0
+        device = self._cuda(pl_module)
+        if device is not None:
+            torch.cuda.reset_peak_memory_stats(device)
+        self._epoch_start = self._now(pl_module)
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        self._step_start = self._now(pl_module)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self._step_start is None:
+            return
+        self._last_step_end = self._now(pl_module)
+        self._step_seconds += self._last_step_end - self._step_start
+        self._steps += 1
+        self._cells += int(getattr(batch, "num_nodes", 0) or 0)
+        self._step_start = None
+
+    def epoch_values(self, pl_module) -> dict[str, float]:
+        """This epoch's scalars, by logged name; empty before a training step has finished."""
+        if self._epoch_start is None or self._last_step_end is None or self._step_seconds <= 0:
+            return {}
+        values = {
+            f"{EFFICIENCY_PREFIX}/train_steps_per_s": self._steps / self._step_seconds,
+            f"{EFFICIENCY_PREFIX}/train_cells_per_s": self._cells / self._step_seconds,
+            f"{EFFICIENCY_PREFIX}/train_epoch_s": self._last_step_end - self._epoch_start,
+        }
+        device = self._cuda(pl_module)
+        if device is not None:
+            values[f"{EFFICIENCY_PREFIX}/peak_gpu_mem_gib"] = torch.cuda.max_memory_allocated(device) / 2**30
+        return values
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        for name, value in self.epoch_values(pl_module).items():
+            pl_module.log(name, value, on_step=False, on_epoch=True, batch_size=1)
+
+
+def build_efficiency_monitor(cfg):
+    """An :class:`EfficiencyMonitor`, or None unless ``optim.log_efficiency`` is set."""
+    return EfficiencyMonitor() if cfg.optim.get("log_efficiency", False) else None
 
 
 class MetricsHistory(Callback):

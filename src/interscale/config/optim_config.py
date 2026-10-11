@@ -39,6 +39,10 @@ def get_optim_cfg(cfg):
     # Metric driving EarlyStopping / ModelCheckpoint / the LR scheduler.
     # "auto" -> val_f1_macro for classification, val_loss for regression.
     cfg.optim.monitor = "auto"
+    # Log what a training epoch costs, under efficiency/ (`train._utils.EfficiencyMonitor`): steps/s
+    # and cells/s over the training steps, the epoch's training seconds, and peak GPU memory. Off by
+    # default: it synchronises the GPU around every step, which costs a little throughput.
+    cfg.optim.log_efficiency = False
 
     # Auxiliary loss terms added beside `optim.loss`, as name -> weight. A weight of 0.0 means the
     # term is never constructed, so every existing config keeps behaving exactly as before. Flat

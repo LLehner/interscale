@@ -664,7 +664,8 @@ dotted sweep parameters. List-valued and backend-dependent choices go through ar
 - masked reconstruction;
 - the configured probe targets (local vs. global vs. `pe`);
 - Stage 1's span, sink mass and effective keys;
-- steps/s, peak memory and the largest S that fits;
+- steps/s, cells/s and peak GPU memory per training epoch (`optim.log_efficiency`, logged under
+  `efficiency/` by `train._utils.EfficiencyMonitor`), and the largest S that fits;
 - the flow control's null pairs where configured;
 - ground-truth scoring where the dataset has it (planted edges on the synthetic ones).
 
