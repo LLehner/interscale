@@ -1296,3 +1296,138 @@ def test_the_pair_form_carries_the_gradient():
     for name in ("distance", "spectral"):
         assert bias.encoders[name].table.grad.abs().sum() > 0
     assert bias.encoders["fourier"].cos_coef.grad.abs().sum() > 0
+
+
+# --------------------------------------------------------------------------- the Exphormer attention pattern
+
+
+def _rgg(n, radius, seed=0):
+    """A random geometric graph as a symmetric edge index (irregular degrees, like a spatial graph)."""
+    rng = np.random.default_rng(seed)
+    pos = rng.uniform(0, 1, size=(n, 2))
+    pairs = [(i, j) for i in range(n) for j in range(n) if i != j and np.linalg.norm(pos[i] - pos[j]) <= radius]
+    return torch.tensor(pairs, dtype=torch.long).T
+
+
+def _pattern_inputs(hops):
+    from interscale.tl.masking import blocked_pairs
+
+    sizes = (14, 9)
+    edges = [_rgg(14, 0.4, seed=3), _rgg(9, 0.5, seed=4)]
+    edge_index = torch.cat([edges[0], edges[1] + 14], dim=1)
+    batch = torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(sizes)])
+    index_nodes = [sorted(np.random.default_rng(0).choice(14, 11, replace=False).tolist()), list(range(9))]
+    blocked = blocked_pairs(edge_index, batch, index_nodes, n_hops=hops)
+    return edge_index, batch, index_nodes, blocked, edges
+
+
+def _codes(pairs, width):
+    return ((pairs[0] * width + pairs[1]) * width + pairs[2]).tolist()
+
+
+def test_the_expander_is_regular_symmetric_and_reproducible():
+    from interscale.tl.masking import random_expander
+
+    edges = random_expander(400, 8, torch.Generator().manual_seed(0))
+    pairs = set(map(tuple, edges.T.tolist()))
+    assert len(pairs) == edges.shape[1]  # no repeated edge
+    assert all(s != d for s, d in pairs)  # no self-loop
+    assert pairs == {(d, s) for s, d in pairs}  # both directions
+    degree = torch.bincount(edges[0], minlength=400)
+    assert int(degree.max()) <= 8 and float((degree == 8).float().mean()) > 0.9
+    assert torch.equal(edges, random_expander(400, 8, torch.Generator().manual_seed(0)))
+    assert not torch.equal(edges, random_expander(400, 8, torch.Generator().manual_seed(1)))
+    assert random_expander(400, 0, torch.Generator()).shape == (2, 0)
+    with pytest.raises(ValueError, match="degree must be even"):
+        random_expander(400, 3, torch.Generator())
+
+
+def test_the_graph_seed_is_a_function_of_the_graph():
+    from interscale.tl.masking import graph_seed
+
+    edges = _rgg(12, 0.5, seed=1)
+    assert graph_seed(0, 12, edges) == graph_seed(0, 12, edges.clone())
+    assert graph_seed(0, 12, edges) == graph_seed(0, 12, edges[:, torch.randperm(edges.shape[1])])  # edge order
+    assert graph_seed(0, 12, edges) != graph_seed(1, 12, edges)
+    assert graph_seed(0, 12, edges) != graph_seed(0, 12, _rgg(12, 0.5, seed=2))
+    assert graph_seed(0, 12, None) != graph_seed(0, 13, None)
+
+
+def test_the_pattern_has_every_source_and_nothing_blocked():
+    """Graph edges (query dst, key src) among the kept cells, expander edges, and CLS both ways --
+    restricted to what pad_batch kept, laid out as it lays out tokens, without blocked pairs,
+    padding keys or duplicates, and with at least one key in every row."""
+    from interscale.tl.masking import _kept_positions, attention_pattern
+
+    edge_index, batch, index_nodes, blocked, edges = _pattern_inputs(hops=0)
+    pairs, types = attention_pattern(edge_index, batch, index_nodes, blocked, graph_edges=True, degree=4, seed=0)
+    seq_len, width = 11, 12
+    codes = _codes(pairs, width)
+    found = dict(zip(codes, types.tolist(), strict=True))
+
+    assert len(set(codes)) == len(codes)
+    assert not set(codes) & set(_codes(blocked, width))
+    for b, (local, n) in enumerate(zip(edges, (14, 9), strict=True)):
+        position = _kept_positions(n, index_nodes[b], seq_len, "cpu")
+        for src, dst in local.T.tolist():
+            if position[src] >= 0 and position[dst] >= 0:
+                assert found[(b * width + int(position[dst])) * width + int(position[src])] == 0
+        kept = range(seq_len - len(index_nodes[b]), seq_len)
+        for i in range(seq_len):
+            assert found[(b * width + i) * width + seq_len] == 2  # every row attends to CLS
+        for j in kept:
+            assert found[(b * width + seq_len) * width + j] == 2  # CLS attends to every kept cell
+        assert found[(b * width + seq_len) * width + seq_len] == 2
+    # The second graph has 9 cells in 11 slots: positions 0 and 1 are padding, never a key.
+    assert not ((pairs[0] == 1) & (pairs[2] < 2)).any()
+    expander = pairs[:, types == 1]
+    assert expander.shape[1] > 0 and (expander[1] < seq_len).all() and (expander[2] < seq_len).all()
+
+
+def test_the_long_range_mask_removes_every_graph_edge():
+    from interscale.tl.masking import attention_pattern
+
+    edge_index, batch, index_nodes, blocked, _ = _pattern_inputs(hops=2)
+    pairs, types = attention_pattern(edge_index, batch, index_nodes, blocked, graph_edges=True, degree=4, seed=0)
+    assert not (types == 0).any()  # the GNN's 2-hop reach contains every graph edge
+    assert not set(_codes(pairs, 12)) & set(_codes(blocked, 12))
+    assert (types == 1).any() and (types == 2).any()
+
+
+def test_a_pair_found_twice_keeps_the_graph_type():
+    """On a complete graph every expander edge is also a graph edge, so no pair is typed expander."""
+    from interscale.tl.masking import attention_pattern, blocked_pairs
+
+    n = 7
+    edge_index = torch.tensor([[i, j] for i in range(n) for j in range(n) if i != j], dtype=torch.long).T
+    batch = torch.zeros(n, dtype=torch.long)
+    blocked = blocked_pairs(edge_index, batch, [list(range(n))], n_hops=0)
+    _, types = attention_pattern(edge_index, batch, [list(range(n))], blocked, graph_edges=True, degree=4, seed=0)
+    assert (types == 0).sum() == n * (n - 1) and not (types == 1).any()
+
+
+def test_the_pattern_is_fixed_per_graph_and_redrawn_only_from_a_generator():
+    from interscale.tl.masking import attention_pattern
+
+    edge_index, batch, index_nodes, blocked, _ = _pattern_inputs(hops=0)
+
+    def draw(**kwargs):
+        return attention_pattern(edge_index, batch, index_nodes, blocked, graph_edges=False, degree=4, **kwargs)[0]
+
+    assert torch.equal(draw(seed=0), draw(seed=0))
+    assert not torch.equal(draw(seed=0), draw(seed=1))
+    generator = torch.Generator().manual_seed(0)
+    first, second = draw(generator=generator), draw(generator=generator)
+    assert not torch.equal(first, second)
+
+
+def test_a_graph_edge_is_its_target_attending_to_its_source():
+    """PyG's direction: an edge src -> dst carries a message to dst, so dst is the query."""
+    from interscale.tl.masking import attention_pattern, blocked_pairs
+
+    edge_index = torch.tensor([[0], [2]])  # 0 -> 2 only
+    batch = torch.zeros(4, dtype=torch.long)
+    blocked = blocked_pairs(edge_index, batch, [list(range(4))], n_hops=0)
+    pairs, types = attention_pattern(edge_index, batch, [list(range(4))], blocked, graph_edges=True, degree=0)
+    graph = pairs[:, types == 0]
+    assert graph.tolist() == [[0], [2], [0]]

@@ -326,6 +326,18 @@ def _local_reach_pairs(edge_index: torch.Tensor, num_nodes: int, n_hops: int) ->
     return torch.unique(pairs, dim=1)
 
 
+def _kept_positions(num_nodes: int, kept_nodes, seq_len: int, device) -> torch.Tensor:
+    """``[num_nodes]``: each node's token position in the padded layout, or -1 for a node ``pad_batch`` dropped.
+
+    ``pad_batch`` left-pads, so a graph's kept nodes are the last ``len(kept_nodes)`` positions
+    before the CLS slot at ``seq_len``, in the order ``kept_nodes`` lists them.
+    """
+    kept = torch.as_tensor(kept_nodes, dtype=torch.long, device=device)
+    position = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
+    position[kept] = seq_len - len(kept) + torch.arange(len(kept), device=device)
+    return position
+
+
 def blocked_pairs(
     edge_index: torch.Tensor,
     batch: torch.Tensor,
@@ -380,15 +392,159 @@ def blocked_pairs(
         in_graph = (batch[edge_index[0]] == b) & (batch[edge_index[1]] == b)
         pairs = _local_reach_pairs(edge_index[:, in_graph] - offset, n_b, n_hops)
 
-        kept = torch.as_tensor(kept_nodes, dtype=torch.long, device=pairs.device)
-        position = torch.full((n_b,), -1, dtype=torch.long, device=pairs.device)
-        position[kept] = seq_len - len(kept) + torch.arange(len(kept), device=pairs.device)
+        position = _kept_positions(n_b, kept_nodes, seq_len, pairs.device)
         query, key = position[pairs[0]], position[pairs[1]]
         keep = (query >= 0) & (key >= 0)
         out.append(torch.stack([torch.full_like(query[keep], b), query[keep], key[keep]]))
     if not out:
         return torch.zeros((3, 0), dtype=torch.long, device=device)
     return torch.cat(out, dim=1).to(device)
+
+
+#: Edge types of an attention pattern (:func:`attention_pattern`), in the order of their ids.
+PATTERN_EDGE_TYPES = ("graph", "expander", "virtual")
+
+
+_MASK64 = 2**64 - 1
+
+
+def _splitmix64(value: int) -> int:
+    """One step of SplitMix64: a fixed, version-independent mixing of a 64-bit integer."""
+    value = (value + 0x9E3779B97F4A7C15) & _MASK64
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return value ^ (value >> 31)
+
+
+def graph_seed(seed: int, num_nodes: int, edge_index: torch.Tensor | None) -> int:
+    """A seed determined by the graph itself: its size and its edges, combined with ``seed``.
+
+    The same graph -- in training, in evaluation, rebuilt by ``get_model_output`` -- always gets the
+    same seed, whatever batch it lands in and in whatever order, so a random structure drawn from it
+    (an expander) is fixed per graph without being stored on it. Mixed with SplitMix64 rather than
+    Python's ``hash``, whose tuple hashing may change between Python versions.
+    """
+    n_edges, edge_sum = 0, 0
+    if edge_index is not None and edge_index.numel():
+        n_edges = int(edge_index.shape[1])
+        edge_sum = int((edge_index[0].long() * 1_000_003 + edge_index[1].long()).sum().item())
+    mixed = 0
+    for value in (int(seed), int(num_nodes), n_edges, edge_sum):
+        mixed = _splitmix64(mixed ^ (value & _MASK64))
+    return mixed & (2**63 - 1)
+
+
+def random_expander(num_nodes: int, degree: int, generator: torch.Generator) -> torch.Tensor:
+    """``[2, E]`` an (approximately) ``degree``-regular random graph: ``degree / 2`` random permutations, both ways.
+
+    Each permutation ``σ`` adds the edges ``i -> σ(i)`` and ``σ(i) -> i``, so every node gets
+    ``degree`` edges; random regular graphs made this way are expanders with high probability
+    (Friedman's theorem), which is what Exphormer relies on for mixing in few layers. Self-loops and
+    repeated edges are dropped, so a few nodes end up with fewer. Drawn on the CPU from
+    ``generator``; ``degree`` must be even.
+    """
+    if degree % 2:
+        raise ValueError(f"the expander is built from degree / 2 permutations, so degree must be even; got {degree}.")
+    if num_nodes < 2 or degree == 0:
+        return torch.zeros((2, 0), dtype=torch.long)
+    nodes = torch.arange(num_nodes)
+    perms = [torch.randperm(num_nodes, generator=generator) for _ in range(degree // 2)]
+    src = torch.cat([nodes.repeat(len(perms)), torch.cat(perms)])
+    dst = torch.cat([torch.cat(perms), nodes.repeat(len(perms))])
+    keep = src != dst
+    return torch.unique(torch.stack([src[keep], dst[keep]]), dim=1)
+
+
+def attention_pattern(
+    edge_index: torch.Tensor | None,
+    batch: torch.Tensor,
+    index_nodes: list,
+    blocked: torch.Tensor,
+    *,
+    graph_edges: bool,
+    degree: int,
+    seed: int = 0,
+    generator: torch.Generator | None = None,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pairs an Exphormer-style attention attends along: ``([3, E] (graph, query, key), [E] edge type)``.
+
+    Three sources (Shirzad et al., ICML 2023), with the types of :data:`PATTERN_EDGE_TYPES`:
+
+    * ``graph`` -- the neighbour graph's edges, when ``graph_edges``; an edge ``src -> dst`` is the
+      query ``dst`` attending to the key ``src``, PyG's direction of a message.
+    * ``expander`` -- a :func:`random_expander` of ``degree`` on the whole graph, drawn from a seed
+      the graph itself determines (:func:`graph_seed`), so it is the same every time the graph is
+      seen; or, given ``generator`` (training with resampling), a fresh one from it.
+    * ``virtual`` -- the CLS slot, linked both ways to every cell: every position's query attends
+      to CLS (padding rows included, so no row is ever empty), CLS attends to every kept cell and to
+      itself.
+
+    Then ``blocked`` (:func:`blocked_pairs`) is removed, whatever a pair's source -- under the
+    long-range mask that removes every graph edge, since the GNN's reach contains them. Both graph
+    and expander edges are drawn on the whole graph and restricted to the nodes ``pad_batch`` kept,
+    laid out as it lays out tokens; padding is never a key. A pair found by two sources keeps the
+    first type above. Nothing here is ``S x S``.
+    """
+    device = blocked.device if device is None else device
+    batch = batch.to(torch.long)
+    seq_len = max(len(nodes) for nodes in index_nodes)
+    cls = seq_len
+    width = seq_len + 1
+
+    graphs, queries, keys, types = [], [], [], []
+    for b, kept_nodes in enumerate(index_nodes):
+        nodes_b = torch.nonzero(batch == b, as_tuple=False).flatten()
+        n_b = int(nodes_b.numel())
+        if n_b == 0:
+            continue
+        offset = int(nodes_b[0].item())
+        local = torch.zeros((2, 0), dtype=torch.long, device=batch.device)
+        if edge_index is not None:
+            in_graph = (batch[edge_index[0]] == b) & (batch[edge_index[1]] == b)
+            local = edge_index[:, in_graph] - offset
+        position = _kept_positions(n_b, kept_nodes, seq_len, local.device)
+
+        sources = []
+        if graph_edges and local.numel():
+            sources.append((local[1], local[0], 0))  # query dst, key src
+        if degree:
+            gen = generator if generator is not None else torch.Generator().manual_seed(graph_seed(seed, n_b, local))
+            expander = random_expander(n_b, degree, gen).to(local.device)
+            sources.append((expander[0], expander[1], 1))
+        for query, key, edge_type in sources:
+            query, key = position[query], position[key]
+            keep = (query >= 0) & (key >= 0)
+            graphs.append(torch.full((int(keep.sum()),), b, dtype=torch.long, device=local.device))
+            queries.append(query[keep])
+            keys.append(key[keep])
+            types.append(torch.full((int(keep.sum()),), edge_type, dtype=torch.long, device=local.device))
+
+    cell_pairs = torch.zeros((3, 0), dtype=torch.long, device=device)
+    cell_types = torch.zeros((0,), dtype=torch.long, device=device)
+    if graphs:
+        pairs = torch.stack([torch.cat(graphs), torch.cat(queries), torch.cat(keys)]).to(device)
+        pair_types = torch.cat(types).to(device)
+        codes = (pairs[0] * width + pairs[1]) * width + pairs[2]
+        # Deduplicate, keeping each pair's first occurrence: graph edges come before expander edges.
+        unique, inverse = torch.unique(codes, return_inverse=True)
+        first = torch.full((len(unique),), len(codes), dtype=torch.long, device=device)
+        first = first.scatter_reduce(0, inverse, torch.arange(len(codes), device=device), reduce="amin")
+        blocked_codes = ((blocked[0] * width + blocked[1]) * width + blocked[2]).to(device)
+        first = first[~torch.isin(unique, blocked_codes)]
+        cell_pairs, cell_types = pairs[:, first], pair_types[first]
+
+    virtual = []
+    for b, kept_nodes in enumerate(index_nodes):
+        everyone = torch.arange(seq_len, device=device)
+        kept = torch.arange(seq_len - len(kept_nodes), seq_len, device=device)
+        virtual.append(torch.stack([torch.full_like(everyone, b), everyone, torch.full_like(everyone, cls)]))
+        virtual.append(torch.stack([torch.full_like(kept, b), torch.full_like(kept, cls), kept]))
+        virtual.append(torch.tensor([[b], [cls], [cls]], device=device))
+    virtual = torch.cat(virtual, dim=1)
+    pairs = torch.cat([cell_pairs, virtual], dim=1)
+    edge_types = torch.cat([cell_types, torch.full((virtual.shape[1],), 2, dtype=torch.long, device=device)])
+    return pairs, edge_types
 
 
 def create_transformer_attention_mask_from_edges(

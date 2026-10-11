@@ -19,6 +19,7 @@ from .geome_utils import (
 from .masking import (
     MASK_STRATEGIES,
     apply_mask,
+    attention_pattern,
     attn_mask_diagonal,
     blocked_pairs,
     create_transformer_attention_mask_from_edges,
@@ -54,6 +55,7 @@ __all__ = [
     "sample_gene_mask",
     "MASK_STRATEGIES",
     "create_transformer_attention_mask_from_edges",
+    "attention_pattern",
     "attn_mask_diagonal",
     "blocked_pairs",
     "remove_zero_expression_cells",
