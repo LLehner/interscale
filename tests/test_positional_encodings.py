@@ -250,7 +250,7 @@ def test_a_valid_pe_config_loads(tmp_path):
 @pytest.mark.parametrize(
     ("lines", "spatial", "match"),
     [
-        (["node: [fourier]"], True, "unknown positional encodings"),
+        (["node: [signnet]"], True, "unknown positional encodings"),
         (["node: [naive, naive]"], True, "more than once"),
         (["node: [naive]"], False, "dataset.spatial_key"),
         (["node: [sinusoidal]", "sinusoidal:", "  dim: 30"], True, "multiple of 4"),
@@ -280,7 +280,14 @@ def test_the_registry_holds_the_encodings_built_so_far():
         "rw": ("node", "rw_pe", True),
         "distance": ("bias", "pos", False),
         "spectral": ("bias", "spectral_pe", True),
+        "fourier": ("bias", "pos", False),
         "rope": ("rotary", "pos", False),
+    }
+    # The forms each bias can be handed to an attention backend in (attention_plan.md).
+    assert {name: sorted(spec.forms) for name, spec in PE_REGISTRY.items() if spec.kind == "bias"} == {
+        "distance": ["dense"],
+        "spectral": ["dense", "factors"],
+        "fourier": ["dense", "factors"],
     }
 
 

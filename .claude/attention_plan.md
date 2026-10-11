@@ -26,7 +26,7 @@ a real state.
 | 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | **done** | 517 tests pass; harness IDENTICAL across 5 cases / 15 epochs after each of the two commits; training steps keep no map and hook nothing unless the loss reads attention; the skeleton's dense core reproduces torch's attention (outputs and maps, with mask, padding and RoPE) and draws its initial weights; a non-default backend leaves every weight built after it unchanged (mutation-checked: without the replayed draws it fails); every validator rejection tested | 2026-10-11 |
 | 1 — attention diagnostics (span in µm, sink mass, effective keys) | not started | | |
 | 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | **Performer implemented, unverified** — `tl.blocked_pairs` equals the dense mask at hops 0–3 (two graphs of different size, one subsampled); the orthogonal features estimate exp(x·y) without bias (found biased by ~7% before the Haar sign fix); the map's error against softmax falls with the feature count (TV 0.10 at m = 16, 0.009 at 4096); factorised and explicit paths agree to 1e-5 with mask and padding; the float64 subtraction stays exact where blocked keys hold 99.7% of a query's mass (float32: ~1e-5 off); blocks exactly the dense mask's pairs; finite on the complete-graph test at hops 1–3 and through 5 training steps; relevance runs; a performer model shares every initial weight with the dense one at one seed and moves the global RNG as dense does; per-layer features from their own seeded generator, redrawn only in training and only when asked; trains through `_common_step`. Three mutations, each caught. 538 tests pass; harness IDENTICAL. **No real-data run yet. Linear (elu+1) and the generated arms not built** | 2026-10-11 |
-| 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | **in progress** — spectral factors implemented, unverified: `U Wᵀ` equals the dense spectral bias on two graphs of different size, one subsampled, CLS and padding zero; a zero bias leaves one side 0 and the other small (mutation-checked: an unbalanced split fails it); a Performer's map converges to dense softmax with the same bias (TV 0.047 → 0.014 from m = 1024 to 16384 at a bias of ±1.2); end to end through the transformer, gradient reaching the filter. 542 tests pass; harness IDENTICAL. Fourier bias not yet | 2026-10-11 |
+| 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | **implemented, unverified** — spectral: `U Wᵀ` equals the dense bias (two graphs of different size, one subsampled; CLS and padding zero); a zero bias leaves one side 0 and the other small (mutation-checked); a Performer's map converges to dense softmax with the same bias (TV 0.047 → 0.014 from m = 1024 to 16384 at a bias of ±1.2). Fourier (`pe.bias: [fourier]`): zero at init; each entry is the learned function of `p_key − p_query` (mutation-checked: a flipped sine sign fails); translation-invariant; isotropic is symmetric and invariant to a turn by 180°/directions, anisotropic is not; the default grid fits a ring at 1 mm with R² > 0.9; derived `max_wavelength`; through Performer and dense attention end to end, gradient reaching the coefficients. 555 tests pass; harness IDENTICAL. **No real-data run yet** | 2026-10-11 |
 | 4 — global tokens and a null key | not started | | |
 | 5 — Exphormer-style sparse attention | not started | | |
 | 6 — fused exact attention (SDPA) | not started | | |
@@ -112,7 +112,7 @@ a real state.
 ✓ works; ✗ cannot work (the validator rejects it); ~ works with the caveat noted. A stage number
 means "from that stage on".
 
-| backend | node PE / SE | rope | distance (profile, linear) | distance (fourier) | spectral | SPD bias (future) | long-range mask | maps + relevance at eval | `SCE_EntropyATT_Loss` |
+| backend | node PE / SE | rope | distance (profile, linear) | fourier | spectral | SPD bias (future) | long-range mask | maps + relevance at eval | `SCE_EntropyATT_Loss` |
 |---|---|---|---|---|---|---|---|---|---|
 | dense | ✓ | ✓ | ✓ | ✓ 3 | ✓ | ✓ | ✓ | ✓ exact | ✓ |
 | performer, linear (2) | ✓ | ✓ | ✗ | ✓ 3 | ✓ 3 | ✗ | ✓ by subtraction | ✓ implied map | ✗ |
@@ -137,7 +137,7 @@ means "from that stage on".
 | encoding | dense | pairs | factors |
 |---|---|---|---|
 | distance, `profile` / `linear` | ✓ | ✓ per-pair norm | ✗ |
-| distance, `fourier` (3) | ✓ | ✓ | ✓, 2R dims |
+| fourier (3) | ✓ | ✓ | ✓, 2R dims |
 | spectral | ✓ | ✓, `Σᵢ h(λᵢ)·N·vᵢ[j]·vᵢ[l]` per pair | ✓, k dims |
 | SPD (Graphormer; future) | ✓ | ✓ from an SPD table (uint8, S² bytes) | ✗ |
 | RRWP (relative random-walk probabilities; future) | ✓ | ~ local only | ✗ |
@@ -382,7 +382,8 @@ as an `arms:` file, logging each rejected combination with its reason.
 
 - **The `factors` form**, starting with the spectral bias: `U = √N·V·diag(h_h(λ))` and `W = √N·V`,
   zero at CLS and padding. That is exactly today's bias as k extra q/k dims per head.
-- **`distance.kind: fourier`** (new): `b_h(Δ) = Σ_r a_{h,r}·cos(ω_rᵀΔ)`, optionally plus
+- **`pe.bias: [fourier]`** (new; its own bias rather than a `distance.kind`, since bias forms are
+  declared per encoding): `b_h(Δ) = Σ_r a_{h,r}·cos(ω_rᵀΔ)`, optionally plus
   `c_{h,r}·sin(ω_rᵀΔ)` for a directional prior.
   - The frequencies sit on a polar grid: directions over 180°, radii geometric over
     `[1/max_wavelength, 1/min_wavelength]`.
@@ -398,7 +399,7 @@ as an `arms:` file, logging each rejected combination with its reason.
     radial profile within its band limit.
   - Performer plus spectral is unbiased as in Stage 2.
 
-#### How Stage 3 was built (so far)
+#### How Stage 3 was built
 
 - **`AttentionBias.factors`** returns `(U, W)`, each `[B·H, S+1, r]`, laid out like the dense
   bias. An encoder brings its low-rank form as a `factors` method; the spectral bias's has width k
@@ -410,6 +411,22 @@ as an `arms:` file, logging each rejected combination with its reason.
   folded biases add to those norms. Measured at m = 16384: TV 0.014 against dense with the same bias
   at a bias range of ±1.2, and 0.05 at ±3. Large learned biases want more features; watch the TV
   diagnostic (Stage 1) on Performer arms with biases.
+
+- **The Fourier bias is `pe.bias: [fourier]`**, with its `pe.fourier` block: `num_directions` 8
+  × `num_scales` 16 over `[min_wavelength 200 µm, max_wavelength]`, so 256 factor dims. Its
+  `max_wavelength` 0 is derived as twice the largest slide diameter (`resolve_fourier_range`,
+  chained in `BaseModel.__init__` after RoPE's). `isotropic` (the default) has one cosine
+  coefficient per head and scale, averaged over the directions; off, there are a cosine and a sine
+  coefficient per head and frequency. Phases are float64; the frequencies are a buffer.
+  `FourierBias.bias_at(offsets)` reads the learned function out.
+- **Grid chosen by fit.** With radial targets within 3 mm (a ring at 1 mm, an exponential decay, a
+  step at 2.5 mm), 8 directions × 16 scales over 200 µm–12 mm fit with R² 0.94–0.99. 16 directions
+  reach 0.96–0.998 at twice the width. Isotropy only holds while a wave's phase across the
+  distance is resolved by the directions, so short wavelengths at long range average out rather
+  than being radial.
+- **Coordinates, not distances.** A bias with `reads_coordinates` gets the padded positions
+  (input key `pos_coords`) rather than the `cdist` the distance bias takes. The registry still says
+  `requires="pos"`, so the spatial-key check applies.
 
 ### 4 — global tokens and a null key
 
@@ -536,7 +553,7 @@ The axes, all independent:
 | backend | dense, performer, linear, exphormer, (fused), (inducing) |
 | add-ons | `global_tokens` 0 / 1 / 4, `null_key` |
 | node encodings | none, naive, sinusoidal, lap, rw, and combinations |
-| biases | none, distance (`profile`, `linear`, `fourier`), spectral |
+| biases | none, distance (`profile`, `linear`), fourier, spectral |
 | rotary | none, rope (`axial`, `mixed`) |
 | width | `model.n_embed`, `n_heads`, `attention.head_dim`, `num_layers`, plus `performer.num_features` and `exphormer.degree` |
 | model | `GlobalModel`, `CombinedModel` (single or dual decoder), long-range mask on / off |

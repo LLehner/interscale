@@ -383,6 +383,113 @@ class SpectralBias(nn.Module):
         return torch.linspace(lo, hi, self.num_knots).exp(), self.table.detach().cpu().clone()
 
 
+class FourierBias(nn.Module):
+    """A learned function of the offset between two cells, as a sum of plane waves -- low rank by construction.
+
+    ``b_h(Δ) = sum_r a_{h,r} cos(ω_r . Δ) + c_{h,r} sin(ω_r . Δ)``, with ``Δ = p_key - p_query`` and
+    the frequencies ``ω_r`` on a polar grid: ``num_directions`` directions over 180° and
+    ``num_scales`` wavelengths spaced geometrically over ``[min_wavelength, max_wavelength]`` (µm).
+    Translation-invariant, like the ``distance`` bias, but unlike it a product of per-cell features:
+    ``cos(ω . (p_j - p_i)) = cos(ω . p_i) cos(ω . p_j) + sin(ω . p_i) sin(ω . p_j)``. So it has a
+    low-rank form (:meth:`factors`, ``2 R`` dims for ``R`` frequencies) that a backend can fold into
+    its queries and keys -- the distance-like bias a Performer can carry.
+
+    ``isotropic`` (the default) ties the cosine coefficients across directions -- each scale's
+    waves are averaged over the directions -- and drops the sines, so the bias is symmetric and close
+    to a function of distance alone: fitted to a ring at 1 mm, an exponential decay and a step at
+    2.5 mm within 3 mm, 8 directions x 16 scales over 200 µm-12 mm reach R² 0.94-0.99. The isotropy
+    holds where a wave's phase across the distance is resolved by the directions (``ω |Δ|`` up to
+    about the number of directions); short wavelengths at long range average out rather than being
+    radial. Otherwise every frequency has its own cosine and sine coefficient per head: a directional
+    prior, and an asymmetric one through the sines ("attend toward +y").
+
+    All coefficients start at zero, so switching it on changes nothing at step 0. One set serves
+    every layer, like the other biases. The frequencies are a buffer, so a checkpoint keeps the
+    wavelengths it was trained with even where another ``max_wavelength`` would be derived.
+    Phases are formed in float64 from the coordinates.
+    """
+
+    def __init__(
+        self,
+        n_heads: int,
+        num_directions: int,
+        num_scales: int,
+        min_wavelength: float,
+        max_wavelength: float,
+        isotropic: bool = True,
+    ):
+        super().__init__()
+        if num_directions < 1 or num_scales < 1:
+            raise ValueError(f"the Fourier bias needs >= 1 direction and scale, got {num_directions}, {num_scales}.")
+        if not 0 < min_wavelength <= max_wavelength:
+            raise ValueError(
+                f"the Fourier bias needs 0 < min_wavelength <= max_wavelength, got {min_wavelength}, {max_wavelength} um."
+            )
+        self.n_heads, self.num_directions, self.num_scales = int(n_heads), int(num_directions), int(num_scales)
+        self.isotropic = bool(isotropic)
+        wavelengths = torch.logspace(
+            math.log10(min_wavelength), math.log10(max_wavelength), self.num_scales, dtype=torch.float64
+        )
+        angle = torch.arange(self.num_directions, dtype=torch.float64) * (math.pi / self.num_directions)
+        direction = torch.stack([angle.cos(), angle.sin()], dim=-1)
+        direction[direction.abs() < 1e-12] = 0.0
+        # [scales * directions, 2] in rad/µm, scale-major.
+        frequencies = ((2 * math.pi / wavelengths)[:, None, None] * direction[None]).reshape(-1, 2)
+        self.register_buffer("frequencies", frequencies)
+        self.factor_dim = 2 * self.num_scales * self.num_directions
+        # Read by AttentionBias: this bias takes the cells' coordinates, not their distances.
+        self.reads_coordinates = True
+        if self.isotropic:
+            self.cos_coef = nn.Parameter(torch.zeros(self.n_heads, self.num_scales))
+        else:
+            self.cos_coef = nn.Parameter(torch.zeros(self.n_heads, self.num_scales, self.num_directions))
+            self.sin_coef = nn.Parameter(torch.zeros(self.n_heads, self.num_scales, self.num_directions))
+
+    def extra_repr(self) -> str:
+        waves = 2 * math.pi / self.frequencies.norm(dim=-1)
+        return (
+            f"num_directions={self.num_directions}, num_scales={self.num_scales}, isotropic={self.isotropic}, "
+            f"wavelengths={float(waves.min()):.0f}-{float(waves.max()):.0f} um"
+        )
+
+    def coefficients(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(a, c)``, each ``[heads, R]``: every frequency's cosine and sine coefficient per head."""
+        if self.isotropic:
+            a = (self.cos_coef / self.num_directions)[:, :, None].expand(-1, -1, self.num_directions)
+            a = a.reshape(self.n_heads, -1)
+            return a, torch.zeros_like(a)
+        return self.cos_coef.reshape(self.n_heads, -1), self.sin_coef.reshape(self.n_heads, -1)
+
+    def factors(self, pos_um: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``[B, S, 2]`` positions (µm) to ``U, W``, each ``[B, heads, S, 2R]``, with ``U W^T`` the bias.
+
+        Per frequency the bias is ``ψ_iᵀ M ψ_j`` with ``ψ = (cos ω.p, sin ω.p)`` and
+        ``M = [[a, c], [-c, a]]`` -- ``a`` times a rotation, so ``U_i = Mᵀ ψ_i / s`` and
+        ``W_j = s ψ_j`` have their norms balanced by ``s = sqrt(sqrt(a² + c²) + eps)`` (detached, as
+        in :func:`balanced_factors`).
+        """
+        phase = torch.einsum("bsc,rc->bsr", pos_um.double(), self.frequencies.double())
+        cos, sin = phase.cos().to(pos_um.dtype).unsqueeze(1), phase.sin().to(pos_um.dtype).unsqueeze(1)
+        a, c = self.coefficients()
+        a, c = a[None, :, None, :], c[None, :, None, :]  # [1, heads, 1, R]
+        with torch.no_grad():
+            scale = ((a * a + c * c).sqrt() + FACTOR_BALANCE_EPS).sqrt()
+        left = torch.cat([a * cos - c * sin, c * cos + a * sin], dim=-1) / torch.cat([scale, scale], dim=-1)
+        right = torch.cat([cos, sin], dim=-1).expand(-1, self.n_heads, -1, -1) * torch.cat([scale, scale], dim=-1)
+        return left, right
+
+    def forward(self, pos_um: torch.Tensor) -> torch.Tensor:
+        """``[B, S, 2]`` positions in µm to ``[B, heads, S, S]`` biases -- the product of :meth:`factors`."""
+        left, right = self.factors(pos_um)
+        return left @ right.transpose(-1, -2)
+
+    def bias_at(self, offsets_um: torch.Tensor) -> torch.Tensor:
+        """``[n, 2]`` offsets ``p_key - p_query`` (µm) to each head's bias, ``[heads, n]``: the learned function, readable."""
+        phase = offsets_um.double() @ self.frequencies.double().T  # [n, R]
+        a, c = self.coefficients()
+        return (a.detach().double() @ phase.cos().T + c.detach().double() @ phase.sin().T).float()
+
+
 ROPE_KINDS = ("axial", "mixed")
 
 
@@ -551,6 +658,21 @@ def _validate_spectral(pe):
         raise ValueError(f"pe.spectral.max_eigval ({s.max_eigval}) must be > min_eigval ({s.min_eigval}).")
 
 
+def _validate_fourier(pe):
+    f = pe.fourier
+    _positive(f.num_directions, "fourier.num_directions")
+    _positive(f.num_scales, "fourier.num_scales")
+    _positive(f.min_wavelength, "fourier.min_wavelength")
+    if not f.max_wavelength >= 0:
+        raise ValueError(
+            f"pe.fourier.max_wavelength must be >= 0 (0 derives it from the data), got {f.max_wavelength}."
+        )
+    if f.max_wavelength > 0 and f.max_wavelength < f.min_wavelength:
+        raise ValueError(
+            f"pe.fourier.max_wavelength ({f.max_wavelength}) must be >= min_wavelength ({f.min_wavelength}), or 0."
+        )
+
+
 def _spectral_inputs(data, pe) -> dict:
     """The spectral bias's precomputed inputs for one graph: two attributes, per cell and per graph."""
     vecs, vals = laplacian_spectrum(data.edge_index, data.num_nodes, int(pe.spectral.k))
@@ -619,6 +741,25 @@ def _build_distance(pe, n_heads):
 def _build_spectral(pe, n_heads):
     s = pe.spectral
     return SpectralBias(n_heads, int(s.num_knots), float(s.min_eigval), float(s.max_eigval), k=int(s.k))
+
+
+@register_pe("fourier", kind="bias", requires="pos", validate=_validate_fourier, forms=frozenset({"dense", "factors"}))
+def _build_fourier(pe, n_heads):
+    f = pe.fourier
+    if not f.max_wavelength > 0:
+        raise ValueError(
+            "pe.fourier.max_wavelength is 0, which means 'derive it from the data', but nothing derived it. "
+            "A model built from AnnData does so in its constructor (resolve_fourier_range); a module built "
+            "directly from the config needs max_wavelength set, or resolve_fourier_range(cfg, adata) first."
+        )
+    return FourierBias(
+        n_heads,
+        int(f.num_directions),
+        int(f.num_scales),
+        float(f.min_wavelength),
+        float(f.max_wavelength),
+        isotropic=bool(f.isotropic),
+    )
 
 
 @register_pe("rope", kind="rotary", requires="pos", validate=_validate_rope)
@@ -740,7 +881,13 @@ class AttentionBias(nn.Module):
     def __init__(self, encoders: dict[str, nn.Module], *, n_heads: int, spatial_unit_um: float):
         super().__init__()
         self.encoders = nn.ModuleDict(encoders)
-        self.requires = {name: PE_REGISTRY[name].requires for name in encoders}
+        # The input each bias is handed, by key: the ``Data`` attribute it reads, except that a
+        # bias reading coordinates (``reads_coordinates``: Fourier) gets the padded positions
+        # ("pos_coords") rather than the pairwise distances the ``distance`` bias takes.
+        self.requires = {
+            name: "pos_coords" if getattr(encoder, "reads_coordinates", False) else PE_REGISTRY[name].requires
+            for name, encoder in encoders.items()
+        }
         self.n_heads = int(n_heads)
         self.spatial_unit_um = float(spatial_unit_um)
 
@@ -750,7 +897,7 @@ class AttentionBias(nn.Module):
 
     def _inputs(self, key: str, batched_data, batch, index_nodes, seq_len: int, dtype, device) -> tuple:
         """What the biases reading ``key`` take, padded like the tokens."""
-        if key == "pos":
+        if key in ("pos", "pos_coords"):
             pos = getattr(batched_data, "pos", None)
             if pos is None:
                 users = sorted(name for name, need in self.requires.items() if need == "pos")
@@ -759,6 +906,8 @@ class AttentionBias(nn.Module):
                     "`pos`. Set dataset.spatial_key (e.g. 'spatial') so they are attached."
                 )
             padded = pad_like(pos.to(device=device, dtype=dtype) * self.spatial_unit_um, batch, index_nodes, seq_len)
+            if key == "pos_coords":
+                return (padded,)
             # The exact path: the matrix-product shortcut loses ~µm on coordinates of a few mm.
             return (torch.cdist(padded, padded, compute_mode="donot_use_mm_for_euclid_dist"),)
         if key == "spectral_pe":
@@ -993,6 +1142,33 @@ def resolve_rope_range(cfg, adata):
     cfg.freeze()
     logger.info(
         "pe.rope.max_wavelength derived from the data: %.1f um (twice the largest slide diameter).", max_wavelength
+    )
+    return cfg
+
+
+def resolve_fourier_range(cfg, adata):
+    """``cfg`` with a derived ``pe.fourier.max_wavelength`` when it is 0, else ``cfg`` itself.
+
+    0 means twice the largest slide diameter (:func:`max_slide_diameter_um`), as for RoPE: the
+    longest wave then turns by at most half a cycle across a slide, so it reaches across the whole
+    slide without wrapping around. Returns a clone; called by every model constructor; a no-op unless
+    the Fourier bias is enabled with ``max_wavelength`` 0.
+    """
+    names, pe = _enabled(cfg, "bias")
+    if "fourier" not in names or pe.fourier.max_wavelength > 0:
+        return cfg
+    max_wavelength = 2.0 * max_slide_diameter_um(adata, cfg)
+    if not max_wavelength >= pe.fourier.min_wavelength:
+        raise ValueError(
+            f"pe.fourier.max_wavelength 0 asks for twice the largest slide diameter, {max_wavelength:.1f} um, "
+            f"which is below pe.fourier.min_wavelength ({pe.fourier.min_wavelength}). Set both explicitly."
+        )
+    cfg = cfg.clone()
+    cfg.defrost()
+    cfg.model.global_component.parameters.pe.fourier.max_wavelength = max_wavelength
+    cfg.freeze()
+    logger.info(
+        "pe.fourier.max_wavelength derived from the data: %.1f um (twice the largest slide diameter).", max_wavelength
     )
     return cfg
 

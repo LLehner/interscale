@@ -839,3 +839,170 @@ def test_a_performer_with_the_spectral_bias_runs_end_to_end():
     out.sum().backward()
     assert torch.allclose(fast, out, atol=1e-5)
     assert torch.isfinite(attn).all() and encoder.table.grad is not None
+
+
+# --------------------------------------------------------------------------- the Fourier bias
+
+
+def _fourier(isotropic=True, seed=2, scale=0.5, directions=8, scales=16, n_heads=N_HEADS):
+    from interscale.module.global_modules.positional_encodings import FourierBias
+
+    bias = FourierBias(n_heads, directions, scales, 200.0, 12000.0, isotropic=isotropic)
+    gen = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for p in bias.parameters():
+            p.copy_(torch.randn(p.shape, generator=gen) * scale)
+    return bias
+
+
+def _fourier_attention_bias(**kwargs):
+    from interscale.module.global_modules.positional_encodings import AttentionBias
+
+    return AttentionBias({"fourier": _fourier(**kwargs)}, n_heads=N_HEADS, spatial_unit_um=1.0)
+
+
+def test_the_fourier_bias_starts_at_zero():
+    from interscale.module.global_modules.positional_encodings import FourierBias
+
+    for isotropic in (True, False):
+        bias = FourierBias(N_HEADS, 8, 16, 200.0, 12000.0, isotropic=isotropic)
+        pos = torch.rand(1, 6, 2) * 3000
+        assert torch.all(bias(pos) == 0)
+
+
+def test_the_fourier_bias_in_factors_is_its_dense_bias_laid_out_like_the_tokens():
+    """Through AttentionBias: the factors' product equals the dense bias on two graphs of different
+    size, one subsampled, with CLS and padding zero -- and each entry is the learned function of the
+    two cells' offset."""
+    batch = _spectral_batch()
+    bias = _fourier_attention_bias(isotropic=False)
+    padding, index_nodes = _padded_layout(batch, max_seq_len=7)
+    dense = bias(batch, index_nodes, padding, dtype=torch.float32, device=torch.device("cpu"))
+    left, right = bias.factors(batch, index_nodes, padding, dtype=torch.float32, device=torch.device("cpu"))
+
+    assert left.shape[-1] == 2 * 8 * 16
+    assert torch.allclose(left @ right.transpose(1, 2), dense, atol=1e-4)
+    assert torch.all(dense[:, -1] == 0) and torch.all(dense[:, :, -1] == 0)  # CLS
+    # graph 0 keeps 7 of its 9 cells: entry (i, j) is b(p_j - p_i) for the kept cells.
+    pos = batch.pos[:9][torch.as_tensor(index_nodes[0])]
+    offsets = (pos[None, :, :] - pos[:, None, :]).reshape(-1, 2)
+    expected = bias.encoders["fourier"].bias_at(offsets).reshape(N_HEADS, 7, 7)
+    assert torch.allclose(dense[:N_HEADS, :7, :7], expected, atol=1e-4)
+
+
+def test_the_fourier_bias_depends_on_offsets_only():
+    bias = _fourier(isotropic=False)
+    pos = torch.rand(1, 8, 2, generator=torch.Generator().manual_seed(0)) * 3000
+    shifted = pos + torch.tensor([4000.0, -2500.0])
+    assert torch.allclose(bias(pos), bias(shifted), atol=1e-4)
+
+
+def test_the_isotropic_fourier_bias_is_symmetric_and_turns_with_its_directions():
+    """Isotropic: no sines, so b(Δ) = b(-Δ); and the direction grid maps onto itself under a turn
+    by 180° / directions, so the bias does too. The anisotropic one is directional and asymmetric."""
+    offsets = torch.rand(50, 2, generator=torch.Generator().manual_seed(1)) * 4000 - 2000
+    iso = _fourier(isotropic=True)
+    assert torch.allclose(iso.bias_at(offsets), iso.bias_at(-offsets), atol=1e-5)
+    turn = math.pi / 8
+    rotation = torch.tensor([[math.cos(turn), -math.sin(turn)], [math.sin(turn), math.cos(turn)]])
+    assert torch.allclose(iso.bias_at(offsets), iso.bias_at(offsets @ rotation.T), atol=1e-4)
+
+    aniso = _fourier(isotropic=False)
+    assert not torch.allclose(aniso.bias_at(offsets), aniso.bias_at(-offsets), atol=1e-2)
+
+
+def test_the_isotropic_fourier_bias_can_single_out_a_distance():
+    """Its coefficients fitted by (ridge) least squares, the default grid reproduces a ring at 1 mm
+    within 3 mm -- the distance profile's job, in a form a Performer can carry. The ridge keeps the
+    coefficients at the scale a model would learn (< 1): plain least squares reaches ~1e9 on the
+    nearly constant longest waves, a cancellation no float32 bias could hold."""
+    from interscale.module.global_modules.positional_encodings import FourierBias
+
+    bias = FourierBias(1, 8, 16, 200.0, 12000.0, isotropic=True)
+    gen = torch.Generator().manual_seed(0)
+    radius = torch.rand(3000, generator=gen, dtype=torch.float64) * 3000
+    angle = torch.rand(3000, generator=gen, dtype=torch.float64) * 2 * math.pi
+    offsets = torch.stack([radius * angle.cos(), radius * angle.sin()], dim=-1)
+    target = torch.exp(-(((radius - 1000) / 300) ** 2))
+
+    phase = offsets @ bias.frequencies.double().T  # [n, scales * directions]
+    per_scale = phase.cos().reshape(len(offsets), 16, 8).mean(-1)  # what cos_coef multiplies
+    design = per_scale - per_scale.mean(0)  # a constant shift is irrelevant to a softmax
+    gram = design.T @ design + 1e-4 * len(design) * torch.eye(16, dtype=torch.float64)
+    coef = torch.linalg.solve(gram, design.T @ (target - target.mean())[:, None])
+    assert coef.abs().max() < 1
+    with torch.no_grad():
+        bias.cos_coef.copy_(coef.T.float())
+    fitted = bias.bias_at(offsets.float())[0].double()
+    residual = (target - target.mean()) - (fitted - fitted.mean())
+    assert 1 - residual.var() / target.var() > 0.9
+
+
+def test_a_performer_carries_the_fourier_bias_end_to_end():
+    batch = _spectral_batch()
+    attention_bias = _fourier_attention_bias(scale=0.05)
+    module = _module_with(_performer_cfg(), long_range=True, hops=1, attention_bias=attention_bias).eval()
+    emb = torch.randn(batch.num_nodes, N_EMBED)
+    padded, padding, _, mask, rotary = module.common_step_local_to_global(batch, emb, eval_step=True)
+    assert mask.bias_factors[0].shape[-1] == 256
+    fast = module.forward(padded, padding, mask, rotary=rotary)[0]
+    out, _, attn = module.forward(padded, padding, mask, register_hook=True, rotary=rotary)
+    out.sum().backward()
+    assert torch.allclose(fast, out, atol=1e-5)
+    assert torch.isfinite(attn).all()
+    assert attention_bias.encoders["fourier"].cos_coef.grad.abs().sum() > 0
+
+
+def test_a_dense_attention_carries_the_fourier_bias_too():
+    batch = _spectral_batch()
+    attention_bias = _fourier_attention_bias()
+    module = _module(long_range=True, hops=1, attention_bias=attention_bias).eval()
+    emb = torch.randn(batch.num_nodes, N_EMBED)
+    padded, padding, _, mask, rotary = module.common_step_local_to_global(batch, emb, eval_step=True)
+    assert mask.is_floating_point()  # merged into the float mask, like the other biases
+    out = module.forward(padded, padding, mask, rotary=rotary)[0]
+    assert torch.isfinite(out).all()
+
+
+def test_the_validator_and_the_config_take_the_fourier_bias():
+    from interscale.config import _validate_attention, _validate_pe
+
+    cfg = _cfg(kind="performer", bias=["fourier"])
+    _validate_attention(cfg)
+    _validate_pe(cfg)
+    cfg.dataset.spatial_key = None
+    with pytest.raises(ValueError, match="read cell coordinates"):
+        _validate_pe(cfg)
+    cfg = _cfg(bias=["fourier"])
+    cfg.model.global_component.parameters.pe.fourier.num_scales = 0
+    with pytest.raises(ValueError, match="fourier.num_scales must be > 0"):
+        _validate_pe(cfg)
+
+
+def test_fourier_max_wavelength_zero_is_twice_the_largest_slide_diameter():
+    import pandas as pd
+    from anndata import AnnData
+
+    from interscale.module.global_modules.positional_encodings import resolve_fourier_range
+
+    coords = np.array([[0, 0], [30, 0], [0, 40], [30, 40], [1000, 0], [1006, 8]], dtype=np.float32)
+    adata = AnnData(X=np.zeros((6, 3), dtype=np.float32))
+    adata.obsm["spatial"] = coords
+    adata.obs["sample"] = pd.Categorical(["a"] * 4 + ["b"] * 2)
+    cfg = _cfg(bias=["fourier"])
+    cfg.dataset.sample_key = ["sample"]
+    cfg.dataset.spatial_unit_um = 2.0
+    cfg.model.global_component.parameters.pe.fourier.min_wavelength = 10.0
+    cfg.freeze()
+
+    resolved = resolve_fourier_range(cfg, adata)
+    assert resolved.model.global_component.parameters.pe.fourier.max_wavelength == pytest.approx(200.0)
+    assert cfg.model.global_component.parameters.pe.fourier.max_wavelength == 0.0
+
+
+def test_the_checkpoint_name_carries_the_fourier_bias():
+    from interscale.tl.utils import get_model_filename_prefix
+
+    cfg = _cfg(kind="performer", bias=["fourier"])
+    cfg.dataset.name = "d"
+    assert get_model_filename_prefix(cfg, False, True).endswith("pe-fourier_attn-performer_")

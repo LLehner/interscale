@@ -28,7 +28,7 @@ def get_global_component_cfg(cfg, global_component_name):
         pe = cfg.model.global_component.parameters.pe = CN()
         pe.node = []  # any of: naive, sinusoidal, lap, rw
         # Attention biases, added to the logit of every pair of tokens: any of: distance, spectral.
-        pe.bias = []
+        pe.bias = []  # any of: distance, spectral, fourier
         # The rotary encoding, which turns every query and key by its cell's position in each
         # attention layer: [] or [rope].
         pe.rotary = []
@@ -89,6 +89,20 @@ def get_global_component_cfg(cfg, global_component_name):
         pe.spectral.num_knots = 32
         pe.spectral.min_eigval = 1e-5
         pe.spectral.max_eigval = 2.0  # the largest eigenvalue a normalised Laplacian can have
+        # A learned function of the offset between two cells as a sum of plane waves: frequencies
+        # on a polar grid of `num_directions` directions over 180 degrees x `num_scales`
+        # wavelengths spaced geometrically over [min_wavelength, max_wavelength] (um); 0 for
+        # max_wavelength derives twice the largest slide diameter. `isotropic` ties the
+        # coefficients across directions (symmetric, close to a function of distance -- the
+        # `distance` profile's counterpart); off, every frequency has its own cosine and sine
+        # coefficient per head (a directional, asymmetric prior). Unlike `distance` it is low rank
+        # (2 x directions x scales dims), so the Performer can carry it. Starts at zero.
+        pe.fourier = CN()
+        pe.fourier.num_directions = 8
+        pe.fourier.num_scales = 16
+        pe.fourier.min_wavelength = 200.0
+        pe.fourier.max_wavelength = 0.0
+        pe.fourier.isotropic = True
         # Rotary position embedding in 2D (RoPE; Su et al. 2021, Heo et al. 2024): pairs of each
         # head's query and key dims are rotated by angles linear in the cell's coordinates, so the
         # logit of two cells depends on their offset, weighted by what the two cells express.
