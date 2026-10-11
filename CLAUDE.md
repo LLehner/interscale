@@ -145,7 +145,11 @@ on a position-derived target counts only where it beats `pe` (`.claude/PE_plan.m
 Targets are `probe.classification_targets`
 (an optional annotation attached to the PyG graphs, so `celltype` requires `dataset.celltype_key`;
 scored with macro precision/recall via logistic regression) and `probe.regression_genes` (a column
-of `adata.var_names`; scored with MSE and R2 via ridge). Results are logged as flat
+of `adata.var_names`; scored with MSE and R2 via ridge). `probe.gene_vector: true` adds the whole
+gene vector as one target: a ridge per gene, scored by the cosine of predicted and true vectors over
+each cell's hidden entries (`masked_probing.probe_expression`, the post-hoc scoring), logged as
+`probe/gene_vector_cosine_{raw,centred}_<embedding>` with a `mean` floor column for the raw cosine.
+Results are logged as flat
 `probe/<target>_<metric>_<embedding>` scalars — monitorable by EarlyStopping/ModelCheckpoint/a
 sweep — plus, under wandb, one custom chart per target carrying both embeddings as two lines. The
 `probe/` prefix is load-bearing: wandb sections split on the text before the first `/`, so it keeps

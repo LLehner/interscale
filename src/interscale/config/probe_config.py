@@ -42,6 +42,16 @@ def get_probe_cfg(cfg):
     # `apply_mask` leaves untouched because it corrupts a clone. Scored with MSE and R2.
     cfg.probe.regression_genes = []
 
+    # The WHOLE gene vector as one target: a ridge per gene predicts every gene from each
+    # embedding, and each val cell's predicted vector is compared with its true one by cosine over
+    # the entries that were hidden (`evaluation.masked_probing.probe_expression`, the same scoring
+    # as the post-hoc evaluation). Logged as probe/gene_vector_cosine_raw_<embedding> and
+    # probe/gene_vector_cosine_centred_<embedding>, plus probe/gene_vector_cosine_raw_mean --
+    # predicting each gene's training mean -- the floor the raw cosine has to beat (the centred
+    # cosine's floor is 0 by construction). Independent of
+    # regression_genes; set that to [] to drop the per-gene curves.
+    cfg.probe.gene_vector = False
+
     # Continuous targets that are NOT genes: numeric `adata.obs` columns such as
     # `dist_to_center` or `hub_response`. Like the categorical targets these never enter the
     # model's input, so they are scored on the clean pass. Requires `dataset.probe_obsm_key`,

@@ -340,6 +340,59 @@ def test_run_emits_a_paired_scalar_for_every_target_and_embedding():
     assert all(np.isfinite(v) for v in results.values())
 
 
+def test_gene_vector_probe_scores_every_gene_by_cosine_without_per_gene_curves():
+    """gene_vector alone: one corrupted pass over all genes, cosine scalars, no gene_<name> scalars."""
+    cfg = probe_cfg()
+    cfg.probe.classification_targets = []
+    cfg.probe.regression_genes = []
+    cfg.probe.gene_vector = True
+    callback = OnlineProbeCallback(cfg, GENES)
+
+    calls = []
+    import interscale.evaluation.online_probes as mod
+
+    real = mod.collect_features
+    mod.collect_features = lambda *a, **kw: (calls.append((kw["corrupt"], sorted(kw["gene_index"]))), real(*a, **kw))[1]
+    try:
+        results = callback.run(
+            build_module(),
+            _Datamodule(make_data_list(sizes=(40, 40)), make_data_list(sizes=(40,), seed=7)),
+            device=torch.device("cpu"),
+        )
+    finally:
+        mod.collect_features = real
+
+    assert calls == [(True, sorted(GENES))] * 2, calls
+    for metric in ("cosine_raw", "cosine_centred"):
+        assert probe_metric_name("gene_vector", metric, "global") in results
+    # The mean profile is the raw cosine's floor. Its centred prediction is all zeros, so its
+    # centred cosine is undefined and is left out rather than logged as NaN.
+    assert probe_metric_name("gene_vector", "cosine_raw", "mean") in results
+    assert probe_metric_name("gene_vector", "cosine_centred", "mean") not in results
+    assert not any(name.startswith("probe/gene_g") for name in results)
+    assert all(np.isfinite(v) for v in results.values())
+
+
+def test_gene_vector_scalars_chart_by_embedding():
+    cfg = probe_cfg()
+    callback = OnlineProbeCallback(cfg, GENES)
+    results = {
+        probe_metric_name("gene_vector", "cosine_raw", "local+global"): 0.9,
+        probe_metric_name("gene_vector", "cosine_raw", "mean"): 0.8,
+    }
+    series = callback.chart_series(None, results)
+    assert series == {"gene_vector_cosine_raw": {"local+global": 0.9, "mean": 0.8}}
+
+
+def test_gene_vector_alone_counts_as_a_probe_target():
+    from interscale.config import _validate_probe
+
+    cfg = get_cfg_defaults()
+    cfg.probe.use = True
+    cfg.probe.gene_vector = True
+    _validate_probe(cfg)
+
+
 def test_unknown_gene_name_raises_rather_than_probing_the_wrong_column():
     cfg = probe_cfg()
     cfg.probe.regression_genes = ["not_a_gene"]

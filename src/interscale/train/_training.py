@@ -134,7 +134,8 @@ class NodeMaskingTrainingPlan:
                 f"Online probes every {self._cfg.probe.every_n_epochs} epoch(s) on "
                 f"{list(self._cfg.probe.embeddings)}: "
                 f"classification={list(self._cfg.probe.classification_targets)}, "
-                f"genes={list(self._cfg.probe.regression_genes)}"
+                f"genes={list(self._cfg.probe.regression_genes)}, "
+                f"gene_vector={bool(self._cfg.probe.get('gene_vector', False))}"
             )
         checkpoint_callback = None
         loss_callback = None

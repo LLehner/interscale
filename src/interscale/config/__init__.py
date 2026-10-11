@@ -227,10 +227,15 @@ def _validate_probe(cfg):
             "(model.global_component.parameters.pe.node), so there is nothing to read a target out of."
         )
 
-    if not (cfg.probe.classification_targets or cfg.probe.regression_genes or cfg.probe.regression_obs):
+    if not (
+        cfg.probe.classification_targets
+        or cfg.probe.regression_genes
+        or cfg.probe.regression_obs
+        or cfg.probe.get("gene_vector", False)
+    ):
         raise ValueError(
             "probe.use is True but no probe target is named (classification_targets, "
-            "regression_genes, regression_obs). The probe would pay for a full extra pass over "
+            "regression_genes, regression_obs, gene_vector). The probe would pay for a full extra pass over "
             "train and val and log nothing."
         )
 

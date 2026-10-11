@@ -499,6 +499,10 @@ class OnlineProbeCallback(Callback):
             )
         self._gene_index = {g: var_names.index(g) for g in cfg.probe.regression_genes}
         self._n_var = len(var_names)
+        # The whole-vector probe needs every gene collected; the per-gene probe only its own.
+        self._gene_vector = bool(cfg.probe.get("gene_vector", False))
+        self._vector_genes = var_names if self._gene_vector else []
+        self._collect_index = {g: i for i, g in enumerate(var_names)} if self._gene_vector else self._gene_index
 
         # Per-metric history, {chart_key: {series_name: [(epoch, value), ...]}}. Kept so each
         # wandb chart can be re-rendered with the full curve every time it is refreshed.
@@ -557,7 +561,7 @@ class OnlineProbeCallback(Callback):
             "prediction_task": self._cfg.dataset.prediction_task,
             "prediction_level": self._cfg.dataset.prediction_level,
             "embeddings": self._embeddings,
-            "gene_index": self._gene_index,
+            "gene_index": self._collect_index,
             "categorical_targets": self._categorical,
             "obs_targets": self._obs_targets,
             "mask_strategy": self._cfg.dataset.mask_strategy,
@@ -567,7 +571,7 @@ class OnlineProbeCallback(Callback):
 
         results: dict[str, float] = {}
         wants_labels = bool(self._categorical or self._obs_targets)
-        wants_genes = bool(self._gene_index)
+        wants_genes = bool(self._gene_index) or self._gene_vector
 
         if wants_labels:
             clean_train = collect_features(module, datamodule.train_data, corrupt=False, **collect_kwargs)
@@ -578,6 +582,8 @@ class OnlineProbeCallback(Callback):
             train = collect_features(module, datamodule.train_data, corrupt=True, **collect_kwargs)
             val = collect_features(module, datamodule.val_data, corrupt=True, **collect_kwargs)
             results.update(self._score_genes(train, val))
+            if self._gene_vector:
+                results.update(self._score_gene_vector(train, val))
 
         return results
 
@@ -638,6 +644,27 @@ class OnlineProbeCallback(Callback):
                 for metric, value in scores.items():
                     results[probe_metric_name(f"gene_{gene}", metric, embedding)] = value
 
+        return results
+
+    def _score_gene_vector(self, train: ProbeBatchFeatures, val: ProbeBatchFeatures) -> dict[str, float]:
+        """Every gene at once: cosine of predicted and true gene vectors over the hidden entries.
+
+        Scored only on hidden entries whatever ``masked_cells_only`` says -- a shown entry is the
+        model's own input, so including it measures invertibility (see the module docstring).
+        """
+        # Imported here: masked_probing imports ProbeBatchFeatures from this module.
+        from interscale.evaluation.masked_probing import probe_expression
+
+        summary, _ = probe_expression(
+            self._capped(train),
+            self._capped(val),
+            self._vector_genes,
+            alpha=float(self._probe_cfg.ridge_alpha),
+        )
+        results: dict[str, float] = {}
+        for row in summary[summary["scope"] == "all"].itertuples():
+            if np.isfinite(row.value):
+                results[probe_metric_name("gene_vector", row.metric, row.feature_set)] = float(row.value)
         return results
 
     def _capped(self, features: ProbeBatchFeatures) -> ProbeBatchFeatures:
