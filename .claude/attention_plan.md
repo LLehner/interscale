@@ -23,7 +23,7 @@ a real state.
 
 | stage | state | verified by | date |
 |---|---|---|---|
-| 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | **in progress** — maps only when consumed: done (503 tests pass, harness IDENTICAL across 5 cases / 15 epochs; training steps keep no map and hook nothing unless the loss reads attention) | | 2026-10-11 |
+| 0 — plumbing: backend registry, free head width, compatibility validator, maps only when consumed | **done** | 517 tests pass; harness IDENTICAL across 5 cases / 15 epochs after each of the two commits; training steps keep no map and hook nothing unless the loss reads attention; the skeleton's dense core reproduces torch's attention (outputs and maps, with mask, padding and RoPE) and draws its initial weights; a non-default backend leaves every weight built after it unchanged (mutation-checked: without the replayed draws it fails); every validator rejection tested | 2026-10-11 |
 | 1 — attention diagnostics (span in µm, sink mass, effective keys) | not started | | |
 | 2 — kernel attention: Performer (FAVOR+) and linear (elu+1); generated sweep arms | not started | | |
 | 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | not started | | |
@@ -244,6 +244,26 @@ parametrised over backends.
   - The skeleton's dense core, with weights copied from MHA, equals it in outputs and maps.
   - Every validator rejection has a test, using test-registered backends that lack a form.
   - Checkpoint names are unchanged by default.
+
+#### How Stage 0 was built
+
+- **`register_hook` became three-valued** instead of two flags. True (what `evaluate` and the tests
+  pass) keeps and returns every layer's map and hooks it for its gradient. False keeps nothing. None,
+  the default of every training step, returns the stacked maps only when
+  `TransformerNodeEncoderHook.return_attention_maps` is set; `from_config` sets it when `optim.loss`
+  is in `train.losses.LOSSES_READING_ATTENTION`. Torch's attention still takes its explicit path
+  every time, so its numbers cannot move. Other backends compute a map only when one is kept.
+- **The skeleton is `attention.ProjectedAttention`**, with `DenseAttention` as its first core. A
+  backend's module replaces `self_attn` in `CustomTransformerEncoderLayer`. Its per-batch extras
+  arrive as `layer.attention_context`, set like `layer.rotary`, and the layer tells backends from
+  torch's attention by `is_backend`.
+- **`attention.head_dim`** reaches RoPE through `build_positional_encodings(..., head_dim=)`. The
+  config-time RoPE check reads it too (`_validate_pe`), and the transformer keeps it as `head_dim`.
+- **Bias forms** are `PESpec.forms`; `AttentionBias.factor_dim()` sums the factor widths of the
+  enabled biases (0 until Stage 3).
+- Code: `module/global_modules/attention.py`, the layer and transformer changes, `_validate_attention`
+  in `config/__init__.py`, `_attention_tag` in `tl/utils.py`; tests in
+  `tests/test_attention_backends.py`.
 
 ### 1 — attention diagnostics
 

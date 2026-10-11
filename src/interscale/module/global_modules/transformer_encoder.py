@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from interscale.module.base import GlobalModule
+from interscale.module.global_modules.attention import attention_head_dim, attention_kind, build_attention_factory
 from interscale.module.global_modules.transformer_encoder_layer import CustomTransformerEncoderLayer
 from interscale.tl import (
     SelfAttentionRelevance,
@@ -49,6 +50,7 @@ class TransformerNodeEncoderHook(GlobalModule):
         attention_bias: nn.Module | None = None,
         rotary_encoding: nn.Module | None = None,
         return_attention_maps: bool = False,
+        attention=None,
         **base_module_kwargs,
     ):
 
@@ -79,9 +81,27 @@ class TransformerNodeEncoderHook(GlobalModule):
                 stacklevel=2,
             )
 
+        # The attention backend (`attention.py`; the `attention` config block, None = dense) and the
+        # width of one head, which `attention.head_dim` may set apart from n_embed / n_heads.
+        self.attention_kind = attention_kind(attention)
+        self.head_dim = attention_head_dim(attention, self.n_embed, self.n_heads)
+        attention_factory = build_attention_factory(
+            attention,
+            embed_dim=self.n_embed,
+            num_heads=self.n_heads,
+            dropout=self.dropout_global,
+            bias_factor_dim=attention_bias.factor_dim() if attention_bias is not None else 0,
+        )
+
         # Create Transformer Encoder
         encoder_layer = CustomTransformerEncoderLayer(
-            self.n_embed, self.n_heads, self.dim_feedforward, self.dropout_global, self.act_func, norm_first=True
+            self.n_embed,
+            self.n_heads,
+            self.dim_feedforward,
+            self.dropout_global,
+            self.act_func,
+            norm_first=True,
+            attention_factory=attention_factory,
         )
         encoder_norm = nn.LayerNorm(self.n_embed)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, self.num_layers, norm=encoder_norm)
@@ -231,7 +251,7 @@ class TransformerNodeEncoderHook(GlobalModule):
                 else "forward() got a rotation, but this transformer has no rotary encoding enabled."
             )
         if rotary is not None:
-            expected = (padded_h_node.size(1) * self.n_heads, padded_h_node.size(0) + 1, self.n_embed // self.n_heads)
+            expected = (padded_h_node.size(1) * self.n_heads, padded_h_node.size(0) + 1, self.head_dim)
             if tuple(rotary[0].shape) != expected:
                 raise ValueError(
                     f"the rotation has shape {tuple(rotary[0].shape)}, but these tokens need {expected} "
@@ -353,5 +373,6 @@ class TransformerNodeEncoderHook(GlobalModule):
             f"positional_encoding: {sorted(self.positional_encoding.encoders) if self.positional_encoding else []}, \n"
             f"attention_bias: {sorted(self.attention_bias.encoders) if self.attention_bias else []}, \n"
             f"rotary_encoding: {sorted(self.rotary_encoding.encoders) if self.rotary_encoding else []}, \n"
+            f"attention: {self.attention_kind}, head_dim: {self.head_dim}, \n"
         )
         return summary

@@ -106,5 +106,13 @@ def get_global_component_cfg(cfg, global_component_name):
         pe.rope.kind = "axial"
         pe.rope.min_wavelength = 50.0
         pe.rope.max_wavelength = 0.0
+        # The attention mechanism, see `.claude/attention_plan.md`. `kind`: any registered backend
+        # (`module/global_modules/attention.py`): `dense` is softmax attention over every pair, the
+        # model from before backends existed. `head_dim` sets the width of one attention head apart
+        # from the model's width; 0 means n_embed / n_heads. Wider heads are cheap (queries, keys and
+        # values are O(S * heads * head_dim)); more heads are not (every map is [heads, S, S]).
+        att = cfg.model.global_component.parameters.attention = CN()
+        att.kind = "dense"
+        att.head_dim = 0
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

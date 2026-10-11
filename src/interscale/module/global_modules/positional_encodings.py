@@ -55,7 +55,10 @@ class PESpec:
     and ``n_heads, head_dim`` for a rotary encoding (the width it rotates). ``validate(pe_cfg)``
     raises on settings that would fail mid-run, and runs at config load. ``precompute(data, pe_cfg)``,
     when set, returns the ``requires`` attribute for one graph -- or a dict of attributes by name,
-    for an encoding that needs several -- and :func:`attach_positional_inputs` stores it.
+    for an encoding that needs several -- and :func:`attach_positional_inputs` stores it. ``forms``,
+    for a bias, are the forms it can be handed to an attention backend in
+    (``attention.BIAS_FORMS``): ``dense`` (the ``[B * heads, S, S]`` float mask) and, for a low-rank
+    bias, ``factors`` (``U, W`` with ``bias = U W^T``, via the encoder's ``factors`` method).
     """
 
     kind: str
@@ -63,18 +66,29 @@ class PESpec:
     build: Callable
     validate: Callable
     precompute: Callable | None = None
+    forms: frozenset = frozenset({"dense"})
 
 
 PE_REGISTRY: dict[str, PESpec] = {}
 
 
-def register_pe(name: str, *, kind: str, requires: str, validate: Callable, precompute: Callable | None = None):
+def register_pe(
+    name: str,
+    *,
+    kind: str,
+    requires: str,
+    validate: Callable,
+    precompute: Callable | None = None,
+    forms: frozenset = frozenset({"dense"}),
+):
     """Register ``build(pe_cfg, width) -> nn.Module`` as the encoding ``name``."""
 
     def decorator(build):
         if name in PE_REGISTRY:
             raise ValueError(f"positional encoding '{name}' is already registered")
-        PE_REGISTRY[name] = PESpec(kind=kind, requires=requires, build=build, validate=validate, precompute=precompute)
+        PE_REGISTRY[name] = PESpec(
+            kind=kind, requires=requires, build=build, validate=validate, precompute=precompute, forms=frozenset(forms)
+        )
         return build
 
     return decorator
@@ -376,8 +390,8 @@ class RotaryPE(nn.Module):
         super().__init__()
         if head_dim % 4:
             raise ValueError(
-                "2D RoPE rotates pairs, one per axis and wavelength, so the head width n_embed / n_heads "
-                f"must be a multiple of 4; got {head_dim}."
+                "2D RoPE rotates pairs, one per axis and wavelength, so the attention head width "
+                f"(attention.head_dim, or n_embed / n_heads) must be a multiple of 4; got {head_dim}."
             )
         if kind not in ROPE_KINDS:
             raise ValueError(f"RoPE kind must be one of {ROPE_KINDS}, got {kind!r}.")
@@ -692,6 +706,10 @@ class AttentionBias(nn.Module):
         self.n_heads = int(n_heads)
         self.spatial_unit_um = float(spatial_unit_um)
 
+    def factor_dim(self) -> int:
+        """Width ``r`` of the low-rank factors of the enabled biases that have them; 0 when none has."""
+        return sum(int(getattr(encoder, "factor_dim", 0)) for encoder in self.encoders.values())
+
     def _inputs(self, key: str, batched_data, batch, index_nodes, seq_len: int, dtype, device) -> tuple:
         """What the biases reading ``key`` take, padded like the tokens."""
         if key == "pos":
@@ -964,18 +982,19 @@ def build_coordinate_frame(cfg) -> CoordinateFrame:
     )
 
 
-def build_positional_encodings(cfg, *, n_embed: int | None, n_heads: int) -> dict:
+def build_positional_encodings(cfg, *, n_embed: int | None, n_heads: int, head_dim: int | None = None) -> dict:
     """Every positional module ``cfg`` enables, as the transformer's keyword arguments (None when off).
 
     The node and the rotary encoding get one :class:`CoordinateFrame`, so in a forward pass they see
-    each graph rotated by the same angle, and draw from a single PE generator.
+    each graph rotated by the same angle, and draw from a single PE generator. ``head_dim`` is the
+    attention's head width (``attention.head_dim``); None means ``n_embed / n_heads``.
     """
     needs_frame = _enabled(cfg, "node")[0] or _enabled(cfg, "rotary")[0]
     frame = build_coordinate_frame(cfg) if needs_frame else None
     return {
         "positional_encoding": build_node_positional_encoding(cfg, n_embed, frame=frame),
         "attention_bias": build_attention_bias(cfg, n_heads),
-        "rotary_encoding": build_rotary_encoding(cfg, n_heads, n_embed, frame=frame),
+        "rotary_encoding": build_rotary_encoding(cfg, n_heads, n_embed, frame=frame, head_dim=head_dim),
     }
 
 
@@ -999,21 +1018,24 @@ def build_node_positional_encoding(
 
 
 def build_rotary_encoding(
-    cfg, n_heads: int, n_embed: int | None, frame: CoordinateFrame | None = None
+    cfg, n_heads: int, n_embed: int | None, frame: CoordinateFrame | None = None, head_dim: int | None = None
 ) -> RotaryEncoding | None:
     """Build the rotary encoding ``cfg`` enables, or None when ``pe.rotary`` is empty.
 
     Built inside a forked RNG, like the others. ``frame`` is the model's shared one; without it, a
-    new one -- whose rotations then differ from the node encodings' in training.
+    new one -- whose rotations then differ from the node encodings' in training. ``head_dim`` is the
+    width it rotates, the attention's head width; None means ``n_embed / n_heads``.
     """
     names, pe = _enabled(cfg, "rotary")
     if not names:
         return None
-    if n_embed is None or n_embed % n_heads:
-        raise ValueError(f"the rotary encoding needs n_embed divisible by n_heads ({n_heads}), got {n_embed}.")
+    if head_dim is None:
+        if n_embed is None or n_embed % n_heads:
+            raise ValueError(f"the rotary encoding needs n_embed divisible by n_heads ({n_heads}), got {n_embed}.")
+        head_dim = int(n_embed) // int(n_heads)
 
     with torch.random.fork_rng(devices=[]):
-        encoders = {name: PE_REGISTRY[name].build(pe, int(n_heads), int(n_embed) // int(n_heads)) for name in names}
+        encoders = {name: PE_REGISTRY[name].build(pe, int(n_heads), int(head_dim)) for name in names}
     return RotaryEncoding(encoders, frame=frame if frame is not None else build_coordinate_frame(cfg))
 
 

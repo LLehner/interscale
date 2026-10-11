@@ -372,9 +372,13 @@ class GlobalModule(BaseModule):
 
         if module_name == "self-attn-transformer":
             from interscale.module.global_modules import TransformerNodeEncoderHook
+            from interscale.module.global_modules.attention import attention_head_dim
             from interscale.module.global_modules.positional_encodings import build_positional_encodings
             from interscale.train.losses import LOSSES_READING_ATTENTION
 
+            attention = params.get("attention", None)
+            n_embed = kwargs.get("n_embed")
+            head_dim = attention_head_dim(attention, n_embed, params["n_heads"]) if n_embed is not None else None
             return TransformerNodeEncoderHook(
                 max_seq_len=params["max_seq_len"],
                 n_heads=params["n_heads"],
@@ -385,7 +389,8 @@ class GlobalModule(BaseModule):
                 long_range_attention=params["long_range_attention"],
                 local_mask_hops=local_mask_hops,
                 return_attention_maps=cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION,
-                **build_positional_encodings(cfg, n_embed=kwargs.get("n_embed"), n_heads=params["n_heads"]),
+                attention=attention,
+                **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,
             )
         # Add more elifs for other modules

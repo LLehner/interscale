@@ -330,14 +330,74 @@ def _validate_pe(cfg):
         raise ValueError(f"dataset.spatial_unit_um must be > 0, got {cfg.dataset.spatial_unit_um}.")
 
     if pe.get("rotary", []):
-        # Pairs of a head's dims are rotated, one pair per axis and wavelength.
+        # Pairs of a head's dims are rotated, one pair per axis and wavelength. The head width is
+        # the attention's: attention.head_dim, or n_embed / n_heads when that is 0.
         n_embed, n_heads = cfg.model.n_embed, params.n_heads
-        if n_embed % n_heads or (n_embed // n_heads) % 4:
+        attention = params.get("attention", None)
+        head_dim = int(attention.get("head_dim", 0)) if attention is not None else 0
+        width = head_dim if head_dim > 0 else (None if n_embed % n_heads else n_embed // n_heads)
+        if width is None or width % 4:
             raise ValueError(
                 f"pe.rotary {list(pe.rotary)} rotates pairs of each head's dims, one per axis and "
-                f"wavelength, so n_embed / n_heads must be a multiple of 4; got model.n_embed {n_embed} "
-                f"and n_heads {n_heads}."
+                "wavelength, so the attention head width (attention.head_dim, or n_embed / n_heads) must "
+                f"be a multiple of 4; got model.n_embed {n_embed}, n_heads {n_heads}, attention.head_dim "
+                f"{head_dim}."
             )
+
+
+def _validate_attention(cfg):
+    """Reject an attention backend that cannot carry what the rest of the config asks of it.
+
+    Each backend declares what it can carry (``attention.AttentionSpec``): the attention-bias forms,
+    RoPE, the mask form, and whether its training passes form the maps an attention-reading loss
+    needs. A combination outside that would otherwise fail at the first forward pass -- or, worse,
+    run without the encoding. The message names what would fit instead. Each backend checks its own
+    sub-block (``AttentionSpec.validate``).
+    """
+    params = cfg.model.global_component.get("parameters", None)
+    attention = params.get("attention", None) if params is not None else None
+    if attention is None:
+        return
+
+    from interscale.module.global_modules.attention import ATTENTION_REGISTRY
+    from interscale.module.global_modules.positional_encodings import PE_REGISTRY
+    from interscale.train.losses import LOSSES_READING_ATTENTION
+
+    kind = attention.kind
+    if kind not in ATTENTION_REGISTRY:
+        raise ValueError(f"attention.kind {kind!r} is not a registered backend. Known: {sorted(ATTENTION_REGISTRY)}.")
+    if not attention.head_dim >= 0:
+        raise ValueError(f"attention.head_dim must be >= 0 (0 means n_embed / n_heads), got {attention.head_dim}.")
+    if attention.head_dim == 0 and cfg.model.n_embed % params.n_heads:
+        raise ValueError(
+            f"model.n_embed ({cfg.model.n_embed}) is not divisible by n_heads ({params.n_heads}); set "
+            "attention.head_dim to choose the head width directly."
+        )
+    spec = ATTENTION_REGISTRY[kind]
+    spec.validate(attention)
+
+    pe = params.get("pe", None)
+    for name in list(pe.get("bias", [])) if pe is not None else []:
+        if name not in PE_REGISTRY or PE_REGISTRY[name].forms & spec.bias_forms:
+            continue  # unknown names are _validate_pe's to report
+        carriers = sorted(k for k, s in ATTENTION_REGISTRY.items() if PE_REGISTRY[name].forms & s.bias_forms)
+        carried = sorted(n for n, s in PE_REGISTRY.items() if s.kind == "bias" and s.forms & spec.bias_forms)
+        raise ValueError(
+            f"attention.kind {kind!r} cannot carry the attention bias {name!r}: the bias comes in the forms "
+            f"{sorted(PE_REGISTRY[name].forms)}, the backend takes {sorted(spec.bias_forms) or 'none'}. "
+            f"Backends that carry it: {carriers}. Biases this backend carries: {carried or 'none'}."
+        )
+    rotary = list(pe.get("rotary", [])) if pe is not None else []
+    if rotary and not spec.rotary:
+        carriers = sorted(k for k, s in ATTENTION_REGISTRY.items() if s.rotary)
+        raise ValueError(f"attention.kind {kind!r} cannot apply pe.rotary {rotary}. Backends that can: {carriers}.")
+    loss = cfg.optim.get("loss", None)
+    if loss in LOSSES_READING_ATTENTION and not spec.training_maps:
+        carriers = sorted(k for k, s in ATTENTION_REGISTRY.items() if s.training_maps)
+        raise ValueError(
+            f"optim.loss {loss!r} reads the attention maps in training, but attention.kind {kind!r} does not "
+            f"form them there. Backends that do: {carriers}."
+        )
 
 
 def _validate(cfg):
@@ -352,6 +412,7 @@ def _validate(cfg):
     _validate_objective(cfg)
     _validate_probe(cfg)
     _validate_pe(cfg)
+    _validate_attention(cfg)
     _validate_sce(cfg)
 
 

@@ -85,6 +85,23 @@ def _positional_encoding_tag(cfg) -> str:
     return f"pe-{'+'.join(names)}_" if names else ""
 
 
+def _attention_tag(cfg) -> str:
+    """``attn-<kind>[-hd<head_dim>]_`` when the global component uses a non-default attention, else ``""``.
+
+    Part of the checkpoint prefix for the same reason as :func:`_positional_encoding_tag`: an
+    attention sweep's arms would otherwise overwrite each other's checkpoints. Empty for dense
+    attention at the default head width, so every name from before backends is unchanged.
+    """
+    params = cfg.model.global_component.get("parameters", None)
+    attention = params.get("attention", None) if params is not None else None
+    if attention is None:
+        return ""
+    kind, head_dim = str(attention.get("kind", "dense")), int(attention.get("head_dim", 0))
+    if kind == "dense" and head_dim == 0:
+        return ""
+    return f"attn-{kind}" + (f"-hd{head_dim}" if head_dim > 0 else "") + "_"
+
+
 def get_model_filename_prefix(cfg, local_component: bool, global_component: bool):
     """Generate the filename prefix for saving model files.
 
@@ -111,14 +128,14 @@ def get_model_filename_prefix(cfg, local_component: bool, global_component: bool
         # GlobalModel: only global component
         if cfg.model.global_component.name:
             file_name_prefix = file_name_prefix + f"{cfg.model.global_component.name}_"
-        file_name_prefix = file_name_prefix + _positional_encoding_tag(cfg)
+        file_name_prefix = file_name_prefix + _positional_encoding_tag(cfg) + _attention_tag(cfg)
     elif local_component and global_component:
         # CombinedModel: both components
         if cfg.model.local_component.name:
             file_name_prefix = file_name_prefix + f"{cfg.model.local_component.name}_"
         if cfg.model.global_component.name:
             file_name_prefix = file_name_prefix + f"{cfg.model.global_component.name}_"
-        file_name_prefix = file_name_prefix + _positional_encoding_tag(cfg)
+        file_name_prefix = file_name_prefix + _positional_encoding_tag(cfg) + _attention_tag(cfg)
         if cfg.model.decoder.dual_decoder:
             file_name_prefix = "dual_" + file_name_prefix
     else:
