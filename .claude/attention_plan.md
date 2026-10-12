@@ -689,17 +689,17 @@ instrument.
 **First runs: synth_spot, one backend per sweep (2026-10-12, not yet run).** The run scripts are
 `notebooks_and_scripts/performer_test.{py,yaml}` + `performer_sweep.yaml` and
 `notebooks_and_scripts/exphormer_test.{py,yaml}` + `exphormer_sweep.yaml`. Each is pe_test_2's
-setup with only the attention changed, so every arm pairs by name with the dense run of the PE
-sweep. The sweeps cover every single PE the backend carries plus the no-PE baseline: the Performer
-gets 10 arms (no distance bias), Exphormer 12. Both add `fourier` and `fourier_aniso`, which have no
-dense run yet. The scripts validate every arm before queueing, because sweeps do not re-validate.
-Besides pe_test_2's evaluation they write:
+setup with the attention changed and 40 epochs instead of 100, still SCELoss, with the accelerator
+fixed to `gpu`. The arm names are pe_sweep_2's. The sweeps cover every single PE the backend carries
+plus the no-PE baseline: the Performer gets 10 arms (no distance bias), Exphormer 12. Both add
+`fourier` and `fourier_aniso`. The scripts validate every arm before queueing, because sweeps do not
+re-validate. They only write files; comparing backends is left to reading those files. Besides
+pe_test_2's evaluation they write:
 
 - Stage 1's diagnostics on the test slides, with the Performer's TV to softmax;
 - per layer, the raw attention on the planted pairs: `coverage` (with `open_share` as the
   edge-blind reference), `rank_open` and `lift_open`;
-- the training summary (`efficiency/*`, final `val_*`);
-- an arm-by-arm comparison with the dense runs' `all_arms.csv`.
+- the training summary (`efficiency/*`, final `val_*`).
 
 Under the long-range mask, Exphormer's k-NN edges all drop out, which leaves the expander (degree 8)
 and CLS. Its `coverage` of long-range pairs should therefore sit near `open_share`, about 8 / 2500.
