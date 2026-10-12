@@ -18,7 +18,7 @@ from interscale.evaluation.online_probes import build_probe_obsm
 from interscale.geome_dataloader import GraphAnnDataModule
 from interscale.pp.segmentation_noise import apply_segmentation_noise
 from interscale.tl import prepare_geome_dataset, remove_zero_expression_cells
-from interscale.tl.utils import get_model_filename_prefix
+from interscale.tl.utils import get_model_filename_prefix, set_full_reproducibility
 
 # geome calls the deprecated `sq.gr.spatial_neighbors` entrypoint; silence its
 # FutureWarnings so they don't flood the training logs.
@@ -148,6 +148,14 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
         if global_component:
             sweep_run.summary["resolved_max_seq_len"] = cfg.model.global_component.parameters.max_seq_len
         sweep_run.summary["resolved_model_save"] = cfg.model.save
+
+    # Seed the trial before anything draws from the global generators: the model's initial weights,
+    # the graphs' precomputed inputs and the masks. `model.train` seeds again, but only once the
+    # model exists, and wandb.agent runs every trial in one process. Without this the first trial
+    # of a sweep was built from a fresh process's state and every later one from the state the
+    # previous trial's training left behind -- two initialisations in one sweep, which made every
+    # first-trial `none` arm of the first synth_spot round a different model from all its PE arms.
+    set_full_reproducibility(cfg.optim.seed)
 
     ####### PREPROCESSING #######
     # Load adata
