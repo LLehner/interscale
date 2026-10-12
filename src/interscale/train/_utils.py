@@ -33,7 +33,8 @@ class EfficiencyMonitor(Callback):
     - ``train_epoch_s``: from the epoch's start to its last training step, data loading included and
       validation (and the probes it runs) left out.
     - ``peak_gpu_mem_gib``: the most memory allocated on the module's GPU during the epoch's training
-      steps. Absent on CPU.
+      steps. Read at the end of each step: Lightning runs validation -- and the probes with it --
+      before the epoch-end hook, so a peak read there would be theirs. Absent on CPU.
 
     Every boundary synchronises the GPU, so a step's queued work is counted in that step; the price
     is that the CPU no longer runs ahead between steps. Built only when ``optim.log_efficiency`` is
@@ -45,6 +46,7 @@ class EfficiencyMonitor(Callback):
         self._clock = clock
         self._epoch_start = self._step_start = self._last_step_end = None
         self._step_seconds, self._steps, self._cells = 0.0, 0, 0
+        self._peak_bytes = 0
 
     @staticmethod
     def _cuda(pl_module):
@@ -60,6 +62,7 @@ class EfficiencyMonitor(Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         self._step_start = self._last_step_end = None
         self._step_seconds, self._steps, self._cells = 0.0, 0, 0
+        self._peak_bytes = 0
         device = self._cuda(pl_module)
         if device is not None:
             torch.cuda.reset_peak_memory_stats(device)
@@ -76,6 +79,9 @@ class EfficiencyMonitor(Callback):
         self._steps += 1
         self._cells += int(getattr(batch, "num_nodes", 0) or 0)
         self._step_start = None
+        device = self._cuda(pl_module)
+        if device is not None:
+            self._peak_bytes = max(self._peak_bytes, torch.cuda.max_memory_allocated(device))
 
     def epoch_values(self, pl_module) -> dict[str, float]:
         """This epoch's scalars, by logged name; empty before a training step has finished."""
@@ -86,9 +92,8 @@ class EfficiencyMonitor(Callback):
             f"{EFFICIENCY_PREFIX}/train_cells_per_s": self._cells / self._step_seconds,
             f"{EFFICIENCY_PREFIX}/train_epoch_s": self._last_step_end - self._epoch_start,
         }
-        device = self._cuda(pl_module)
-        if device is not None:
-            values[f"{EFFICIENCY_PREFIX}/peak_gpu_mem_gib"] = torch.cuda.max_memory_allocated(device) / 2**30
+        if self._cuda(pl_module) is not None:
+            values[f"{EFFICIENCY_PREFIX}/peak_gpu_mem_gib"] = self._peak_bytes / 2**30
         return values
 
     def on_train_epoch_end(self, trainer, pl_module):

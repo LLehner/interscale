@@ -90,6 +90,22 @@ def test_on_a_gpu_every_boundary_synchronises_and_the_peak_is_logged(monkeypatch
     assert monitor.epoch_values(module)[PEAK] == pytest.approx(1.5)
 
 
+def test_the_peak_is_the_training_steps_not_the_validation_after_them(monkeypatch):
+    """Lightning validates -- probes included -- before the epoch-end hook. Here the steps peak at
+    0.5 and 1.5 GiB, then validation allocates 6 GiB: the epoch's peak is 1.5."""
+    allocated = [2**29, 3 * 2**29]
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device=None: None)
+    monkeypatch.setattr(
+        torch.cuda, "max_memory_allocated", lambda device=None: allocated.pop(0) if allocated else 6 * 2**30
+    )
+    monitor, module = EfficiencyMonitor(clock=_Clock([0.0, 1.0, 2.0, 3.0, 4.0])), _Module("cuda:0")
+    _epoch(monitor, module, (4, 4))
+    monitor.on_train_epoch_end(None, module)
+
+    assert module.logged[PEAK][0] == pytest.approx(1.5)
+
+
 def test_it_is_built_only_when_asked_for():
     from interscale.config import get_cfg_defaults
 
