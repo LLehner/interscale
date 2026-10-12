@@ -737,6 +737,106 @@ and CLS. Its `coverage` of long-range pairs should therefore sit near `open_shar
 Dense runs the same 12 arms as Exphormer. Each backend and round has its own W&B project, and
 checkpoints and results go to `13_10_results/attention_<backend>_2`.
 
+## Why attention stays uniform, and what to change (2026-10-12)
+
+Round 2 (results in `attention_{dense,performer,exphormer}_2`) changed three things: the long-range
+mask off, width 64 with 16-wide heads, and a warm-up of 8. Thanks to the seeding fix, all 34 runs
+started from the same weights. The outcome:
+
+- **Every run converged to the same function.** Val SCE is 0.08336–0.08342 everywhere, still above
+  predicting each gene's training mean (0.0816) and a neighbour average (0.0811).
+- **The backends ended as the same network.** Gene ranks correlate at 1.00, decoder loadings agree
+  to three decimals, and the weights differ by 0.2–8%.
+- **Attention stayed uniform with the mask off.** Dense and Performer spread over ~2,480 of ~2,500
+  keys, Exphormer over 15.95 of 16. RoPE heads attend farther, not nearer.
+- **The biases learned only a faint preference.** Their parameters stay ≤ 0.024. Dense spectral,
+  Fourier and distance biases rank immediate neighbours at the top (rank up to 0.998), but add only
+  ≤ 17% weight. `naive` ranks planted senders at 0.63–0.68, with ~1% extra weight. Neither changes
+  the loss.
+- **The probes improved, all through the GCN.** Region 0.987 (neighbour baseline 0.989), M9 stripe
+  0.80, source distances 0.43, R3/R4 0.38. Local equals global and is the same in every run.
+- **Exphormer's relevance AUROC of 1.0 on short-range pairs is by construction.** Those pairs are
+  its k-NN edges.
+
+Uniform attention in three independent implementations is a design problem, not an attention bug.
+The optimizer gets every parameter, and the global decoder's loss reaches the transformer.
+
+### Diagnosis
+
+1. **The tokens are nearly identical across spots.**
+   - From the data alone: 84% of each spot's `log1p_norm` vector is the shared mean profile; two
+     random spots have cosine 0.844. Only ~15% is spot-specific, and the slide mean adds 0.5%.
+   - Masking 30% of entries to −1 adds random per-spot noise larger than the biological
+     differences: cosine drops to 0.435.
+   - The GCN averages neighbours, so its outputs keep the shared component. The per-token
+     LayerNorm (`norm_input`) does not remove a component shared across tokens.
+   - **Evidence:** RoPE rotates queries and keys by position, whatever the content. It is the only
+     arm whose spread matches random attention on distinct tokens: ~1,950 effective keys, against
+     ~1,950 predicted for a logit spread of ~0.5 at xavier init. Every content-based arm sits at
+     ~2,480, a logit spread of ~0.08.
+   - With identical keys the attention output is the slide mean whatever the weights, so W_q and
+     W_k get no useful gradient. That is a fixed point. Their norms stayed at about the
+     initialisation value: 5.6, against 5.66 expected for xavier.
+2. **Training is tiny.** 24 training slides at batch size 4 give 6 optimizer steps per epoch, so 40
+   epochs is 240 steps, about 1–2 min of GPU time. The decoders only reached the mean profile.
+3. **The task never needs the global model.**
+   - 30% gene masking leaves each spot's other genes and its neighbours visible, so the GCN suffices.
+   - Raw SCE is ~85% satisfied by the mean profile: a neighbour average beats the gene mean by only
+     0.0005.
+   - Under the dual decoder the global head predicts the same target as the local head, so copying
+     local is optimal for it.
+
+### Levers, by expected impact
+
+Every code change goes in as an opt-in config flag with tests, so defaults stay unchanged.
+
+1. **More optimizer steps (config only).**
+   - Batch size 1 and ~200 epochs give ~4,800 steps, 20× round 2 and still minutes per run.
+   - Set `lr_warmup` to ~20 (10% of the run).
+   - Set `probe.every_n_epochs` to ~10, or the probes dominate the runtime.
+2. **Centre the tokens per slide before attention (small).**
+   - After `norm_input`, subtract each graph's mean token from its spot tokens, leaving CLS alone;
+     optionally rescale.
+   - Queries and keys then compare what differs between spots, which breaks the fixed point.
+   - Add a diagnostic: mean pairwise cosine of the tokens entering each layer.
+3. **Spatial block masking (moderate).**
+   - Hide whole spots in discs wider than the GCN's reach (radius > 283 µm). The local model can't
+     fill them in from neighbours, so the global model must use distant context.
+   - This is the main lever for "global learns what local can't". Expect the gap on the
+     long-range and spatially variable programmes.
+   - Trade-off: receptors are hidden too, so the sparse responses can't be learned inside discs.
+     Keep gene masking selectable, or combine both.
+   - Touches mask drawing in `GraphAnnDataModule` (train and the fixed val mask), `entry_mask` and
+     the probes.
+4. **Residual global decoder (moderate).**
+   - The global head predicts the local head's error, with no gradient into local; the final
+     prediction is local plus global.
+   - The global component is then rewarded only for what local misses, which is the local-vs-global
+     question itself.
+   - Touches `DualDecoderCombinedModule` and how the losses and metrics are reported.
+5. **SCE on gene-centred targets (small).**
+   - Subtract the training gene means from prediction and target before the cosine, so
+     context-dependent deviations drive the gradient.
+   - Z-scoring the *input* instead would put the −1 mask value inside the data range (CLAUDE.md,
+     masking).
+
+### Plan
+
+- **Round 3a:** levers 1 and 2 on a reduced grid (dense and Performer × none / naive / rope /
+  fourier). Question: does attention leave uniform once the tokens are centred and training is long
+  enough? Read the effective keys, the token cosine, `planted_edges` lift and rank, and whether val
+  SCE drops below 0.0816.
+- **Round 3b:** add levers 3 and 4, with the long-range mask back on. This is the actual "global
+  learns something the local can't" experiment: the local-vs-global gap per programme, the probes
+  on hidden discs, and planted long-range edges.
+- **Controls:**
+  - evaluate an untrained checkpoint through the same script, to see what a random GCN already
+    preserves;
+  - run several seeds once differences appear.
+
+Status: diagnosed 2026-10-12, nothing implemented yet. The user asked to continue on 2026-10-13
+and called it urgent.
+
 ## Predictions to check, not assume
 
 1. **Kernel attention matches dense where the long-range signal is smooth, and loses where a few
