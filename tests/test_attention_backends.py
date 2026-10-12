@@ -1006,6 +1006,9 @@ def test_the_checkpoint_name_carries_the_fourier_bias():
     cfg = _cfg(kind="performer", bias=["fourier"])
     cfg.dataset.name = "d"
     assert get_model_filename_prefix(cfg, False, True).endswith("pe-fourier_attn-performer_")
+    # The directional variant is another model under the same name, so it needs its own checkpoint.
+    cfg.model.global_component.parameters.pe.fourier.isotropic = False
+    assert get_model_filename_prefix(cfg, False, True).endswith("pe-fourier-aniso_attn-performer_")
 
 
 # --------------------------------------------------------------------------- linear attention

@@ -72,8 +72,9 @@ def _positional_encoding_tag(cfg) -> str:
     it carries the seed but nothing else that a PE ablation varies, so without the tag every arm
     of a PE sweep would overwrite the previous arm's checkpoint. Empty when off, so every name from
     before PEs is unchanged. A distance bias of the non-default `linear` kind is tagged
-    `distance-linear`, and RoPE of the non-default `mixed` kind `rope-mixed`, since each is a
-    different model under the same encoding name.
+    `distance-linear`, RoPE of the non-default `mixed` kind `rope-mixed`, and a directional
+    (non-isotropic) Fourier bias `fourier-aniso`, since each is a different model under the same
+    encoding name.
     """
     params = cfg.model.global_component.get("parameters", None)
     pe = params.get("pe", None) if params is not None else None
@@ -82,6 +83,8 @@ def _positional_encoding_tag(cfg) -> str:
         names[names.index("distance")] = f"distance-{pe.distance.kind}"
     if "rope" in names and pe.rope.get("kind", "axial") != "axial":
         names[names.index("rope")] = f"rope-{pe.rope.kind}"
+    if "fourier" in names and not pe.fourier.get("isotropic", True):
+        names[names.index("fourier")] = "fourier-aniso"
     return f"pe-{'+'.join(names)}_" if names else ""
 
 
