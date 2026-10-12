@@ -693,8 +693,10 @@ setup with the attention changed and 40 epochs instead of 100, still SCELoss, wi
 fixed to `gpu`. The arm names are pe_sweep_2's. The sweeps cover every single PE the backend carries
 plus the no-PE baseline: the Performer gets 10 arms (no distance bias), Exphormer 12. Both add
 `fourier` and `fourier_aniso`. The scripts validate every arm before queueing, because sweeps do not
-re-validate. They only write files; comparing backends is left to reading those files. Besides
-pe_test_2's evaluation they write:
+re-validate. They only write files; comparing backends is left to reading those files. They drop
+pe_test_2's gene-vector probe, both online (too slow every epoch) and post hoc; the gene ranks and
+decoder loadings cover reconstruction per gene. Besides the rest of pe_test_2's evaluation they
+write:
 
 - Stage 1's diagnostics on the test slides, with the Performer's TV to softmax;
 - per layer, the raw attention on the planted pairs: `coverage` (with `open_share` as the
