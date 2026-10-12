@@ -686,7 +686,7 @@ through arms.
 A probe gap alone settles nothing about range (the contrastive plan's finding); the ablation is the
 instrument.
 
-**First runs: synth_spot, one backend per sweep (2026-10-12, not yet run).** The run scripts are
+**First runs: synth_spot, one backend per sweep (2026-10-12; results read the same day).** The run scripts are
 `notebooks_and_scripts/performer_test.{py,yaml}` + `performer_sweep.yaml` and
 `notebooks_and_scripts/exphormer_test.{py,yaml}` + `exphormer_sweep.yaml`. Each is pe_test_2's
 setup with the attention changed and 40 epochs instead of 100, still SCELoss, with the accelerator
@@ -705,6 +705,37 @@ write:
 
 Under the long-range mask, Exphormer's k-NN edges all drop out, which leaves the expander (degree 8)
 and CLS. Its `coverage` of long-range pairs should therefore sit near `open_share`, about 8 / 2500.
+
+**What round 1 showed** (with the dense PE sweep, `PE_test_sce`), one seed per arm:
+
+- **Attention stayed uniform in every backend.**
+  - The Performer spread over ~2,460 of ~2,500 keys, and Exphormer over 7.9 of its 8 expander
+    partners. The span (2.6 mm) is the mean distance between two spots.
+  - Planted senders ranked at chance, and relevance was flat with distance. The Performer's TV to
+    softmax (0.006) only says both maps are uniform.
+  - So neither backend was really tested.
+- **The biases never learned.** Their coefficients stayed at 0.01–0.03, and several bias arms are
+  the same model to three decimals. Only `naive` had an effect, on position-derived readouts.
+- **The decoders scored below the gene-mean floor.** The val SCE of the attention runs was
+  0.107–0.121; predicting each gene's training mean scores 0.082.
+- **Raw SCE barely rewards context.** A neighbour average scores 0.081, against 0.082 for the gene
+  mean.
+- **Every sweep's `none` arm was a different initialisation.** `main_sweep` built the model before
+  seeding, so the first trial started from another random state than all later ones (relative weight
+  distance ~1.1 vs ≤0.08 among PE arms). The same held across sweeps. Fixed 2026-10-12: each trial now
+  seeds before it builds its model.
+- **The efficiency monitor's peak memory included validation and the probes.** Fixed the same day:
+  it is now read at the end of each training step.
+
+**Round 2 (2026-10-12, not yet run):** `notebooks_and_scripts/{dense,performer,exphormer}_test_2.{py,yaml}`
++ `*_sweep_2.yaml`. The same arms and readouts, with three changes:
+
+- the long-range mask off, as a sanity check that attention can learn structure at all;
+- `optim.lr_warmup: 8`, the PE sweep's schedule shape at 40 epochs;
+- width 64 with four 16-wide heads (`model.n_embed`, `n_heads`, `attention.head_dim` in the config).
+
+Dense runs the same 12 arms as Exphormer. Each backend and round has its own W&B project, and
+checkpoints and results go to `13_10_results/attention_<backend>_2`.
 
 ## Predictions to check, not assume
 
