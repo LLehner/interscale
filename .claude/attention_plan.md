@@ -897,16 +897,41 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
   cosine, `planted_edges` lift and rank, and whether val SCE drops below 0.0816. Lever 5 belongs
   here, not in 3b: it changes what the whole model is asked to learn, not what global must do that
   local can't.
+  - Set up 2026-10-13 in round 2's files, updated in place (`notebooks_and_scripts/`):
+    `dense_test_2.{py,yaml}`, `performer_test_2.{py,yaml}`, `dense_sweep_2.yaml`,
+    `performer_sweep_2.yaml`. Batch size 1, 200 epochs (4,800 steps), warm-up 20, probes every 10
+    epochs; W&B projects `Interscale_{dense,performer}_synth_spot_3a`, results in
+    `13_10_results/attention_{dense,performer}_3a`. Everything else is round 2's (long-range mask
+    off, width 64, gene masking at 0.3). `exphormer_test_2` stays at round 2.
+  - Arms, 7 per backend: `none`, `naive`, `rope` (axial), `fourier` (isotropic), each with
+    `center_qk` and `center_targets`; `none_no_cqk` (centred targets only), `none_no_ctr` (centred
+    queries and keys only), `none_plain` (neither: round 2's model on the longer schedule, so it
+    shows what the steps alone do).
+  - With centred targets `val_loss` and the heads' losses are centred. The raw SCE on the hidden
+    entries, comparable to round 2's `val_loss` (0.0834) and the gene-mean floor (0.0816), is
+    `val_masked_scaled_cosine_error` (checked equal to the masked SCE loss).
 - **Round 3b:** add levers 3 and 4, with the long-range mask back on. This is the actual "global
   learns something the local can't" experiment: the local-vs-global gap per programme, the probes
   on hidden discs, and planted long-range edges.
+  - Settings to flip, on top of whatever 3a shows works: `mask_strategy: node`,
+    `mask_percentage: 0`, `mask_block_radius_um: 500`, `mask_block_fraction: 0.3` (the discs are
+    then the only targets, so `masked_*`, the split losses and the gene probes read the discs);
+    `model.decoder.global_residual: true`; `long_range_attention: true`.
+  - Read `val_global_loss` against `val_local_loss`: under the residual decoder the difference is
+    what the global component adds on the hidden discs.
+  - The scripts then need two changes: the preflight insists on gene masking, and the evaluation's
+    probe passes are hard-wired to gene masking at `mask_percentage`. `smoke_arm` should pass
+    `**block_mask_kwargs(trial)` to the datamodule.
+  - Without a positional encoding, all tokens deep inside a disc are identical (all −1 input, the
+    same GCN output), so the transformer can only give them one prediction per slide. Telling
+    them apart needs position, so 3b is also the first real test of the encodings.
 - **Controls:**
   - evaluate an untrained checkpoint through the same script, to see what a random GCN already
     preserves;
   - run several seeds once differences appear.
 
 Status: diagnosed 2026-10-12 (the user called it urgent). On 2026-10-13 levers 2–5 were
-implemented, each unverified on data; the round-3a configs are in progress.
+implemented, each unverified on data, and round 3a was set up (not run yet).
 
 ## Predictions to check, not assume
 
