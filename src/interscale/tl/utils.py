@@ -89,7 +89,7 @@ def _positional_encoding_tag(cfg) -> str:
 
 
 def _attention_tag(cfg) -> str:
-    """``attn-<kind>[-hd<head_dim>]_`` when the global component uses a non-default attention, else ``""``.
+    """``attn-<kind>[-hd<head_dim>][-cqk]_`` when the global component uses a non-default attention, else ``""``.
 
     Part of the checkpoint prefix for the same reason as :func:`_positional_encoding_tag`: an
     attention sweep's arms would otherwise overwrite each other's checkpoints. Empty for dense
@@ -100,9 +100,10 @@ def _attention_tag(cfg) -> str:
     if attention is None:
         return ""
     kind, head_dim = str(attention.get("kind", "dense")), int(attention.get("head_dim", 0))
-    if kind == "dense" and head_dim == 0:
+    center = bool(attention.get("center_qk", False))
+    if kind == "dense" and head_dim == 0 and not center:
         return ""
-    return f"attn-{kind}" + (f"-hd{head_dim}" if head_dim > 0 else "") + "_"
+    return f"attn-{kind}" + (f"-hd{head_dim}" if head_dim > 0 else "") + ("-cqk" if center else "") + "_"
 
 
 def get_model_filename_prefix(cfg, local_component: bool, global_component: bool):

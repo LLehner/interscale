@@ -195,10 +195,21 @@ class ProjectedAttention(nn.Module):
         """
         if is_causal:
             raise ValueError("attention backends attend bidirectionally; is_causal is not supported.")
-        if query is not key or key is not value:
-            raise ValueError("attention backends are self-attention only: query, key and value must be one tensor.")
+        if query is not key or value.shape != query.shape:
+            raise ValueError(
+                "attention backends are self-attention only: query and key must be one tensor, and the values "
+                "the same tokens (or, under attention.center_qk, the tokens queries and keys were centred from)."
+            )
         seq_len, n_graphs, _ = query.shape
-        q, k, v = F.linear(query, self.in_proj_weight, self.in_proj_bias).chunk(3, dim=-1)
+        if value is key:
+            q, k, v = F.linear(query, self.in_proj_weight, self.in_proj_bias).chunk(3, dim=-1)
+        else:
+            # Queries and keys from one input, values from another (`attention.center_qk`).
+            inner = self.num_heads * self.head_dim
+            w_qk, w_v = self.in_proj_weight.split([2 * inner, inner])
+            b_qk, b_v = (None, None) if self.in_proj_bias is None else self.in_proj_bias.split([2 * inner, inner])
+            q, k = F.linear(query, w_qk, b_qk).chunk(2, dim=-1)
+            v = F.linear(value, w_v, b_v)
         q, k, v = (t.reshape(seq_len, n_graphs * self.num_heads, self.head_dim).transpose(0, 1) for t in (q, k, v))
         if rotary is not None:
             if not self.supports_rotary:

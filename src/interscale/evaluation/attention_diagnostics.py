@@ -11,6 +11,9 @@ clean pass (nothing masked, dropout off) over a fixed set of graphs:
   looks at one cell, ``n`` for one spread evenly over ``n``.
 * **TV to softmax**, for a backend that estimates softmax (the Performer) -- ``1/2 sum_j |Â_ij - A_ij|``
   between its implied map and the exact softmax on the same queries, keys and biases.
+* **token cosine**, per layer -- the mean cosine between two cell tokens entering attention,
+  before any centring. Near 1 the tokens are nearly identical, and attention computed from their
+  content cannot tell keys apart (see ``attention.center_qk``).
 
 Every number is over **cell queries**: CLS and padding rows are left out. Padding is never a key.
 Span, radii and effective keys renormalise each row over its cell keys -- CLS is the sink and is
@@ -218,6 +221,7 @@ def attention_diagnostics(
         graphs = graphs[:max_graphs]
 
     per_cell: dict[tuple[str, int, int], list[np.ndarray]] = defaultdict(list)
+    token_cosine: dict[int, list[float]] = defaultdict(list)
     without_pos = False
     was_training = module.training
     module.eval()
@@ -259,6 +263,9 @@ def attention_diagnostics(
                     )
                     for key, values in found.items():
                         per_cell[key].extend(values)
+                    if entry.get("token_cosine") is not None:
+                        for layer, values in enumerate(entry["token_cosine"].cpu().tolist()):
+                            token_cosine[layer].extend(values)
     finally:
         module.train(was_training)
 
@@ -269,4 +276,9 @@ def attention_diagnostics(
             RuntimeWarning,
             stacklevel=2,
         )
-    return summarize(per_cell)
+    results = summarize(per_cell)
+    for layer, values in token_cosine.items():
+        results[attention_metric_name("token_cosine", layer)] = float(np.mean(values))
+    if token_cosine:
+        results[attention_metric_name("token_cosine")] = float(np.mean([np.mean(v) for v in token_cosine.values()]))
+    return results

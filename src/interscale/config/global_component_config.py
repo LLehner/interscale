@@ -128,6 +128,12 @@ def get_global_component_cfg(cfg, global_component_name):
         att = cfg.model.global_component.parameters.attention = CN()
         att.kind = "dense"
         att.head_dim = 0
+        # Queries and keys from each slide's mean-centred tokens, layer-normalised; values and the
+        # residual stream keep the tokens as they are. Most of every spot's expression is the profile
+        # all spots share (on synth_spot 84% of a spot's squared norm), so raw tokens are nearly
+        # identical, their dot products barely tell keys apart, and attention stays uniform with no
+        # gradient to leave it. Centring compares spots by what differs between them. Any backend.
+        att.center_qk = False
         # `linear`: elu+1 linear attention, O(S) like the performer but with a fixed, deterministic
         # feature map instead of random features -- not an estimate of softmax. Each head's map has
         # rank <= head_dim, so it wants wide heads (head_dim >= 32; it warns below). It carries

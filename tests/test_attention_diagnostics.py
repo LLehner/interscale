@@ -266,7 +266,12 @@ def test_the_diagnostics_read_the_maps_the_step_returns():
     results = _diagnose(module, graphs, radii_um=(20.0,))
 
     assert random.getstate() == state
-    assert results.keys() == summarize(expected).keys()
+    # Beside the per-head maps, the token cosine of every layer and its mean (`attention.center_qk`).
+    cosine = {name for name in results if "token_cosine" in name}
+    assert cosine == {attention_metric_name("token_cosine", layer) for layer in (0, 1)} | {
+        attention_metric_name("token_cosine")
+    }
+    assert results.keys() - cosine == summarize(expected).keys()
     for name, value in summarize(expected).items():
         assert results[name] == pytest.approx(value, abs=1e-6), name
 

@@ -799,6 +799,18 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
      optionally rescale.
    - Queries and keys then compare what differs between spots, which breaks the fixed point.
    - Add a diagnostic: mean pairwise cosine of the tokens entering each layer.
+   - **Implemented 2026-10-13, unverified on data:** `attention.center_qk`. Queries and keys come
+     from `center_tokens`: each sequence's tokens minus the mean of its cells (padding and CLS left
+     out), layer-normalised without affine weights. Values and the residual stream keep the raw
+     tokens, so the slide-level information stays. Works in every backend; the backends now accept
+     a separate value tensor. Checkpoint tag `-cqk`. The diagnostics log `attn_token_cosine_l<l>`:
+     the mean pairwise cosine of the cell tokens entering each layer, before centring.
+   - Verified by tests:
+     - centred attention is unchanged by a shared shift of every token, and uncentred is not;
+     - the values are the raw tokens;
+     - near-identical tokens give uniform attention without centring and ≥10% fewer effective keys
+       with it, in dense, Performer and Exphormer.
+     Six mutations, each caught; harness IDENTICAL.
 3. **Spatial block masking (moderate).**
    - Hide whole spots in discs wider than the GCN's reach (radius > 283 µm). The local model can't
      fill them in from neighbours, so the global model must use distant context.

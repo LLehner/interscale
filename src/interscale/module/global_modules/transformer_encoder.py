@@ -113,6 +113,7 @@ class TransformerNodeEncoderHook(GlobalModule):
             self.act_func,
             norm_first=True,
             attention_factory=attention_factory,
+            center_qk=bool(attention.get("center_qk", False)) if attention is not None else False,
         )
         encoder_norm = nn.LayerNorm(self.n_embed)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, self.num_layers, norm=encoder_norm)
@@ -287,11 +288,14 @@ class TransformerNodeEncoderHook(GlobalModule):
         """Record every pass made inside: each layer's attention map and the layout of its tokens.
 
         Yields a list. Each pass through :meth:`common_step_local_to_global` and :meth:`forward`
-        appends ``{"index_nodes", "src_padding_mask", "maps", "reference"}``: ``maps`` is
+        appends ``{"index_nodes", "src_padding_mask", "maps", "reference", "token_cosine"}``: ``maps`` is
         ``[layers, B * heads, S + 1, S + 1]``, every layer's map from its explicit path, detached;
         with ``reference``, ``"reference"`` holds the same for the attention a backend estimates
         (the Performer's exact softmax on the same queries, keys and biases), or None where a
-        backend estimates nothing. What the diagnostics read (``evaluation.attention_diagnostics``).
+        backend estimates nothing. ``token_cosine`` is ``[layers, B]``: per layer and sequence, the
+        mean pairwise cosine of the cell tokens entering attention, before any centring -- near 1
+        when the tokens are nearly identical, which leaves content-based attention uniform. What the
+        diagnostics read (``evaluation.attention_diagnostics``).
 
         The passes inside take each backend's explicit path, as ``evaluate()`` does: dense
         attention takes it anyway, so its numbers are unchanged; a kernel backend's explicit path
@@ -306,12 +310,16 @@ class TransformerNodeEncoderHook(GlobalModule):
         self._attention_record, self.return_attention_maps = record, True
         for attention in estimators:
             attention.record_reference = bool(reference)
+        for layer in self.transformer_encoder.layers:
+            layer.record_tokens = True
         try:
             yield record
         finally:
             self._attention_record, self.return_attention_maps = None, saved
             for attention in estimators:
                 attention.record_reference, attention.reference_weights = False, None
+            for layer in self.transformer_encoder.layers:
+                layer.record_tokens, layer.token_cosine = False, None
 
     def forward(self, padded_h_node, src_padding_mask, mask=None, register_hook: bool | None = None, rotary=None):
         """
@@ -421,6 +429,8 @@ class TransformerNodeEncoderHook(GlobalModule):
                 getattr(layer.self_attn, "reference_weights", None) for layer in self.transformer_encoder.layers
             ]
             entry["reference"] = torch.stack(references) if all(r is not None for r in references) else None
+            cosines = [layer.token_cosine for layer in self.transformer_encoder.layers]
+            entry["token_cosine"] = torch.stack(cosines) if all(c is not None for c in cosines) else None
 
         return transformer_out, src_padding_mask, final_attn
 

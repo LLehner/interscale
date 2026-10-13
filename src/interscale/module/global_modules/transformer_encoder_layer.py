@@ -8,6 +8,45 @@ from torch.nn.modules import TransformerEncoderLayer
 from interscale.module.global_modules.transformer_utils import MultiHeadAttentionWithEdits
 
 
+def cell_positions(x: Tensor, key_padding_mask: Tensor | None) -> Tensor:
+    """``[N, L]`` boolean: which positions of the ``[L, N, E]`` tokens are cells -- not padding, not CLS.
+
+    CLS is the last position of every sequence. ``key_padding_mask`` is True (or ``-inf``) at
+    padding, as the encoder hands it on.
+    """
+    seq_len, n_graphs, _ = x.shape
+    if key_padding_mask is None:
+        cells = torch.ones(n_graphs, seq_len, dtype=torch.bool, device=x.device)
+    elif key_padding_mask.dtype == torch.bool:
+        cells = ~key_padding_mask
+    else:
+        cells = ~torch.isneginf(key_padding_mask)
+    cells = cells.clone()
+    cells[:, -1] = False
+    return cells
+
+
+def center_tokens(x: Tensor, cells: Tensor) -> Tensor:
+    """Each sequence's tokens minus the mean of its cell tokens, layer-normalised without affine weights.
+
+    What queries and keys are computed from under ``attention.center_qk``. Most of every spot's
+    expression is the profile all spots share, so raw tokens are nearly identical and their dot
+    products barely tell keys apart; subtracting the sequence mean leaves what differs between
+    spots, and the normalisation gives it the scale a token had before.
+    """
+    weight = cells.T.unsqueeze(-1).to(x.dtype)  # [L, N, 1]
+    mean = (x * weight).sum(0, keepdim=True) / weight.sum(0, keepdim=True).clamp_min(1.0)
+    return F.layer_norm(x - mean, x.shape[-1:])
+
+
+def mean_pairwise_cosine(x: Tensor, cells: Tensor) -> Tensor:
+    """``[N]``: per sequence, the mean cosine between two different cell tokens (1: all identical)."""
+    unit = F.normalize(x, dim=-1) * cells.T.unsqueeze(-1).to(x.dtype)
+    n = cells.sum(1).to(x.dtype)
+    total = unit.sum(0)  # [N, E]
+    return ((total * total).sum(-1) - n) / (n * (n - 1)).clamp_min(1.0)
+
+
 class CustomTransformerEncoderLayer(TransformerEncoderLayer):
     """Overwrite TransformerEncoderLayer from PyTorch to implement attention map and gradient hook in the self-attention block."""
 
@@ -25,6 +64,7 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
         device=None,
         dtype=None,
         attention_factory: Callable | None = None,
+        center_qk: bool = False,
         *args,
         **kwargs,
     ):
@@ -72,6 +112,13 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
         # What an attention backend needs beyond the dense mask for this pass (the blocked pairs and
         # bias factors of `attention.StructuredMask`), set and cleared like `rotary`.
         self.attention_context = None
+        # `attention.center_qk`: queries and keys from each sequence's mean-centred tokens
+        # (`center_tokens`); values and the residual stream keep the tokens as they are.
+        self.center_qk = bool(center_qk)
+        # Set by `TransformerNodeEncoderHook.recording_attention`: then each pass stores the mean
+        # pairwise cosine of the cell tokens entering attention, before any centring, per sequence.
+        self.record_tokens = False
+        self.token_cosine = None
 
     def save_attn_gradients(self, attn_gradients):
         self.attn_gradients = attn_gradients
@@ -106,9 +153,16 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
         # may otherwise take a cheaper path to the same output.
         backend = getattr(self.self_attn, "is_backend", False)
         extra = {"context": self.attention_context} if backend else {}
+        query = key = x
+        if self.center_qk or self.record_tokens:
+            cells = cell_positions(x, key_padding_mask)
+            if self.record_tokens:
+                self.token_cosine = mean_pairwise_cosine(x.detach(), cells)
+            if self.center_qk:
+                query = key = center_tokens(x, cells)
         attn_output, attn_output_weights = self.self_attn(
-            x,
-            x,
+            query,
+            key,
             x,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
