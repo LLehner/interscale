@@ -820,6 +820,31 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
      Keep gene masking selectable, or combine both.
    - Touches mask drawing in `GraphAnnDataModule` (train and the fixed val mask), `entry_mask` and
      the probes.
+   - **Implemented 2026-10-13, unverified on data:** `dataset.mask_block_radius_um` and
+     `dataset.mask_block_fraction`. `tl.masking.sample_block_mask` draws discs (every cell within
+     the radius of a centre cell, centres among the cells not yet covered) until the fraction is
+     covered; the datamodule adds them to either strategy's mask, redrawn with it each epoch, the
+     val mask fixed. Under `node` they join the masked cells, and `mask_percentage` may be 0, so the
+     discs are the only targets and `masked_*` metrics, the split losses and the gene probes read
+     the discs alone. Under `gene` every entry of a disc cell is masked on top of the Bernoulli
+     entries. With fraction 0 nothing changes and no random number is drawn. The radius is in µm
+     (`block_mask_kwargs` divides by `spatial_unit_um` for every entrypoint). The validator needs
+     `spatial_key`, regression at node level, and consistent keys. Checkpoint tag
+     `var-blk<radius>f<fraction>_`. `entry_mask` and the probes needed no change: they read
+     `data.mask` / `gene_mask`.
+   - Sizing on synth_spot: the 2-layer GCN on k-NN 8 reaches ~283 µm, so a disc of radius r keeps a
+     blind core of radius r − 283 µm. At 300 µm that is the centre spot alone; at 500 µm ~13 spots
+     of ~78; overlapping discs merge into larger blind areas.
+   - Verified by tests:
+     - one disc is exactly the cells within the radius of a cell;
+     - the fraction is covered, overshooting by at most one disc;
+     - discs leave cells whose whole 2-hop neighbourhood is hidden, a Bernoulli mask of the same
+       rate leaves none;
+     - node: discs alone at rate 0, the union otherwise; gene: whole rows in discs;
+     - train redrawn, val fixed;
+     - off: the samplers' own draws and the same random state afterwards;
+     - both entrypoints pass the radius in `pos` units.
+     Fourteen mutations, each caught; harness IDENTICAL.
 4. **Residual global decoder (moderate).**
    - The global head predicts the local head's error, with no gradient into local; the final
      prediction is local plus global.
@@ -880,8 +905,8 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
     preserves;
   - run several seeds once differences appear.
 
-Status: diagnosed 2026-10-12 (the user called it urgent). On 2026-10-13 levers 2, 4 and 5 were
-implemented, each unverified on data; lever 3 and the round-3a configs are in progress.
+Status: diagnosed 2026-10-12 (the user called it urgent). On 2026-10-13 levers 2–5 were
+implemented, each unverified on data; the round-3a configs are in progress.
 
 ## Predictions to check, not assume
 

@@ -14,7 +14,21 @@ VALID_SPLIT = {"node", "graph"}
 # TODO: Fix dataloader
 import torch
 
-from interscale.tl.masking import MASK_STRATEGIES, sample_gene_mask, sample_node_mask
+from interscale.tl.masking import MASK_STRATEGIES, sample_block_mask, sample_gene_mask, sample_node_mask
+
+
+def block_mask_kwargs(cfg) -> dict:
+    """The spatial-block arguments of :class:`GraphAnnDataModule` from ``cfg.dataset``.
+
+    The config states the radius in µm and the graphs' ``pos`` are in the units of
+    ``obsm[spatial_key]``, so the radius is divided by ``dataset.spatial_unit_um`` here, once for
+    every entrypoint.
+    """
+    fraction = float(cfg.dataset.get("mask_block_fraction", 0.0))
+    if fraction == 0:
+        return {}
+    radius = float(cfg.dataset.mask_block_radius_um) / float(cfg.dataset.spatial_unit_um)
+    return {"mask_block_radius": radius, "mask_block_fraction": fraction}
 
 
 class GraphAnnDataModule(pl.LightningDataModule):
@@ -28,6 +42,8 @@ class GraphAnnDataModule(pl.LightningDataModule):
         mask_percentage: float = 0.5,
         mask_strategy: Literal["node", "gene"] = "node",
         learning_type: Literal["node", "graph"] = "node",
+        mask_block_radius: float = 0.0,
+        mask_block_fraction: float = 0.0,
     ):
         """Manages loading and sampling schemes before loading to GPU.
 
@@ -48,6 +64,12 @@ class GraphAnnDataModule(pl.LightningDataModule):
             If "graph" is selected, `batch_size` means the number of graphs and `datas` is expected to be a list of Data.
             If "node" is selected, `batch_size` means the number of nodes and `datas` is expected to be a list of Data objects
             with an edge_index attribute. Defaults to "node".
+        mask_block_radius (float, optional): Radius of the spatial blocks, in the units of each
+            graph's `pos`. See `mask_block_fraction`. Defaults to 0.0.
+        mask_block_fraction (float, optional): Share of each graph's cells hidden in discs of
+            `mask_block_radius` (`tl.masking.sample_block_mask`), on top of the strategy's own
+            mask, redrawn with it. 0 draws no discs and consumes no random numbers. With discs,
+            `mask_percentage` 0 under "node" skips the Bernoulli cells. Defaults to 0.0.
 
         Raises
         ------
@@ -71,6 +93,13 @@ class GraphAnnDataModule(pl.LightningDataModule):
             raise ValueError("mask_strategy must be one of %r." % (MASK_STRATEGIES,))
         self.mask_strategy = mask_strategy
         self.mask_percentage = mask_percentage
+        if mask_block_fraction and not (0 < mask_block_fraction < 1 and mask_block_radius > 0):
+            raise ValueError(
+                f"Spatial blocks need a fraction in (0, 1) and a radius > 0, got fraction "
+                f"{mask_block_fraction} and radius {mask_block_radius}."
+            )
+        self.mask_block_radius = mask_block_radius
+        self.mask_block_fraction = mask_block_fraction
         self.first_time = True
 
     def _nodewise_setup(self, stage: str | None) -> None:
@@ -153,13 +182,33 @@ class GraphAnnDataModule(pl.LightningDataModule):
 
         `gene_mask` is a node-level attribute of shape `[num_nodes, ...]`, so PyG collates it by
         concatenating along dim 0 exactly like `x` -- no custom `__cat_dim__` needed.
+
+        With spatial blocks the cells in the discs are added to either: masked cells under "node",
+        whole masked rows under "gene".
         """
         if self.mask_strategy == "gene":
             gene_mask = sample_gene_mask(data.num_nodes, data.x.shape[1], self.mask_percentage)
+            blocks = self._sample_blocks(data)
+            if blocks is not None:
+                gene_mask[blocks] = True
             data.gene_mask = gene_mask
             data.mask = gene_mask.any(dim=1)
         else:
-            data.mask = sample_node_mask(data.num_nodes, self.mask_percentage)
+            blocks = self._sample_blocks(data)
+            if blocks is None:
+                data.mask = sample_node_mask(data.num_nodes, self.mask_percentage)
+            elif self.mask_percentage > 0:
+                data.mask = sample_node_mask(data.num_nodes, self.mask_percentage) | blocks
+            else:
+                data.mask = blocks
+
+    def _sample_blocks(self, data: BaseData) -> torch.Tensor | None:
+        """The cells in this draw's discs, ``[N]``, or None without spatial blocks."""
+        if not self.mask_block_fraction:
+            return None
+        if getattr(data, "pos", None) is None:
+            raise ValueError("Spatial blocks are drawn over cell coordinates, but a graph has no `pos`.")
+        return sample_block_mask(data.pos, self.mask_block_radius, self.mask_block_fraction)
 
     def resample_train_mask(self) -> None:
         """Redraws the masked node set for every training graph, in place.

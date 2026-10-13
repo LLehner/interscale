@@ -111,13 +111,15 @@ def _training_tag(cfg) -> str:
 
     For the same reason as the encoding and attention tags: a sweep over one of these would
     otherwise write every arm to one checkpoint. ``ctr``: ``optim.center_targets``; ``res``:
-    ``model.decoder.global_residual``.
+    ``model.decoder.global_residual``; ``blk<radius µm>f<fraction>``: spatial blocks.
     """
     parts = []
     if cfg.optim.get("center_targets", False):
         parts.append("ctr")
     if cfg.model.decoder.get("global_residual", False):
         parts.append("res")
+    if cfg.dataset.get("mask_block_fraction", 0.0) > 0:
+        parts.append(f"blk{cfg.dataset.mask_block_radius_um:g}f{cfg.dataset.mask_block_fraction:g}")
     return f"var-{'+'.join(parts)}_" if parts else ""
 
 

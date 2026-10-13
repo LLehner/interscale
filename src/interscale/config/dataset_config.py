@@ -43,6 +43,15 @@ def get_dataset_cfg(cfg):
     # run with no masking. Note the two strategies are not comparable at equal values: a per-entry
     # rate is a different quantity from a per-cell one (MAE/GraphMAE use 0.25-0.75 for features).
     cfg.dataset.mask_percentage = 0.2
+    # Spatial blocks, on top of either strategy: whole cells in discs of this radius (µm, via
+    # spatial_unit_um), until mask_block_fraction of each graph's cells lie in one; redrawn with the
+    # rest of the mask. Both strategies leave a hidden entry's neighbours visible, so the local
+    # component can fill it in; a disc wider than its reach cannot be (on a 100 µm lattice with a
+    # 2-layer GCN on k-NN 8 the reach is ~283 µm, so a 500 µm disc keeps a blind core of ~13 spots).
+    # Needs dataset.spatial_key, regression at node level; under "node" mask_percentage may then be
+    # 0, leaving the discs as the only targets. Fraction 0 (the default) draws no discs.
+    cfg.dataset.mask_block_radius_um = 0.0
+    cfg.dataset.mask_block_fraction = 0.0
 
     # Optional per-cell annotations attached to every PyG Data object when set. All default to
     # None, which attaches nothing and leaves the graphs byte-identical to before.

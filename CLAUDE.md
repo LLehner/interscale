@@ -108,12 +108,13 @@ Mirrors the model hierarchy at the `pytorch_lightning`/`LightningModule` level:
 
 ### Masking (`tl/masking.py`)
 
-Two config axes, both under `cfg.dataset`. Read the module docstring of `tl/masking.py` before changing any of them.
+Two config axes, both under `cfg.dataset`, plus optional spatial blocks. Read the module docstring of `tl/masking.py` before changing any of them.
 
 | key | values | meaning |
 | --- | --- | --- |
 | `mask_strategy` | `node` (default) / `gene` | Granularity. `node` blanks whole cells (`data.mask` `[N]`) and scores all G genes of them. `gene` blanks individual `(cell, gene)` entries (`data.gene_mask` `[N, G]`, every cell a target) and scores **only those entries**. |
-| `mask_percentage` | float | The Bernoulli rate, per cell under `node` and per entry under `gene` — one key, because the strategy already says what a unit is. Not comparable across strategies at equal values. `_validate_masking` rejects a regression config with a rate outside (0, 1]. |
+| `mask_percentage` | float | The Bernoulli rate, per cell under `node` and per entry under `gene` — one key, because the strategy already says what a unit is. Not comparable across strategies at equal values. `_validate_masking` rejects a regression config with a rate outside (0, 1], except 0 under `node` with spatial blocks. |
+| `mask_block_radius_um`, `mask_block_fraction` | float, float | Spatial blocks on top of either strategy (default fraction 0: off, no random draws): whole cells in discs of the radius until the fraction of each graph is covered — masked cells under `node`, whole masked rows under `gene`. A disc wider than the local reach cannot be filled in from neighbours (`.claude/attention_plan.md`, lever 3). |
 
 Masked positions are always filled with `tl.masking.MASK_VALUE`, which is **-1** and is not
 configurable. Two things are easy to get wrong here:

@@ -15,7 +15,7 @@ from interscale.config import load_config
 from interscale.config.cli import add_config_args, print_registry, resolve_cfg_from_args
 from interscale.config.sweep import ARM_PARAM, apply_sweep_config, build_sweep_config, load_arms
 from interscale.evaluation.online_probes import build_probe_obsm
-from interscale.geome_dataloader import GraphAnnDataModule
+from interscale.geome_dataloader import GraphAnnDataModule, block_mask_kwargs
 from interscale.pp.segmentation_noise import apply_segmentation_noise
 from interscale.tl import prepare_geome_dataset, remove_zero_expression_cells
 from interscale.tl.utils import get_model_filename_prefix, set_full_reproducibility
@@ -223,6 +223,7 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
         mask_percentage=cfg.dataset.mask_percentage,
         mask_strategy=cfg.dataset.mask_strategy,
         learning_type=cfg.dataset.prediction_level,
+        **block_mask_kwargs(cfg),
     )
     print_memory_usage("After datamodule creation")
 

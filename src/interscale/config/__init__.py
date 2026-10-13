@@ -133,10 +133,47 @@ def _validate_masking(cfg):
     if "regression" not in cfg.dataset.prediction_task:
         return
 
+    # Spatial blocks under "node" are targets of their own, so the Bernoulli cells may be off.
+    blocks_alone = cfg.dataset.get("mask_block_fraction", 0.0) > 0 and cfg.dataset.mask_strategy == "node"
+    if blocks_alone and cfg.dataset.mask_percentage == 0:
+        return
     if not 0 < cfg.dataset.mask_percentage <= 1:
         raise ValueError(
             f"dataset.mask_percentage must be in (0, 1] for a regression task, got "
             f"{cfg.dataset.mask_percentage}. With no masking a reconstruction target is its own input."
+        )
+
+
+def _validate_block_mask(cfg):
+    """Spatial blocks (``dataset.mask_block_fraction``) need coordinates and a node-level reconstruction."""
+    fraction = cfg.dataset.get("mask_block_fraction", 0.0)
+    radius = cfg.dataset.get("mask_block_radius_um", 0.0)
+    if fraction == 0:
+        if radius != 0:
+            raise ValueError(
+                f"dataset.mask_block_radius_um is {radius} but dataset.mask_block_fraction is 0, so no disc "
+                "would be drawn. Set the fraction too, or the radius back to 0."
+            )
+        return
+    if not 0 < fraction < 1:
+        raise ValueError(f"dataset.mask_block_fraction must be in (0, 1), got {fraction}.")
+    if not radius > 0:
+        raise ValueError(f"dataset.mask_block_fraction is {fraction}; it needs mask_block_radius_um > 0, got {radius}.")
+    if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":
+        raise ValueError(
+            "Spatial blocks hide cells to reconstruct; they need a regression task at prediction_level node."
+        )
+    if cfg.dataset.spatial_key is None:
+        raise ValueError(
+            "Spatial blocks are drawn over cell coordinates, but dataset.spatial_key is unset, so none are "
+            "attached to the graphs. Set it (e.g. 'spatial')."
+        )
+    if not cfg.dataset.spatial_unit_um > 0:
+        raise ValueError(f"dataset.spatial_unit_um must be > 0, got {cfg.dataset.spatial_unit_um}.")
+    if cfg.dataset.mask_strategy == "gene" and cfg.dataset.mask_percentage == 0:
+        raise ValueError(
+            "Under mask_strategy gene every cell keeps at least one masked entry, so mask_percentage 0 would "
+            "still mask one entry per cell. For the discs alone use mask_strategy node."
         )
 
 
@@ -424,6 +461,7 @@ def _validate(cfg):
     ran for a config file, which is every real run.
     """
     _validate_optim(cfg)
+    _validate_block_mask(cfg)
     _validate_masking(cfg)
     _validate_objective(cfg)
     _validate_probe(cfg)

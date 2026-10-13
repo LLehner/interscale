@@ -17,6 +17,14 @@ Two granularities are available, selected by ``mask_strategy``:
     cell's remaining genes to condition on, so within-cell co-expression -- not just the
     population mean -- is available and rewarded.
 
+Spatial blocks (``dataset.mask_block_fraction`` > 0) -- on top of either strategy
+    Whole cells in discs of ``dataset.mask_block_radius_um`` (:func:`sample_block_mask`) are
+    hidden as well: under ``"node"`` they join the masked cells, under ``"gene"`` every entry of
+    their rows is masked. Both strategies leave each hidden entry's neighbourhood visible, so the
+    local component alone can fill it in; a disc wider than its reach cannot be, which is what
+    asks the global component for context from beyond it. Under ``"node"`` the Bernoulli rate may
+    then be 0, making the discs the only targets.
+
 Note on GraphMAE (arXiv:2205.10803): GraphMAE itself masks whole nodes, exactly as ``"node"``
 does here. What it changes to avoid the trivial solution is the *criterion* (scaled cosine
 error, already available as ``interscale.train.losses.SCELoss``), a learnable ``[MASK]`` token
@@ -40,6 +48,8 @@ and scored identically to the fixed -1 to three decimals: the token drifts only 
 100 epochs from any initialisation, so the fill behaves as a constant, not as something worth
 learning. It was removed rather than kept as an option.
 """
+
+import math
 
 import torch
 from torch_geometric.data import Batch
@@ -112,6 +122,44 @@ def sample_gene_mask(
     if empty_rows.any():
         fill = torch.randint(num_genes, (int(empty_rows.sum()),), generator=generator)
         mask[empty_rows, fill] = True
+    return mask
+
+
+def sample_block_mask(
+    pos: torch.Tensor, radius: float, fraction: float, generator: torch.Generator | None = None
+) -> torch.Tensor:
+    """Draw spatial blocks: discs of cells, until at least ``fraction`` of the cells lie in one.
+
+    Each disc is every cell within ``radius`` of a centre cell, the centre drawn uniformly among
+    the cells no disc covers yet, so every disc adds at least its centre and the draw ends. A disc
+    wider than the local component's reach holds cells whose whole neighbourhood is hidden: no
+    message-passing layer can fill those in, and only context from beyond the disc can.
+
+    Parameters
+    ----------
+    pos
+        ``[N, D]`` cell coordinates.
+    radius
+        Disc radius, in the units of ``pos``.
+    fraction
+        Share of the cells to cover, in (0, 1). Discs are whole, so the result overshoots it by at
+        most one disc.
+    generator
+        Optional RNG, for reproducible draws.
+
+    Returns
+    -------
+    torch.Tensor
+        Boolean tensor of shape ``[N]``.
+    """
+    pos = pos.double()
+    num_nodes = pos.shape[0]
+    target = max(1, math.ceil(fraction * num_nodes))
+    mask = torch.zeros(num_nodes, dtype=torch.bool)
+    while int(mask.sum()) < target:
+        free = torch.where(~mask)[0]
+        centre = free[torch.randint(len(free), (1,), generator=generator)]
+        mask |= (pos - pos[centre]).norm(dim=1) <= radius
     return mask
 
 
