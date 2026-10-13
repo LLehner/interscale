@@ -230,10 +230,14 @@ class TrainingPlan(pl.LightningModule):
         lr_max_epochs: int = 100000,
         patience_in_steps: int = 100000,
         sce_gamma: float = 3.0,
+        target_center: torch.Tensor | None = None,
         **kwargs,
     ):
         super().__init__()
         self.module = module
+        # `optim.center_targets`: each gene's training mean, subtracted from predictions and targets
+        # before the reconstruction loss (never before the metrics). None leaves the loss as it was.
+        self.register_buffer("target_center", None if target_center is None else torch.as_tensor(target_center).float())
         # Auxiliary terms added beside the reconstruction criterion; empty unless some
         # `optim.aux_loss_weights` entry is non-zero. They are stored on the MODULE, not here, so
         # that their heads travel with `module.state_dict()` and `module.parameters()` -- see
@@ -414,6 +418,9 @@ class TrainingPlan(pl.LightningModule):
             The masked-only versions are logged alongside under a ``masked_`` prefix; they are
             the honest held-out score and the two differ a lot, so read the prefix.
         """
+        # What the loss sees: the values minus each gene's training mean under optim.center_targets.
+        y_pred_raw, y_true_raw = y_pred, y_true
+        y_pred, y_true = self.centred(y_pred, y_true)
         if self.loss is None:
             # No reconstruction criterion: the objective comes entirely from the auxiliary terms.
             # Metrics are still computed and logged -- they say what the representation can do,
@@ -433,6 +440,7 @@ class TrainingPlan(pl.LightningModule):
                 loss = self.loss(y_pred[rows] * m, y_true[rows] * m, attn)
         else:
             loss = masked_loss(self.loss, self.loss_type, y_pred, y_true, entry_mask)
+        y_pred, y_true = y_pred_raw, y_true_raw
 
         # Primary metrics: every cell the model produced, masked or not.
         metrics = metrics(y_pred, y_true)
@@ -562,7 +570,9 @@ class TrainingPlan(pl.LightningModule):
                 y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask, extra_loss=aux_total
             )
 
-        separate_losses = self.module.compute_separate_losses(self.loss, self.loss_type, y_pred, y_true, entry_mask)
+        separate_losses = self.module.compute_separate_losses(
+            self.loss, self.loss_type, *self.centred(y_pred, y_true), entry_mask
+        )
 
         for key in ("local_loss", "global_loss", "combined_loss"):
             # `val` never logged combined_loss; preserved to keep this refactor number-identical.
@@ -616,8 +626,7 @@ class TrainingPlan(pl.LightningModule):
             return out
 
         extra = [
-            self.module._common_step(batch, self.prediction_task, self.prediction_level)
-            for _ in range(n_views - 1)
+            self.module._common_step(batch, self.prediction_task, self.prediction_level) for _ in range(n_views - 1)
         ]
         out.views = [out.view, *(o.view for o in extra)]
         return out
@@ -658,6 +667,12 @@ class TrainingPlan(pl.LightningModule):
     def test_step(self, batch):
         """Test step for the model."""
         return self._step(batch, "test")
+
+    def centred(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(y_pred, y_true)`` minus each gene's training mean under ``optim.center_targets``, else as given."""
+        if self.target_center is None:
+            return y_pred, y_true
+        return y_pred - self.target_center, y_true - self.target_center
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""

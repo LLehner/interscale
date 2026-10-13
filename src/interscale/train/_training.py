@@ -12,7 +12,12 @@ from lightning.pytorch.trainer import seed_everything
 from interscale.evaluation.online_probes import build_probe_callback
 from interscale.tl.utils import get_model_filename_prefix
 from interscale.train._trainingplans import TrainingPlan
-from interscale.train._utils import MetricsHistory, NodeMaskResampleCallback, build_efficiency_monitor
+from interscale.train._utils import (
+    MetricsHistory,
+    NodeMaskResampleCallback,
+    build_efficiency_monitor,
+    train_gene_means,
+)
 
 # from interscale.model.base._trainer import TrainRunner
 
@@ -149,6 +154,12 @@ class NodeMaskingTrainingPlan:
         aux_losses = self.module.aux_losses
         if aux_losses:
             print(f"Auxiliary losses: {dict(aux_losses.weights)} (views required: {aux_losses.requires_views})")
+        # optim.center_targets: the loss compares predictions and targets minus each gene's mean
+        # over the training split (never val or test).
+        target_center = None
+        if self._cfg.optim.get("center_targets", False):
+            target_center = train_gene_means(datamodule.train_data)
+            print(f"Loss on gene-centred values: means of {len(target_center)} genes over the training graphs")
 
         training_plan = self._training_plan_cls(
             self.module,
@@ -168,6 +179,7 @@ class NodeMaskingTrainingPlan:
             lr_max_epochs=self._cfg.optim.n_epochs,
             patience_in_steps=steps_per_epoch,
             sce_gamma=self._cfg.optim.sce_gamma,
+            target_center=target_center,
         )
 
         monitor, mode = self._resolve_monitor()

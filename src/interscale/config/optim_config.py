@@ -24,6 +24,13 @@ def get_optim_cfg(cfg):
     # regression run whatever its loss. 1 is the plain cosine error; above 1, cells that are already
     # reconstructed well count for less (GraphMAE uses 1-3, per dataset). 3 was the fixed value before.
     cfg.optim.sce_gamma = 3.0
+    # Subtract each gene's training-set mean from predictions and targets before the loss. Changes
+    # only row-normalising losses (SCE, Pearson): on raw expression most of every spot's vector is
+    # the profile all spots share (84% on synth_spot), so a raw cosine is nearly satisfied by that
+    # mean profile and barely rewards context -- a neighbour average beats the gene mean by 0.0005 in
+    # SCE. Centred, what is left to predict is how a spot differs from the average one. The metrics
+    # stay on the raw values (val_scaled_cosine_error is the raw SCE); `<mode>_loss` is the centred one.
+    cfg.optim.center_targets = False
     cfg.optim.seed = 40
     cfg.optim.cross_corr = "cell"  # Currently cell is the only one that really works
     cfg.optim.n_epochs = 100

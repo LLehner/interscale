@@ -106,6 +106,14 @@ def build_efficiency_monitor(cfg):
     return EfficiencyMonitor() if cfg.optim.get("log_efficiency", False) else None
 
 
+def train_gene_means(data_list) -> torch.Tensor:
+    """``[G]``: each gene's mean over every spot of the training graphs, for ``optim.center_targets``.
+
+    Read from ``data.x``, which the masking never touches (``apply_mask`` corrupts a clone).
+    """
+    return torch.cat([data.x.float() for data in data_list]).mean(0)
+
+
 class MetricsHistory(Callback):
     def __init__(self):
         super().__init__()

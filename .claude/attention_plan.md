@@ -831,6 +831,17 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
      context-dependent deviations drive the gradient.
    - Z-scoring the *input* instead would put the −1 mask value inside the data range (CLAUDE.md,
      masking).
+   - **Implemented 2026-10-13, unverified on data:** `optim.center_targets`. `train()` takes each
+     gene's mean over the training graphs (`train_gene_means`), and the plan subtracts it from
+     prediction and target before the reconstruction loss and the dual decoder's split losses,
+     never before the metrics. So `<mode>_loss` is centred while `val_scaled_cosine_error` stays the
+     raw SCE. The validator allows it only for regression with a row-normalising loss. Checkpoint
+     tag `var-ctr_`.
+   - Verified by tests:
+     - the loss is the SCE of the centred values over the same masked entries;
+     - predicting the mean profile scores 1.0 instead of < 0.05 raw;
+     - the split losses are centred and the metrics stay raw.
+     Six mutations, each caught; harness IDENTICAL.
 
 ### Plan
 

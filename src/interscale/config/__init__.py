@@ -430,6 +430,27 @@ def _validate(cfg):
     _validate_pe(cfg)
     _validate_attention(cfg)
     _validate_sce(cfg)
+    _validate_center_targets(cfg)
+
+
+def _validate_center_targets(cfg):
+    """Reject ``optim.center_targets`` where it would change nothing or make no sense.
+
+    Subtracting the same per-gene constant from prediction and target leaves an element-wise loss
+    (MSE, SmoothL1) unchanged, so only row-normalising criteria are allowed; and a class label has
+    no gene mean.
+    """
+    if not cfg.optim.get("center_targets", False):
+        return
+    from interscale.tl.masking import _ROW_STRUCTURED_LOSSES
+
+    if "regression" not in cfg.dataset.prediction_task:
+        raise ValueError("optim.center_targets centres gene expression; it needs a regression task.")
+    if cfg.optim.loss not in _ROW_STRUCTURED_LOSSES:
+        raise ValueError(
+            f"optim.center_targets only changes row-normalising losses {list(_ROW_STRUCTURED_LOSSES)}; "
+            f"with optim.loss {cfg.optim.loss!r} the same per-gene shift of prediction and target changes nothing."
+        )
 
 
 def _validate_sce(cfg):
