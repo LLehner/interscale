@@ -826,6 +826,26 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
    - The global component is then rewarded only for what local misses, which is the local-vs-global
      question itself.
    - Touches `DualDecoderCombinedModule` and how the losses and metrics are reported.
+   - **Implemented 2026-10-13, unverified on data:** `model.decoder.global_residual` (needs
+     `dual_decoder` and node level). The global head's prediction is `combine_global`: the local
+     prediction, detached, plus the global decoder's output, for the same cells in the same order.
+     Training (`_common_step`) and inference (`get_model_output`, which decodes outside the step)
+     both report that sum, so `global_loss`, the metrics, `y_pred_global` and the gene ranks all read
+     the combined prediction. The local decoder answers to the local loss alone; the GCN still gets
+     the global loss through the tokens, as before. Composes with `optim.center_targets` (the sum is
+     centred like any prediction). Checkpoint tag `var-res_`.
+   - How to read it: `global_loss` below `local_loss` is what the global component adds. The global
+     decoder starts from random weights, so the gap starts negative and must first recover.
+     Zero-initialising its last layer would start the gap at 0; not done, add it if the curves are
+     hard to read.
+   - Verified by tests:
+     - with the same weights, the global half equals the local half plus the plain global output;
+     - a loss on the global half leaves every local-decoder gradient at zero and reaches the global
+       decoder;
+     - inference on a subsampled slide reports each kept cell's own local prediction plus the global
+       output;
+     - the validator requires the dual decoder at node level.
+     Eight mutations, each caught; harness IDENTICAL.
 5. **SCE on gene-centred targets (small).**
    - Subtract the training gene means from prediction and target before the cosine, so
      context-dependent deviations drive the gradient.
@@ -845,10 +865,13 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
 
 ### Plan
 
-- **Round 3a:** levers 1 and 2 on a reduced grid (dense and Performer × none / naive / rope /
-  fourier). Question: does attention leave uniform once the tokens are centred and training is long
-  enough? Read the effective keys, the token cosine, `planted_edges` lift and rank, and whether val
-  SCE drops below 0.0816.
+- **Round 3a:** levers 1, 2 and 5 on a reduced grid (dense and Performer × none / naive / rope /
+  fourier), plus ablation arms on `none` that switch off lever 2, lever 5 or both, to tell them
+  apart. Question: does attention leave uniform once the tokens are centred, the loss rewards
+  deviations from the mean profile, and training is long enough? Read the effective keys, the token
+  cosine, `planted_edges` lift and rank, and whether val SCE drops below 0.0816. Lever 5 belongs
+  here, not in 3b: it changes what the whole model is asked to learn, not what global must do that
+  local can't.
 - **Round 3b:** add levers 3 and 4, with the long-range mask back on. This is the actual "global
   learns something the local can't" experiment: the local-vs-global gap per programme, the probes
   on hidden discs, and planted long-range edges.
@@ -857,8 +880,8 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
     preserves;
   - run several seeds once differences appear.
 
-Status: diagnosed 2026-10-12, nothing implemented yet. The user asked to continue on 2026-10-13
-and called it urgent.
+Status: diagnosed 2026-10-12 (the user called it urgent). On 2026-10-13 levers 2, 4 and 5 were
+implemented, each unverified on data; lever 3 and the round-3a configs are in progress.
 
 ## Predictions to check, not assume
 

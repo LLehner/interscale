@@ -110,11 +110,14 @@ def _training_tag(cfg) -> str:
     """``var-<switches>_`` for training-side switches off their default, else ``""``.
 
     For the same reason as the encoding and attention tags: a sweep over one of these would
-    otherwise write every arm to one checkpoint. ``ctr``: ``optim.center_targets``.
+    otherwise write every arm to one checkpoint. ``ctr``: ``optim.center_targets``; ``res``:
+    ``model.decoder.global_residual``.
     """
     parts = []
     if cfg.optim.get("center_targets", False):
         parts.append("ctr")
+    if cfg.model.decoder.get("global_residual", False):
+        parts.append("res")
     return f"var-{'+'.join(parts)}_" if parts else ""
 
 

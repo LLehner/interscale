@@ -26,5 +26,11 @@ def get_model_cfg(cfg):
     cfg.model.decoder.dual_decoder = (
         False  # [True, False] If True, use dual decoder for combined module. Both local and global decoders are used.
     )
+    # With the dual decoder: the global head predicts what the local head misses. Its prediction is
+    # the local prediction (no gradient back into it) plus the global decoder's output, so the global
+    # component is rewarded only for the part of each spot the local component cannot reconstruct --
+    # under plain dual decoding copying the local head is already optimal for it. The reported
+    # global prediction (metrics, get_model_output, gene ranks) is that sum.
+    cfg.model.decoder.global_residual = False
 
     return cfg

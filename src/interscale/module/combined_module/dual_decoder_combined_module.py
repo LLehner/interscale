@@ -29,6 +29,9 @@ class DualDecoderCombinedModule(BaseModule):
 
         self.registered_local_component = True
         self.registered_global_component = True
+        # `model.decoder.global_residual`: the global head's prediction is the local one (detached)
+        # plus the global decoder's output -- see `combine_global`.
+        self.global_residual = bool(cfg.model.decoder.get("global_residual", False))
 
         # Local module with decoder
         self.local_module = LocalModule.from_config(
@@ -112,6 +115,19 @@ class DualDecoderCombinedModule(BaseModule):
         y_pred = self.global_module.predict(global_embedding, src_padding_mask, prediction_level)
         return y_pred
 
+    def combine_global(self, y_pred_local: torch.Tensor, y_pred_global: torch.Tensor) -> torch.Tensor:
+        """The global head's prediction from the two decoders' outputs for the same cells, in the same order.
+
+        Under ``model.decoder.global_residual`` it is ``y_pred_local.detach() + y_pred_global``: the
+        global decoder models what the local prediction misses. The global loss does not reach the
+        local prediction, so the local decoder answers to the local loss alone and cannot drift
+        toward whatever makes the sum easy; the GCN still gets the global loss through the tokens,
+        as under plain dual decoding. Otherwise the global decoder's output as it is.
+        """
+        if not self.global_residual:
+            return y_pred_global
+        return y_pred_local.detach() + y_pred_global
+
     def forward(self, batch_masked):
         """Forward pass through the model"""
         local_out = self.local_module.forward(batch_masked.x, batch_masked.edge_index)
@@ -171,6 +187,7 @@ class DualDecoderCombinedModule(BaseModule):
 
             # Both branches gathered by the SAME index, so row i of each is the same cell.
             y_pred_local = self.predict_local(local_embedding, padded_node_idx)
+            y_pred_global = self.combine_global(y_pred_local, y_pred_global)
 
             if entry_mask is None:
                 # Node-level classification: the masked cells are the supervision targets, so

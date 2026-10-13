@@ -431,6 +431,22 @@ def _validate(cfg):
     _validate_attention(cfg)
     _validate_sce(cfg)
     _validate_center_targets(cfg)
+    _validate_global_residual(cfg)
+
+
+def _validate_global_residual(cfg):
+    """``model.decoder.global_residual`` needs a local prediction to be residual to, cell by cell."""
+    if not cfg.model.decoder.get("global_residual", False):
+        return
+    if not cfg.model.decoder.dual_decoder:
+        raise ValueError(
+            "model.decoder.global_residual makes the global head predict the local head's error; it needs "
+            "model.decoder.dual_decoder: true, where both heads exist."
+        )
+    if cfg.dataset.prediction_level != "node":
+        raise ValueError(
+            "model.decoder.global_residual pairs the two heads cell by cell; it needs prediction_level node."
+        )
 
 
 def _validate_center_targets(cfg):
