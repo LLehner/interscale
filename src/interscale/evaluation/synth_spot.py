@@ -14,10 +14,18 @@ responds to a sender that is not in the data. One slide is one graph and one tra
 sequence, so ``max_seq_len`` must be >= 2500. The split is per slide, 12/4/4 train/val/test in
 each condition (60/20/20), and val and test each hold both values of every slide-level factor.
 
-Expression levels are named: ``0`` is a structural zero, ``down`` a mean of 1, ``up`` and
-``medium`` a mean of 5, ``high`` a mean of 10. Genes defined by such levels or by a spatial field
-("structured" genes) scatter by about a count around their mean -- a ``down`` gene reads 1 about
-two times in three and 0 or 2 otherwise. Background genes follow their own distributions.
+Expression levels are named: ``0`` is a structural zero, ``down`` a base mean of 1, ``up`` and
+``medium`` a base mean of 5, ``high`` a base mean of 10. Genes defined by such levels or by a
+spatial field ("structured" genes) scatter around their mean by ``noise_scale * sqrt(mean)``.
+Background genes follow their own distributions.
+
+Every structured gene's mean -- levels, fields, sparse responses -- is multiplied by
+``signal_scale`` (default 6) before counts are drawn; the numbers quoted in this module and next to
+the code are the base values, before that factor. At 1 (the datasets made before 2026-10-14) a
+structured gene averaged 1.7 expected counts per spot against 10.2 for a background gene, and the
+background genes held 92% of every spot's counts: after per-spot normalisation the noise dominated
+the expression vector. At 6 a structured gene averages about what a background gene does, and
+``high`` reads 60. Zeros stay zeros, so every pattern keeps its shape and its ground truth.
 
 Programmes, with the item of the original specification in brackets:
 
@@ -66,9 +74,13 @@ from scipy.special import ndtr
 SPACING_UM = 100.0
 CONDITIONS = ("A", "B")
 
-#: Mean count of each named level. "0" is a structural zero, so such a gene reads exactly 0.
-#: "medium" appears only as the R3/R4 default, between 0 and "high".
+#: Base mean count of each named level, before ``signal_scale``. "0" is a structural zero, so such a
+#: gene reads exactly 0. "medium" appears only as the R3/R4 default, between 0 and "high".
 LEVELS = {"0": 0.0, "down": 1.0, "medium": 5.0, "up": 5.0, "high": 10.0}
+
+#: Factor on every structured gene's mean (see the module docstring): 6 brings a structured gene's
+#: average expected count (1.7 x 6) to the background genes' average (10.2).
+SIGNAL_SCALE = 6.0
 
 #: Condition genes [6]: level in condition A, level in condition B. Constant within a slide.
 CONDITION_GENES = {"cg_1": ("down", "high"), "cg_2": ("0", "up"), "cg_3": ("down", "high")}
@@ -937,7 +949,18 @@ def _low_noise_counts(r: np.random.Generator, mean: np.ndarray, noise_scale: flo
 
 
 def _simulate_slide(
-    seed: int, info, genes: pd.DataFrame, *, n_side, spacing, n_crop_lines, max_holes, noise_scale, sender_rates, cutoff
+    seed: int,
+    info,
+    genes: pd.DataFrame,
+    *,
+    n_side,
+    spacing,
+    n_crop_lines,
+    max_holes,
+    noise_scale,
+    signal_scale,
+    sender_rates,
+    cutoff,
 ):
     """Simulate one slide: lattice, every programme, counts, and its ground-truth records."""
     slide = info.slide
@@ -958,6 +981,8 @@ def _simulate_slide(
     sp_mean, sp_obs, sp_sources, sp_edges = _sparse_responses(seed, slide, grid)
     mean |= sr_mean | lr_mean | sv_mean | rg_mean | sp_mean
     sources += sp_sources
+    # Every structured gene, before its counts are drawn; the background genes below are untouched.
+    mean = {gene: mu * signal_scale for gene, mu in mean.items()}
 
     counts = {gene: _low_noise_counts(_rng(seed, slide, "noise", gene), mu, noise_scale) for gene, mu in mean.items()}
     bg_counts, bg_expected = _background(seed, slide, n, genes[genes["noise_model"] != "low_noise"])
@@ -1019,6 +1044,7 @@ def make_synth_spot(
     n_with_holes_per_condition: int = 10,
     max_holes: int = 5,
     noise_scale: float = 0.4,
+    signal_scale: float = SIGNAL_SCALE,
     sender_rates: dict[str, float] | None = None,
     n_hv: int = 10,
     n_nb: int = 40,
@@ -1045,8 +1071,11 @@ def make_synth_spot(
     n_with_holes_per_condition, max_holes
         Slides per condition with holes, and the most holes one gets (at least 1).
     noise_scale
-        Scatter of the structured genes around their mean, in units of ``sqrt(mean)``. The
-        default 0.4 reproduces the spec's "down" level; 1.0 gives Poisson-sized variance.
+        Scatter of the structured genes around their mean, in units of ``sqrt(mean)``. 1.0 gives
+        Poisson-sized variance. The relative scatter shrinks as ``signal_scale`` grows.
+    signal_scale
+        Factor on every structured gene's mean; 1 reproduces the datasets made before 2026-10-14.
+        Background genes are not scaled.
     sender_rates
         Fraction of spots carrying each short-range sender; defaults to :data:`SENDER_RATES`.
     n_hv, n_nb, n_zinb, n_poi, n_hk
@@ -1072,6 +1101,8 @@ def make_synth_spot(
         Freeman-Tukey layer, coordinates in ``obsm['spatial']`` (µm), a reference graph in
         ``obsp``, and the ground truth in ``obs``, ``var`` and ``uns['synthetic']``.
     """
+    if not signal_scale > 0:
+        raise ValueError(f"signal_scale must be > 0, got {signal_scale}.")
     if n_val_per_condition + n_test_per_condition >= n_slides_per_condition:
         raise ValueError("need at least one train slide per condition")
     if max(n_cropped_per_condition, n_with_holes_per_condition) > n_slides_per_condition:
@@ -1104,6 +1135,7 @@ def make_synth_spot(
             n_crop_lines=n_crop_lines,
             max_holes=max_holes,
             noise_scale=noise_scale,
+            signal_scale=signal_scale,
             sender_rates=rates,
             cutoff=edge_weight_cutoff,
         )
@@ -1178,6 +1210,7 @@ def make_synth_spot(
             "n_with_holes_per_condition": n_with_holes_per_condition,
             "max_holes": max_holes,
             "noise_scale": noise_scale,
+            "signal_scale": signal_scale,
             "sender_rates": rates,
             "levels": dict(LEVELS),
             "long_range": {k: np.asarray(v, dtype=float) for k, v in LONG_RANGE.items()},
@@ -1300,7 +1333,9 @@ def plot_slide_maps(adata: AnnData, slide: str | None = None, layer: str = "expe
     # One range per gene for the whole dataset, so a gene's panels compare across slides and layers.
     reference = adata.layers["expected"] if "expected" in adata.layers else adata.layers[layer]
     top = np.asarray(reference[:, adata.var_names.get_indexer(genes)].max(axis=0)).ravel()
-    vmax = np.maximum(top, LEVELS["high"])
+    # "high" in this file's units; files from before signal_scale existed were made at 1.
+    high = LEVELS["high"] * float(params.get("signal_scale", 1.0))
+    vmax = np.maximum(top, high)
 
     cmap = LinearSegmentedColormap.from_list("synth_spot", _MAP_RAMP)
     cmap.set_bad("#ffffff")  # removed spots show the background: a hole reads as missing tissue
@@ -1321,9 +1356,9 @@ def plot_slide_maps(adata: AnnData, slide: str | None = None, layer: str = "expe
             extent=(-half, half, -half, half),
             interpolation="nearest",
         )
-        if vmax[j] == LEVELS["high"]:
+        if vmax[j] == high:
             shared = im
-        title = gene if vmax[j] == LEVELS["high"] else f"{gene}  (0-{vmax[j]:.0f})"
+        title = gene if vmax[j] == high else f"{gene}  (0-{vmax[j]:.0f})"
         ax.set_title(title, fontsize=9, color="#222222", pad=2)
         ax.set_xticks([])
         ax.set_yticks([])
@@ -1353,6 +1388,7 @@ def main() -> None:
     parser.add_argument("--n-slides-per-condition", type=int, default=20)
     parser.add_argument("--n-side", type=int, default=50)
     parser.add_argument("--noise-scale", type=float, default=0.4)
+    parser.add_argument("--signal-scale", type=float, default=SIGNAL_SCALE)
     parser.add_argument("--graph-radius", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--plot-slide", type=str, default=None, help="slide to map; default: the most damaged one")
@@ -1363,6 +1399,7 @@ def main() -> None:
         n_slides_per_condition=args.n_slides_per_condition,
         n_side=args.n_side,
         noise_scale=args.noise_scale,
+        signal_scale=args.signal_scale,
         graph_radius=args.graph_radius,
         seed=args.seed,
     )
