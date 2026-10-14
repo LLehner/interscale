@@ -938,7 +938,7 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
     - `none_plain` ~2,400;
     - centred queries and keys only ~900 (dense) / 1,250 (Performer);
     - centred targets only ~1,500 / 1,900;
-    - both ~1,000–1,300, dense `rope` lowest at 810.
+    - both ~1,000–1,400, dense `rope` lowest at 810.
     Span stays ~2.5 mm (median), so attention concentrates on some keys but not on near ones.
   - **The probes improved with centred targets, both embeddings:**
     - R3/R4 sender state, local 0.45 → 0.56, global 0.39 → 0.50;
@@ -977,6 +977,20 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
   - Without a positional encoding, all tokens deep inside a disc are identical (all −1 input, the
     same GCN output), so the transformer can only give them one prediction per slide. Telling
     them apart needs position, so 3b is also the first real test of the encodings.
+  - **Built for 3b, 2026-10-14** (library, each tested and mutation-checked):
+    - `masked_probing.draw_masks(..., "blocks", rate, seed, radius=...)`: disc masks for the
+      evaluation passes, from a private generator, so every arm is scored on the same discs.
+    - `masked_probing.collect_head_predictions` and `score_heads`: both decoder heads on the hidden
+      entries of such a pass. Per gene (R², Pearson r), per gene group (mean R², pooled centred
+      cosine), per cell (SCE, centred cosine), and **by depth**: each wholly hidden cell's
+      distance to the nearest cell with any visible entry, in µm. Every table has `global - local`
+      columns. Depth beyond the GCN's reach (~283 µm on synth_spot) is where local has nothing to
+      go on, so the global gain there is the cleanest read of "global learns what local can't".
+    - The long-range mask in checkpoint names (`var-lrm_`), so an arm with the mask off does not
+      overwrite one with it on. Off is the default and adds nothing. Checkpoints trained with the
+      mask on before 2026-10-14 (round 1, the PE sweeps) carry no tag; rename them to reload them
+      under the current code.
+    15 mutations, each caught; 717 tests pass; harness IDENTICAL.
 - **Controls:**
   - evaluate an untrained checkpoint through the same script, to see what a random GCN already
     preserves;

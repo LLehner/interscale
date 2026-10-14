@@ -10,6 +10,15 @@ a pass in which the values it predicts were hidden from the model, drawn with a 
   while its response is hidden -- is fair input, as it was in training.
 * ``"cells"`` -- whole cells hidden. A hidden cell's embedding knows only its context, so the gene
   vector, labels and covariates read from it measure what the context says about the cell.
+* ``"blocks"`` -- whole cells hidden in discs (:func:`~interscale.tl.masking.sample_block_mask`).
+  Deep inside a disc wider than the local component's reach, the context a cell's embedding knows
+  is only what came from beyond the disc.
+
+Besides the probes, :func:`collect_head_predictions` and :func:`score_heads` score the model's own
+two decoder heads on the hidden entries of such a pass -- per gene, per gene group, and by how deep
+inside the hidden area a cell lies. That is where a dual decoder's local and global heads can be
+compared fairly: a pass without masking (``get_model_output``) hands each head the values it is
+scored on.
 
 Regression is scored by **cosine similarity** between predicted and true vectors, per cell: over the
 whole gene vector (its hidden entries), and over a vector of covariates. Two versions, side by
@@ -33,34 +42,47 @@ sets are whatever :func:`~interscale.evaluation.online_probes.collect_features` 
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import balanced_accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler
+from torch_geometric.loader import DataLoader
 
-from interscale.evaluation.online_probes import ProbeBatchFeatures
+from interscale.evaluation.online_probes import ProbeBatchFeatures, _rng_untouched
+from interscale.tl.masking import sample_block_mask
 
-MASK_KINDS = ("entries", "cells")
+MASK_KINDS = ("entries", "cells", "blocks")
 
 
-def draw_masks(data_list, kind: str, rate: float, seed: int) -> None:
+def draw_masks(data_list, kind: str, rate: float, seed: int, radius: float | None = None) -> None:
     """Hide entries or whole cells of every graph in ``data_list``, in place, from a private generator.
 
     Writes ``data.gene_mask`` ``[N, G]`` and ``data.mask`` ``[N]`` (its row-wise OR), the attributes
-    the gene-masking pipeline reads. ``"cells"`` hides every gene of a hidden cell. The global
-    torch generator is not touched.
+    the gene-masking pipeline reads; under ``mask_strategy="node"`` the model reads ``data.mask``,
+    which for ``"cells"`` and ``"blocks"`` hides the same cells. ``"cells"`` hides every gene of a
+    hidden cell. ``"blocks"`` hides every gene of the cells in discs of ``radius`` (in the units of
+    ``data.pos``) until ``rate`` of each graph's cells lie in one. The global torch generator is
+    not touched.
     """
     if kind not in MASK_KINDS:
         raise ValueError(f"kind must be one of {MASK_KINDS}, got {kind!r}.")
+    if kind == "blocks" and not (radius is not None and radius > 0 and 0 < rate < 1):
+        raise ValueError(f"'blocks' needs a radius > 0 and a rate in (0, 1), got radius {radius} and rate {rate}.")
     gen = torch.Generator().manual_seed(int(seed))
     for data in data_list:
         n, g = data.x.shape
         if kind == "entries":
             gene_mask = torch.rand(n, g, generator=gen) < rate
-        else:
+        elif kind == "cells":
             gene_mask = (torch.rand(n, generator=gen) < rate)[:, None].expand(n, g).clone()
+        else:
+            if getattr(data, "pos", None) is None:
+                raise ValueError("'blocks' are drawn over cell coordinates, but a graph has no `pos`.")
+            gene_mask = sample_block_mask(data.pos, radius, rate, generator=gen)[:, None].expand(n, g).clone()
         data.gene_mask = gene_mask
         data.mask = gene_mask.any(dim=1)
 
@@ -301,3 +323,242 @@ def probe_covariates(
             }
         )
     return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- the decoder heads
+
+
+@dataclass
+class HeadPredictions:
+    """Both decoder heads' predictions over one masked pass, every array in the same cell order.
+
+    Attributes
+    ----------
+    local, global_
+        ``[N, G]`` the local and the global head's predictions (the global one as the model reports
+        it, i.e. local plus residual under ``model.decoder.global_residual``).
+    true
+        ``[N, G]`` uncorrupted expression.
+    hidden
+        ``[N, G]`` boolean, True where the entry was hidden from the model.
+    depth_um
+        ``[N]`` distance from each wholly hidden cell to the nearest cell of its graph with any
+        visible entry, in µm; 0 for every other cell and ``inf`` in a graph hidden completely.
+        None when the graphs carry no ``pos``.
+    """
+
+    local: np.ndarray
+    global_: np.ndarray
+    true: np.ndarray
+    hidden: np.ndarray
+    depth_um: np.ndarray | None = None
+
+
+def _hidden_depth(pos: torch.Tensor, hidden_cell: torch.Tensor, graph: torch.Tensor) -> torch.Tensor:
+    """``[N]`` distance from each hidden cell to the nearest non-hidden cell of the same graph."""
+    depth = torch.zeros(len(pos), dtype=torch.float64, device=pos.device)
+    for g in torch.unique(graph):
+        rows = torch.where(graph == g)[0]
+        hid = hidden_cell[rows]
+        if not hid.any():
+            continue
+        p = pos[rows].double()
+        if hid.all():
+            depth[rows] = float("inf")
+            continue
+        depth[rows[hid]] = torch.cdist(p[hid], p[~hid]).min(dim=1).values
+    return depth
+
+
+def collect_head_predictions(
+    module,
+    data_list,
+    *,
+    prediction_task: str,
+    prediction_level: str,
+    mask_strategy: str,
+    batch_size: int,
+    device,
+    spatial_unit_um: float | None = None,
+) -> HeadPredictions:
+    """Run a dual-decoder ``module`` over masked graphs and gather both heads' predictions.
+
+    The graphs keep the masks they carry (e.g. from :func:`draw_masks`), and the module corrupts
+    its input with them exactly as in training, so every hidden entry is predicted from what the
+    model could see. Row ``i`` of every output array is the same cell: the halves of the step's
+    ``y_pred`` are already gathered by one index, and the depth is gathered by that index too.
+
+    Parameters
+    ----------
+    module
+        A :class:`~interscale.module.combined_module.DualDecoderCombinedModule`.
+    data_list
+        PyG ``Data`` objects carrying ``mask`` and, for ``mask_strategy="gene"``, ``gene_mask``.
+    prediction_task, prediction_level
+        Must be ``"regression"`` and ``"node"``: the heads reconstruct expression per cell.
+    mask_strategy
+        ``cfg.dataset.mask_strategy``; decides which attribute says what was hidden, as in
+        :func:`~interscale.evaluation.online_probes.collect_features`.
+    batch_size
+        Graphs per forward pass.
+    device
+        Device to move each batch to.
+    spatial_unit_um
+        ``dataset.spatial_unit_um``. When given and the graphs carry ``pos``, ``depth_um`` is filled.
+
+    Returns
+    -------
+    HeadPredictions
+    """
+    if not hasattr(module, "predict_local"):
+        raise TypeError("collect_head_predictions compares the local and global heads; it needs a dual-decoder module.")
+    if "regression" not in prediction_task or prediction_level != "node":
+        raise ValueError("The heads are scored on reconstructed expression; it needs regression at node level.")
+
+    was_training = module.training
+    module.eval()
+    chunks = {"local": [], "global_": [], "true": [], "hidden": [], "depth_um": []}
+    loader = DataLoader(dataset=data_list, shuffle=False, batch_size=batch_size, num_workers=0)
+    try:
+        with _rng_untouched(device), torch.no_grad():
+            for batch in loader:
+                batch = batch.to(device)
+                out = module._common_step(batch, prediction_task, prediction_level)
+                n = len(out.y_pred) // 2
+                idx = out.view.padded_node_idx
+                chunks["local"].append(out.y_pred[:n].cpu().numpy())
+                chunks["global_"].append(out.y_pred[n:].cpu().numpy())
+                chunks["true"].append(out.y_true[:n].cpu().numpy())
+                chunks["hidden"].append(out.entry_mask[:n].bool().cpu().numpy())
+                pos = getattr(batch, "pos", None)
+                if spatial_unit_um is not None and pos is not None:
+                    gene_mask = getattr(batch, "gene_mask", None) if mask_strategy == "gene" else None
+                    hidden_cell = batch.mask.bool() if gene_mask is None else gene_mask.bool().all(dim=1)
+                    depth = _hidden_depth(pos, hidden_cell, batch.batch) * float(spatial_unit_um)
+                    chunks["depth_um"].append(depth[idx].cpu().numpy())
+    finally:
+        module.train(was_training)
+
+    def cat(name):
+        return np.concatenate(chunks[name]) if chunks[name] else None
+
+    return HeadPredictions(
+        local=cat("local"), global_=cat("global_"), true=cat("true"), hidden=cat("hidden"), depth_um=cat("depth_um")
+    )
+
+
+def _r2(pred: np.ndarray, true: np.ndarray) -> float:
+    """``1 - SSE / SST`` around the mean of ``true``; NaN with fewer than two values or no spread."""
+    if len(true) < 2:
+        return float("nan")
+    sst = float(((true - true.mean()) ** 2).sum())
+    return 1.0 - float(((pred - true) ** 2).sum()) / sst if sst > 0 else float("nan")
+
+
+def _pearson(pred: np.ndarray, true: np.ndarray) -> float:
+    if len(true) < 2 or pred.std() == 0 or true.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(pred, true)[0, 1])
+
+
+def score_heads(
+    pred: HeadPredictions,
+    genes: list[str],
+    *,
+    center: np.ndarray | None = None,
+    gene_groups: dict[str, list[str]] | None = None,
+    depth_bins_um: list[float] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Score the local and global heads on the hidden entries of one pass.
+
+    Parameters
+    ----------
+    pred
+        From :func:`collect_head_predictions`.
+    genes
+        Gene names, in the column order of ``pred``.
+    center
+        ``[G]`` the training mean of each gene (``train._utils.train_gene_means``). The centred
+        cosine is the cosine of the deviations from it: predicting the mean scores 0. Without it,
+        the centred columns are left out.
+    gene_groups
+        ``{group: [genes]}``, e.g. ``var['program']``, for the per-group table.
+    depth_bins_um
+        Bin edges for the depth table, in µm, e.g. ``[0, 100, 300, 500, inf]``. Needs
+        ``pred.depth_um``; only wholly hidden cells (depth > 0) are binned.
+
+    Returns
+    -------
+    dict
+        ``"cells"``: per head, over the cells with a hidden entry, the mean SCE (1 − cosine of the
+        hidden entries, as ``val_masked_scaled_cosine_error`` at gamma 1) and the mean centred
+        cosine. ``"per_gene"``: per gene, its hidden entries' count and each head's R² and Pearson
+        r. ``"by_group"`` (with ``gene_groups``): per group, the mean of its genes' R² per head and
+        the cosine pooled over all its hidden entries. ``"by_depth"`` (with ``depth_bins_um``): the
+        ``"cells"`` columns per depth bin. Each table carries ``global - local`` columns: positive
+        is the global head better for R², r and cosine, negative for SCE.
+    """
+    heads = {"local": pred.local.astype(np.float64), "global": pred.global_.astype(np.float64)}
+    true, hidden = pred.true.astype(np.float64), pred.hidden.astype(bool)
+    scored = hidden.any(axis=1)
+    tables = {}
+
+    def cell_columns(rows: np.ndarray) -> dict[str, float]:
+        out = {"n_cells": int(rows.sum())}
+        for name, p in heads.items():
+            out[f"{name}_sce"] = float(np.nanmean(1.0 - _cosine_rows(p[rows], true[rows], hidden[rows])))
+            if center is not None:
+                cos = _cosine_rows(p[rows] - center, true[rows] - center, hidden[rows])
+                out[f"{name}_cosine_centred"] = float(np.nanmean(cos))
+        out["global - local_sce"] = out["global_sce"] - out["local_sce"]
+        if center is not None:
+            out["global - local_cosine_centred"] = out["global_cosine_centred"] - out["local_cosine_centred"]
+        return out
+
+    tables["cells"] = pd.DataFrame([cell_columns(scored)])
+
+    rows = []
+    for j, gene in enumerate(genes):
+        keep = hidden[:, j]
+        row = {"gene": gene, "n_hidden": int(keep.sum())}
+        for name, p in heads.items():
+            row[f"{name}_r2"] = _r2(p[keep, j], true[keep, j])
+            row[f"{name}_pearson"] = _pearson(p[keep, j], true[keep, j])
+        row["global - local_r2"] = row["global_r2"] - row["local_r2"]
+        row["global - local_pearson"] = row["global_pearson"] - row["local_pearson"]
+        rows.append(row)
+    per_gene = pd.DataFrame(rows)
+    tables["per_gene"] = per_gene
+
+    if gene_groups:
+        position = {g: i for i, g in enumerate(genes)}
+        offset = center if center is not None else 0.0
+        rows = []
+        for group, members in gene_groups.items():
+            cols = [position[g] for g in members if g in position]
+            if not cols:
+                continue
+            keep = np.zeros_like(hidden)
+            keep[:, cols] = hidden[:, cols]
+            in_group = per_gene["gene"].isin([genes[c] for c in cols])
+            row = {"group": group, "n_genes": len(cols), "n_hidden": int(keep.sum())}
+            for name, p in heads.items():
+                row[f"{name}_r2"] = float(per_gene.loc[in_group, f"{name}_r2"].mean())
+                row[f"{name}_cosine"] = _pooled_cosine(p - offset, true - offset, keep)
+            row["global - local_r2"] = row["global_r2"] - row["local_r2"]
+            row["global - local_cosine"] = row["global_cosine"] - row["local_cosine"]
+            rows.append(row)
+        tables["by_group"] = pd.DataFrame(rows)
+
+    if depth_bins_um is not None:
+        if pred.depth_um is None:
+            raise ValueError("depth_bins_um needs the depth of each cell; collect with spatial_unit_um and `pos`.")
+        deep = scored & (pred.depth_um > 0)
+        bins = pd.cut(pd.Series(pred.depth_um), bins=list(depth_bins_um), right=True)
+        rows = []
+        for interval in bins.cat.categories:
+            in_bin = deep & (bins == interval).to_numpy()
+            if in_bin.any():
+                rows.append({"depth_um": str(interval), **cell_columns(in_bin)})
+        tables["by_depth"] = pd.DataFrame(rows)
+    return tables

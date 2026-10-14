@@ -565,3 +565,17 @@ def test_the_self_only_pair_list_is_the_diagonal_mask():
     pairs = blocked_pairs(edge_index, batch, index_nodes, n_hops=0)
 
     assert torch.equal(_dense_from_pairs(pairs, 2, 5), dense)
+
+
+def test_the_checkpoint_name_carries_the_mask():
+    """An arm with the mask on and one with it off would otherwise share a checkpoint. Off is the
+    default and adds nothing, so names without the mask are unchanged."""
+    from interscale.tl.utils import get_model_filename_prefix
+
+    cfg = _component_cfg("GCN", long_range=False)
+    cfg.dataset.name = "d"
+    assert "var-" not in get_model_filename_prefix(cfg, True, True)
+    cfg.model.global_component.parameters.long_range_attention = True
+    assert get_model_filename_prefix(cfg, True, True).endswith("var-lrm_")
+    cfg.model.decoder.global_residual = True
+    assert get_model_filename_prefix(cfg, True, True).endswith("var-res+lrm_")
