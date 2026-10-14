@@ -26,6 +26,12 @@ before touching the attention layers (`transformer_encoder_layer.py`, `transform
 per-batch attention inputs of `common_step_local_to_global`, or the bias forms, and update its
 status table in the same commit as the work it describes.
 
+Why the global component struggles to learn, and the experiments that separate the causes
+(global model alone, other local embeddings, separate training of local and global), are planned in
+[`.claude/global_plan.md`](.claude/global_plan.md), with the same layout. Read it before touching
+`GlobalModel`'s input, the local modules' embeddings, the dual decoder's loss weighting or the
+training loop, and update its status table in the same commit as the work it describes.
+
 ## Common commands
 
 This project uses `hatch` as the primary project manager (also works with `uv` or `pip`; see `docs/installation.md`).
