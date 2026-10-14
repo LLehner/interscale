@@ -971,9 +971,26 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
     `model.decoder.global_residual: true`; `long_range_attention: true`.
   - Read `val_global_loss` against `val_local_loss`: under the residual decoder the difference is
     what the global component adds on the hidden discs.
-  - The scripts then need two changes: the preflight insists on gene masking, and the evaluation's
-    probe passes are hard-wired to gene masking at `mask_percentage`. `smoke_arm` should pass
-    `**block_mask_kwargs(trial)` to the datamodule.
+  - **Set up 2026-10-14** as copies, so round 3a's files stay as they ran
+    (`notebooks_and_scripts/`): `dense_test_3b.{py,yaml}`, `performer_test_3b.{py,yaml}`,
+    `dense_sweep_3b.yaml`, `performer_sweep_3b.yaml`. Round 3a's settings stay on (centred queries
+    and keys, centred targets, batch size 1, 200 epochs). W&B projects
+    `Interscale_{dense,performer}_synth_spot_3b`, results in `13_10_results/attention_{dense,performer}_3b`.
+  - Arms, 7 per backend: `none`, `naive`, `rope` (axial), `fourier` (isotropic), each with discs
+    (node masking at rate 0, 500 µm over 30%), the residual decoder and the long-range mask. Three
+    ablations on RoPE switch one off each: `rope_no_res`, `rope_no_lrm`, `rope_gene` (round 3a's
+    gene masking at 0.3 instead of the discs). All 14 arms validate; checkpoint names are distinct.
+  - Script changes against 3a: the preflight accepts node masking with discs (and refuses it
+    without), its arm table shows residual, mask and masking; `smoke_arm` passes the disc settings
+    to the datamodule; every probe and the new head scores read one pass with the same discs for
+    every arm (`EVAL_BLOCK_RADIUS_UM`, `EVAL_BLOCK_FRACTION`, seeded); depth bins
+    `[0, 150, 290, 500, inf]` µm (one hop, two hops, beyond the GCN's reach, deep); the head tables
+    go to `heads_*.csv`, `all_arms.csv`, the headline and W&B (`eval/heads*`). Checked on stub data
+    (preflight, masking checks, head tables through the headline and W&B summary); not run.
+  - **What to read first:** `global - local` SCE by depth, above all in `(290, 500]` and beyond,
+    where local reaches no visible spot; `none` against the encoding arms there (without position
+    the blind core gets one prediction); `rope` against `rope_no_res` (does scoring global on local's
+    error change what it learns?) and against `rope_no_lrm`; `rope_gene` on the discs.
   - Without a positional encoding, all tokens deep inside a disc are identical (all −1 input, the
     same GCN output), so the transformer can only give them one prediction per slide. Telling
     them apart needs position, so 3b is also the first real test of the encodings.
@@ -998,7 +1015,8 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
 
 Status: diagnosed 2026-10-12 (the user called it urgent). On 2026-10-13 levers 2–5 were
 implemented and round 3a was set up. Round 3a ran and was read on 2026-10-14: levers 1, 2 and 5
-verified on data (above). Levers 3 and 4 are still unverified on data.
+verified on data (above). Round 3b set up on 2026-10-14 (head scores on hidden discs, long-range
+tag, scripts and sweeps); not run yet, so levers 3 and 4 are still unverified on data.
 
 ## Predictions to check, not assume
 
