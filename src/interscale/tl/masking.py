@@ -62,6 +62,17 @@ MASK_VALUE = -1.0
 MASK_STRATEGIES = ("node", "gene")
 
 
+def block_masking_on(cfg) -> bool:
+    """Whether ``cfg`` hides spatial blocks (``dataset.mask_block_fraction`` > 0).
+
+    The modules and the trainer ask this next to ``mask_percentage > 0`` when deciding whether the
+    reconstruction input is corrupted at all: with discs alone the Bernoulli rate is 0, and a
+    module that only looked at the rate would pass the input through unmasked, training an
+    autoencoder.
+    """
+    return float(cfg.dataset.get("mask_block_fraction", 0.0)) > 0
+
+
 def sample_node_mask(num_nodes: int, pct: float, generator: torch.Generator | None = None) -> torch.Tensor:
     """Draw a per-cell mask: each cell is masked independently with probability ``pct``.
 

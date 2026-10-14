@@ -9,6 +9,7 @@ from interscale.model.base._base_model import BaseModel
 from interscale.module.base import GlobalModule
 from interscale.module.global_modules.positional_encodings import attach_positional_inputs
 from interscale.tl import SelfAttentionRelevance, prepare_a2d_dataset
+from interscale.tl.masking import block_masking_on
 from interscale.train._training import NodeMaskingTrainingPlan
 
 
@@ -43,6 +44,7 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
             decoder_hidden_dims=self._cfg.model.decoder.hidden_dims,
             mask_percentage=self._cfg.dataset.mask_percentage,
             mask_strategy=self._cfg.dataset.mask_strategy,
+            block_masking=block_masking_on(self._cfg),
             type_gex_embedding=self._cfg.model.global_component.parameters.type_gex_embedding,
         )
 

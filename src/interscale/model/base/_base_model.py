@@ -18,6 +18,7 @@ from yacs.config import CfgNode as CN
 
 from interscale.module.base import LocalModule
 from interscale.module.local_modules import GCN
+from interscale.tl.masking import block_masking_on
 from interscale.tl.utils import get_model_filename_prefix
 
 logger = logging.getLogger(__name__)
@@ -493,6 +494,7 @@ class BaseModel(metaclass=BaseModelMeta):
                 dropout_decoder=self._cfg.model.decoder.dropout_decoder,
                 mask_percentage=self._cfg.dataset.mask_percentage,
                 mask_strategy=self._cfg.dataset.mask_strategy,
+                block_masking=block_masking_on(self._cfg),
                 n_layers=self._cfg.model.local_component.parameters.num_layers,
                 hidden_dim=self._cfg.model.local_component.parameters.hidden_dim,
                 dropout_local=self._cfg.model.local_component.parameters.dropout_local,

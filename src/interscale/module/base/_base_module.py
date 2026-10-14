@@ -23,6 +23,7 @@ class BaseModule(L.LightningModule, ABC):
         mask_percentage: float = 0.0,
         mask_strategy: Literal["node", "gene"] = "node",
         type_gex_embedding: Literal["PCA", "NMF", "scvi"] | None = None,
+        block_masking: bool = False,
     ):
         """
         Parameters
@@ -49,6 +50,9 @@ class BaseModule(L.LightningModule, ABC):
             Granularity of the reconstruction corruption; see ``interscale.tl.masking``.
         type_gex_embedding: Literal["PCA", "NMF","scvi"] | None
             Type of GEX embedding to use.
+        block_masking: bool
+            Spatial blocks are hidden as well (``dataset.mask_block_fraction`` > 0). With a
+            ``mask_percentage`` of 0 they are the only corruption, and still count as one.
         """
         super().__init__()
 
@@ -70,7 +74,8 @@ class BaseModule(L.LightningModule, ABC):
         # are blanked". Both strategies set it: under gene masking every cell is a supervision
         # target, so `pad_batch`'s keep_indices is all-True and it degenerates to the plain
         # subsampling branch, which is the correct behaviour.
-        self.masked_nodes = self.mask_percentage > 0
+        self.block_masking = bool(block_masking)
+        self.masked_nodes = self.mask_percentage > 0 or self.block_masking
 
         # Define components
         self.local_component = None

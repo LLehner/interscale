@@ -28,6 +28,7 @@ class CombinedModule(BaseModule):
             decoder_hidden_dims=[],
             mask_percentage=self.mask_percentage,
             mask_strategy=self.mask_strategy,
+            block_masking=self.block_masking,
         )
         self.global_module = GlobalModule.from_config(
             cfg,
@@ -39,6 +40,7 @@ class CombinedModule(BaseModule):
             decoder_type=cfg.model.decoder.type,
             mask_percentage=self.mask_percentage,
             mask_strategy=self.mask_strategy,
+            block_masking=self.block_masking,
         )
 
     def predict_local(self, local_embedding):

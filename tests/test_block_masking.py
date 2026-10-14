@@ -289,3 +289,113 @@ def test_the_checkpoint_name_carries_the_blocks():
     assert get_model_filename_prefix(cfg, True, True).endswith("var-blk500f0.3_")
     cfg.optim.center_targets = True
     assert get_model_filename_prefix(cfg, True, True).endswith("var-ctr+blk500f0.3_")
+
+
+# --------------------------------------------------------------------------- the model really hides them
+
+
+def _hidden_values_reach_predictions(module):
+    """Max change of the predictions when ONLY the hidden cells' true values change."""
+    from torch_geometric.data import Batch
+
+    graphs = []
+    for seed in (0, 1):
+        g = _graph(side=6, genes=8)
+        g.x = g.x + seed
+        g.obs_names = torch.arange(g.num_nodes)
+        g.mask = sample_block_mask(g.pos, 1.5, 0.3, generator=torch.Generator().manual_seed(seed))
+        graphs.append(g)
+    batch = Batch.from_data_list(graphs)
+    batch.obs_names = torch.cat([g.obs_names for g in graphs])
+    module.eval()
+    with torch.no_grad():
+        before = module._common_step(batch, "regression", "node").y_pred
+        changed = batch.clone()
+        changed.x = changed.x.clone()
+        hidden = changed.mask.bool()
+        changed.x[hidden] = changed.x[hidden] + 5.0
+        after = module._common_step(changed, "regression", "node").y_pred
+    return float((before - after).abs().max())
+
+
+def _block_module(rate, block_masking):
+    from interscale.config import get_cfg_defaults
+    from interscale.config.global_component_config import get_global_component_cfg
+    from interscale.config.local_component_config import get_local_component_cfg
+    from interscale.module.combined_module import DualDecoderCombinedModule
+
+    cfg = get_cfg_defaults()
+    cfg.model.local_component.name = "GCN"
+    cfg.model.global_component.name = "self-attn-transformer"
+    cfg = get_local_component_cfg(cfg, "GCN")
+    cfg = get_global_component_cfg(cfg, "self-attn-transformer")
+    cfg.model.global_component.parameters.max_seq_len = 64
+    cfg.model.decoder.dual_decoder = True
+    torch.manual_seed(0)
+    return DualDecoderCombinedModule(
+        cfg=cfg,
+        n_input=8,
+        n_output=8,
+        n_embed=16,
+        decoder_type=None,
+        dropout_decoder=0.0,
+        decoder_hidden_dims=[16],
+        mask_percentage=rate,
+        mask_strategy="node",
+        block_masking=block_masking,
+    )
+
+
+def test_discs_alone_corrupt_the_input_of_a_module():
+    """With the Bernoulli rate at 0 the discs are the only corruption. A module that read the rate
+    alone passed the input through, and trained an autoencoder: hidden spots were reconstructed from
+    their own values (SCE 0.037 against a gene-mean floor of 0.082)."""
+    module = _block_module(0.0, block_masking=True)
+    assert _hidden_values_reach_predictions(module) == 0.0
+    # The submodules too: the transformer keeps the hidden cells when it subsamples a long slide.
+    assert module.global_module.masked_nodes and module.local_module.masked_nodes
+    assert _hidden_values_reach_predictions(_block_module(0.3, block_masking=False)) == 0.0
+    # What the bug looked like: no rate, no flag, and the hidden values come straight through.
+    assert _hidden_values_reach_predictions(_block_module(0.0, block_masking=False)) > 0.01
+
+
+def test_a_model_built_from_a_config_with_discs_alone_hides_them():
+    import numpy as np
+    import pandas as pd
+    from anndata import AnnData
+
+    from interscale.model.combined_model import CombinedModel
+
+    rng = np.random.default_rng(0)
+    adata = AnnData(X=rng.integers(0, 10, size=(8, 8)).astype(np.float32))
+    adata.obs["sample"] = pd.Categorical(["s1"] * 4 + ["s2"] * 4)
+    adata.obs["split"] = pd.Categorical(["train"] * 6 + ["val"] * 2)
+    CombinedModel._setup_anndata(
+        adata=adata, layer_key=None, sample_key_list=["sample"], prediction_task="regression", view_registry=False
+    )
+    from interscale.config.global_component_config import get_global_component_cfg
+    from interscale.config.local_component_config import get_local_component_cfg
+
+    cfg = _cfg(mask_percentage=0.0)
+    cfg.model.local_component.name = "GCN"
+    cfg.model.global_component.name = "self-attn-transformer"
+    cfg = get_local_component_cfg(cfg, "GCN")
+    cfg = get_global_component_cfg(cfg, "self-attn-transformer")
+    cfg.model.global_component.parameters.max_seq_len = 64
+    cfg.model.decoder.dual_decoder = True
+    model = CombinedModel(adata, cfg=cfg)
+    assert model.module.masked_nodes and model.module.block_masking
+    assert _hidden_values_reach_predictions(model.module) == 0.0
+
+    cfg.dataset.mask_block_fraction, cfg.dataset.mask_block_radius_um = 0.0, 0.0
+    cfg.dataset.mask_percentage = 0.3
+    assert CombinedModel(adata, cfg=cfg).module.block_masking is False
+
+
+def test_the_masks_are_redrawn_every_epoch_with_discs_alone():
+    """The resample callback was only built for a rate > 0, leaving one fixed set of discs."""
+    from interscale.train._utils import redraws_masks
+
+    assert redraws_masks(_cfg(mask_percentage=0.0))
+    assert redraws_masks(_cfg(mask_percentage=0.3, mask_block_fraction=0.0, mask_block_radius_um=0.0))
+    assert not redraws_masks(_cfg(mask_percentage=0.0, mask_block_fraction=0.0, mask_block_radius_um=0.0))

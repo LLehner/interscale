@@ -16,6 +16,7 @@ from interscale.train._utils import (
     MetricsHistory,
     NodeMaskResampleCallback,
     build_efficiency_monitor,
+    redraws_masks,
     train_gene_means,
 )
 
@@ -130,7 +131,7 @@ class NodeMaskingTrainingPlan:
         print("Steps per epoch", steps_per_epoch)
         lr_monitor = LearningRateMonitor(logging_interval="epoch")
         self.history_ = MetricsHistory()
-        mask_resample_callback = NodeMaskResampleCallback() if self._cfg.dataset.mask_percentage > 0 else None
+        mask_resample_callback = NodeMaskResampleCallback() if redraws_masks(self._cfg) else None
         # None unless cfg.probe.use, so a run without probes builds the trainer it always did.
         # Reads adata for var_names only -- the probe resolves gene names to batch.x columns.
         probe_callback = build_probe_callback(self._cfg, self._adata)

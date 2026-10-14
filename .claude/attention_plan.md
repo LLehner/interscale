@@ -987,7 +987,32 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
     `[0, 150, 290, 500, inf]` µm (one hop, two hops, beyond the GCN's reach, deep); the head tables
     go to `heads_*.csv`, `all_arms.csv`, the headline and W&B (`eval/heads*`). Checked on stub data
     (preflight, masking checks, head tables through the headline and W&B summary); not run.
-  - **What to read first:** `global - local` SCE by depth, above all in `(290, 500]` and beyond,
+  - **Round 3b as first run (read 2026-10-14) is invalid: the disc arms trained as autoencoders.**
+    `BaseModule.masked_nodes` was `mask_percentage > 0`, and the 3b configs set the rate to 0 (the
+    discs are the only targets), so the modules passed the input through unmasked. The trainer's
+    mask-redraw callback had the same test, so the discs were not even redrawn per epoch. My unit
+    tests built modules at rate 0.3, and the datamodule tests never reached a module, so nothing
+    caught it. Evidence in the results:
+    - raw SCE 0.037 on hidden spots, below the 0.0816 gene-mean floor, while the best context
+      predictor on the same hidden spots (slide mean, region mean, neighbour mean) reaches 0.074–0.079;
+    - centred cosine 0.86 on whole hidden spots (best context predictor 0.28);
+    - flat across depth (0.0390 within 150 µm, 0.0387 beyond 500 µm) for the local head, which sees
+      nothing beyond 283 µm if the input is hidden;
+    - the pure-noise ZINB genes (no spatial structure, 60% of the variance) predicted at Pearson 0.997;
+    - the R3/R4 sender state read from "hidden" spots at 0.76, against 0.56 in 3a and 0.33 for the
+      neighbours' inputs.
+    Only `rope_gene` (rate 0.3, so masked) trained normally: raw SCE 0.0704 against 3a's 0.0702.
+    Its head scores on the discs (SCE 1.8) just show a model that never saw a wholly hidden spot.
+    No conclusion about global vs local, depth, the residual decoder or the long-range mask can be
+    drawn from these runs.
+    **Fixed 2026-10-14:** `block_masking` on the modules (`masked_nodes` is the rate or the discs),
+    `tl.masking.block_masking_on(cfg)`, and `train._utils.redraws_masks` for the callback. Tests:
+    a module at rate 0 with discs does not let hidden values reach its predictions (and does
+    without the flag, the bug), the same through `CombinedModel` built from a config, the
+    submodules carry the flag, and the callback is built. 5 mutations, each caught. Round 3b needs
+    a rerun with the same files after installing the fix; move the old `attention_*_3b` folders and
+    W&B projects aside first, since checkpoint names are unchanged.
+  - **What to read first** (for the rerun): `global - local` SCE by depth, above all in `(290, 500]` and beyond,
     where local reaches no visible spot; `none` against the encoding arms there (without position
     the blind core gets one prediction); `rope` against `rope_no_res` (does scoring global on local's
     error change what it learns?) and against `rope_no_lrm`; `rope_gene` on the discs.
@@ -1016,7 +1041,8 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
 Status: diagnosed 2026-10-12 (the user called it urgent). On 2026-10-13 levers 2–5 were
 implemented and round 3a was set up. Round 3a ran and was read on 2026-10-14: levers 1, 2 and 5
 verified on data (above). Round 3b set up on 2026-10-14 (head scores on hidden discs, long-range
-tag, scripts and sweeps); not run yet, so levers 3 and 4 are still unverified on data.
+tag, scripts and sweeps) and run once, but that run was invalid (disc arms trained unmasked, see
+above); fixed the same day, awaiting a rerun. Levers 3 and 4 are still unverified on data.
 
 ## Predictions to check, not assume
 

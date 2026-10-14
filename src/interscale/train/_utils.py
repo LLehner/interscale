@@ -5,8 +5,19 @@ import pandas as pd
 import torch
 from lightning.pytorch.callbacks import Callback
 
+from interscale.tl.masking import block_masking_on
+
 #: wandb section of the efficiency scalars (it splits panels on the text before the first "/").
 EFFICIENCY_PREFIX = "efficiency"
+
+
+def redraws_masks(cfg) -> bool:
+    """Whether the training masks are redrawn every epoch: any Bernoulli rate or spatial blocks.
+
+    Blocks with a rate of 0 used to fall through (the check read the rate alone), leaving one fixed
+    set of discs for the whole run.
+    """
+    return cfg.dataset.mask_percentage > 0 or block_masking_on(cfg)
 
 
 class NodeMaskResampleCallback(Callback):

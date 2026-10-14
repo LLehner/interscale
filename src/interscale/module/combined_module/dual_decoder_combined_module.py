@@ -44,6 +44,7 @@ class DualDecoderCombinedModule(BaseModule):
             decoder_hidden_dims=cfg.model.decoder.hidden_dims,
             mask_percentage=self.mask_percentage,
             mask_strategy=self.mask_strategy,
+            block_masking=self.block_masking,
         )
         # Global module with decoder
         self.global_module = GlobalModule.from_config(
@@ -58,6 +59,7 @@ class DualDecoderCombinedModule(BaseModule):
             decoder_hidden_dims=cfg.model.decoder.hidden_dims,
             mask_percentage=self.mask_percentage,
             mask_strategy=self.mask_strategy,
+            block_masking=self.block_masking,
         )
 
         # Store split point for separating concatenated predictions

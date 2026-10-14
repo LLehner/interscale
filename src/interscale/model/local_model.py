@@ -7,6 +7,7 @@ from yacs.config import CfgNode as CN
 from interscale.model.base._base_model import BaseModel
 from interscale.module.base import LocalModule
 from interscale.tl.geome_utils import prepare_a2d_dataset
+from interscale.tl.masking import block_masking_on
 from interscale.train._training import NodeMaskingTrainingPlan
 
 
@@ -35,6 +36,7 @@ class LocalModel(NodeMaskingTrainingPlan, BaseModel):
             decoder_hidden_dims=self._cfg.model.decoder.hidden_dims,
             mask_percentage=self._cfg.dataset.mask_percentage,
             mask_strategy=self._cfg.dataset.mask_strategy,
+            block_masking=block_masking_on(self._cfg),
         )
 
         self._attach_aux_losses()

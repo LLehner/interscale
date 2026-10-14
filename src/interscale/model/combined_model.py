@@ -8,6 +8,7 @@ from interscale.model.base._base_model import BaseModel
 from interscale.module import CombinedModule, DualDecoderCombinedModule
 from interscale.module.global_modules.positional_encodings import attach_positional_inputs
 from interscale.tl import prepare_a2d_dataset
+from interscale.tl.masking import block_masking_on
 from interscale.train import NodeMaskingTrainingPlan
 
 
@@ -39,6 +40,7 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
                 decoder_hidden_dims=self._cfg.model.decoder.hidden_dims,
                 mask_percentage=self._cfg.dataset.mask_percentage,
                 mask_strategy=self._cfg.dataset.mask_strategy,
+                block_masking=block_masking_on(self._cfg),
             )
         else:
             self.module = CombinedModule(
@@ -51,6 +53,7 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
                 decoder_hidden_dims=self._cfg.model.decoder.hidden_dims,
                 mask_percentage=self._cfg.dataset.mask_percentage,
                 mask_strategy=self._cfg.dataset.mask_strategy,
+                block_masking=block_masking_on(self._cfg),
             )
 
         self._model_summary_string = self._model_summary_string + self.module.get_model_summary()
