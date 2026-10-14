@@ -910,6 +910,58 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
   - With centred targets `val_loss` and the heads' losses are centred. The raw SCE on the hidden
     entries, comparable to round 2's `val_loss` (0.0834) and the gene-mean floor (0.0816), is
     `val_masked_scaled_cosine_error` (checked equal to the masked SCE loss).
+- **Round 3a results** (`13_10_results/attention_{dense,performer}_3a`, read 2026-10-14; one seed
+  per arm, dense and Performer agree on every point below):
+  - **The answer is yes: the model now learns beyond the mean profile.** Raw masked SCE on val:
+
+    | arm | `center_qk` | `center_targets` | dense | Performer |
+    |---|---|---|---|---|
+    | round 2 `none` (240 steps) | off | off | 0.0834 | 0.0834 |
+    | `none_plain` | off | off | 0.0727 | 0.0727 |
+    | `none_no_ctr` | on | off | 0.0727 | 0.0727 |
+    | `none_no_cqk` | off | on | 0.0706 | 0.0704 |
+    | `none` | on | on | 0.0701 | 0.0702 |
+    | `rope` / `fourier` / `naive` | on | on | 0.0702 / 0.0701 / 0.0710 | 0.0702 / 0.0701 / 0.0711 |
+
+    Gene-mean floor 0.0816, neighbour average 0.0811. Every arm is now below both.
+  - **What did it, in order of size:**
+    - The longer schedule (lever 1) alone: 0.0834 → 0.0727.
+    - Centred targets (lever 5) on top: → 0.0706.
+    - Centred queries and keys (lever 2): → 0.0701, and only together with centred targets.
+      Alone they change nothing (0.0727 both ways).
+  - **Centred targets changed the representation, not just the readout.** The token cosine
+    (similarity of the cell tokens entering attention, measured before any centring) is ~0.95 in
+    every arm without centred targets and 0.69–0.74 with them (`naive` 0.61). Under the raw loss
+    the encoder had no reason to make cells differ; under the centred one it does. This was the
+    root cause in the diagnosis (near-identical tokens).
+  - **Attention left uniform.** Effective keys in layer 0, of ~2,500 open keys:
+    - `none_plain` ~2,400;
+    - centred queries and keys only ~900 (dense) / 1,250 (Performer);
+    - centred targets only ~1,500 / 1,900;
+    - both ~1,000–1,300, dense `rope` lowest at 810.
+    Span stays ~2.5 mm (median), so attention concentrates on some keys but not on near ones.
+  - **The probes improved with centred targets, both embeddings:**
+    - R3/R4 sender state, local 0.45 → 0.56, global 0.39 → 0.50;
+    - M9 stripe, local 0.87 → 0.91, global ~0.80 → ~0.89;
+    - source distances, local 0.48 → 0.52, global 0.41 → 0.45–0.48;
+    - region is saturated (~0.99).
+    The `neighbours` input baseline (mean of the neighbours' masked inputs) still beats both
+    embeddings on R3/R4 (0.67) and source distances (0.55). Local is ahead of global on every
+    probe, and `local+global` never beats `local`.
+  - **Heads on hidden entries:** with centred targets `val_global_loss` is below `val_local_loss`
+    in every arm (dense `none`: 0.6184 vs 0.6225 centred), without them by 0.0002 raw. A small but
+    consistent global edge on masked entries.
+  - **The encodings still do not matter for the loss**: `none`, `rope` and `fourier` agree to
+    0.0001; `naive` is worse by ~0.001, as in every earlier round.
+  - **Planted edges**: `rank_open` 0.47–0.52 (chance 0.5) and `lift_open` 0.87–1.0. No
+    preference for planted senders. Not expected with the mask off.
+  - **Caveat on the gene ranks.** On a few sparse responses (MC18, MC20, MC22, MC23) global ranks
+    far above local in every arm with centred targets, in both backends (e.g. MC23: global 4,
+    local 201). Without centred targets neither head ranks them well. But `gene_rank_plot` reads
+    `get_model_output`, which runs **without masking**, so these ranks score how well each head
+    passes the cell's own visible values through, not reconstruction from context. A gap there may
+    be decoding capacity rather than global context. Round 3b scores the heads per gene on hidden
+    cells instead (`masked_probing.score_heads`).
 - **Round 3b:** add levers 3 and 4, with the long-range mask back on. This is the actual "global
   learns something the local can't" experiment: the local-vs-global gap per programme, the probes
   on hidden discs, and planted long-range edges.
@@ -931,7 +983,8 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
   - run several seeds once differences appear.
 
 Status: diagnosed 2026-10-12 (the user called it urgent). On 2026-10-13 levers 2–5 were
-implemented, each unverified on data, and round 3a was set up (not run yet).
+implemented and round 3a was set up. Round 3a ran and was read on 2026-10-14: levers 1, 2 and 5
+verified on data (above). Levers 3 and 4 are still unverified on data.
 
 ## Predictions to check, not assume
 
