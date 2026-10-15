@@ -470,6 +470,23 @@ def _validate(cfg):
     _validate_sce(cfg)
     _validate_center_targets(cfg)
     _validate_global_residual(cfg)
+    _validate_gex_embedding(cfg)
+
+
+#: The values ``GlobalModule`` builds a token input for (``scvi`` is named in old docstrings only).
+GEX_EMBEDDINGS = (None, "PCA", "NMF", "Precomputed", "Linear")
+
+
+def _validate_gex_embedding(cfg):
+    """``type_gex_embedding`` must be one the global module can build."""
+    params = cfg.model.global_component.get("parameters", None)
+    if params is None:
+        return
+    value = params.get("type_gex_embedding", None)
+    if value not in GEX_EMBEDDINGS:
+        raise ValueError(
+            f"model.global_component.parameters.type_gex_embedding must be one of {GEX_EMBEDDINGS}, got {value!r}."
+        )
 
 
 def _validate_global_residual(cfg):

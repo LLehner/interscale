@@ -20,6 +20,9 @@ def get_global_component_cfg(cfg, global_component_name):
         # radius to set: the mask always covers exactly what the local module mixed (its
         # `receptive_field_hops`), so the two components stay disjoint by construction.
         cfg.model.global_component.parameters.long_range_attention = False
+        # The tokens of a GlobalModel (no local component; a CombinedModel ignores this): None for
+        # none, PCA (fitted once and frozen), NMF, Precomputed (obsm[latent_obsm_key]) or Linear (a
+        # learned layer on the masked expression, trained with the transformer; .claude/global_plan.md, A1).
         cfg.model.global_component.parameters.type_gex_embedding = None
 
         # Positional encodings, see `.claude/PE_plan.md`. An empty `node` list builds nothing and

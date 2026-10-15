@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import torch
 from anndata import AnnData
 from torch.nn import functional as F
 from yacs.config import CfgNode as CN
@@ -96,13 +95,7 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
         self_attention_relevance = SelfAttentionRelevance(self.module)
 
         for batch in pyg:
-            if hasattr(batch, "embeddings"):
-                embedding = batch.embeddings
-            else:
-                embedding = self.module.create_gex_embedding(
-                    batch.x, type=self._cfg.model.global_component.parameters.type_gex_embedding
-                )
-            embedding = torch.tensor(embedding, dtype=torch.float32, device=batch.x.device)
+            embedding = self.module.gex_embedding(batch)
             transformer_in, global_embedding, src_padding_mask, pad_index_nodes, I = self.module.evaluate(
                 batch, embedding
             )

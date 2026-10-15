@@ -41,6 +41,11 @@ class GlobalModule(BaseModule):
             self.nmf = NMF(n_components=self.n_embed, init="random", random_state=0)
         elif self.type_gex_embedding == "Precomputed":
             pass
+        elif self.type_gex_embedding == "Linear":
+            # A learned map from the (masked) expression to the tokens, trained with the
+            # transformer -- the only input of a global-only model that is not fixed in advance.
+            # The transformer's own input LayerNorm normalises its output.
+            self.input_embedding = torch.nn.Linear(self.n_input, self.n_embed)
         elif self.type_gex_embedding is None:
             # No GEX embedding needed when using CombinedModule (local module provides embeddings)
             pass
@@ -54,6 +59,21 @@ class GlobalModule(BaseModule):
             embeddings: torch.Tensor
                 Size: [N, E], either output of local component or user-provided embeddings.
         """
+
+    def gex_embedding(self, batch) -> torch.Tensor:
+        """``[N, n_embed]`` tokens of a model without a local component, from ``batch`` as given.
+
+        ``Linear`` maps ``batch.x`` through the learned layer, on its device and in the graph;
+        otherwise precomputed ``batch.embeddings``, or the PCA/NMF projection of ``batch.x``. The
+        caller passes the masked batch in training and the clean one at inference.
+        """
+        if self.type_gex_embedding == "Linear":
+            return self.input_embedding(batch.x.float())
+        if hasattr(batch, "embeddings"):
+            embedding = batch.embeddings
+        else:
+            embedding = self.create_gex_embedding(batch.x.cpu().numpy(), type=self.type_gex_embedding)
+        return torch.tensor(embedding, dtype=torch.float32, device=batch.x.device)
 
     def create_gex_embedding(self, embeddings: torch.Tensor, type: Literal["PCA", "NMF", "scvi"]):
         """Generate embeddings for GEX if no local component is used.
@@ -296,12 +316,7 @@ class GlobalModule(BaseModule):
         """
         # Mask nodes  - before GEX embedding because otherwise embedding contains information about masked nodes
         batch_masked, _, _ = self._common_step_masking(batch)
-        if hasattr(batch_masked, "embeddings"):
-            embedding = batch_masked.embeddings
-        else:
-            embedding = self.create_gex_embedding(batch_masked.x.cpu().numpy(), type=self.type_gex_embedding)
-
-        embedding = torch.tensor(embedding, dtype=torch.float32, device=batch_masked.x.device)
+        embedding = self.gex_embedding(batch_masked)
         assert embedding.shape == (batch_masked.x.shape[0], self.n_embed), (
             f"Mismatch: embedding.shape: {embedding.shape}, batch_masked.x.shape: {batch_masked.x.shape}"
         )

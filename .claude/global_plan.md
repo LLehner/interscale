@@ -22,14 +22,14 @@ user runs smoke, sweeps and evaluation on the cluster.
 
 ## Status
 
-Last updated 2026-10-14.
+Last updated 2026-10-15.
 
 | stage | state | verified by | date |
 |---|---|---|---|
 | 0a — head scores for single-head models (GlobalModel, LocalModel) | not started | | |
 | 0b — reference predictors in the evaluation (slide mean, kernel smoother, nearest visible) | not started | | |
 | 0c — calibrated magnitude in the evaluation | not started, **deferred until the user decides** | | |
-| A1 — learned linear input for the global-only model | not started | | |
+| A1 — learned linear input for the global-only model | **implemented, unverified** — `type_gex_embedding: Linear` builds `input_embedding` (an `nn.Linear`; the transformer's input LayerNorm normalises it), trained with the transformer; training maps the masked batch and inference (`GlobalModel.get_model_output`) the clean one, both through `GlobalModule.gex_embedding`; hidden cells' values never reach a prediction, visible ones do; the validator accepts only buildable inputs; `emb-linear` in the global-only checkpoint name only. 4 mutations, each caught; 735 tests pass; harness IDENTICAL (its GlobalModel/PCA and LocalModel cases included). **Not run on data** | 2026-10-15 |
 | A2 — global-only sweep (input × encoding) and a local-only reference | not started | | |
 | B1 — local-embedding variants under one global model (scVI joint, scVI frozen, frozen random GCN, 1-layer GCN) | not started | | |
 | B2 — embedding sweep | not started | | |
@@ -166,7 +166,10 @@ long-range mask has nothing to block and warns). Its tokens come from `create_ge
 - `NMF`, which cannot take −1 inputs.
 - `Precomputed`, which reads `obsm[latent_obsm_key]` attached to the graphs.
 
-There is no learned input map, so the transformer cannot shape its own tokens.
+There is no learned input map, so the transformer cannot shape its own tokens. Note on PCA: it is
+fitted on the first batch the module sees, and Lightning's sanity validation runs before training,
+so in practice it is fitted on the first (masked) **validation** slide, not a training batch. Left
+as is (changing it would change existing runs); `pca_rope` is read as "a fixed linear projection".
 
 ### A1 — a learned linear input
 

@@ -106,6 +106,18 @@ def _attention_tag(cfg) -> str:
     return f"attn-{kind}" + (f"-hd{head_dim}" if head_dim > 0 else "") + ("-cqk" if center else "") + "_"
 
 
+def _embedding_tag(cfg) -> str:
+    """``emb-linear_`` when a GlobalModel's tokens come from the learned linear input, else ``""``.
+
+    Only the global-only prefix carries it: a CombinedModel ignores ``type_gex_embedding``. The
+    older inputs (PCA, NMF, Precomputed) add nothing, so their names are unchanged.
+    """
+    params = cfg.model.global_component.get("parameters", None)
+    if params is not None and params.get("type_gex_embedding", None) == "Linear":
+        return "emb-linear_"
+    return ""
+
+
 def _training_tag(cfg) -> str:
     """``var-<switches>_`` for training-side switches off their default, else ``""``.
 
@@ -155,7 +167,13 @@ def get_model_filename_prefix(cfg, local_component: bool, global_component: bool
         # GlobalModel: only global component
         if cfg.model.global_component.name:
             file_name_prefix = file_name_prefix + f"{cfg.model.global_component.name}_"
-        file_name_prefix = file_name_prefix + _positional_encoding_tag(cfg) + _attention_tag(cfg) + _training_tag(cfg)
+        file_name_prefix = (
+            file_name_prefix
+            + _embedding_tag(cfg)
+            + _positional_encoding_tag(cfg)
+            + _attention_tag(cfg)
+            + _training_tag(cfg)
+        )
     elif local_component and global_component:
         # CombinedModel: both components
         if cfg.model.local_component.name:
