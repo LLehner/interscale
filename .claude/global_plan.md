@@ -27,10 +27,10 @@ Last updated 2026-10-15.
 | stage | state | verified by | date |
 |---|---|---|---|
 | 0a — head scores for single-head models (GlobalModel, LocalModel) | **implemented, unverified** — `HeadPredictions.heads` is a dict; a dual decoder gives `local` and `global`, a GlobalModel or single-decoder CombinedModel `global`, a LocalModel `local`, each the step's own output in the step's row order, with no hidden value reaching it; `score_heads` writes `global - local` columns only when both exist, under the same column names as before (the 3b script reads them unchanged). 1 mutation, caught | 2026-10-15 |
-| 0b — reference predictors in the evaluation (slide mean, kernel smoother, nearest visible) | **implemented, unverified** — `masked_probing.reference_predictions`: `ref_slide_mean`, `ref_label_mean` (optional label key, e.g. an oracle region), `ref_kernel_<s>um`, `ref_nearest_<k>`, each the weighted mean of the *visible entries* of the same graph (per entry, so it works under cell, entry and block masking), never the cell itself; `collect_head_predictions(..., references=...)` adds them as heads gathered by the model's own row index and checks that both saw the same hidden entries. Exact on a constant per slide (slide mean) and on smooth fields (kernel, nearest beat the slide mean 5×), ~0 centred cosine on noise, graphs never mix, perturbing hidden values changes nothing, no kernel overflow at 5 mm, rows aligned on subsampled graphs. 8 mutations, each caught; 736 tests pass; harness IDENTICAL | 2026-10-15 |
+| 0b — reference predictors in the evaluation (slide mean, kernel smoother, nearest visible) | **implemented, unverified** — `masked_probing.reference_predictions`: `ref_slide_mean`, `ref_label_mean` (optional label key, e.g. an oracle region), `ref_kernel_<s>um`, `ref_nearest_<k>`, each the weighted mean of the *visible entries* of the same graph (per entry, so it works under cell, entry and block masking), never the cell itself; `collect_head_predictions(..., references=...)` adds them as heads gathered by the model's own row index and checks that both saw the same hidden entries. Exact on a constant per slide (slide mean) and on smooth fields (kernel, nearest beat the slide mean 5×), ~0 centred cosine on noise, graphs never mix, perturbing hidden values changes nothing, no kernel overflow at 5 mm, rows aligned on subsampled graphs. 8 mutations, each caught; 735 tests pass; harness IDENTICAL | 2026-10-15 |
 | 0c — calibrated magnitude in the evaluation | not started, **deferred until the user decides** | | |
 | A1 — learned linear input for the global-only model | **implemented, unverified** — `type_gex_embedding: Linear` builds `input_embedding` (an `nn.Linear`; the transformer's input LayerNorm normalises it), trained with the transformer; training maps the masked batch and inference (`GlobalModel.get_model_output`) the clean one, both through `GlobalModule.gex_embedding`; hidden cells' values never reach a prediction, visible ones do; the validator accepts only buildable inputs; `emb-linear` in the global-only checkpoint name only. 4 mutations, each caught; 735 tests pass; harness IDENTICAL (its GlobalModel/PCA and LocalModel cases included). **Not run on data** | 2026-10-15 |
-| A2 — global-only sweep (input × encoding) and a local-only reference | not started | | |
+| A2 — global-only sweep (input × encoding) and a local-only reference | **set up, not run** — `notebooks_and_scripts/slurm/global_only.{py,yaml}`, `global_only_sweep.yaml`; 7 arms validate with their model types, checkpoint names distinct; script checked on stub data (preflight, one W&B sweep per model type, stale-file guard, head tables and W&B summary for single- and dual-head arms) | 2026-10-15 |
 | B1 — local-embedding variants under one global model (scVI joint, scVI frozen, frozen random GCN, 1-layer GCN) | not started | | |
 | B2 — embedding sweep | not started | | |
 | C1 — per-head loss weights and module freezing | not started | | |
@@ -214,6 +214,25 @@ to C). If it is far below the smoother, the transformer cannot even learn smooth
 tokens, and the earlier "global = smoother" came from the GCN's tokens.
 
 Cost: 5 arms + 1 reference, ~the 3b sweep's runtime each.
+
+**Set up 2026-10-15** in `notebooks_and_scripts/slurm/` (the yaml paths inside point at
+`/lustre/.../MA/yaml/`, results go to `/lustre/.../MA/15_10_results/global_only`):
+
+- `global_only.yaml`: round 3b's disc task with round 3a's settings, dense attention, width 64,
+  `type_gex_embedding: Linear`, the long-range mask off (a GlobalModel has nothing to block),
+  `global_residual: false`.
+- `global_only_sweep.yaml`: the five GlobalModel arms above plus `local_gcn` (LocalModel) and
+  `joint_rope` (CombinedModel = round 3b's best joint arm, `rope_no_res`: plain dual decoder, mask
+  on), with a `model_types` map. The sweep machinery skips keys under a component a model type does
+  not have, so one base config serves all three model types.
+- `global_only.py`: a copy of `dense_test_3b.py` that:
+  - registers one W&B sweep per model type in the same project;
+  - rebuilds `synth_spot_pp.h5ad` by itself when its recorded `signal_scale` differs from the
+    source's;
+  - scores every head next to the references (kernels at 150, 400 and 1000 µm, the 50 nearest
+    spots, the oracle region mean);
+  - runs the attention analyses only for models with a transformer, and gene ranks and loadings
+    only for the joint model.
 
 ## Stage B — other local embeddings under the same global model
 
