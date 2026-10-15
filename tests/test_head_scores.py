@@ -144,8 +144,8 @@ def test_the_predictions_are_the_steps_two_halves_with_the_mask_it_used():
     with torch.no_grad():
         out = module._common_step(batch, "regression", "node")
     n = len(out.y_pred) // 2
-    assert np.allclose(pred.local, out.y_pred[:n].numpy(), atol=1e-6)
-    assert np.allclose(pred.global_, out.y_pred[n:].numpy(), atol=1e-6)
+    assert np.allclose(pred.heads["local"], out.y_pred[:n].numpy(), atol=1e-6)
+    assert np.allclose(pred.heads["global"], out.y_pred[n:].numpy(), atol=1e-6)
     assert np.allclose(pred.true, out.y_true[:n].numpy())
     hidden_cells = torch.cat([d.mask for d in datas]).numpy()
     assert np.array_equal(pred.hidden, np.repeat(hidden_cells[:, None], G, axis=1))
@@ -194,17 +194,59 @@ def test_the_pass_leaves_the_module_and_the_random_state_as_they_were():
     assert torch.equal(state, torch.get_rng_state())
 
 
-def test_a_module_without_two_heads_is_refused():
-    with pytest.raises(TypeError, match="dual-decoder"):
-        collect_head_predictions(
-            torch.nn.Linear(2, 2),
-            [],
-            prediction_task="regression",
-            prediction_level="node",
-            mask_strategy="node",
-            batch_size=1,
-            device=torch.device("cpu"),
-        )
+def _single_head_module(kind, max_seq_len=256):
+    """The module of a GlobalModel (learned linear input) or a LocalModel (GCN), at rate 0 with discs."""
+    from interscale.config import get_cfg_defaults
+    from interscale.config.global_component_config import get_global_component_cfg
+    from interscale.config.local_component_config import get_local_component_cfg
+    from interscale.module.base import GlobalModule, LocalModule
+
+    cfg = get_cfg_defaults()
+    cfg.model.local_component.name = "GCN"
+    cfg.model.global_component.name = "self-attn-transformer"
+    cfg = get_local_component_cfg(cfg, "GCN")
+    cfg = get_global_component_cfg(cfg, "self-attn-transformer")
+    cfg.model.global_component.parameters.max_seq_len = max_seq_len
+    common = {"n_input": G, "n_output": G, "n_embed": 16, "decoder_type": "linear", "dropout_decoder": 0.1}
+    common |= {"decoder_hidden_dims": [16], "mask_percentage": 0.0, "mask_strategy": "node", "block_masking": True}
+    torch.manual_seed(0)
+    if kind == "global":
+        return GlobalModule.from_config(cfg, local_mask_hops=0, type_gex_embedding="Linear", **common)
+    return LocalModule.from_config(cfg, **common)
+
+
+@pytest.mark.parametrize("kind", ["global", "local"])
+def test_a_single_head_model_gives_its_one_head_on_the_cells_it_hid(kind):
+    """GlobalModel and LocalModel modules: one head, named for the component, the step's own output,
+    and none of the hidden cells' values reach it."""
+    from torch_geometric.data import Batch
+
+    module, datas = _single_head_module(kind), _datas()
+    pred = _collect(module, datas)
+    assert set(pred.heads) == {kind}
+
+    module.eval()
+    batch = Batch.from_data_list(datas)
+    batch.obs_names = torch.cat([d.obs_names for d in datas])
+    with torch.no_grad():
+        out = module._common_step(batch, "regression", "node")
+    assert np.allclose(pred.heads[kind], out.y_pred.numpy(), atol=1e-6)
+    hidden_cells = torch.cat([d.mask for d in datas]).numpy()
+    assert np.array_equal(pred.hidden, np.repeat(hidden_cells[:, None], G, axis=1))
+
+    changed = [d.clone() for d in datas]
+    for d in changed:
+        d.x = d.x.clone()
+        d.x[d.mask] = d.x[d.mask] + 5.0
+    again = _collect(module, changed)
+    assert np.allclose(again.heads[kind], pred.heads[kind], atol=1e-6)
+
+
+def test_a_single_head_model_scores_without_global_minus_local_columns():
+    pred = _collect(_single_head_module("global"), _datas())
+    tables = score_heads(pred, [f"g{j}" for j in range(G)], center=pred.true.mean(0), depth_bins_um=[0, 15, 100])
+    assert "global_sce" in tables["cells"] and not any("global - local" in c for c in tables["cells"].columns)
+    assert not any("global - local" in c for c in tables["per_gene"].columns)
 
 
 # --------------------------------------------------------------------------- the scores
@@ -220,7 +262,9 @@ def _planted(n=400, seed=0):
     local = np.tile(np.nanmean(np.where(hidden, true, np.nan), axis=0), (n, 1))
     depth = np.zeros(n)
     depth[: n // 2] = np.linspace(10, 400, n // 2)
-    return HeadPredictions(local=local, global_=true.copy(), true=true, hidden=hidden, depth_um=depth), true
+    return HeadPredictions(
+        heads={"local": local, "global": true.copy()}, true=true, hidden=hidden, depth_um=depth
+    ), true
 
 
 def test_the_scores_read_planted_heads_per_gene_group_and_depth():
