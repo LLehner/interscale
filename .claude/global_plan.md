@@ -261,9 +261,14 @@ not the route for Stage B.
     fill of expression;
   - gene masking refused with `Precomputed`, since an embedding cannot hide single genes;
   - a test through the real model that hidden cells' embeddings never reach a prediction.
-- **The `Precomputed` local module** (an embedding in place of the GCN, inside a CombinedModel) is
-  disabled in `LocalModule.from_config`, and it reads `x` as the embedding, which clashes with `x`
-  being the reconstruction target. It needs to read `obsm` instead before Stage B can use it.
+
+  Why it leaks: the target is the hidden cell's expression, and its precomputed embedding was made
+  from that expression -- a compressed copy of the answer (cf. round 3b's first run, where hidden
+  discs were not hidden: SCE 0.037, noise genes at r = 0.997). Why not −inf: as a token value it
+  turns into NaN at the first LayerNorm (inf − inf); −inf only works on attention logits, and
+  blocking hidden cells as keys would still leave a hidden cell's own token in its residual stream,
+  straight to its own prediction. The token itself must be replaced, and embeddings have no known
+  range for a fixed out-of-range value (as −1 is for expression), hence a learned vector.
 
 **Implementation:**
 - Both training and inference go through `GlobalModule.gex_embedding(batch)`. Training passes the
@@ -353,7 +358,11 @@ decoder and joint training, so only the embedding changes.
 1. **`SCVI` joint:** the encoder as above, with `q_m` at evaluation. Per-cell, so a hidden cell's
    embedding is one constant: the local head is blind at every depth, and the global head must do
    everything from context.
-2. **scVI frozen, pretrained (the preferred route, by the design principle in Stage A):** train scvi-tools' `SCVI` on the training slides' raw counts once,
+2. **scVI frozen, pretrained (the preferred route, by the design principle in Stage A):** as a
+   **GlobalModel** with `type_gex_embedding: Precomputed`, not inside a CombinedModel: without the
+   GCN there is no local component, and a second head decoding a hidden cell's own (filled)
+   embedding could only predict a constant, which the reference predictors already cover. The text
+   below predates the design principle; the user computes the embedding. train scvi-tools' `SCVI` on the training slides' raw counts once,
    with the evaluation's masking regime so a hidden cell gets the embedding of an all-masked
    input. Write the latent mean to `obsm`, and feed it through `Precomputed`.
    - Enable the `Precomputed` local branch, so the dual decoder still has a local head.
