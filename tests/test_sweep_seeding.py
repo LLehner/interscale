@@ -79,3 +79,44 @@ def test_a_swept_seed_is_the_one_a_trial_starts_from(trial):
     swept = trial(_cfg(seed=7), {"optim.seed": 11}, sweep_params=["optim.seed"])
 
     assert torch.equal(swept, torch.rand(4, generator=torch.Generator().manual_seed(11)))
+
+
+def test_prepare_adata_sees_the_read_data_and_the_trial_config_before_the_model_is_built(monkeypatch):
+    """The hook a sweep script uses to compute embeddings when the data is read (`prepare_adata`)."""
+    events = []
+
+    class _Model:
+        @classmethod
+        def _setup_anndata(cls, adata, **kwargs):
+            events.append(("setup", "X_emb" in adata.obsm))
+
+        def __init__(self, adata, cfg):
+            events.append(("model", "X_emb" in adata.obsm))
+
+        def train(self, **kwargs):
+            pass
+
+    class _Run:
+        def __init__(self, config):
+            self.config, self.name, self.summary = config, "run", {}
+
+    read = types.SimpleNamespace(obsm={})
+    values = {"optim.seed": 11}
+    monkeypatch.setattr(
+        main_sweep_module, "wandb", types.SimpleNamespace(init=lambda **kwargs: _Run(values), config=values)
+    )
+    monkeypatch.setattr(main_sweep_module.sc, "read_h5ad", lambda path: read)
+    monkeypatch.setattr(main_sweep_module, "remove_zero_expression_cells", lambda adata: adata)
+    monkeypatch.setattr(main_sweep_module, "build_probe_obsm", lambda adata, cfg: False)
+    monkeypatch.setattr(main_sweep_module, "prepare_geome_dataset", lambda adata, cfg: ([[], [], []], None))
+    monkeypatch.setattr(main_sweep_module, "GraphAnnDataModule", lambda **kwargs: object())
+    monkeypatch.setattr(interscale.model, "GlobalModel", _Model)
+
+    def prepare(adata, cfg):
+        events.append(("prepare", adata is read, cfg.optim.seed))
+        adata.obsm["X_emb"] = "embedding"
+
+    main_sweep_module.main_sweep(
+        lambda: _cfg().clone(), "GlobalModel", "hyperparmeter", sweep_params=["optim.seed"], prepare_adata=prepare
+    )
+    assert events == [("prepare", True, 11), ("setup", True), ("model", True)]  # the trial's seed, before the model

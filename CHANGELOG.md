@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- `main_sweep(..., prepare_adata=...)`: a function called on the AnnData once a sweep trial has read
+  it, before the model is built -- e.g. to compute an embedding into `obsm` that the model reads through
+  `type_gex_embedding: Precomputed`.
 - Staged runs record each phase's end (`model.phase_summaries_`, and in the W&B summary as
   `schedule/phase<k>_<metric>`): how far each component's weights moved (`drift_<component>`, 0 when
   frozen) and the phase's last validation losses. The results file shows them as a `phases` section.

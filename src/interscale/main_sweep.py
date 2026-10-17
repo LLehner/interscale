@@ -66,7 +66,7 @@ def print_memory_debug():
         print(f"Memory debug failed: {e}")
 
 
-def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None):
+def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None, prepare_adata=None):
     """Run one sweep trial.
 
     Parameters
@@ -86,6 +86,11 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
     arms : dict, optional
         The sweep yaml's ``arms:`` block. Each trial's ``arm`` value expands into that arm's
         coupled dotted overrides.
+    prepare_adata : callable, optional
+        ``prepare_adata(adata, cfg)``, called on the AnnData once it is read (and cells without
+        expression are dropped), before the model is built, with the trial's config. It changes
+        ``adata`` in place -- e.g. computes an embedding into ``obsm`` that the model then reads
+        through ``type_gex_embedding: Precomputed``.
     """
     print_memory_usage("Start of main_sweep")
 
@@ -167,6 +172,8 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
         print("Applying segmentation noise...")
         sq.gr.spatial_neighbors(adata, **cfg.dataset.spatial_neigbors_kwargs)
         adata = apply_segmentation_noise(adata, cfg.dataset.segmentation_robustness)
+    if prepare_adata is not None:
+        prepare_adata(adata, cfg)
 
     if model_type == "LocalModel":
         print_memory_usage("Before LocalModel setup")
