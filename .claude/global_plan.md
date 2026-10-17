@@ -156,6 +156,13 @@ below is read on raw SCE or R².
 **Question:** can a transformer, given every cell's masked expression and its position, fill in
 hidden discs better than a smoother of visible cells? This removes P2 and P3 entirely.
 
+**Purpose (the user's, 2026-10-17):**
+1. Simplify the model for finding bugs.
+2. Remove every influence of the local model.
+3. Let the global model learn on its own.
+
+None of these needs a learned input: a fixed input serves all three, and A2 keeps one (`pca_rope`).
+
 ### What exists
 
 `GlobalModel` wraps a `GlobalModule` without a local component (`local_mask_hops = 0`, so the
@@ -181,7 +188,8 @@ model doing badly could just mean PCA threw away the useful directions.
 ### A1 — a learned linear input
 
 **What it is.** In one sentence: training, not variance, chooses which 64 directions of a spot's
-expression reach the transformer. `type_gex_embedding: Linear` gives the `GlobalModule` one learned
+expression reach the transformer. A convenience, not a requirement of Stage A (see its purpose
+above); fixed inputs stay available for debugging (below). `type_gex_embedding: Linear` gives the `GlobalModule` one learned
 layer,
 `input_embedding = nn.Linear(n_input, n_embed)`, from a spot's expression vector to its token.
 On synth_spot that is 253 genes → 64 dimensions, 16,256 parameters. It is trained together with
@@ -232,6 +240,16 @@ not by what helps reconstruction. The transformer can recombine those 64, but no
 sits in the pure-noise ZINB genes. On a disc-masked slide the contrast between hidden (all −1) and
 visible rows is likely a leading component. So a frozen PCA probably spends much of its capacity
 on noise and on "hidden or not". `pca_rope` stays in A2 to show what learning the input buys.
+
+**Fixed inputs for debugging, and their caveats:**
+- **`PCA` works.** It is computed from the *masked* input, so hidden values never reach it. It is
+  fixed after the first slide it sees: a validation slide (sanity check), whose hidden rows are all
+  −1. Fixed, but not fitted on what one would expect. Fitting it once on the training slides would
+  be cleaner; not done, since it changes existing runs.
+- **`Precomputed` leaks under masking as it stands.** `apply_mask` overwrites only `x`, not the
+  `embeddings` read from `obsm`. A hidden spot would hand the transformer an embedding of its own
+  true expression. It needs the same guard as B1's frozen scVI before any masked run: hidden
+  spots' embeddings replaced by one constant, or recomputed from the masked input.
 
 **Implementation:**
 - Both training and inference go through `GlobalModule.gex_embedding(batch)`. Training passes the
