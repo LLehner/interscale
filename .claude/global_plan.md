@@ -241,6 +241,12 @@ sits in the pure-noise ZINB genes. On a disc-masked slide the contrast between h
 visible rows is likely a leading component. So a frozen PCA probably spends much of its capacity
 on noise and on "hidden or not". `pca_rope` stays in A2 to show what learning the input buys.
 
+**Design principle (the user, 2026-10-17):** other embeddings are not computed inside InterScale.
+The user computes them per cell outside it (scVI, PCA, ...), stores them in `adata.obsm`, and passes
+them in through `Precomputed` (`latent_obsm_key`). The pipeline's only job with them is to hide the
+embeddings of hidden cells (below). The in-pipeline inputs (PCA, NMF, Linear) remain, but they are
+not the route for Stage B.
+
 **Fixed inputs for debugging, and their caveats:**
 - **`PCA` works.** It is computed from the *masked* input, so hidden values never reach it. It is
   fixed after the first slide it sees: a validation slide (sanity check), whose hidden rows are all
@@ -248,8 +254,16 @@ on noise and on "hidden or not". `pca_rope` stays in A2 to show what learning th
   be cleaner; not done, since it changes existing runs.
 - **`Precomputed` leaks under masking as it stands.** `apply_mask` overwrites only `x`, not the
   `embeddings` read from `obsm`. A hidden spot would hand the transformer an embedding of its own
-  true expression. It needs the same guard as B1's frozen scVI before any masked run: hidden
-  spots' embeddings replaced by one constant, or recomputed from the masked input.
+  true expression. It needs a guard before any masked run (not built; the fill is the user's
+  decision):
+  - a hidden cell's whole embedding replaced by a fill. Recommended: one *learned* mask embedding.
+    Not zeros: in a centred embedding zero is roughly an average cell, the same trap as the old 0
+    fill of expression;
+  - gene masking refused with `Precomputed`, since an embedding cannot hide single genes;
+  - a test through the real model that hidden cells' embeddings never reach a prediction.
+- **The `Precomputed` local module** (an embedding in place of the GCN, inside a CombinedModel) is
+  disabled in `LocalModule.from_config`, and it reads `x` as the embedding, which clashes with `x`
+  being the reconstruction target. It needs to read `obsm` instead before Stage B can use it.
 
 **Implementation:**
 - Both training and inference go through `GlobalModule.gex_embedding(batch)`. Training passes the
@@ -339,7 +353,7 @@ decoder and joint training, so only the embedding changes.
 1. **`SCVI` joint:** the encoder as above, with `q_m` at evaluation. Per-cell, so a hidden cell's
    embedding is one constant: the local head is blind at every depth, and the global head must do
    everything from context.
-2. **scVI frozen, pretrained:** train scvi-tools' `SCVI` on the training slides' raw counts once,
+2. **scVI frozen, pretrained (the preferred route, by the design principle in Stage A):** train scvi-tools' `SCVI` on the training slides' raw counts once,
    with the evaluation's masking regime so a hidden cell gets the embedding of an all-masked
    input. Write the latent mean to `obsm`, and feed it through `Precomputed`.
    - Enable the `Precomputed` local branch, so the dual decoder still has a local head.
