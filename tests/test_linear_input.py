@@ -1,7 +1,8 @@
 """The learned linear input of a global-only model (`type_gex_embedding: Linear`; global_plan.md, A1).
 
-Before it, a GlobalModel's tokens were a PCA fitted once and frozen, NMF, or precomputed: nothing
-the transformer could shape. Pinned here: the layer is built and trained with the transformer;
+Before it, a GlobalModel's tokens were a PCA fitted once and frozen, NMF, or precomputed: fixed
+maps that the loss could not reach, so which directions of the expression got through was decided
+before training (by variance, for PCA). Pinned here: the layer is built and trained with the transformer;
 the masked input is what it maps, so hidden values never reach a prediction; inference maps the
 clean input through the same layer; the config accepts only inputs the module can build; and only
 the global-only checkpoint name carries it.

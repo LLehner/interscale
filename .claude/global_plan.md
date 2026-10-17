@@ -170,13 +170,19 @@ GCN, so `type_gex_embedding` says where its tokens come from. Before A1 there we
 - **`NMF`:** cannot take the −1 fill of masked entries.
 - **`Precomputed`:** reads an embedding from `obsm[latent_obsm_key]`.
 
-None of these is trained, so the transformer cannot shape its own input. Whatever the fixed
-projection drops or mixes up, the transformer never gets back. That would confound A2: a
-global-only model doing badly could just mean a bad fixed input.
+None of these is trained. Being computed outside the transformer is not the issue: in the joint
+model the GCN computes the tokens too, but the global loss flows back through them into the GCN's
+weights, so they adapt to what the transformer needs. A fixed input never adapts. The transformer
+can still recombine what a fixed input keeps, since its first operations are learned linear maps
+(queries, keys, values), but it cannot recover what the input discarded. PCA squeezes 253 genes
+into 64 directions once, chosen by variance before training. That would confound A2: a global-only
+model doing badly could just mean PCA threw away the useful directions.
 
 ### A1 — a learned linear input
 
-**What it is.** `type_gex_embedding: Linear` gives the `GlobalModule` one learned layer,
+**What it is.** In one sentence: training, not variance, chooses which 64 directions of a spot's
+expression reach the transformer. `type_gex_embedding: Linear` gives the `GlobalModule` one learned
+layer,
 `input_embedding = nn.Linear(n_input, n_embed)`, from a spot's expression vector to its token.
 On synth_spot that is 253 genes → 64 dimensions, 16,256 parameters. It is trained together with
 the transformer and the decoder, by the same reconstruction loss.
@@ -221,7 +227,8 @@ attention. If A2 shows the global-only model far below the smoother, a deeper in
 one follow-up, but not before we know.
 
 **Why not keep PCA.** Its 64 directions are fixed by the variance of one masked validation slide,
-not by what helps reconstruction. On the rescaled synth_spot about 45% of the deviation variance
+not by what helps reconstruction. The transformer can recombine those 64, but not get back the
+189 that were dropped. On the rescaled synth_spot about 45% of the deviation variance
 sits in the pure-noise ZINB genes. On a disc-masked slide the contrast between hidden (all −1) and
 visible rows is likely a leading component. So a frozen PCA probably spends much of its capacity
 on noise and on "hidden or not". `pca_rope` stays in A2 to show what learning the input buys.
