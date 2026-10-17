@@ -33,12 +33,12 @@ Last updated 2026-10-17 (Stage C built).
 | 0e — receptive field and representations | **implemented, unverified** — `receptive_field`: Hutchinson estimate within 10% of the exact squared Jacobian norm (correlation > 0.95), queries on subsampled graphs read their own row, a GCN reads exactly 0 beyond its hops while a transformer and a dual decoder's global head do not, planted pairs ranked on influence, no generator touched, parameters and `gex_embedding` restored; `representation_table`: CKA 1 under rotation and scale and low for unrelated sets, participation ratio counts directions, wide sets reduced. 15 mutations across 0d and 0e, each caught; full suite passes | 2026-10-17 |
 | 0f — one results file per sweep | **implemented, unverified** — `evaluation.report`: `append_sections` appends an arm's compact tables as `## <arm> | <analysis>` sections (CSV, index columns counted in the fence) to `RESULTS_DIR/results.md`; `read_sections` reads them back, the later section winning; `write_report` rewrites the file with the cross-arm summary on top (counts and references once, gains over the smoother, untrained twins under their arms). `global_only.py` writes nothing else. 6 tests, 7 mutations caught; checked on stub data (7 arms + twins, 3,515 lines, summary in the first ~700) | 2026-10-17 |
 | A1 — learned linear input for the global-only model | **implemented, unverified** — `type_gex_embedding: Linear` builds `input_embedding` (an `nn.Linear`; the transformer's input LayerNorm normalises it), trained with the transformer; training maps the masked batch and inference (`GlobalModel.get_model_output`) the clean one, both through `GlobalModule.gex_embedding`; hidden cells' values never reach a prediction, visible ones do; the validator accepts only buildable inputs; `emb-linear` in the global-only checkpoint name only. 4 mutations, each caught; 735 tests pass; harness IDENTICAL (its GlobalModel/PCA and LocalModel cases included). **Not run on data** | 2026-10-15 |
-| A2 — global-only sweep (input × encoding) and a local-only reference | **set up, not run** — `notebooks_and_scripts/slurm/global_only.{py,yaml}`, `global_only_sweep.yaml`; 7 arms validate with their model types, checkpoint names distinct; script checked on stub data (preflight, one W&B sweep per model type, stale-file guard, head tables and W&B summary for single- and dual-head arms). Evaluation switched to 0d/0e on 2026-10-17 | 2026-10-15 |
+| A2 — global-only sweep (input × encoding) and a local-only reference | **set up, not run** — `notebooks_and_scripts/slurm/global_only.{py,yaml}`, `global_only_sweep.yaml`; 7 arms validate with their model types, checkpoint names distinct; script checked on stub data (preflight, one W&B sweep per model type, stale-file guard, head tables and W&B summary for single- and dual-head arms). Evaluation switched to 0d/0e on 2026-10-17; the machinery moved to `slurm/sweep_common.py`, shared with the B and C3 sweeps | 2026-10-17 |
 | B1 — local-embedding variants under one global model (scVI joint, scVI frozen, frozen random GCN, 1-layer GCN) | not started | | |
-| B2 — embedding sweep | not started | | |
+| B2 — embedding sweep | **PCA stand-in set up, not run** — `slurm/global_precomputed.{py,yaml}`, `global_precomputed_sweep.yaml`: GlobalModel on `obsm['X_pca']` (64 PCs of log1p_norm fitted on the training slides, computed by the script before training, as a user's embedding), arms `pre_pca_rope`, `pre_pca_rope_m1`, `pre_pca_none`, `pre_pca_fourier`, and `pca_rope` (in-pipeline PCA); scVI is one more obsm key and arm. The checkpoint tag now carries the obsm key | 2026-10-17 |
 | C1 — per-head loss weights and module freezing | **implemented, unverified** — `optim.loss_weights` (default 0.5 / 0.5 = the old stacked loss, same code path, harness IDENTICAL) and `optim.frozen`; the weighted sum is what `<mode>_loss` reports; a head with weight 0 sends no gradient; frozen components are out of the optimizer, unchanged after steps, in eval at every training step, and get their own `requires_grad` back | 2026-10-17 |
 | C2 — staged training driver (phases: local → global, fine-tune, alternating) | **implemented, unverified** — `optim.schedule` presets and `custom` phases; `train()` runs the phases with their epochs (exact split), learning rates, warm-ups and cosines; an end-to-end run on toy data trains each component only in its phases, carries the weights over, redraws masks every phase, checkpoints and saves once; one W&B run with a continuing step; `copy_local_from` takes a trained LocalModel as phase 1. 28 mutations across C1 and C2, each caught; 779 tests pass; harness IDENTICAL. **Not run on data** | 2026-10-17 |
-| C3 — staged-training sweep | not started | | |
+| C3 — staged-training sweep | **set up, not run** — `slurm/staged_training.{py,yaml}`, `staged_training_sweep.yaml`: 9 arms of A2's `joint_rope` model: `joint`, `joint_res`, `l2g_res`, `l2g_ft_res`, `alt4_res`, `altc4_res`, `l2g`, `frozen_local` (GCN frozen at initialisation, global loss only), `global_loss_only`; untrained twins for the two baselines only. Readout per phase: `phase_summaries_` (drift per component, last validation losses) into the results file's `phases` section | 2026-10-17 |
 | guard — hidden cells' precomputed embeddings (`precomputed_mask_fill`: learned / −1) | **implemented, unverified** — see Stage A, "Fixed inputs for debugging". 10 mutations caught; 748 tests pass; harness IDENTICAL. **Not run on data** | 2026-10-17 |
 
 ## What we know (rounds 1–3b)
@@ -284,8 +284,9 @@ not the route for Stage B.
   - **Gene masking is refused,** by the config validator and by the module: an embedding cannot
     hide single genes.
   - **`latent_obsm_key` must be set.**
-  - **Checkpoint tag:** `emb-pre-learned_` / `emb-pre-m1_`. Precomputed checkpoints from before
-    2026-10-17 carry no tag, and their hidden cells leaked.
+  - **Checkpoint tag:** `emb-pre-<key>-learned_` / `emb-pre-<key>-m1_`, with the `obsm` key in
+    letters and digits (`X_pca` → `Xpca`), so two embeddings never share a checkpoint.
+    Precomputed checkpoints from before 2026-10-17 carry no tag, and their hidden cells leaked.
   - **Tests,** through a GlobalModel built from a config:
     - a random change to the hidden cells' embeddings never changes a prediction, while a change
       to a visible cell's embedding does;
@@ -535,6 +536,12 @@ This is not wired into the scripts yet.
 
 Arms, all RoPE, discs: `joint`, `local_then_global`, `local_then_global_ft`, `alternating_4`,
 `alternating_4_coupled`, plus `local_then_global` with the residual decoder off.
+
+Set up 2026-10-17 (`slurm/staged_training.*`) with the residual decoder on for the staged arms, and
+three arms beyond the plan: `joint_res` (the baseline for them), `frozen_local` (the GCN frozen at
+initialisation, only the global loss: B1's "frozen random GCN" as a dual model) and
+`global_loss_only` (the GCN trained only through the global loss). The per-phase readout is the
+drift and last validation losses of each phase, not a full evaluation at each phase's end.
 
 Readouts:
 - as A2, per phase at its end, the deep field above all;

@@ -10,7 +10,7 @@ from lightning.pytorch.trainer import seed_everything
 
 from interscale.evaluation.online_probes import build_probe_callback
 from interscale.tl.utils import get_model_filename_prefix
-from interscale.train._schedule import freezing, phase_epochs, phase_warmup, schedule_phases
+from interscale.train._schedule import component_modules, freezing, phase_epochs, phase_warmup, schedule_phases
 from interscale.train._trainingplans import TrainingPlan
 from interscale.train._utils import (
     MetricsHistory,
@@ -73,7 +73,9 @@ class NodeMaskingTrainingPlan:
         weights, learning rate, warm-up and cosine, on the weights the previous phase left. All
         phases log to one W&B run, the step continuing across them. Only the last phase restores
         its best epoch, validates, tests and saves. ``self.history_`` is the last phase's history,
-        ``self.phase_histories_`` every phase's.
+        ``self.phase_histories_`` every phase's, and ``self.phase_summaries_`` each phase's end: how
+        far each component's weights moved and the last epoch's validation losses (also in the W&B
+        summary as ``schedule/phase<k>_<metric>``).
 
         Parameters
         ----------
@@ -138,6 +140,7 @@ class NodeMaskingTrainingPlan:
                 f"loss weights {phase.loss_weights or 'default'}, lr x{phase.lr_scale:g}"
             )
         self.phase_histories_ = []
+        self.phase_summaries_ = []
         for i, (phase, n) in enumerate(zip(phases, epochs, strict=True)):
             self._train_phase(
                 phase,
@@ -331,6 +334,10 @@ class NodeMaskingTrainingPlan:
                 self._wandb_logger = StepOffsetWandbLogger(name=run_name, log_model=True)
             logger = self._wandb_logger
 
+        # Where each component's weights start, for how far the phase moves them.
+        start = (
+            {name: _parameter_vector(part) for name, part in component_modules(self.module).items()} if staged else None
+        )
         with freezing(self.module, phase.frozen):
             if logger is not None:
                 total_params = sum(p.numel() for p in self.module.parameters())
@@ -365,6 +372,8 @@ class NodeMaskingTrainingPlan:
             if logger is not None:
                 # The next phase's trainer counts from 0 again; its points go after this phase's.
                 logger.step_offset += trainer.global_step
+            if staged:
+                self._record_phase(index, start)
             if not last:
                 return
 
@@ -407,6 +416,37 @@ class NodeMaskingTrainingPlan:
             logger.finalize("success")
 
         self.is_trained_ = True
+
+    def _record_phase(self, index: int, start: dict) -> None:
+        """A phase's end, in ``self.phase_summaries_`` and the W&B summary (``schedule/phase<k>_<metric>``).
+
+        ``drift_<component>`` is ``||w_end - w_start|| / ||w_start||`` over that component's weights:
+        0 for a component the phase kept frozen. Beside it, the validation losses of the phase's last
+        epoch (:data:`PHASE_METRICS`, those that were logged).
+        """
+        summary = {}
+        for name, part in component_modules(self.module).items():
+            before, after = start[name], _parameter_vector(part)
+            norm = float(before.norm())
+            summary[f"drift_{name}"] = float((after - before).norm()) / norm if norm > 0 else float("nan")
+        logged = [epoch for epoch in self.history_.history if "val_loss" in epoch]
+        if logged:
+            summary.update({key: float(logged[-1][key]) for key in PHASE_METRICS if key in logged[-1]})
+        self.phase_summaries_.append({"phase": index, **summary})
+        if self.wandb_use and wandb.run is not None:
+            for key, value in summary.items():
+                wandb.run.summary[f"schedule/phase{index}_{key}"] = value
+        print(f"phase {index} done: " + ", ".join(f"{key} {value:.4g}" for key, value in summary.items()))
+
+
+#: The validation metrics a staged run records at the end of every phase (``_record_phase``).
+PHASE_METRICS = ("val_loss", "val_local_loss", "val_global_loss", "val_masked_scaled_cosine_error")
+
+
+def _parameter_vector(module) -> torch.Tensor:
+    """Every parameter of ``module``, detached and flattened into one float64 vector on the CPU."""
+    parts = [p.detach().reshape(-1).double().cpu() for p in module.parameters()]
+    return torch.cat(parts) if parts else torch.zeros(0, dtype=torch.float64)
 
 
 # adjusted from scvi-tools

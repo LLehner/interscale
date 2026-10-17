@@ -144,6 +144,9 @@ one phase, unchanged), `local_then_global`, `local_then_global_ft`, `alternating
   `cfg.optim.freeze` would return the method.
 - **`train()` runs the phases in one process,** with the weights carrying over. Only the last phase
   checkpoints and saves, and all phases log to one W&B run with a continuing step.
+- **Each phase's end is recorded** (`model.phase_summaries_`, and the W&B summary as
+  `schedule/phase<k>_<metric>`): `drift_<component>`, the relative change of that component's
+  weights (0 when frozen), and the phase's last validation losses.
 
 ### Preprocessing / robustness utilities (`interscale.pp`)
 

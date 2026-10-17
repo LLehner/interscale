@@ -485,6 +485,18 @@ def test_a_staged_run_trains_each_component_only_in_its_phases_and_saves_once(tm
     assert len(model.phase_histories_) == 2 and model.history_ is model.phase_histories_[-1]
     assert model.is_trained_
 
+    # Each phase's end: the frozen component did not move at all, the trained one by exactly its
+    # relative weight change, and the phase's last validation losses are kept beside.
+    summaries = model.phase_summaries_
+    assert [s["phase"] for s in summaries] == [0, 1]
+    assert summaries[0]["drift_global"] == 0.0 and summaries[1]["drift_local"] == 0.0
+    for summary, record, part in ((summaries[0], records[0], "local"), (summaries[1], records[1], "global")):
+        names = [f"{part}_module.{n}" for n, _ in getattr(model.module, f"{part}_module").named_parameters()]
+        before = torch.cat([record.start[n].reshape(-1).double() for n in names])
+        after = torch.cat([record.end[n].reshape(-1).double() for n in names])
+        assert summary[f"drift_{part}"] == pytest.approx(float((after - before).norm() / before.norm()))
+        assert summary[f"drift_{part}"] > 0 and "val_loss" in summary and "val_global_loss" in summary
+
     files = sorted(p.name for p in save.iterdir())
     assert not any("-v1" in f for f in files), files
     assert sum(f.endswith(".ckpt") for f in files) == 2  # the best epoch, and the final trainer state

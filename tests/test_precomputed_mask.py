@@ -187,5 +187,9 @@ def test_the_checkpoint_name_tells_the_fills_apart():
         cfg = _cfg(fill)
         cfg.dataset.name = "d"
         names[fill] = get_model_filename_prefix(cfg, False, True)
-    assert names["learned"].endswith("self-attn-transformer_emb-pre-learned_")
-    assert names["minus_one"].endswith("self-attn-transformer_emb-pre-m1_")
+    assert names["learned"].endswith("self-attn-transformer_emb-pre-Xscvi-learned_")
+    assert names["minus_one"].endswith("self-attn-transformer_emb-pre-Xscvi-m1_")
+    cfg = _cfg("learned")  # another embedding, another checkpoint
+    cfg.dataset.name = "d"
+    cfg.model.global_component.latent_obsm_key = "X_pca"
+    assert get_model_filename_prefix(cfg, False, True).endswith("_emb-pre-Xpca-learned_")

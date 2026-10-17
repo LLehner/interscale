@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Staged runs record each phase's end (`model.phase_summaries_`, and in the W&B summary as
+  `schedule/phase<k>_<metric>`): how far each component's weights moved (`drift_<component>`, 0 when
+  frozen) and the phase's last validation losses. The results file shows them as a `phases` section.
 - One results file per evaluation run (`interscale.evaluation.report`). `append_sections` appends an
   arm's analyses to a Markdown file as `## <arm> | <analysis>` sections, each a compact CSV table;
   `read_sections` reads them back, a later section replacing an earlier one; `write_report`
@@ -91,6 +94,8 @@ and this project adheres to [Semantic Versioning][].
 
 ### Changed
 
+- A precomputed embedding's checkpoint tag carries its `obsm` key (`emb-pre-<key>-<fill>_`, letters and
+  digits only), so two embeddings never share a checkpoint.
 - The in-training attention diagnostics read the val graphs under their own masks
   (`probe.attention_masked`, default `true`); `false` restores the clean pass.
 - `_common_step` returns a `StepOutput` (named fields, with `ViewOutput`, `gather_tokens` and

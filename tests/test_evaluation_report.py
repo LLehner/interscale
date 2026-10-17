@@ -245,6 +245,17 @@ def test_the_summary_reads_the_gain_over_the_smoother_and_lists_references_once(
     assert list(profile.columns) == ["(0.0, 300.0]", "(300.0, 500.0]"]
 
 
+def test_staged_phases_pass_through_and_get_a_summary_table(tmp_path):
+    path = tmp_path / "results.md"
+    phases = pd.DataFrame({"drift_local": [0.3, 0.0], "drift_global": [0.0, 0.2], "val_global_loss": [0.9, 0.5]})
+    append_sections(path, "l2g", compact_tables({"phases": phases.rename_axis("phase")}))
+    append_sections(path, "joint", compact_tables(_raw()))  # no phases: no rows
+    found = read_sections(path)
+    assert found[("l2g", "phases")].loc[1, "drift_global"] == pytest.approx(0.2)
+    table = next(t for title, t in summary_tables(found, ["l2g", "joint"]) if title.startswith("staged training"))
+    assert list(table.index) == [("l2g", 0), ("l2g", 1)] and table.loc[("l2g", 1), "drift_local"] == 0.0
+
+
 def test_depth_labels_are_ordered_by_their_lower_edge():
     assert ordered(["(500.0, inf]", "x", "visible", "(0.0, 150.0]", "all"]) == [
         "all",

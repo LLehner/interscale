@@ -25,7 +25,8 @@ Status as of 2026-10-17. *Current* means used by `slurm/global_only.py` and the 
 | Planted pairs, attention | Does a hidden receiver attend to its visible sender more than to visible spots at the same distance? (`matched_rank`, 0.5 = blind to the edge; `coverage`) | same → `edges` | masked |
 | Receptive field | Which visible spots a hidden spot's prediction depends on: squared Jacobian norms (Hutchinson), by depth and distance, per head. Replaces relevance. The GCN alone must read 0 where it cannot reach, which checks the instrument | `receptive_field.receptive_field` → `by_query`, `profile` | masked |
 | Planted pairs, influence | The same matched rank on the receptive field: does the prediction use the sender? | same → `edges` | masked |
-| Untrained twin | Every task again on the arm's model at initialisation (same seed). Only a gain over it is learned | `global_only.py` (`EVAL_UNTRAINED`, `<arm>_untrained`) | masked |
+| Untrained twin | Every task again on the arm's model at initialisation (same seed). Only a gain over it is learned | `slurm/sweep_common.py` (`EVAL_UNTRAINED`, `UNTRAINED_ARMS`, `<arm>_untrained`) | masked |
+| Phases (staged training) | How far each component's weights moved in each phase (0: frozen) and the phase's last validation losses | `TrainingMixin.phase_summaries_`, W&B `schedule/phase<k>_*` → results `phases` | training |
 | Online probes (training curves) | Label probes (clean pass: labels are not inputs), gene probes on masked cells, the gene vector, attention diagnostics per epoch | `online_probes.OnlineProbeCallback` | mixed; attention masked by default (`probe.attention_masked`) |
 
 ### Reading them

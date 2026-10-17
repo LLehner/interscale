@@ -75,6 +75,8 @@ NOTES = {
     "erf_profile": "influence per distance bin (µm) over uniform weights (1: uniform)",
     "erf_edges": "planted pairs: the sender's rank in the receiver's influence among visible spots as far (0.5: blind)",
     "training": "the last epoch's throughput and peak memory, the final validation metrics",
+    "phases": "staged training, each phase's end: drift_<component> = relative weight change (0: frozen), "
+    "and the phase's last validation losses",
 }
 
 LEGEND = """\
@@ -504,6 +506,16 @@ def summary_tables(sections, arms: list[str]) -> list[tuple[str, pd.DataFrame]]:
     rows = [table["value"].rename(arm) for arm, table in _per_arm(sections, "training", arms).items()]
     if rows:
         add("training: the last epoch's throughput and peak memory, the final validation metrics", pd.DataFrame(rows))
+    parts = []
+    for arm, table in _per_arm(sections, "phases", arms).items():
+        part = table.copy()
+        part.index = pd.MultiIndex.from_tuples([(arm, phase) for phase in part.index], names=["arm", "phase"])
+        parts.append(part)
+    if parts:
+        add(
+            "staged training, each phase's end: relative weight change per component (0: frozen), last validation losses",
+            pd.concat(parts),
+        )
     return out
 
 
