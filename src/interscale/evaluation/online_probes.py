@@ -118,6 +118,10 @@ class ProbeBatchFeatures:
         ``{gene_name: [N]}`` boolean, True where *that gene of that cell* was blanked. Equal to
         :attr:`cell_masked` under ``mask_strategy="node"``, where a masked cell has every gene
         blanked; genuinely per-gene under ``"gene"``.
+    depth_um
+        ``[N]`` distance from each wholly hidden cell to the nearest cell of its graph with any
+        visible entry, in µm (:func:`hidden_depth`); 0 for every other cell. None unless collected
+        with ``spatial_unit_um`` from graphs that carry ``pos``.
     """
 
     embeddings: dict[str, np.ndarray] = field(default_factory=dict)
@@ -125,6 +129,7 @@ class ProbeBatchFeatures:
     continuous: dict[str, np.ndarray] = field(default_factory=dict)
     cell_masked: np.ndarray | None = None
     gene_masked: dict[str, np.ndarray] = field(default_factory=dict)
+    depth_um: np.ndarray | None = None
 
     def n_cells(self) -> int:
         """Number of collected cells, or 0 when nothing was collected."""
@@ -145,6 +150,7 @@ class ProbeBatchFeatures:
             continuous={k: v[rows] for k, v in self.continuous.items()},
             cell_masked=None if self.cell_masked is None else self.cell_masked[rows],
             gene_masked={k: v[rows] for k, v in self.gene_masked.items()},
+            depth_um=None if self.depth_um is None else self.depth_um[rows],
         )
 
     def subsample(self, max_cells: int, rng: np.random.Generator) -> ProbeBatchFeatures:
@@ -197,6 +203,25 @@ def node_positional_encoding(module, batch) -> torch.Tensor | None:
     return encoding(batch, dtype=dtype, device=batch.x.device)
 
 
+def hidden_depth(pos: torch.Tensor, hidden_cell: torch.Tensor, graph: torch.Tensor) -> torch.Tensor:
+    """``[N]`` distance from each hidden cell to the nearest non-hidden cell of the same graph.
+
+    In the units of ``pos``; 0 for a cell that is not hidden, ``inf`` in a graph hidden completely.
+    """
+    depth = torch.zeros(len(pos), dtype=torch.float64, device=pos.device)
+    for g in torch.unique(graph):
+        rows = torch.where(graph == g)[0]
+        hid = hidden_cell[rows]
+        if not hid.any():
+            continue
+        p = pos[rows].double()
+        if hid.all():
+            depth[rows] = float("inf")
+            continue
+        depth[rows[hid]] = torch.cdist(p[hid], p[~hid]).min(dim=1).values
+    return depth
+
+
 def _concat(chunks: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
     """Concatenate a list of per-batch dicts into one dict of full-split arrays."""
     if not chunks:
@@ -220,6 +245,8 @@ def collect_features(
     device,
     corrupt: bool = True,
     input_baselines: bool = False,
+    spatial_unit_um: float | None = None,
+    extra_features=None,
 ) -> ProbeBatchFeatures:
     """Run ``module`` over ``data_list`` and gather embeddings and probe targets.
 
@@ -262,6 +289,14 @@ def collect_features(
         Also gather :data:`INPUT_BASELINES` as extra entries of ``embeddings``, in the same cell
         order: ``expression``, each cell's input with its hidden entries at ``MASK_VALUE``, and
         ``neighbours``, the mean of that input over the cell's in-neighbours in ``edge_index``.
+    spatial_unit_um
+        ``dataset.spatial_unit_um``. When given and the graphs carry ``pos``, ``depth_um`` is filled:
+        how deep each wholly hidden cell lies in the hidden area.
+    extra_features
+        A function ``(batch, hidden) -> {name: [N, F] tensor}``, called on each uncorrupted batch
+        with ``hidden`` the ``[N, G]`` entries the model was not shown, returning features in batch
+        node order; each is gathered as one more entry of ``embeddings``, in the same cell order.
+        For model-free feature sets such as :func:`~interscale.evaluation.masked_probing.smoother_features`.
 
     Returns
     -------
@@ -276,6 +311,7 @@ def collect_features(
     con_chunks: list[dict[str, np.ndarray]] = []
     mask_chunks: list[dict[str, np.ndarray]] = []
     gene_mask_chunks: list[dict[str, np.ndarray]] = []
+    depth_chunks: list[np.ndarray] = []
 
     loader = DataLoader(dataset=data_list, shuffle=False, batch_size=batch_size, num_workers=0)
 
@@ -319,10 +355,11 @@ def collect_features(
                     pe = node_positional_encoding(module, batch)
                     if pe is not None:
                         batch_emb["pe"] = pe[idx].detach().cpu().numpy()
+                # The entries the model was not shown (none in a clean pass: the masks are blank).
+                hidden = batch.mask.bool()[:, None].expand_as(x_true)
+                if mask_strategy == "gene" and getattr(batch, "gene_mask", None) is not None:
+                    hidden = batch.gene_mask.bool()
                 if input_baselines:
-                    hidden = batch.mask.bool()[:, None].expand_as(x_true)
-                    if mask_strategy == "gene" and getattr(batch, "gene_mask", None) is not None:
-                        hidden = batch.gene_mask.bool()
                     x_input = x_true.masked_fill(hidden, MASK_VALUE)
                     src, dst = batch.edge_index
                     total = torch.zeros_like(x_input).index_add_(0, dst, x_input[src])
@@ -331,6 +368,12 @@ def collect_features(
                     )
                     batch_emb["expression"] = x_input[idx].detach().cpu().numpy()
                     batch_emb["neighbours"] = (total / count.clamp(min=1)[:, None])[idx].detach().cpu().numpy()
+                if extra_features is not None:
+                    for name, value in extra_features(batch, hidden).items():
+                        batch_emb[name] = value[idx].detach().cpu().numpy()
+                if spatial_unit_um is not None and getattr(batch, "pos", None) is not None:
+                    depth = hidden_depth(batch.pos, hidden.all(dim=1), batch.batch) * float(spatial_unit_um)
+                    depth_chunks.append(depth[idx].cpu().numpy())
 
                 if not batch_emb:
                     raise RuntimeError(
@@ -379,6 +422,7 @@ def collect_features(
         continuous=_concat(con_chunks),
         cell_masked=_concat(mask_chunks).get("cell"),
         gene_masked=_concat(gene_mask_chunks),
+        depth_um=np.concatenate(depth_chunks) if depth_chunks and len(depth_chunks) == len(mask_chunks) else None,
     )
 
 
@@ -601,6 +645,7 @@ class OnlineProbeCallback(Callback):
                     spatial_unit_um=float(self._cfg.dataset.spatial_unit_um),
                     radii_um=tuple(float(r) for r in self._probe_cfg.attention_radii_um),
                     max_graphs=int(self._probe_cfg.attention_graphs),
+                    masked=bool(self._probe_cfg.get("attention_masked", True)),
                 )
             )
 

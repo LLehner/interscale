@@ -39,11 +39,18 @@ they should sit at 0 for every representation.
 
 Everything is dataset-agnostic: genes, groups, labels and covariates are arguments. The feature
 sets are whatever :func:`~interscale.evaluation.online_probes.collect_features` gathered --
-``local``, ``global``, ``pe`` and the input baselines -- plus ``local+global``.
+``local``, ``global``, ``pe``, the input baselines and :func:`smoother_features` -- plus
+``local+global``, and ``smoother+<embedding>`` for each model embedding when the smoother is there.
+The smoother is the bar for context: what averages of the visible expression around a hidden cell
+say about it. An embedding knows more than such a smoother only where ``smoother+<embedding>``
+beats ``smoother``. With ``depth_bins_um`` the label and covariate probes are also scored by how deep
+each hidden cell lies (distance to the nearest visible cell): most hidden cells of a disc lie near
+its rim, inside the local component's reach, so a pooled score mostly measures the rim.
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -55,6 +62,7 @@ from sklearn.preprocessing import StandardScaler
 from torch_geometric.loader import DataLoader
 
 from interscale.evaluation.online_probes import ProbeBatchFeatures, _rng_untouched
+from interscale.evaluation.online_probes import hidden_depth as _hidden_depth
 from interscale.tl.geome_utils import label_codes
 from interscale.tl.masking import sample_block_mask
 
@@ -90,12 +98,68 @@ def draw_masks(data_list, kind: str, rate: float, seed: int, radius: float | Non
         data.mask = gene_mask.any(dim=1)
 
 
+#: The feature set :func:`smoother_features` adds.
+SMOOTHER = "smoother"
+#: The model embeddings that get a ``smoother+<name>`` set when the smoother was collected.
+MODEL_EMBEDDINGS = ("local", "global", "local+global")
+
+
 def feature_sets(features: ProbeBatchFeatures) -> dict[str, np.ndarray]:
-    """The collected representations, plus ``local+global`` when both are there."""
+    """The collected representations, plus ``local+global`` and ``smoother+<embedding>`` where possible."""
     sets = dict(features.embeddings)
     if "local" in sets and "global" in sets:
         sets["local+global"] = np.concatenate([sets["local"], sets["global"]], axis=1)
+    if SMOOTHER in sets:
+        for name in MODEL_EMBEDDINGS:
+            if name in sets:
+                sets[f"{SMOOTHER}+{name}"] = np.concatenate([sets[SMOOTHER], sets[name]], axis=1)
     return sets
+
+
+def smoother_features(*, spatial_unit_um: float, kernels_um: tuple[float, ...] = (), k_nearest: tuple[int, ...] = ()):
+    """A model-free feature set for the probes: averages of the visible expression around each cell.
+
+    Returns a function for :func:`~interscale.evaluation.online_probes.collect_features`'s
+    ``extra_features``. It gives each cell its :func:`reference_predictions` -- the slide mean, one
+    Gaussian kernel per bandwidth in ``kernels_um``, the ``k`` nearest cells per ``k_nearest`` --
+    side by side as :data:`SMOOTHER`, ``[N, G * (1 + kernels + k)]``, from the entries the model was
+    shown. No label mean: a label probe would read its own target from it.
+    """
+
+    def features(batch, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+        if getattr(batch, "pos", None) is None:
+            raise ValueError("the smoother averages over neighbours in µm, but the graphs carry no `pos`.")
+        refs = reference_predictions(
+            batch.x,
+            hidden,
+            batch.pos,
+            batch.batch,
+            spatial_unit_um=float(spatial_unit_um),
+            kernels_um=tuple(kernels_um),
+            k_nearest=tuple(k_nearest),
+        )
+        return {SMOOTHER: torch.cat(list(refs.values()), dim=1).float()}
+
+    return features
+
+
+def _depth_rows(depth_um: np.ndarray | None, rows: np.ndarray, depth_bins_um) -> list[tuple[str, np.ndarray]]:
+    """``("all", every row)``, then one ``(bin, rows)`` per non-empty depth bin of the wholly hidden rows.
+
+    ``rows`` selects the cells a probe is scored on; the masks returned are over that selection.
+    """
+    out = [("all", np.ones(int(rows.sum()), dtype=bool))]
+    if depth_bins_um is None:
+        return out
+    if depth_um is None:
+        raise ValueError("depth_bins_um needs each cell's depth; collect the features with spatial_unit_um.")
+    depth = np.asarray(depth_um, dtype=float)[rows]
+    cut = pd.cut(pd.Series(depth), bins=[float(b) for b in depth_bins_um], right=True)
+    for interval in cut.cat.categories:
+        in_bin = (depth > 0) & (cut == interval).to_numpy()
+        if in_bin.any():
+            out.append((str(interval), in_bin))
+    return out
 
 
 def _ridge_predictions(x_train, y_train, rows_train, x_eval, rows_eval, alpha) -> np.ndarray:
@@ -235,6 +299,7 @@ def probe_labels(
     hidden_only: bool = True,
     max_iter: int = 2000,
     seed: int = 0,
+    depth_bins_um: list[float] | None = None,
 ) -> pd.DataFrame:
     """Read each categorical target out of each representation with a balanced logistic regression.
 
@@ -246,10 +311,15 @@ def probe_labels(
     -------
     pandas.DataFrame
         One row per ``(target, feature_set, metric)``: ``balanced_accuracy`` and ``f1_macro``, with
-        a ``majority`` row as the floor.
+        a ``majority`` row as the floor. With ``depth_bins_um`` (needs ``depth_um``) every row also
+        carries ``depth_um``: ``"all"`` for every test cell, else the depth bin -- the same probe, fit
+        on every training cell, scored on the wholly hidden test cells in that bin. A bin holding a
+        single class scores NaN: there is nothing to tell apart (balanced accuracy would read 1 for
+        predicting that class everywhere).
     """
     tr = train.cell_masked.astype(bool) if hidden_only else np.ones(train.n_cells(), bool)
     te = test.cell_masked.astype(bool) if hidden_only else np.ones(test.n_cells(), bool)
+    groups = _depth_rows(test.depth_um, te, depth_bins_um)
     sets, test_sets = feature_sets(train), feature_sets(test)
     rows = []
     for target in targets:
@@ -264,24 +334,26 @@ def probe_labels(
                 clf.fit(scaler.transform(x[tr]), y_tr)
                 scored[name] = clf.predict(scaler.transform(test_sets[name][te]))
         for name, pred in scored.items():
-            rows.append(
-                {
-                    "target": target,
-                    "feature_set": name,
-                    "metric": "balanced_accuracy",
-                    "value": balanced_accuracy_score(y_te, pred),
-                    "n": int(te.sum()),
-                }
-            )
-            rows.append(
-                {
-                    "target": target,
-                    "feature_set": name,
-                    "metric": "f1_macro",
-                    "value": f1_score(y_te, pred, average="macro", labels=classes, zero_division=0),
-                    "n": int(te.sum()),
-                }
-            )
+            for depth, keep in groups:
+                if len(np.unique(y_te[keep])) < 2:
+                    accuracy = f1 = float("nan")
+                else:
+                    with warnings.catch_warnings():
+                        # A depth bin can lack a class the probe predicts; it is scored over the classes present.
+                        warnings.simplefilter("ignore", UserWarning)
+                        accuracy = balanced_accuracy_score(y_te[keep], pred[keep])
+                    f1 = f1_score(y_te[keep], pred[keep], average="macro", labels=classes, zero_division=0)
+                extra = {} if depth_bins_um is None else {"depth_um": depth}
+                rows.append(
+                    {"target": target, "feature_set": name, "metric": "balanced_accuracy", "value": accuracy}
+                    | extra
+                    | {"n": int(keep.sum())}
+                )
+                rows.append(
+                    {"target": target, "feature_set": name, "metric": "f1_macro", "value": f1}
+                    | extra
+                    | {"n": int(keep.sum())}
+                )
     return pd.DataFrame(rows)
 
 
@@ -292,6 +364,7 @@ def probe_covariates(
     *,
     hidden_only: bool = True,
     alpha: float = 1.0,
+    depth_bins_um: list[float] | None = None,
 ) -> pd.DataFrame:
     """Predict a vector of numeric covariates (e.g. distances to every source); score by cosine.
 
@@ -302,29 +375,32 @@ def probe_covariates(
     Returns
     -------
     pandas.DataFrame
-        One row per ``feature_set`` with the mean per-cell ``cosine_centred``.
+        One row per ``feature_set`` with the mean per-cell ``cosine_centred``. With ``depth_bins_um``
+        (needs ``depth_um``) also one per depth bin, each row carrying ``depth_um`` (``"all"`` for
+        every test cell), as in :func:`probe_labels`.
     """
     tr = train.cell_masked.astype(bool) if hidden_only else np.ones(train.n_cells(), bool)
     te = test.cell_masked.astype(bool) if hidden_only else np.ones(test.n_cells(), bool)
+    groups = _depth_rows(test.depth_um, te, depth_bins_um)
     y_tr = np.stack([train.continuous[c] for c in names], axis=1)[tr].astype(np.float64)
     y_te = np.stack([test.continuous[c] for c in names], axis=1)[te].astype(np.float64)
     mu, sd = y_tr.mean(0), y_tr.std(0)
     sd = np.where(sd > 0, sd, 1.0)
     z_tr, z_te = (y_tr - mu) / sd, (y_te - mu) / sd
     sets, test_sets = feature_sets(train), feature_sets(test)
-    keep = np.ones_like(z_te, dtype=bool)
+    keep_all = np.ones_like(z_te, dtype=bool)
     rows = []
     for name, x in sets.items():
         scaler = StandardScaler().fit(x[tr])
         pred = Ridge(alpha=alpha).fit(scaler.transform(x[tr]), z_tr).predict(scaler.transform(test_sets[name][te]))
-        rows.append(
-            {
-                "feature_set": name,
-                "metric": "cosine_centred",
-                "value": float(np.nanmean(_cosine_rows(pred, z_te, keep))),
-                "n": int(te.sum()),
-            }
-        )
+        cosine = _cosine_rows(pred, z_te, keep_all)
+        for depth, keep in groups:
+            extra = {} if depth_bins_um is None else {"depth_um": depth}
+            rows.append(
+                {"feature_set": name, "metric": "cosine_centred", "value": float(np.nanmean(cosine[keep]))}
+                | extra
+                | {"n": int(keep.sum())}
+            )
     return pd.DataFrame(rows)
 
 
@@ -364,22 +440,6 @@ class HeadPredictions:
     true: np.ndarray
     hidden: np.ndarray
     depth_um: np.ndarray | None = None
-
-
-def _hidden_depth(pos: torch.Tensor, hidden_cell: torch.Tensor, graph: torch.Tensor) -> torch.Tensor:
-    """``[N]`` distance from each hidden cell to the nearest non-hidden cell of the same graph."""
-    depth = torch.zeros(len(pos), dtype=torch.float64, device=pos.device)
-    for g in torch.unique(graph):
-        rows = torch.where(graph == g)[0]
-        hid = hidden_cell[rows]
-        if not hid.any():
-            continue
-        p = pos[rows].double()
-        if hid.all():
-            depth[rows] = float("inf")
-            continue
-        depth[rows[hid]] = torch.cdist(p[hid], p[~hid]).min(dim=1).values
-    return depth
 
 
 def _weighted_mean(w: torch.Tensor, xv: torch.Tensor, vis: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
@@ -615,6 +675,10 @@ def _pearson(pred: np.ndarray, true: np.ndarray) -> float:
     return float(np.corrcoef(pred, true)[0, 1])
 
 
+#: What :func:`score_heads` can score per gene.
+GENE_METRICS = ("r2", "pearson", "cosine")
+
+
 def score_heads(
     pred: HeadPredictions,
     genes: list[str],
@@ -622,6 +686,7 @@ def score_heads(
     center: np.ndarray | None = None,
     gene_groups: dict[str, list[str]] | None = None,
     depth_bins_um: list[float] | None = None,
+    gene_metrics: tuple[str, ...] = ("r2", "pearson"),
 ) -> dict[str, pd.DataFrame]:
     """Score every head of one pass -- the model's and the references -- on its hidden entries.
 
@@ -640,6 +705,9 @@ def score_heads(
     depth_bins_um
         Bin edges for the depth table, in µm, e.g. ``[0, 100, 300, 500, inf]``. Needs
         ``pred.depth_um``; only wholly hidden cells (depth > 0) are binned.
+    gene_metrics
+        What the per-gene table holds, from :data:`GENE_METRICS`: ``r2``, ``pearson`` (Pearson r),
+        and ``cosine``, the centred cosine pooled over the gene's hidden entries (needs ``center``).
 
     Returns
     -------
@@ -647,13 +715,18 @@ def score_heads(
         One column per head and metric, named ``<head>_<metric>``. ``"cells"``: over the cells
         with a hidden entry, the mean SCE (1 − cosine of the hidden entries, as
         ``val_masked_scaled_cosine_error`` at gamma 1) and the mean centred cosine. ``"per_gene"``:
-        per gene, its hidden entries' count and each head's R² and Pearson r. ``"by_group"`` (with
-        ``gene_groups``): per group, the mean of its genes' R² per head and the cosine pooled over
-        all its hidden entries. ``"by_depth"`` (with ``depth_bins_um``): the ``"cells"`` columns per
-        depth bin. With both a ``local`` and a ``global`` head, each table also carries
-        ``global - local`` columns: positive is the global head better for R², r and cosine,
-        negative for SCE.
+        per gene, its hidden entries' count and each head's ``gene_metrics``. ``"by_group"`` (with
+        ``gene_groups``): per group, the cosine pooled over all its hidden entries, and with ``r2``
+        among the ``gene_metrics`` the mean of its genes' R². ``"by_depth"`` (with
+        ``depth_bins_um``): the ``"cells"`` columns per depth bin. With both a ``local`` and a
+        ``global`` head, each table also carries ``global - local`` columns: positive is the global
+        head better for R², r and cosine, negative for SCE.
     """
+    unknown = sorted(set(gene_metrics) - set(GENE_METRICS))
+    if unknown:
+        raise ValueError(f"gene_metrics must come from {GENE_METRICS}, got {unknown}.")
+    if "cosine" in gene_metrics and center is None:
+        raise ValueError("the per-gene cosine is centred on the training mean; pass center.")
     heads = {name: value.astype(np.float64) for name, value in pred.heads.items()}
     both = "local" in heads and "global" in heads
     true, hidden = pred.true.astype(np.float64), pred.hidden.astype(bool)
@@ -680,11 +753,15 @@ def score_heads(
         keep = hidden[:, j]
         row = {"gene": gene, "n_hidden": int(keep.sum())}
         for name, p in heads.items():
-            row[f"{name}_r2"] = _r2(p[keep, j], true[keep, j])
-            row[f"{name}_pearson"] = _pearson(p[keep, j], true[keep, j])
+            if "r2" in gene_metrics:
+                row[f"{name}_r2"] = _r2(p[keep, j], true[keep, j])
+            if "pearson" in gene_metrics:
+                row[f"{name}_pearson"] = _pearson(p[keep, j], true[keep, j])
+            if "cosine" in gene_metrics:
+                row[f"{name}_cosine"] = _pooled_cosine(p[:, [j]] - center[j], true[:, [j]] - center[j], hidden[:, [j]])
         if both:
-            row["global - local_r2"] = row["global_r2"] - row["local_r2"]
-            row["global - local_pearson"] = row["global_pearson"] - row["local_pearson"]
+            for metric in gene_metrics:
+                row[f"global - local_{metric}"] = row[f"global_{metric}"] - row[f"local_{metric}"]
         rows.append(row)
     per_gene = pd.DataFrame(rows)
     tables["per_gene"] = per_gene
@@ -702,10 +779,12 @@ def score_heads(
             in_group = per_gene["gene"].isin([genes[c] for c in cols])
             row = {"group": group, "n_genes": len(cols), "n_hidden": int(keep.sum())}
             for name, p in heads.items():
-                row[f"{name}_r2"] = float(per_gene.loc[in_group, f"{name}_r2"].mean())
+                if "r2" in gene_metrics:
+                    row[f"{name}_r2"] = float(per_gene.loc[in_group, f"{name}_r2"].mean())
                 row[f"{name}_cosine"] = _pooled_cosine(p - offset, true - offset, keep)
             if both:
-                row["global - local_r2"] = row["global_r2"] - row["local_r2"]
+                if "r2" in gene_metrics:
+                    row["global - local_r2"] = row["global_r2"] - row["local_r2"]
                 row["global - local_cosine"] = row["global_cosine"] - row["local_cosine"]
             rows.append(row)
         tables["by_group"] = pd.DataFrame(rows)

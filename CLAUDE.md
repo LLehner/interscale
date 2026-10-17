@@ -158,6 +158,18 @@ one phase, unchanged), `local_then_global`, `local_then_global_ft`, `alternating
 
 Post-hoc analysis utilities operating on the `adata` produced by `save_evaluation_results`/`get_model_output`: gene loadings, gene-rank analysis, gene-set covariance, latent-space analysis, graph classification metrics, and network/attention stream visualization (`net_streams.py`).
 
+What each evaluation task answers, which pass it reads, and which ones not to base conclusions on:
+[`.claude/linear_probing_docs.md`](.claude/linear_probing_docs.md). In short, reconstruction from
+context is read on a **masked pass** (the input corrupted as in training, seeded discs hidden):
+`masked_probing` (head scores and model-free references by depth, label/covariate probes by depth
+with a `smoother` feature set), `attention_diagnostics.attention_by_query` (attention of hidden
+queries against uniform attention, distance profiles, planted pairs against distance-matched cells),
+`receptive_field` (which visible cells a hidden cell's prediction depends on, by gradient) and
+`representations` (CKA, participation ratio). The relevance rollout (`tl/self_attn_relevance.py`)
+backpropagates the summed output after an affine LayerNorm, a degenerate target, so `_attn_matrix`,
+`cls_horizontal`/`cls_vertical` and everything built on them (`downstream_regression`,
+`net_streams`, `flow_control`, `graph_classification`) are not interpretable.
+
 #### Online probes (`evaluation/online_probes.py`)
 
 `linear_probing.py` probes a finished run's `.h5ad`. `online_probes.py` probes *during* training,
@@ -181,11 +193,12 @@ Results are logged as flat
 sweep — plus, under wandb, one custom chart per target carrying both embeddings as two lines. The
 `probe/` prefix is load-bearing: wandb sections split on the text before the first `/`, so it keeps
 these out of the default panel section where InterScale's own `train_`/`val_` metrics live.
-`probe.attention_diagnostics: true` adds per-layer, per-head attention diagnostics from a clean pass
-over the first `probe.attention_graphs` val graphs: span in µm, the share beyond each of
-`probe.attention_radii_um`, CLS mass, effective keys, and the Performer's TV distance to softmax, as
-`probe/attn_<metric>_l<layer>_h<head>` (`evaluation/attention_diagnostics.py`; Stage 1 of
-`.claude/attention_plan.md`).
+`probe.attention_diagnostics: true` adds per-layer, per-head attention diagnostics over the first
+`probe.attention_graphs` val graphs, under their own masks (`probe.attention_masked`, default; false
+reads a clean pass): span in µm and relative to uniform attention, the share beyond each of
+`probe.attention_radii_um`, CLS mass, effective keys (also over the keys a cell can attend to), and
+the Performer's TV distance to softmax, as `probe/attn_<metric>_l<layer>_h<head>`
+(`evaluation/attention_diagnostics.py`; Stage 1 of `.claude/attention_plan.md`).
 
 Numeric `obs` targets reach the graphs as an **obsm matrix** (`dataset.probe_obsm_key`), because
 geome cannot attach a numeric obs column — it returns a pandas Series and dies in `torch.cat`.

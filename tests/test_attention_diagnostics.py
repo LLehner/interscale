@@ -405,8 +405,12 @@ def test_the_probe_callback_logs_the_diagnostics_as_its_only_target():
         module, _Datamodule(), device=torch.device("cpu")
     )
 
-    assert results == _diagnose(module, _Datamodule.val_data[:2], radii_um=(20.0,))
+    assert results == _diagnose(module, _Datamodule.val_data[:2], radii_um=(20.0,), masked=True)
     assert attention_metric_name("beyond_20um", 0, 0) in results
+
+    cfg.probe.attention_masked = False
+    clean = OnlineProbeCallback(cfg, [f"g{i}" for i in range(8)]).run(module, _Datamodule(), device=torch.device("cpu"))
+    assert clean == _diagnose(module, _Datamodule.val_data[:2], radii_um=(20.0,))
 
 
 @pytest.mark.parametrize(

@@ -14,6 +14,14 @@ clean pass (nothing masked, dropout off) over a fixed set of graphs:
 * **token cosine**, per layer -- the mean cosine between two cell tokens entering attention,
   before any centring. Near 1 the tokens are nearly identical, and attention computed from their
   content cannot tell keys apart (see ``attention.center_qk``).
+* **against uniform** -- ``span_rel``, the span over the mean distance to the keys the query can
+  attend to (what uniform attention reaches; 2.6 mm on a 5 mm slide), and ``effective_keys_rel``,
+  effective keys over the number of those keys: 1 for uniform attention.
+
+:func:`attention_by_query` reads a **masked** pass instead -- the masks the graphs carry, as in
+training -- by how deep each query lies in the hidden area, with visible-versus-hidden key mass,
+distance profiles and planted edges against distance-matched cells. That is where a global
+component has to work; :func:`attention_diagnostics` can take the masked pass too (``masked``).
 
 Every number is over **cell queries**: CLS and padding rows are left out. Padding is never a key.
 Span, radii and effective keys renormalise each row over its cell keys -- CLS is the sink and is
@@ -38,10 +46,24 @@ from collections import defaultdict
 from collections.abc import Sequence
 
 import numpy as np
+import pandas as pd
 import torch
 from torch_geometric.loader import DataLoader
 
-from interscale.evaluation.online_probes import PROBE_PREFIX, _rng_untouched
+from interscale.evaluation._spatial_weights import (
+    VISIBLE,
+    add_finite,
+    bin_labels,
+    distance_profile,
+    graph_edges,
+    hidden_cells,
+    matched_ranks,
+    pair_exclusions,
+    query_groups,
+    radius_metric,
+    row_statistics,
+)
+from interscale.evaluation.online_probes import PROBE_PREFIX, _rng_untouched, hidden_depth
 from interscale.tl.padding import pad_like
 
 #: A row whose attention on cells sums to less than this is all sink: its span, radii and effective
@@ -60,11 +82,6 @@ def attention_metric_name(metric: str, layer: int | None = None, head: int | Non
     if head is None:
         return f"{PROBE_PREFIX}/attn_{metric}_l{layer}_mean"
     return f"{PROBE_PREFIX}/attn_{metric}_l{layer}_h{head}"
-
-
-def radius_metric(radius_um: float) -> str:
-    """``300`` -> ``"beyond_300um"``, ``37.5`` -> ``"beyond_37p5um"``: no dot, which wandb reads as nesting."""
-    return "beyond_" + np.format_float_positional(float(radius_um), trim="-").replace(".", "p") + "um"
 
 
 def head_statistics(
@@ -121,20 +138,26 @@ def head_statistics(
             for head in range(n_heads):
                 row = b * n_heads + head
                 queries = maps[layer, row][cells].double()  # [n, S + 1]: cell queries, every key
+                exact = None if reference is None else reference[layer, row][cells].double()
                 on_cells = queries[:, cells]  # [n, n]
                 mass = on_cells.sum(-1)
                 kept = mass > MIN_CELL_MASS
                 share = on_cells / mass.clamp_min(MIN_CELL_MASS)[:, None]
+                # The keys a query can attend to: a weight above 0 in the exact map.
+                open_keys = (queries if exact is None else exact)[:, cells] > 0
+                n_open = open_keys.sum(-1).double().clamp_min(1.0)
                 stats = {
                     "cls_mass": queries[:, seq_len],
                     "effective_keys": torch.special.entr(share).sum(-1).exp(),
                 }
+                stats["effective_keys_rel"] = stats["effective_keys"] / n_open
                 if dist is not None:
                     stats["span_um"] = (share * dist).sum(-1)
+                    uniform = (dist * open_keys).sum(-1) / n_open
+                    stats["span_rel"] = stats["span_um"] / uniform.clamp_min(1e-12)
                     for radius in radii_um:
                         stats[radius_metric(radius)] = (share * (dist > float(radius))).sum(-1)
-                if reference is not None:
-                    exact = reference[layer, row][cells].double()
+                if exact is not None:
                     stats["tv_softmax"] = 0.5 * (queries - exact).abs().sum(-1)
                 for metric, values in stats.items():
                     picked = values if metric in _EVERY_ROW else values[kept]
@@ -182,6 +205,7 @@ def attention_diagnostics(
     spatial_unit_um: float = 1.0,
     radii_um: Sequence[float] = (),
     max_graphs: int = 4,
+    masked: bool = False,
 ) -> dict[str, float]:
     """Run ``module`` over the first ``max_graphs`` graphs of ``data_list`` and diagnose its attention.
 
@@ -202,6 +226,10 @@ def attention_diagnostics(
         Radii (µm) for the mass beyond them.
     max_graphs
         How many graphs to read; 0 or less reads all of them.
+    masked
+        False blanks every mask first: a clean pass, every cell attending with its own expression.
+        True keeps the masks the graphs carry, so the module corrupts its input as in training
+        (:func:`attention_by_query` reads that pass by query depth).
 
     Returns
     -------
@@ -232,9 +260,9 @@ def attention_diagnostics(
                 batch = batch.to(device)
                 # Clean: nothing blanked, so attention is read on the real expression. New tensors,
                 # never written in place -- they may share storage with the split's Data objects.
-                if getattr(batch, "mask", None) is not None:
+                if not masked and getattr(batch, "mask", None) is not None:
                     batch.mask = torch.zeros_like(batch.mask)
-                if getattr(batch, "gene_mask", None) is not None:
+                if not masked and getattr(batch, "gene_mask", None) is not None:
                     batch.gene_mask = torch.zeros_like(batch.gene_mask)
                 module._common_step(batch, prediction_task, prediction_level)
                 passes = list(record)
@@ -282,3 +310,264 @@ def attention_diagnostics(
     if token_cosine:
         results[attention_metric_name("token_cosine")] = float(np.mean([np.mean(v) for v in token_cosine.values()]))
     return results
+
+
+@torch.no_grad()
+def attention_by_query(
+    module,
+    data_list,
+    *,
+    prediction_task: str,
+    prediction_level: str,
+    device,
+    spatial_unit_um: float,
+    depth_bins_um: Sequence[float],
+    radii_um: Sequence[float] = (),
+    distance_bins_um: Sequence[float] = (),
+    edges: pd.DataFrame | None = None,
+    tolerance_um: float = 50.0,
+    max_graphs: int = 0,
+) -> dict[str, pd.DataFrame]:
+    """The raw attention of a masked pass, by how deep each query lies in the hidden area.
+
+    The graphs keep the masks they carry (e.g. discs from ``masked_probing.draw_masks``) and the
+    module corrupts its input with them as in training. A hidden cell then queries with its mask
+    token and position in the first layer, and with what it gathered in later ones. A clean pass
+    reads a regime training never shows: every cell holds its own expression, a receiver its own
+    response, so nothing needs to look anywhere.
+
+    Each cell query falls in a group -- ``"visible"``, or the depth bin (``depth_bins_um``) of a
+    wholly hidden cell, its distance to the nearest cell with a visible entry -- and is read over the
+    cell keys it can attend to (a weight above 0 in the exact map: the Performer's reference, else the
+    map itself), against uniform attention over them:
+
+    * ``span_um``, ``span_rel``, ``effective_rel``, ``beyond_<r>um`` -- span, span over the uniform
+      span, effective keys over the number of keys, the share beyond each radius
+      (:func:`~interscale.evaluation._spatial_weights.row_statistics`);
+    * ``visible_mass`` -- the share of the cell mass on visible cells; ``visible_lift`` -- that over
+      the visible cells' share of the keys: 1 is blind to what is hidden, above 1 prefers what can
+      be seen;
+    * ``cls_mass`` -- the weight on CLS; ``tv_softmax`` -- the Performer's distance to softmax;
+    * ``token_cosine`` (query ``"all"``) -- the mean cosine of the cell tokens entering each layer.
+
+    Consumes no RNG and leaves the module as it was, like :func:`attention_diagnostics`.
+
+    Parameters
+    ----------
+    edges
+        Planted ``sender``, ``receiver``, ``range_class`` pairs by position in the AnnData the graphs
+        were built from (:func:`~interscale.evaluation._spatial_weights.graph_edges`).
+    tolerance_um
+        How far a comparison cell's distance to the receiver may differ from the sender's.
+
+    Returns
+    -------
+    dict
+        ``"by_query"``: ``layer, head, query, metric, value, n_queries`` -- per head (``h<k>``) and
+        their mean (``mean``), each a mean over the group's queries of every graph. ``"profile"``
+        (with ``distance_bins_um``): ``layer, query, distance_um, lift, n_queries`` -- the head-mean
+        map's weight per distance bin over what uniform attention puts there (1 is uniform).
+        ``"edges"`` (with ``edges``): ``layer, range_class, metric, value, n_pairs`` for the planted
+        pairs with a wholly hidden receiver and a visible sender, from the head-mean map --
+        ``coverage``, the share whose sender the receiver can attend to, and ``matched_rank``, the
+        sender's rank among the visible cells about as far from the receiver
+        (:func:`~interscale.evaluation._spatial_weights.matched_ranks`): 0.5 is attention blind to
+        the edge, a distance kernel for one; 1 the top.
+    """
+    transformer = getattr(module, "global_module", module)
+    if not hasattr(transformer, "recording_attention"):
+        warnings.warn(
+            "attention_by_query: this module has no transformer; nothing to read.", RuntimeWarning, stacklevel=2
+        )
+        return {}
+    graphs = list(data_list)
+    if max_graphs > 0:
+        graphs = graphs[:max_graphs]
+    groups = [VISIBLE, *bin_labels(depth_bins_um)]
+    unit = float(spatial_unit_um)
+    sums: dict[tuple, list] = {}
+    profile: dict[tuple, np.ndarray] = {}
+    edge_sums: dict[tuple, np.ndarray] = {}
+    token_cosine: dict[int, list[float]] = defaultdict(list)
+    n_bins = max(len(distance_bins_um) - 1, 0)
+    n_heads = 0
+    was_training = module.training
+    module.eval()
+    loader = DataLoader(dataset=graphs, shuffle=False, batch_size=1, num_workers=0)
+    try:
+        with _rng_untouched(device), transformer.recording_attention(reference=True) as record:
+            for batch in loader:
+                batch = batch.to(device)
+                if getattr(batch, "pos", None) is None:
+                    raise ValueError("attention_by_query reads distances, but a graph carries no `pos`.")
+                module._common_step(batch, prediction_task, prediction_level)
+                entry = record[0]
+                record.clear()
+                if entry.get("maps") is None:
+                    continue
+                maps, reference = entry["maps"], entry.get("reference")
+                dev = maps.device
+                padding = entry["src_padding_mask"][0].bool().to(dev)
+                seq_len = padding.shape[0]
+                spots = (~padding).nonzero().squeeze(1)  # the cells' token positions, CLS left out
+                nodes = torch.as_tensor(entry["index_nodes"][0], dtype=torch.long, device=dev)
+                hidden_cell = hidden_cells(module, batch).to(dev)
+                depth = hidden_depth(batch.pos.to(dev), hidden_cell, batch.batch.to(dev)) * unit
+                hid = hidden_cell[nodes]
+                where = batch.pos.to(dev)[nodes].double() * unit
+                dist = torch.cdist(where, where, compute_mode="donot_use_mm_for_euclid_dist")
+                group = query_groups(depth[nodes].cpu().numpy(), hid.cpu().numpy(), depth_bins_um)
+                n_layers, n_heads = maps.shape[0], maps.shape[1]
+
+                for layer in range(n_layers):
+                    for head in range(n_heads):
+                        rows = maps[layer, head][spots].double()  # [n, S + 1]
+                        exact = rows if reference is None else reference[layer, head][spots].double()
+                        attn, open_keys = rows[:, spots], exact[:, spots] > 0
+                        stats = row_statistics(attn, dist, open_keys, radii_um)
+                        cell_mass = torch.where(open_keys, attn, torch.zeros_like(attn)).sum(1)
+                        visible_keys = open_keys & ~hid[None, :]
+                        visible_mass = torch.where(visible_keys, attn, torch.zeros_like(attn)).sum(1)
+                        visible_mass = visible_mass / cell_mass.clamp_min(torch.finfo(torch.float64).tiny)
+                        visible_share = visible_keys.sum(1).double() / open_keys.sum(1).double().clamp_min(1.0)
+                        nan = torch.full_like(visible_mass, float("nan"))
+                        stats["visible_mass"] = torch.where(cell_mass > 0, visible_mass, nan)
+                        stats["visible_lift"] = torch.where(
+                            (cell_mass > 0) & (visible_share > 0), visible_mass / visible_share.clamp_min(1e-12), nan
+                        )
+                        stats["cls_mass"] = rows[:, seq_len]
+                        if reference is not None:
+                            stats["tv_softmax"] = 0.5 * (rows - exact).abs().sum(1)
+                        for metric, values in stats.items():
+                            values = values.cpu().numpy()
+                            for g in groups:
+                                add_finite(sums, (layer, head, g, metric), values, group == g)
+
+                    mean_rows = maps[layer].mean(0)[spots].double()
+                    mean_exact = mean_rows if reference is None else reference[layer].mean(0)[spots].double()
+                    mean_attn, mean_open = mean_rows[:, spots], mean_exact[:, spots] > 0
+                    if n_bins:
+                        weight_in, uniform_in = distance_profile(mean_attn, dist, mean_open, distance_bins_um)
+                        defined = torch.isfinite(weight_in).all(1).cpu().numpy()
+                        weight_in, uniform_in = weight_in.cpu().numpy(), uniform_in.cpu().numpy()
+                        for g in groups:
+                            pick = (group == g) & defined
+                            if pick.any():
+                                acc = profile.setdefault((layer, g), np.zeros((3, n_bins)))
+                                acc += [weight_in[pick].sum(0), uniform_in[pick].sum(0), np.full(n_bins, pick.sum())]
+                    if edges is not None:
+                        pairs = _token_pairs(edges, batch, nodes, hid)
+                        if len(pairs):
+                            r = torch.as_tensor(pairs["receiver"].to_numpy(), device=dev)
+                            s = torch.as_tensor(pairs["sender"].to_numpy(), device=dev)
+                            covered = mean_open[r, s].cpu().numpy()
+                            ranks = (
+                                matched_ranks(
+                                    mean_attn,
+                                    dist,
+                                    mean_open & ~hid[None, :],
+                                    r,
+                                    s,
+                                    pair_exclusions(pairs, len(nodes), dev),
+                                    tolerance_um,
+                                )
+                                .cpu()
+                                .numpy()
+                            )
+                            classes = pairs["range_class"].to_numpy()
+                            for range_class in [*np.unique(classes), "any"]:
+                                pick = np.ones(len(classes), bool) if range_class == "any" else classes == range_class
+                                ranked = pick & np.isfinite(ranks)
+                                acc = edge_sums.setdefault((layer, str(range_class)), np.zeros(4))
+                                acc += [pick.sum(), covered[pick].sum(), ranks[ranked].sum(), ranked.sum()]
+                if entry.get("token_cosine") is not None:
+                    for layer, values in enumerate(entry["token_cosine"].cpu().tolist()):
+                        token_cosine[layer].extend(values)
+    finally:
+        module.train(was_training)
+
+    rows = []
+    for (layer, head, g, metric), (total, count) in sorted(
+        sums.items(), key=lambda kv: (kv[0][0], kv[0][1], groups.index(kv[0][2]), kv[0][3])
+    ):
+        rows.append(
+            {
+                "layer": layer,
+                "head": f"h{head}",
+                "query": g,
+                "metric": metric,
+                "value": total / count,
+                "n_queries": count,
+            }
+        )
+    by_query = pd.DataFrame(rows, columns=["layer", "head", "query", "metric", "value", "n_queries"])
+    if len(by_query):
+        means = by_query.groupby(["layer", "query", "metric"], sort=False).agg(
+            value=("value", "mean"), n_queries=("n_queries", "max")
+        )
+        by_query = pd.concat([by_query, means.reset_index().assign(head="mean")], ignore_index=True)
+    cosines = [
+        {
+            "layer": layer,
+            "head": "mean",
+            "query": "all",
+            "metric": "token_cosine",
+            "value": float(np.mean(v)),
+            "n_queries": len(v),
+        }
+        for layer, v in sorted(token_cosine.items())
+    ]
+    by_query = pd.concat([by_query, pd.DataFrame(cosines, columns=by_query.columns)], ignore_index=True)
+    out = {"by_query": by_query}
+    if n_bins:
+        labels = bin_labels(distance_bins_um)
+        rows = []
+        for (layer, g), (weight, uniform, count) in sorted(
+            profile.items(), key=lambda kv: (kv[0][0], groups.index(kv[0][1]))
+        ):
+            for b, label in enumerate(labels):
+                lift = weight[b] / uniform[b] if uniform[b] > 0 else np.nan
+                rows.append(
+                    {"layer": layer, "query": g, "distance_um": label, "lift": lift, "n_queries": int(count[b])}
+                )
+        out["profile"] = pd.DataFrame(rows, columns=["layer", "query", "distance_um", "lift", "n_queries"])
+    if edges is not None:
+        rows = []
+        for (layer, range_class), (n, covered, rank_sum, ranked) in sorted(edge_sums.items()):
+            rows.append(
+                {
+                    "layer": layer,
+                    "range_class": range_class,
+                    "metric": "coverage",
+                    "value": covered / n if n else np.nan,
+                    "n_pairs": int(n),
+                }
+            )
+            rows.append(
+                {
+                    "layer": layer,
+                    "range_class": range_class,
+                    "metric": "matched_rank",
+                    "value": rank_sum / ranked if ranked else np.nan,
+                    "n_pairs": int(ranked),
+                }
+            )
+        out["edges"] = pd.DataFrame(rows, columns=["layer", "range_class", "metric", "value", "n_pairs"])
+    return out
+
+
+def _token_pairs(edges: pd.DataFrame, batch, nodes: torch.Tensor, hid: torch.Tensor) -> pd.DataFrame:
+    """The planted pairs of ``batch``'s graph as token indices, where the receiver is wholly hidden and the sender visible.
+
+    ``nodes`` maps each cell token to its node; ``hid`` marks the tokens whose cells are hidden.
+    """
+    pairs = graph_edges(edges, batch.obs_names)
+    token = np.full(batch.num_nodes, -1, dtype=np.int64)
+    token[nodes.cpu().numpy()] = np.arange(len(nodes))
+    sender, receiver = token[pairs["sender"].to_numpy()], token[pairs["receiver"].to_numpy()]
+    hidden = hid.cpu().numpy()
+    keep = (sender >= 0) & (receiver >= 0)
+    keep[keep] &= hidden[receiver[keep]] & ~hidden[sender[keep]]
+    return pd.DataFrame(
+        {"sender": sender[keep], "receiver": receiver[keep], "range_class": pairs["range_class"].to_numpy()[keep]}
+    )
