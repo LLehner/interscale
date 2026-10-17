@@ -22,7 +22,7 @@ user runs smoke, sweeps and evaluation on the cluster.
 
 ## Status
 
-Last updated 2026-10-15.
+Last updated 2026-10-17.
 
 | stage | state | verified by | date |
 |---|---|---|---|
@@ -36,6 +36,7 @@ Last updated 2026-10-15.
 | C1 — per-head loss weights and module freezing | not started | | |
 | C2 — staged training driver (phases: local → global, fine-tune, alternating) | not started | | |
 | C3 — staged-training sweep | not started | | |
+| guard — hidden cells' precomputed embeddings (`precomputed_mask_fill`: learned / −1) | **implemented, unverified** — see Stage A, "Fixed inputs for debugging". 10 mutations caught; 748 tests pass; harness IDENTICAL. **Not run on data** | 2026-10-17 |
 
 ## What we know (rounds 1–3b)
 
@@ -252,32 +253,61 @@ not the route for Stage B.
   fixed after the first slide it sees: a validation slide (sanity check), whose hidden rows are all
   −1. Fixed, but not fitted on what one would expect. Fitting it once on the training slides would
   be cleaner; not done, since it changes existing runs.
-- **`Precomputed` leaks under masking as it stands.** `apply_mask` overwrites only `x`, not the
-  `embeddings` read from `obsm`. A hidden spot would hand the transformer an embedding of its own
-  true expression. It needs a guard before any masked run (not built; the fill is the user's
-  decision):
-  - a hidden cell's whole embedding replaced by a fill. Recommended: one *learned* mask embedding.
-    Not zeros: in a centred embedding zero is roughly an average cell, the same trap as the old 0
-    fill of expression;
-  - gene masking refused with `Precomputed`, since an embedding cannot hide single genes;
-  - a test through the real model that hidden cells' embeddings never reach a prediction.
+- **`Precomputed` is guarded (built 2026-10-17).** `apply_mask` overwrites only `x`, not the
+  `embeddings` read from `obsm`, so a hidden cell used to hand the transformer an embedding of its
+  own true expression -- a compressed copy of the answer (cf. round 3b's first run, where hidden
+  discs were not hidden: SCE 0.037, noise genes at r = 0.997). Now:
+  - **The fill.** `GlobalModule.hide_embeddings` replaces a hidden cell's whole embedding with
+    the fill set by `model.global_component.parameters.precomputed_mask_fill`:
+    - `learned` (default): one trained vector shared by every hidden cell, drawn from a private
+      generator, so the rest of the model is initialised identically under both fills;
+    - `minus_one`: every entry −1 (`MASK_VALUE`), as masked expression.
+  - **Where it applies.** In every masked pass: training, validation, probes and head scores.
+    Inference (`get_model_output`) and clean probe passes leave the embeddings as they are.
+  - **Gene masking is refused,** by the config validator and by the module: an embedding cannot
+    hide single genes.
+  - **`latent_obsm_key` must be set.**
+  - **Checkpoint tag:** `emb-pre-learned_` / `emb-pre-m1_`. Precomputed checkpoints from before
+    2026-10-17 carry no tag, and their hidden cells leaked.
+  - **Tests,** through a GlobalModel built from a config:
+    - a random change to the hidden cells' embeddings never changes a prediction, while a change
+      to a visible cell's embedding does;
+    - the learned fill trains, and the −1 fill adds no parameter;
+    - a clean pass is untouched;
+    - both fills initialise the rest of the model identically;
+    - the config and the module refuse what they should.
 
-  Why it leaks: the target is the hidden cell's expression, and its precomputed embedding was made
-  from that expression -- a compressed copy of the answer (cf. round 3b's first run, where hidden
-  discs were not hidden: SCE 0.037, noise genes at r = 0.997). Why not −inf: as a token value it
-  turns into NaN at the first LayerNorm (inf − inf); −inf only works on attention logits, and
-  blocking hidden cells as keys would still leave a hidden cell's own token in its residual stream,
-  straight to its own prediction. The token itself must be replaced, and embeddings have no known
-  range for a fixed out-of-range value (as −1 is for expression), hence a learned vector.
+    10 mutations, each caught; 748 tests pass; harness IDENTICAL.
+
+  **Correction (2026-10-17) of what this plan said before.** I had recommended the learned vector
+  because "zero is roughly an average cell" and "embeddings have no known range for an
+  out-of-range value". That does not hold here. Every token first goes through the transformer's
+  input LayerNorm, which removes a token's mean and scale. So **any constant fill (−1, 0, 5)
+  comes out as the LayerNorm's bias vector**. No real embedding becomes that, since a real one is
+  not constant across its dimensions, however close to zero it is. An average-looking real
+  embedding is rescaled to unit variance and keeps its direction.
+
+  So −1 is a valid fill, and the two settings differ in this way:
+  - `minus_one`: the hidden token is the LayerNorm bias, which is shared with every token's
+    offset;
+  - `learned`: the hidden token is a direction of its own.
+
+  Which works better is an empirical question, hence both. A side effect of the same LayerNorm:
+  a per-cell offset or scale in a precomputed embedding (e.g. one that tracks library size)
+  never reaches the transformer.
+
+  Why not −inf: as a token value it turns into NaN at that LayerNorm (inf − inf). −inf only works
+  on attention logits, and blocking hidden cells as keys would still leave a hidden cell's own
+  token in its residual stream, straight to its own prediction. The token itself must be replaced.
 
 **Implementation:**
 - Both training and inference go through `GlobalModule.gex_embedding(batch)`. Training passes the
   masked batch, `GlobalModel.get_model_output` the clean one.
-- The other inputs (PCA, NMF, Precomputed) behave exactly as before.
+- PCA and NMF behave exactly as before; Precomputed now hides hidden cells' embeddings (above).
 - The config validator accepts only inputs the module can build: None, PCA, NMF, Precomputed,
   Linear. The `scvi` value named in old docstrings is refused.
-- Only the global-only checkpoint name carries `emb-linear_`. A `CombinedModel` ignores
-  `type_gex_embedding`, so its name is unchanged, and PCA/NMF/Precomputed names are unchanged too.
+- Only the global-only checkpoint name carries `emb-linear_` (or `emb-pre-*_`). A `CombinedModel`
+  ignores `type_gex_embedding`, so its name is unchanged, and PCA/NMF names are unchanged too.
 
 **Verified by tests:**
 - the layer is built and receives gradient;

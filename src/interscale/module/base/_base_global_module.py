@@ -5,13 +5,24 @@ import numpy as np
 import torch
 from sklearn.decomposition import NMF, PCA
 
+from interscale.tl.masking import MASK_VALUE
+
 from ._base_module import BaseModule
 from ._step_output import StepOutput, ViewOutput, gather_cls, gather_tokens
 
+#: How a hidden cell's precomputed embedding is replaced (``precomputed_mask_fill``).
+PRECOMPUTED_MASK_FILLS = ("learned", "minus_one")
+
 
 class GlobalModule(BaseModule):
-    def __init__(self, **base_module_kwargs):
+    def __init__(self, precomputed_mask_fill: str = "learned", **base_module_kwargs):
+        """``precomputed_mask_fill``: what a hidden cell's ``Precomputed`` embedding is replaced by.
 
+        A precomputed embedding was made from the cell's own expression, which is the
+        reconstruction target, so a hidden cell must not hand it to the transformer.
+        ``"learned"``: one trained vector shared by every hidden cell. ``"minus_one"``: every entry
+        set to ``MASK_VALUE``, as masked expression is. See :meth:`hide_embeddings`.
+        """
         super().__init__(**base_module_kwargs)
 
         self.registered_local_component = False
@@ -40,7 +51,21 @@ class GlobalModule(BaseModule):
         elif self.type_gex_embedding == "NMF":
             self.nmf = NMF(n_components=self.n_embed, init="random", random_state=0)
         elif self.type_gex_embedding == "Precomputed":
-            pass
+            if precomputed_mask_fill not in PRECOMPUTED_MASK_FILLS:
+                raise ValueError(
+                    f"precomputed_mask_fill must be one of {PRECOMPUTED_MASK_FILLS}, got {precomputed_mask_fill!r}."
+                )
+            if self.masked_nodes and self.mask_strategy == "gene":
+                raise ValueError(
+                    "Precomputed embeddings cannot hide single genes: a cell's embedding encodes all of its "
+                    "expression. Use mask_strategy node (or spatial blocks)."
+                )
+            self.precomputed_mask_fill = precomputed_mask_fill
+            if precomputed_mask_fill == "learned":
+                # From a private generator, so building it draws nothing from the global one: the
+                # rest of the model is initialised identically under either fill.
+                gen = torch.Generator().manual_seed(0)
+                self.mask_embedding = torch.nn.Parameter(torch.randn(self.n_embed, generator=gen))
         elif self.type_gex_embedding == "Linear":
             # A learned map from the (masked) expression to the tokens, trained with the
             # transformer -- the only input of a global-only model that is not fixed in advance.
@@ -60,12 +85,14 @@ class GlobalModule(BaseModule):
                 Size: [N, E], either output of local component or user-provided embeddings.
         """
 
-    def gex_embedding(self, batch) -> torch.Tensor:
+    def gex_embedding(self, batch, hidden: torch.Tensor | None = None) -> torch.Tensor:
         """``[N, n_embed]`` tokens of a model without a local component, from ``batch`` as given.
 
         ``Linear`` maps ``batch.x`` through the learned layer, on its device and in the graph;
         otherwise precomputed ``batch.embeddings``, or the PCA/NMF projection of ``batch.x``. The
-        caller passes the masked batch in training and the clean one at inference.
+        caller passes the masked batch in training and the clean one at inference. ``hidden``
+        (``[N]`` boolean) marks the cells whose precomputed embeddings must not reach the model;
+        the other inputs are computed from the masked ``batch.x`` and need no such marker.
         """
         if self.type_gex_embedding == "Linear":
             return self.input_embedding(batch.x.float())
@@ -73,7 +100,25 @@ class GlobalModule(BaseModule):
             embedding = batch.embeddings
         else:
             embedding = self.create_gex_embedding(batch.x.cpu().numpy(), type=self.type_gex_embedding)
-        return torch.tensor(embedding, dtype=torch.float32, device=batch.x.device)
+        embedding = torch.tensor(embedding, dtype=torch.float32, device=batch.x.device)
+        if self.type_gex_embedding == "Precomputed" and hidden is not None:
+            embedding = self.hide_embeddings(embedding, hidden)
+        return embedding
+
+    def hide_embeddings(self, embedding: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        """``embedding`` with the rows of ``hidden`` cells replaced by the mask fill.
+
+        Masking corrupts ``batch.x`` only, so without this a hidden cell would hand the transformer
+        its precomputed embedding -- a compressed copy of the expression it is scored on. The fill
+        goes through the transformer's input LayerNorm like any token. Note that a constant vector
+        (``"minus_one"``) comes out of it as the LayerNorm's bias: the same token whatever the
+        constant, and different from any real (non-constant) embedding.
+        """
+        if self.precomputed_mask_fill == "learned":
+            fill = self.mask_embedding.to(embedding.dtype)
+        else:
+            fill = torch.full((self.n_embed,), MASK_VALUE, dtype=embedding.dtype, device=embedding.device)
+        return torch.where(hidden.bool()[:, None], fill.expand_as(embedding), embedding)
 
     def create_gex_embedding(self, embeddings: torch.Tensor, type: Literal["PCA", "NMF", "scvi"]):
         """Generate embeddings for GEX if no local component is used.
@@ -316,7 +361,10 @@ class GlobalModule(BaseModule):
         """
         # Mask nodes  - before GEX embedding because otherwise embedding contains information about masked nodes
         batch_masked, _, _ = self._common_step_masking(batch)
-        embedding = self.gex_embedding(batch_masked)
+        # The cells whose own values the model must not see; a precomputed embedding of theirs is
+        # replaced too (`hide_embeddings`).
+        hidden = batch_masked.mask.bool() if self.masked_nodes else None
+        embedding = self.gex_embedding(batch_masked, hidden=hidden)
         assert embedding.shape == (batch_masked.x.shape[0], self.n_embed), (
             f"Mismatch: embedding.shape: {embedding.shape}, batch_masked.x.shape: {batch_masked.x.shape}"
         )
@@ -406,6 +454,7 @@ class GlobalModule(BaseModule):
                 return_attention_maps=cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION,
                 attention=attention,
                 attention_seed=int(cfg.optim.get("seed", 0) or 0),
+                precomputed_mask_fill=params.get("precomputed_mask_fill", "learned"),
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,
             )

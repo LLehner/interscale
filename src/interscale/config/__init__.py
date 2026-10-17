@@ -471,6 +471,35 @@ def _validate(cfg):
     _validate_center_targets(cfg)
     _validate_global_residual(cfg)
     _validate_gex_embedding(cfg)
+    _validate_precomputed_embedding(cfg)
+
+
+def _validate_precomputed_embedding(cfg):
+    """``Precomputed`` tokens need an obsm key, a known mask fill, and whole-cell masking."""
+    from interscale.module.base._base_global_module import PRECOMPUTED_MASK_FILLS
+
+    params = cfg.model.global_component.get("parameters", None)
+    if params is None:
+        return
+    fill = params.get("precomputed_mask_fill", "learned")
+    if fill not in PRECOMPUTED_MASK_FILLS:
+        raise ValueError(
+            f"model.global_component.parameters.precomputed_mask_fill must be one of {PRECOMPUTED_MASK_FILLS}, "
+            f"got {fill!r}."
+        )
+    if params.get("type_gex_embedding", None) != "Precomputed":
+        return
+    if cfg.model.global_component.get("latent_obsm_key", None) is None:
+        raise ValueError(
+            "type_gex_embedding Precomputed reads the embeddings from adata.obsm, but "
+            "model.global_component.latent_obsm_key is unset."
+        )
+    if cfg.dataset.mask_strategy == "gene":
+        raise ValueError(
+            "type_gex_embedding Precomputed cannot be combined with mask_strategy gene: a cell's embedding "
+            "encodes all of its expression, so single hidden genes would still reach the model through it. "
+            "Use mask_strategy node (or spatial blocks)."
+        )
 
 
 #: The values ``GlobalModule`` builds a token input for (``scvi`` is named in old docstrings only).

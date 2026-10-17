@@ -24,6 +24,11 @@ def get_global_component_cfg(cfg, global_component_name):
         # none, PCA (fitted once and frozen), NMF, Precomputed (obsm[latent_obsm_key]) or Linear (a
         # learned layer on the masked expression, trained with the transformer; .claude/global_plan.md, A1).
         cfg.model.global_component.parameters.type_gex_embedding = None
+        # With Precomputed: what a hidden cell's embedding is replaced by, since it was made from
+        # the expression the model is scored on. learned: one trained vector for every hidden cell;
+        # minus_one: every entry -1 (MASK_VALUE), as masked expression. Gene masking is refused
+        # with Precomputed (an embedding cannot hide single genes).
+        cfg.model.global_component.parameters.precomputed_mask_fill = "learned"
 
         # Positional encodings, see `.claude/PE_plan.md`. An empty `node` list builds nothing and
         # is the model from before PEs existed. Node encodings are summed into each cell's token;

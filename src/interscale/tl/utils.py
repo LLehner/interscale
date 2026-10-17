@@ -107,14 +107,21 @@ def _attention_tag(cfg) -> str:
 
 
 def _embedding_tag(cfg) -> str:
-    """``emb-linear_`` when a GlobalModel's tokens come from the learned linear input, else ``""``.
+    """The token input of a GlobalModel, for its checkpoint name.
 
-    Only the global-only prefix carries it: a CombinedModel ignores ``type_gex_embedding``. The
-    older inputs (PCA, NMF, Precomputed) add nothing, so their names are unchanged.
+    ``emb-linear_`` for the learned linear input; ``emb-pre-learned_`` / ``emb-pre-m1_`` for
+    precomputed embeddings with a learned or a -1 mask fill (added 2026-10-17: checkpoints made
+    with Precomputed before then carry no tag, and their hidden cells' embeddings were not masked).
+    Only the global-only prefix carries it: a CombinedModel ignores ``type_gex_embedding``. PCA and
+    NMF add nothing, so their names are unchanged.
     """
     params = cfg.model.global_component.get("parameters", None)
-    if params is not None and params.get("type_gex_embedding", None) == "Linear":
+    embedding = params.get("type_gex_embedding", None) if params is not None else None
+    if embedding == "Linear":
         return "emb-linear_"
+    if embedding == "Precomputed":
+        fill = params.get("precomputed_mask_fill", "learned")
+        return f"emb-pre-{'learned' if fill == 'learned' else 'm1'}_"
     return ""
 
 
