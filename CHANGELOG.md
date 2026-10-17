@@ -12,6 +12,58 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- One results file per evaluation run (`interscale.evaluation.report`). `append_sections` appends an
+  arm's analyses to a Markdown file as `## <arm> | <analysis>` sections, each a compact CSV table;
+  `read_sections` reads them back, a later section replacing an earlier one; `write_report`
+  rewrites the file with a summary across arms on top. Missing analyses are simply absent.
+- Masked-pass evaluation, every analysis read with the input corrupted as in training (overview:
+  `.claude/linear_probing_docs.md`). Label and covariate probes are scored by depth into the hidden
+  area (`depth_bins_um`) beside a model-free `smoother` feature set (`masked_probing.smoother_features`).
+  `attention_diagnostics.attention_by_query` gives the attention of hidden queries against uniform
+  attention, distance profiles and planted pairs against distance-matched cells.
+  `evaluation.receptive_field` measures how much each visible cell influences a hidden cell's
+  prediction (Hutchinson estimates of Jacobian norms). `evaluation.representations` gives linear
+  CKA and participation ratios. `score_heads(gene_metrics=...)` can score genes by centred cosine.
+- Staged training of the local and global components (`train/_schedule.py`): per-head loss weights
+  (`optim.loss_weights`, default 0.5/0.5, the previous stacked loss), frozen components
+  (`optim.frozen`), and schedules of phases (`optim.schedule`: `joint`, `local_then_global`,
+  `local_then_global_ft`, `alternating`, `alternating_coupled`, or `custom` with
+  `optim.schedule_phases`) in one W&B run. `CombinedModel.copy_local_from` starts from a trained
+  `LocalModel`.
+- `precomputed_mask_fill` (`learned` | `minus_one`): a hidden cell's precomputed embedding
+  (`type_gex_embedding: Precomputed`) is replaced by a learned vector or -1, so it cannot hand the
+  model the values it is scored on.
+- `type_gex_embedding: Linear`, a learned linear input for the global-only `GlobalModel`, trained
+  with the transformer.
+- Head scores on hidden cells for every model type (`masked_probing.collect_head_predictions`,
+  `score_heads`): per cell, gene, gene group and depth, beside model-free references
+  (`reference_predictions`: slide mean, label mean, Gaussian kernels, nearest visible cells).
+- Spatial block masking: `dataset.mask_block_radius_um` and `dataset.mask_block_fraction` hide whole
+  cells in discs, alone or beside node or gene masking.
+- `attention.center_qk` (queries and keys from per-slide centred tokens), `optim.center_targets` (the
+  loss on gene-centred targets) and `model.decoder.global_residual` (the global head predicts the
+  local head's error).
+- Attention backends behind a registry (`attention.kind`, free head width): dense softmax, Performer
+  (FAVOR+), elu+1 linear attention and Exphormer-style sparse attention. Also attention diagnostics
+  (`probe.attention_diagnostics`: span, CLS mass, effective keys, TV distance to softmax), an
+  efficiency logging callback (`optim.log_efficiency`) and a generator for sweep arms.
+- Positional encodings (`pe.node`, `pe.bias`, `pe.rotary`): naive, sinusoidal, Laplacian
+  eigenvectors, random walk, relative distance, spectral and Fourier distance biases, and RoPE; a
+  `pe` control column in the probes.
+- `synth_spot`, a spot-lattice benchmark with planted short- and long-range programmes
+  (`evaluation/synth_spot.py`, `signal_scale`).
+- Masked post-hoc probing (`masked_probing`): gene-vector, label and covariate probes from the
+  embeddings of hidden cells.
+- Auxiliary losses (`optim.aux_loss_weights`): VICReg (variance, invariance and covariance terms),
+  context NCE with composition-matched negatives, and ring NCE (the anchor's long-range ring against
+  the GNN's neighbourhood); multi-view forward passes.
+- Online probes during training (`probe.use`): label, gene and gene-vector probes per epoch on
+  hidden cells, logged as `probe/*` with W&B charts.
+- Long-range attention masking (`long_range_attention`): the transformer cannot attend inside the
+  local component's receptive field.
+- `synth_data_0`, a synthetic dataset with known niches and a ligand-receptor interaction
+  (`evaluation/synthetic_data.py`), with post-hoc probes (`linear_probing`, `downstream_regression`)
+  and an attention-flow control (`flow_control`).
 - The scaled cosine error of GraphMAE (Hou et al., KDD 2022, eq. 2), `(1 - cos(pred, true)) ** gamma`
   per cell, is logged for every regression run whatever its loss, as `{train,val,test}_scaled_cosine_error`
   over all cells and `..._masked_scaled_cosine_error` over the masked ones. With `SCELoss` as the
@@ -39,6 +91,11 @@ and this project adheres to [Semantic Versioning][].
 
 ### Changed
 
+- The in-training attention diagnostics read the val graphs under their own masks
+  (`probe.attention_masked`, default `true`); `false` restores the clean pass.
+- `_common_step` returns a `StepOutput` (named fields, with `ViewOutput`, `gather_tokens` and
+  `gather_cls`) instead of a tuple, and the train, val and test steps share one body.
+- The transformer keeps attention maps only when something reads them.
 - `SCELoss` and `SCE_EntropyATT_Loss` take `gamma` (the paper's name) instead of `alpha`, and
   validate it is `>= 1`. `1 - cos` is clamped at 0 before the power, so a non-integer `gamma` no
   longer turns two identical rows into NaN.
@@ -68,8 +125,26 @@ and this project adheres to [Semantic Versioning][].
 - `LocalModule._common_step` returned a 4-tuple where the training plan unpacked 5; it now
   matches the 6-tuple contract of the other modules.
 
+### Deprecated
+
+- Relevance-based readouts. `tl/self_attn_relevance.py` backpropagates the summed transformer output
+  after its affine LayerNorm: the gradient is zero while the norm's scale is uniform and points in an
+  arbitrary direction after. `_attn_matrix` and `cls_horizontal`/`cls_vertical` from
+  `get_model_output`, and everything built on them (`downstream_regression`, `net_streams`,
+  `flow_control`, `graph_classification`), should not be interpreted. `evaluation.receptive_field`
+  measures what a prediction depends on.
+
 ### Fixed
 
+- Spatial blocks alone (`mask_percentage` 0) left the model input unmasked.
+- Sweep trials seed before building the model; the efficiency monitor measures training memory only;
+  the directional Fourier bias has its own checkpoint tag.
+- The long-range mask's reach follows the local module's hops (`resolve_local_mask_hops`).
+- `load_config` skipped the objective check for config files, and a `GlobalModel` was built from the
+  underived config.
+- Auxiliary loss heads were lost on save and reload.
+- Online probes masked their label targets, and the probe pass moved the global random generators;
+  it now restores every one.
 - The masked per-cell cosine (`..._masked_cosine_similarity`) averaged over every cell, and a cell
   without a masked entry entered as a cosine of 0. Under cell masking that is every unmasked cell,
   so the logged value was scaled by the fraction of cells masked: a near-perfect reconstruction
