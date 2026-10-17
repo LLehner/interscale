@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.loggers import WandbLogger
 
 from interscale.tl.masking import block_masking_on
 
@@ -123,6 +124,24 @@ def train_gene_means(data_list) -> torch.Tensor:
     Read from ``data.x``, which the masking never touches (``apply_mask`` corrupts a clone).
     """
     return torch.cat([data.x.float() for data in data_list]).mean(0)
+
+
+class StepOffsetWandbLogger(WandbLogger):
+    """A ``WandbLogger`` whose ``trainer/global_step`` continues across the phases of a schedule.
+
+    Every phase of a staged run (``train._schedule``) is its own ``Trainer``, whose global step
+    starts at 0. One logger serves all phases; after each one the training driver adds that
+    phase's steps to ``step_offset``, so the next phase's points come after it on the x axis
+    instead of on top of it. With a single phase the offset stays 0 and nothing changes.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.step_offset = 0
+
+    def log_metrics(self, metrics, step: int | None = None) -> None:
+        """Log ``metrics`` at ``step`` plus the steps of the phases before."""
+        super().log_metrics(metrics, None if step is None else step + self.step_offset)
 
 
 class MetricsHistory(Callback):

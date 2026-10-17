@@ -60,6 +60,22 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
 
         self._attach_aux_losses()
 
+    def copy_local_from(self, local_model) -> None:
+        """Take the local component (and its decoder) from a trained ``LocalModel``.
+
+        A staged schedule's first phase trains the local component alone (``train._schedule``); a
+        ``LocalModel`` trained on the same config is that phase already, and this copies it in so
+        the global phases can start from it. Needs the dual decoder, whose local module is built
+        exactly like a ``LocalModel``'s module. Strict: every weight must match by name and shape.
+        The ``LocalModel``'s auxiliary-loss heads, if any, are left behind.
+        """
+        if not self._cfg.model.decoder.dual_decoder:
+            raise ValueError(
+                "copy_local_from needs model.decoder.dual_decoder: true, where the local part has a decoder."
+            )
+        state = {k: v for k, v in local_model.module.state_dict().items() if not k.startswith("aux_losses.")}
+        self.module.local_module.load_state_dict(state, strict=True)
+
     def get_model_output(self, adata: AnnData | None = None, prefix: str = ""):
         """Save the embeddings, predictions and attentionsin the adata object.
 

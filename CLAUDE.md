@@ -132,6 +132,19 @@ configurable. Two things are easy to get wrong here:
 
 The registered ablation pairs are `<dataset>/node_reg` (cell) vs `<dataset>/node_reg_genemask` (gene) — note each carries its own `dataset.name` so the two arms do not share a checkpoint prefix. `config_files/sweeps/mask_granularity_legnini.yaml` runs the granularity/rate grid.
 
+### Staged training (`train/_schedule.py`)
+
+`optim.schedule` splits a run into phases (`.claude/global_plan.md`, Stage C): `joint` (default,
+one phase, unchanged), `local_then_global`, `local_then_global_ft`, `alternating`,
+`alternating_coupled`, or `custom` (`optim.schedule_phases`). Each phase can freeze components
+(`frozen`) and weight the dual decoder's two losses (`loss_weights`). `optim.loss_weights`
+(default 0.5 / 0.5 = the old mean of both heads) and `optim.frozen` apply to a joint run.
+
+- **The config key is `frozen`, not `freeze`:** a yacs `CfgNode` has a `freeze()` method, so
+  `cfg.optim.freeze` would return the method.
+- **`train()` runs the phases in one process,** with the weights carrying over. Only the last phase
+  checkpoints and saves, and all phases log to one W&B run with a continuing step.
+
 ### Preprocessing / robustness utilities (`interscale.pp`)
 
 `pp.segmentation_noise.apply_segmentation_noise` simulates cell-segmentation errors (used when `cfg.dataset.segmentation_robustness` is set in `main.py`/`main_sweep.py`) for robustness sweeps.

@@ -132,8 +132,13 @@ def _training_tag(cfg) -> str:
     otherwise write every arm to one checkpoint. ``ctr``: ``optim.center_targets``; ``res``:
     ``model.decoder.global_residual``; ``blk<radius µm>f<fraction>``: spatial blocks; ``lrm``: the
     long-range attention mask (``long_range_attention``, off by default). ``lrm`` was added on
-    2026-10-14: checkpoints trained with the mask on before then carry no tag.
+    2026-10-14: checkpoints trained with the mask on before then carry no tag. ``sch-<schedule>``,
+    ``lw<local>-<global>`` and ``frz-<components>``: a staged schedule, loss weights other than
+    the default 0.5 / 0.5, and frozen components (``train._schedule``).
     """
+    # Here, not at module level: interscale.train imports this module.
+    from interscale.train._schedule import resolve_loss_weights, schedule_tag
+
     parts = []
     if cfg.optim.get("center_targets", False):
         parts.append("ctr")
@@ -142,6 +147,14 @@ def _training_tag(cfg) -> str:
     params = cfg.model.global_component.get("parameters", None)
     if params is not None and params.get("long_range_attention", False):
         parts.append("lrm")
+    schedule = schedule_tag(cfg)
+    if schedule:
+        parts.append(schedule)
+    weights = resolve_loss_weights(cfg.optim.get("loss_weights", None))
+    if weights is not None:
+        parts.append(f"lw{weights['local']:g}-{weights['global']:g}")
+    if list(cfg.optim.get("frozen", [])):
+        parts.append("frz-" + "-".join(sorted(cfg.optim.frozen)))
     if cfg.dataset.get("mask_block_fraction", 0.0) > 0:
         parts.append(f"blk{cfg.dataset.mask_block_radius_um:g}f{cfg.dataset.mask_block_fraction:g}")
     return f"var-{'+'.join(parts)}_" if parts else ""

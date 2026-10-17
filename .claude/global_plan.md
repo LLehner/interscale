@@ -22,7 +22,7 @@ user runs smoke, sweeps and evaluation on the cluster.
 
 ## Status
 
-Last updated 2026-10-17.
+Last updated 2026-10-17 (Stage C built).
 
 | stage | state | verified by | date |
 |---|---|---|---|
@@ -33,8 +33,8 @@ Last updated 2026-10-17.
 | A2 — global-only sweep (input × encoding) and a local-only reference | **set up, not run** — `notebooks_and_scripts/slurm/global_only.{py,yaml}`, `global_only_sweep.yaml`; 7 arms validate with their model types, checkpoint names distinct; script checked on stub data (preflight, one W&B sweep per model type, stale-file guard, head tables and W&B summary for single- and dual-head arms) | 2026-10-15 |
 | B1 — local-embedding variants under one global model (scVI joint, scVI frozen, frozen random GCN, 1-layer GCN) | not started | | |
 | B2 — embedding sweep | not started | | |
-| C1 — per-head loss weights and module freezing | not started | | |
-| C2 — staged training driver (phases: local → global, fine-tune, alternating) | not started | | |
+| C1 — per-head loss weights and module freezing | **implemented, unverified** — `optim.loss_weights` (default 0.5 / 0.5 = the old stacked loss, same code path, harness IDENTICAL) and `optim.frozen`; the weighted sum is what `<mode>_loss` reports; a head with weight 0 sends no gradient; frozen components are out of the optimizer, unchanged after steps, in eval at every training step, and get their own `requires_grad` back | 2026-10-17 |
+| C2 — staged training driver (phases: local → global, fine-tune, alternating) | **implemented, unverified** — `optim.schedule` presets and `custom` phases; `train()` runs the phases with their epochs (exact split), learning rates, warm-ups and cosines; an end-to-end run on toy data trains each component only in its phases, carries the weights over, redraws masks every phase, checkpoints and saves once; one W&B run with a continuing step; `copy_local_from` takes a trained LocalModel as phase 1. 28 mutations across C1 and C2, each caught; 779 tests pass; harness IDENTICAL. **Not run on data** | 2026-10-17 |
 | C3 — staged-training sweep | not started | | |
 | guard — hidden cells' precomputed embeddings (`precomputed_mask_fill`: learned / −1) | **implemented, unverified** — see Stage A, "Fixed inputs for debugging". 10 mutations caught; 748 tests pass; harness IDENTICAL. **Not run on data** | 2026-10-17 |
 
@@ -425,50 +425,94 @@ neighbours, scVI ones do not.
 training lets the GCN absorb the global loss through the tokens, and the easy local solution wins
 first. Separate training gives global a fixed input and the residual problem.
 
-### C1 — per-head loss weights and freezing
+### C1 — per-head loss weights and freezing (built 2026-10-17)
 
-- **`optim.loss_weights: {local: 1.0, global: 1.0}`.** The dual decoder's loss is now one masked
-  loss over the stacked `[2N]` predictions, which equals the mean of the two heads' losses. Make
-  it `w_local · L_local + w_global · L_global`, computed from `compute_separate_losses`, which
-  already returns both. With the defaults it must equal the current loss (harness IDENTICAL).
-- **`optim.freeze: []`**, a list of `local` / `global`: those submodules get
-  `requires_grad = False` and are kept in eval mode (dropout off) for the whole fit. Lightning calls
-  `module.train()` every epoch, so a callback re-applies eval to frozen parts at every train epoch
-  start. The optimizer is built from trainable parameters only (it already filters on
-  `requires_grad`).
-- Tests:
-  - frozen parameters are bit-identical after several steps, and dropout is off in them;
-  - the default weights reproduce the current loss to the bit;
-  - with `w_local = 0`, no gradient reaches the local decoder;
-  - with the local component frozen, the global loss gives no gradient to the GCN.
+- **`optim.loss_weights: {local: 0.5, global: 0.5}`.** A dual decoder's loss becomes
+  `w_local · L_local + w_global · L_global`, from `compute_separate_losses`.
+  - The default 0.5 / 0.5 is the mean of the two heads, i.e. the stacked loss of every earlier run,
+    and it keeps that exact code path (harness IDENTICAL). The plan had said 1 / 1, which would
+    have doubled the loss.
+  - Any other weights replace `<mode>_loss` by the weighted sum, so checkpointing and early stopping
+    follow the phase's objective.
+  - A head with weight 0 sends no gradient. With `w_global = 0` the GCN learns from the local loss
+    alone; with `w_local = 0` the local decoder gets nothing, but the GCN still learns through the
+    tokens.
+  - Refused on a single-head model, and for a loss that cannot give each head its own loss
+    (`none`, `SCE_EntropyATT_Loss`).
+- **`optim.frozen: []`** (`local` / `global`): those components get `requires_grad = False` for the
+  fit (`train._schedule.freezing`, which restores each parameter's own previous flag afterwards),
+  so the optimizer never sees them.
+  - The training plan puts them back into eval mode at **every training step**, not just once per
+    epoch: a probe pass can switch the model back to training mode between steps.
+  - **Named `frozen`, not `freeze`,** because a yacs `CfgNode` has a `freeze()` method, and
+    `cfg.optim.freeze` would return the method instead of the key.
+  - Freezing every component of the model is refused.
+- **Checkpoint tag:** `lw<local>-<global>` and `frz-<components>` in the training tag.
 
-### C2 — the staged training driver
+### C2 — the staged training driver (built 2026-10-17)
 
-`train.staged_train(model, datamodule, phases)`, a sequence of ordinary `model.train()` calls in
-one process, each phase with its own epochs, freeze list, loss weights, learning rate and warm-up.
-Weights carry over in memory, so no checkpoint naming problem between phases. Only the last phase
-saves a checkpoint, under a schedule tag.
+`train()` dispatches on `optim.schedule`. `joint` (the default) is one phase with the top-level
+settings and runs exactly as before. Anything else runs a list of phases (`train._schedule.Phase`:
+`share`, `frozen`, `loss_weights`, `lr_scale`) through `_train_phase`.
 
-Schedules, in config (`optim.schedule`, a list of phases):
+**Schedules:**
 
 | schedule | phases |
 |---|---|
-| `joint` | one phase, nothing frozen (today) |
-| `local_then_global` | (1) local only: global frozen, `w_global = 0`; (2) global only: local frozen, `w_local = 0` |
-| `local_then_global_ft` | as above, then (3) joint fine-tuning at 0.1× learning rate |
-| `alternating_k` | (1) local only, then k cycles of (global only, local only) with `w_global = 0` in the local phases, so the GCN never learns from the global loss |
-| `alternating_k_coupled` | as `alternating_k`, but the local phases keep `w_global = 1`: the GCN may adapt its tokens to what global needs, while global is frozen |
+| `joint` | one phase, `optim.frozen` and `optim.loss_weights` (today) |
+| `local_then_global` | (1) local alone: global frozen, only the local loss; (2) global alone: local frozen, only the global loss; 50 / 50 |
+| `local_then_global_ft` | as above on 40 / 40, then 20% joint fine-tuning at 0.1× learning rate |
+| `alternating` | `optim.schedule_cycles` (default 4) cycles of (local alone, global alone), equal shares; the local phases use only the local loss, so the GCN never learns from the global one |
+| `alternating_coupled` | as `alternating`, but the local phases keep the default mean of both losses: the GCN may adapt its tokens to what the (frozen) global component needs |
+| `custom` | `optim.schedule_phases`, a list of `{share, frozen, loss_weights, lr_scale}` |
 
-- **Phase 1 can also be a plain `LocalModel`,** whose module has the same keys as the dual
-  decoder's `local_module` (both come from `LocalModule.from_config`). It is copied in with
-  `load_state_dict(strict=True)`, so the local-only reference of A2 doubles as phase 1. Test the
-  key match.
-- Each phase logs to the same W&B run with a `phase` prefix, and the efficiency monitor and probes
-  keep working.
-- Every phase gets the mask redraw callback (`redraws_masks`). Test that hidden values cannot
-  reach the predictions in every phase.
-- Epoch budget: the same total as the joint run (200), e.g. 100 + 100 for `local_then_global`, so
-  the comparison is not about more steps.
+**Deviation:** the alternating schedules are cycles of (local, global), **ending on a global
+phase**. The plan had (local, then cycles of (global, local)), which ends on a local phase: the
+GCN would change while the global component is frozen, leaving the final global head trained on
+stale tokens.
+
+**Per phase:**
+- `max_epochs` (= `optim.n_epochs` in a real run) is split by the shares with largest-remainder
+  rounding, so a staged run gets exactly the joint budget. A smoke run with fewer epochs than
+  phases gives every phase one epoch.
+- Each phase gets its own optimizer, learning rate (`optim.lr × lr_scale`), warm-up
+  (`optim.lr_warmup` scaled to the phase, at least 1) and cosine (over the phase).
+- `min_epochs` is capped at the phase length. Early stopping, if on, applies within each phase.
+- The mask redraw, efficiency monitor and online probes run in every phase.
+
+**Run-level:**
+- Only the first phase seeds and opens W&B; later phases continue the random streams. One W&B run
+  serves all phases, and its `trainer/global_step` continues across them (`StepOffsetWandbLogger`,
+  instead of the plan's per-phase prefixes, so every metric is one continuous curve).
+  `schedule/phase` marks the boundaries.
+- Only the last phase checkpoints, restores its best epoch, validates, tests and saves. Earlier
+  phases hand their final weights on in memory, with Lightning's default checkpoint turned off.
+- `self.history_` is the last phase's history, `self.phase_histories_` all of them.
+- **Checkpoint tag:** `sch-l2g`, `sch-l2gft`, `sch-alt<k>`, `sch-altc<k>`, `sch-custom-<hash>`.
+- Staged schedules need `model.decoder.dual_decoder: true`, and per-phase settings rule out the
+  top-level `frozen` / `loss_weights` (the validator says so).
+
+**Phase 1 from a trained LocalModel:** `CombinedModel.copy_local_from(local_model)` copies a
+`LocalModel`'s module into the dual decoder's local part, strictly by name and shape, leaving its
+auxiliary-loss heads behind. The local-only reference of A2 can therefore stand in for phase 1.
+This is not wired into the scripts yet.
+
+**Verified by tests** (`tests/test_staged_training.py`):
+- the presets, the epoch split and the validator;
+- the default loss is bit-identical to the stacked one, other weights give the weighted sum
+  (also as `val_loss`), and a weight of 0 sends no gradient;
+- a frozen component does not move, is out of the optimizer, stays in eval, and its flags come
+  back; hidden values never reach a prediction with a component frozen;
+- the driver hands each phase its epochs, learning rate, warm-up, cosine and `min_epochs`;
+- an end-to-end `local_then_global` run on toy data:
+  - each component moves only in its phase;
+  - the weights carry over;
+  - frozen parts are in eval at every step;
+  - masks are redrawn in both phases;
+  - the model is checkpointed and saved once, with no duplicate files;
+- the W&B step offset; `copy_local_from`; the checkpoint tags.
+
+28 mutations, each caught. 779 tests pass; harness IDENTICAL (its dual-decoder case included).
 
 ### C3 — the staged-training sweep
 

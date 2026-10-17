@@ -6,15 +6,16 @@ import lightning.pytorch as pl
 import torch
 import wandb
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
-from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.trainer import seed_everything
 
 from interscale.evaluation.online_probes import build_probe_callback
 from interscale.tl.utils import get_model_filename_prefix
+from interscale.train._schedule import freezing, phase_epochs, phase_warmup, schedule_phases
 from interscale.train._trainingplans import TrainingPlan
 from interscale.train._utils import (
     MetricsHistory,
     NodeMaskResampleCallback,
+    StepOffsetWandbLogger,
     build_efficiency_monitor,
     redraws_masks,
     train_gene_means,
@@ -66,11 +67,19 @@ class NodeMaskingTrainingPlan:
     ):
         """Train the model.
 
+        With ``optim.schedule`` other than ``joint`` the run is split into phases
+        (``interscale.train._schedule``; ``.claude/global_plan.md``, Stage C): ``max_epochs`` is
+        divided by the phases' shares, and each phase trains with its own frozen components, loss
+        weights, learning rate, warm-up and cosine, on the weights the previous phase left. All
+        phases log to one W&B run, the step continuing across them. Only the last phase restores
+        its best epoch, validates, tests and saves. ``self.history_`` is the last phase's history,
+        ``self.phase_histories_`` every phase's.
+
         Parameters
         ----------
         max_epochs
             The maximum number of epochs to train the model. The actual number of
-            epochs may be less if early stopping is enabled.
+            epochs may be less if early stopping is enabled. Split over the phases of a schedule.
         shuffle_set_split
             Whether to shuffle indices before splitting. If ``False``, the val,
             train, and test set are split in the sequential order of the data.
@@ -78,7 +87,7 @@ class NodeMaskingTrainingPlan:
             Whether to load data as sparse tensors.
         early_stopping
             Perform early stopping. Additional arguments can be passed in through
-            ``**trainer_kwargs``.
+            ``**trainer_kwargs``. In a schedule it applies within each phase.
         patience
             Patience for early stopping: number of epochs to wait for improvement
             before stopping.
@@ -94,36 +103,91 @@ class NodeMaskingTrainingPlan:
             Whether to log to Weights & Biases. Defaults to the project config.
         **trainer_kwargs
             Additional keyword arguments passed into the
-            :class:`~lightning.pytorch.trainer.trainer.Trainer`.
+            :class:`~lightning.pytorch.trainer.trainer.Trainer` (of every phase).
         """
-        # if datamodule is not None and not self._module_init_on_train:
-        #     raise ValueError(
-        #         "Cannot pass in `datamodule` if the model was initialized with `adata`."
-        #     )
-        # elif datamodule is None and self._module_init_on_train:
-        #     raise ValueError(
-        #         "If the model was not initialized with `adata`, a `datamodule` must be passed in."
-        #     )
+        phases = schedule_phases(self._cfg)
+        run = {
+            "early_stopping": early_stopping,
+            "patience": patience,
+            "plan_kwargs": plan_kwargs or {},
+            "datamodule": datamodule,
+            "wandb_use": wandb_use,
+            "trainer_kwargs": trainer_kwargs,
+        }
+        if len(phases) == 1:
+            # One phase (`joint`, the default): the run as it always was, with `optim.frozen` and
+            # `optim.loss_weights` applied.
+            self._train_phase(
+                phases[0],
+                0,
+                1,
+                max_epochs=max_epochs,
+                lr=self._cfg.optim.lr * phases[0].lr_scale,
+                lr_warmup=self._cfg.optim.lr_warmup,
+                lr_max_epochs=self._cfg.optim.n_epochs,
+                min_epochs=int(self._cfg.optim.min_epochs),
+                **run,
+            )
+            return
 
-        # if datamodule is None:
-        #     datasplitter_kwargs = datasplitter_kwargs or {}
-        #     datamodule = self._data_splitter_cls(
-        #         self.adata_manager,
-        #         train_size=train_size,
-        #         validation_size=validation_size,
-        #         batch_size=batch_size,
-        #         shuffle_set_split=shuffle_set_split,
-        #         **datasplitter_kwargs,
-        #     )
+        epochs = phase_epochs(phases, int(max_epochs))
+        print(f"Schedule {self._cfg.optim.schedule!r}: {len(phases)} phases, epochs {epochs}")
+        for i, (phase, n) in enumerate(zip(phases, epochs, strict=True)):
+            print(
+                f"  phase {i}: {n} epochs, frozen {list(phase.frozen) or 'none'}, "
+                f"loss weights {phase.loss_weights or 'default'}, lr x{phase.lr_scale:g}"
+            )
+        self.phase_histories_ = []
+        for i, (phase, n) in enumerate(zip(phases, epochs, strict=True)):
+            self._train_phase(
+                phase,
+                i,
+                len(phases),
+                max_epochs=n,
+                lr=self._cfg.optim.lr * phase.lr_scale,
+                lr_warmup=phase_warmup(self._cfg.optim.lr_warmup, n, int(max_epochs)),
+                lr_max_epochs=n,
+                min_epochs=min(int(self._cfg.optim.min_epochs), n),
+                **run,
+            )
 
-        plan_kwargs = plan_kwargs or {}
+    def _train_phase(
+        self,
+        phase,
+        index: int,
+        n_phases: int,
+        *,
+        max_epochs: int,
+        lr: float,
+        lr_warmup: int,
+        lr_max_epochs: int,
+        min_epochs: int,
+        early_stopping: bool,
+        patience: int | None,
+        plan_kwargs: dict,
+        datamodule: L.LightningDataModule,
+        wandb_use: bool | None,
+        trainer_kwargs: dict,
+    ):
+        """One phase of :meth:`train`; the whole run when there is one phase.
 
-        seed_everything(self._cfg.optim.seed, workers=True)
+        The first phase seeds and opens the W&B run; later ones continue its random streams and its
+        logger, whose step they offset past the earlier phases'. The last phase alone checkpoints,
+        restores the best epoch, validates, tests and saves. The phase's frozen components are
+        untrainable for the fit and trainable again afterwards.
+        """
+        first, last = index == 0, index == n_phases - 1
+        staged = n_phases > 1
+        if staged:
+            print(f"\n=== phase {index} of {n_phases} ({self._cfg.optim.schedule}): {max_epochs} epochs ===")
 
-        self.wandb_use = wandb_use if wandb_use is not None else self._cfg.wandb.use
-        self.batch_size = self._cfg.dataset.batch_size
-        self.train_size = self._cfg.dataset.train_size
-        self.validation_size = self._cfg.dataset.val_size
+        if first:
+            seed_everything(self._cfg.optim.seed, workers=True)
+
+            self.wandb_use = wandb_use if wandb_use is not None else self._cfg.wandb.use
+            self.batch_size = self._cfg.dataset.batch_size
+            self.train_size = self._cfg.dataset.train_size
+            self.validation_size = self._cfg.dataset.val_size
 
         # TODO: change steps per epoch to be based on datamodule
         # steps_per_epoch = math.ceil(len(train_ds) / cfg.dataset.batch_size)
@@ -131,6 +195,8 @@ class NodeMaskingTrainingPlan:
         print("Steps per epoch", steps_per_epoch)
         lr_monitor = LearningRateMonitor(logging_interval="epoch")
         self.history_ = MetricsHistory()
+        if staged:
+            self.phase_histories_.append(self.history_)
         mask_resample_callback = NodeMaskResampleCallback() if redraws_masks(self._cfg) else None
         # None unless cfg.probe.use, so a run without probes builds the trainer it always did.
         # Reads adata for var_names only -- the probe resolves gene names to batch.x columns.
@@ -175,12 +241,14 @@ class NodeMaskingTrainingPlan:
             aux_losses=aux_losses,
             lr_scheduler=self._cfg.optim.lr_scheduler,
             weight_decay=self._cfg.optim.wd,
-            lr=self._cfg.optim.lr,
-            lr_warmup=self._cfg.optim.lr_warmup,
-            lr_max_epochs=self._cfg.optim.n_epochs,
+            lr=lr,
+            lr_warmup=lr_warmup,
+            lr_max_epochs=lr_max_epochs,
             patience_in_steps=steps_per_epoch,
             sce_gamma=self._cfg.optim.sce_gamma,
             target_center=target_center,
+            loss_weights=phase.loss_weights,
+            frozen=phase.frozen,
         )
 
         monitor, mode = self._resolve_monitor()
@@ -204,7 +272,8 @@ class NodeMaskingTrainingPlan:
                 mode=mode,
             )
 
-        if self._cfg.model.save is not None:
+        # Only the last phase checkpoints: an earlier phase hands its final weights on in memory.
+        if last and self._cfg.model.save is not None:
             run_name = get_model_filename_prefix(self._cfg, self.local_component, self.global_component)
             if "classification" in self._cfg.dataset.prediction_task:
                 checkpoint_callback = ModelCheckpoint(
@@ -248,53 +317,75 @@ class NodeMaskingTrainingPlan:
             if callback is not None
         ]
 
-        # Set up WandB logger if requested
+        # Set up WandB logger if requested: once, in the first phase; later phases reuse it.
         logger = None
         if self.wandb_use:
-            print("Wandb initialize...")
-            run_name = get_model_filename_prefix(self._cfg, self.local_component, self.global_component)
-            if self._cfg.wandb.project_name is None:
-                raise ValueError("wandb_project must be specified when use_wandb is True")
-            wandb.init(project=self._cfg.wandb.project_name, config=self._cfg, name=run_name, job_type="model_training")
-            logger = WandbLogger(name=run_name, log_model=True)
-            total_params = sum(p.numel() for p in self.module.parameters())
-            trainable_params = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
-            wandb.log({"total_parameters": total_params, "trainable_parameters": trainable_params})
-            print(f"Total parameters: {total_params:,}")
-            print(f"Trainable parameters: {trainable_params:,}")
+            if first:
+                print("Wandb initialize...")
+                run_name = get_model_filename_prefix(self._cfg, self.local_component, self.global_component)
+                if self._cfg.wandb.project_name is None:
+                    raise ValueError("wandb_project must be specified when use_wandb is True")
+                wandb.init(
+                    project=self._cfg.wandb.project_name, config=self._cfg, name=run_name, job_type="model_training"
+                )
+                self._wandb_logger = StepOffsetWandbLogger(name=run_name, log_model=True)
+            logger = self._wandb_logger
 
-        trainer = pl.Trainer(
-            min_epochs=int(self._cfg.optim.min_epochs),
-            max_epochs=int(max_epochs),
-            # enable_progress_bar=True,
-            callbacks=callbacks,
-            log_every_n_steps=1,
-            logger=logger,
-            deterministic=True,  # ensure reproducibility
-            accelerator=self._cfg.optim.accelerator,  # Default to CPU (can be overridden via trainer_kwargs)
-            **trainer_kwargs,
-        )
+        with freezing(self.module, phase.frozen):
+            if logger is not None:
+                total_params = sum(p.numel() for p in self.module.parameters())
+                trainable_params = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
+                if first:
+                    wandb.log({"total_parameters": total_params, "trainable_parameters": trainable_params})
+                    print(f"Total parameters: {total_params:,}")
+                    print(f"Trainable parameters: {trainable_params:,}")
+                if staged:
+                    wandb.log({"schedule/phase": index, "schedule/trainable_parameters": trainable_params})
+            if staged:
+                trainable = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
+                print(f"phase {index}: frozen {list(phase.frozen) or 'none'}, {trainable:,} trainable parameters")
 
-        trainer.fit(training_plan, datamodule)
+            if not last:
+                # Lightning adds a default ModelCheckpoint (lightning_logs/) unless told not to; an
+                # earlier phase hands its weights on in memory and must not write any.
+                trainer_kwargs = {**trainer_kwargs, "enable_checkpointing": False}
+            trainer = pl.Trainer(
+                min_epochs=min_epochs,
+                max_epochs=int(max_epochs),
+                # enable_progress_bar=True,
+                callbacks=callbacks,
+                log_every_n_steps=1,
+                logger=logger,
+                deterministic=True,  # ensure reproducibility
+                accelerator=self._cfg.optim.accelerator,  # Default to CPU (can be overridden via trainer_kwargs)
+                **trainer_kwargs,
+            )
 
-        # EarlyStopping does not restore best weights and ModelCheckpoint only writes them to
-        # disk. Without this, the validate()/test() calls below -- and the save() further down --
-        # all report the LAST epoch, which for an early-stopped run is `patience` epochs past the
-        # best one.
-        best_ckpt = getattr(checkpoint_callback, "best_model_path", "") if checkpoint_callback else ""
-        if best_ckpt and os.path.exists(best_ckpt):
-            best_score = checkpoint_callback.best_model_score
-            print(f"Restoring best checkpoint ({monitor}={float(best_score):.4f}) from {best_ckpt}")
-            state = torch.load(best_ckpt, map_location="cpu", weights_only=False)["state_dict"]
-            missing, unexpected = training_plan.load_state_dict(state, strict=False)
-            if missing or unexpected:
-                print(f"restore: missing={missing}, unexpected={unexpected}")
-        else:
-            print("WARNING: no best checkpoint found; evaluating FINAL-epoch weights.")
+            trainer.fit(training_plan, datamodule)
+            if logger is not None:
+                # The next phase's trainer counts from 0 again; its points go after this phase's.
+                logger.step_offset += trainer.global_step
+            if not last:
+                return
 
-        trainer.validate(training_plan, datamodule)
-        if self._cfg.dataset.evaluate_test and self.train_size + self.validation_size < 1:
-            trainer.test(training_plan, datamodule)
+            # EarlyStopping does not restore best weights and ModelCheckpoint only writes them to
+            # disk. Without this, the validate()/test() calls below -- and the save() further down --
+            # all report the LAST epoch, which for an early-stopped run is `patience` epochs past the
+            # best one.
+            best_ckpt = getattr(checkpoint_callback, "best_model_path", "") if checkpoint_callback else ""
+            if best_ckpt and os.path.exists(best_ckpt):
+                best_score = checkpoint_callback.best_model_score
+                print(f"Restoring best checkpoint ({monitor}={float(best_score):.4f}) from {best_ckpt}")
+                state = torch.load(best_ckpt, map_location="cpu", weights_only=False)["state_dict"]
+                missing, unexpected = training_plan.load_state_dict(state, strict=False)
+                if missing or unexpected:
+                    print(f"restore: missing={missing}, unexpected={unexpected}")
+            else:
+                print("WARNING: no best checkpoint found; evaluating FINAL-epoch weights.")
+
+            trainer.validate(training_plan, datamodule)
+            if self._cfg.dataset.evaluate_test and self.train_size + self.validation_size < 1:
+                trainer.test(training_plan, datamodule)
 
         # Print early stopping information if it was used
         if early_stopping and loss_callback is not None:

@@ -12,6 +12,7 @@ from interscale.module.base._base_module import BaseModule
 from interscale.nn import CosineWarmupScheduler
 from interscale.tl.masking import masked_loss
 
+from ._schedule import frozen_modules, resolve_loss_weights
 from .aux_losses import CompositeAuxLoss
 from .losses import BalancedPearsonCorrelationLoss, SCE_EntropyATT_Loss, SCELoss, scaled_cosine_error
 
@@ -231,10 +232,24 @@ class TrainingPlan(pl.LightningModule):
         patience_in_steps: int = 100000,
         sce_gamma: float = 3.0,
         target_center: torch.Tensor | None = None,
+        loss_weights: dict | None = None,
+        frozen: tuple[str, ...] = (),
         **kwargs,
     ):
         super().__init__()
         self.module = module
+        # Stage C of .claude/global_plan.md. `loss_weights`: w_local * L_local + w_global * L_global
+        # for a dual decoder; None (or the default 0.5 / 0.5) keeps the stacked loss of every run before,
+        # which is that mean, computed as it always was. `frozen`: components kept in eval mode at every
+        # training step; making them untrainable (requires_grad) is `train._schedule.freezing`'s job.
+        self.loss_weights = resolve_loss_weights(loss_weights)
+        if self.loss_weights is not None:
+            if not hasattr(module, "compute_separate_losses"):
+                raise ValueError("loss_weights weight the two heads of a dual decoder; this module has one head.")
+            if loss in NO_LOSS or loss == "SCE_EntropyATT_Loss":
+                raise ValueError(f"loss_weights need each head's own loss, which loss {loss!r} does not give.")
+        self.frozen = tuple(frozen)
+        self._frozen_modules = frozen_modules(module, self.frozen)
         # `optim.center_targets`: each gene's training mean, subtracted from predictions and targets
         # before the reconstruction loss (never before the metrics). None leaves the loss as it was.
         self.register_buffer("target_center", None if target_center is None else torch.as_tensor(target_center).float())
@@ -482,6 +497,7 @@ class TrainingPlan(pl.LightningModule):
         attn: torch.Tensor | None,
         entry_mask: torch.Tensor | None = None,
         extra_loss: torch.Tensor | None = None,
+        loss_override: torch.Tensor | None = None,
     ):
         """Helper method to log metrics for training, validation, or test steps.
 
@@ -505,6 +521,12 @@ class TrainingPlan(pl.LightningModule):
 
         elif "regression" in self.prediction_task:
             loss, metrics = self._regression_metrics(y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask)
+
+        if loss_override is not None:
+            # The weighted sum of the two heads' losses (`loss_weights`): what this run optimises,
+            # so what `<mode>_loss` -- monitored by checkpointing and early stopping -- must report.
+            loss = loss_override
+            metrics[f"{mode}_loss"] = loss
 
         if extra_loss is not None:
             # `<mode>_loss` must be the quantity actually optimised, not the reconstruction half
@@ -573,6 +595,14 @@ class TrainingPlan(pl.LightningModule):
         separate_losses = self.module.compute_separate_losses(
             self.loss, self.loss_type, *self.centred(y_pred, y_true), entry_mask
         )
+        weighted = None
+        if self.loss_weights is not None:
+            if separate_losses.get("local_loss") is None or separate_losses.get("global_loss") is None:
+                raise RuntimeError("loss_weights need both heads' losses; this step produced one (graph level?).")
+            weighted = (
+                self.loss_weights["local"] * separate_losses["local_loss"]
+                + self.loss_weights["global"] * separate_losses["global_loss"]
+            )
 
         for key in ("local_loss", "global_loss", "combined_loss"):
             # `val` never logged combined_loss; preserved to keep this refactor number-identical.
@@ -583,7 +613,14 @@ class TrainingPlan(pl.LightningModule):
 
         # Metrics are computed from the combined predictions, as before.
         loss = self._compute_and_log_metrics(
-            y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask, extra_loss=aux_total
+            y_pred,
+            y_true,
+            mode,
+            metrics,
+            attn=attn,
+            entry_mask=entry_mask,
+            extra_loss=aux_total,
+            loss_override=weighted,
         )
 
         if separate_losses.get("kl_loss") is not None:
@@ -654,10 +691,15 @@ class TrainingPlan(pl.LightningModule):
     def training_step(self, batch):
         """Training step for the model.
 
+        Frozen components go back to eval mode first: Lightning puts the whole model into training
+        mode at every epoch, and a probe pass may have done so since the last step.
+
         Returns
         -------
             loss: torch.nn.Module
         """
+        for module in self._frozen_modules:
+            module.eval()
         return self._step(batch, "train")
 
     def validation_step(self, batch):

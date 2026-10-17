@@ -472,6 +472,14 @@ def _validate(cfg):
     _validate_global_residual(cfg)
     _validate_gex_embedding(cfg)
     _validate_precomputed_embedding(cfg)
+    _validate_schedule(cfg)
+
+
+def _validate_schedule(cfg):
+    """``optim.schedule``, ``optim.loss_weights`` and ``optim.frozen`` (``train._schedule``)."""
+    from interscale.train._schedule import validate_schedule
+
+    validate_schedule(cfg)
 
 
 def _validate_precomputed_embedding(cfg):

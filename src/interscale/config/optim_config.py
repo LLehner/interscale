@@ -51,6 +51,25 @@ def get_optim_cfg(cfg):
     # default: it synchronises the GPU around every step, which costs a little throughput.
     cfg.optim.log_efficiency = False
 
+    # Staged training of the local and global components (`interscale.train._schedule`;
+    # .claude/global_plan.md, Stage C). A dual decoder's loss is w_local * L_local + w_global *
+    # L_global; the default 0.5 / 0.5 is the mean of the two heads' losses, computed exactly as before.
+    # A weight of 0 still lets the head train through the other head's gradient into shared parts.
+    # Keys local / global (set by item: `global` is a Python keyword, so no attribute access).
+    cfg.optim.loss_weights = CN({"local": 0.5, "global": 0.5})
+    # Components not trained at all: any of local, global. Their parameters get no gradient and
+    # they stay in eval mode (dropout off). With schedule joint only. Not `freeze`: a CfgNode
+    # already has a freeze() method, which `cfg.optim.freeze` would return instead of the key.
+    cfg.optim.frozen = []
+    # joint (one phase, the run as always), local_then_global, local_then_global_ft, alternating,
+    # alternating_coupled, or custom (phases from schedule_phases). Phases split n_epochs by their
+    # shares; each gets its own warm-up and cosine, and only the last one checkpoints and saves.
+    cfg.optim.schedule = "joint"
+    # Cycles of (local alone, global alone) for the alternating schedules.
+    cfg.optim.schedule_cycles = 4
+    # For schedule custom: a list of phases, each {share, frozen, loss_weights, lr_scale}.
+    cfg.optim.schedule_phases = []
+
     # Auxiliary loss terms added beside `optim.loss`, as name -> weight. A weight of 0.0 means the
     # term is never constructed, so every existing config keeps behaving exactly as before. Flat
     # float keys rather than a list of nested nodes, so a sweep can set
