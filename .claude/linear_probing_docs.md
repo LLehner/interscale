@@ -44,6 +44,19 @@ Status as of 2026-10-17. *Current* means used by `slurm/global_only.py` and the 
 - With few test slides, collapsed hidden tokens give a participation ratio of at most
   (number of slides − 1).
 
+### The results file
+
+A sweep writes one file, `RESULTS_DIR/results.md` (`interscale.evaluation.report`). Each arm's
+analyses are appended as sections when it finishes, `## <arm> | <analysis>`, each with a one-line
+note and a compact CSV table (index columns counted in the fence, ```` ```csv index=2 ````); the
+untrained twin is `<arm>_untrained`. A later section replaces an earlier one with the same header,
+and a missing analysis is simply absent. At the end of a sweep (or `MODE = "evaluate"`) the file
+is rewritten with `# Summary` on top: one text table per question, arms as rows, counts and
+references once. To read it, start with the summary (`grep -n '^### '` lists its tables) and go
+to `## <arm> |` sections for detail; in Python, `read_sections(path)` returns
+`{(arm, analysis): DataFrame}`. Per-gene head scores are not written (the per-group table
+summarises them).
+
 ## Kept, valid, not in the sweeps
 
 | Task | What it answers | Where | Note |

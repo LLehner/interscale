@@ -165,7 +165,8 @@ context is read on a **masked pass** (the input corrupted as in training, seeded
 with a `smoother` feature set), `attention_diagnostics.attention_by_query` (attention of hidden
 queries against uniform attention, distance profiles, planted pairs against distance-matched cells),
 `receptive_field` (which visible cells a hidden cell's prediction depends on, by gradient) and
-`representations` (CKA, participation ratio). The relevance rollout (`tl/self_attn_relevance.py`)
+`representations` (CKA, participation ratio). A sweep writes all of it to one Markdown file
+(`evaluation.report`: sections appended per arm, a cross-arm summary on top). The relevance rollout (`tl/self_attn_relevance.py`)
 backpropagates the summed output after an affine LayerNorm, a degenerate target, so `_attn_matrix`,
 `cls_horizontal`/`cls_vertical` and everything built on them (`downstream_regression`,
 `net_streams`, `flow_control`, `graph_classification`) are not interpretable.
