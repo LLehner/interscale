@@ -159,32 +159,90 @@ hidden discs better than a smoother of visible cells? This removes P2 and P3 ent
 ### What exists
 
 `GlobalModel` wraps a `GlobalModule` without a local component (`local_mask_hops = 0`, so the
-long-range mask has nothing to block and warns). Its tokens come from `create_gex_embedding`:
+long-range mask has nothing to block and warns). The transformer needs one vector per spot, its
+**token**, as input. In a `CombinedModel` the token is the GCN's output. A `GlobalModel` has no
+GCN, so `type_gex_embedding` says where its tokens come from. Before A1 there were three options:
 
-- `type_gex_embedding: PCA`: sklearn PCA fitted once on the **first masked training batch** and
-  frozen; a fixed, unlearned projection that was fitted on −1 fills.
-- `NMF`, which cannot take −1 inputs.
-- `Precomputed`, which reads `obsm[latent_obsm_key]` attached to the graphs.
+- **`PCA`:** sklearn PCA, fitted once on the first batch the module sees and then frozen. That is
+  the first (masked) **validation** slide, not a training batch, because Lightning's sanity check
+  runs one validation step before training starts. Left as is, since changing it would change
+  existing runs.
+- **`NMF`:** cannot take the −1 fill of masked entries.
+- **`Precomputed`:** reads an embedding from `obsm[latent_obsm_key]`.
 
-There is no learned input map, so the transformer cannot shape its own tokens. Note on PCA: it is
-fitted on the first batch the module sees, and Lightning's sanity validation runs before training,
-so in practice it is fitted on the first (masked) **validation** slide, not a training batch. Left
-as is (changing it would change existing runs); `pca_rope` is read as "a fixed linear projection".
+None of these is trained, so the transformer cannot shape its own input. Whatever the fixed
+projection drops or mixes up, the transformer never gets back. That would confound A2: a
+global-only model doing badly could just mean a bad fixed input.
 
 ### A1 — a learned linear input
 
-`type_gex_embedding: Linear`: an `nn.Linear(n_input, n_embed)` plus LayerNorm on the masked
-expression, trained end to end with the transformer. This is the fair global-only model: the same
-number of trainable input parameters as the GCN's input projection, but no neighbourhood mixing.
+**What it is.** `type_gex_embedding: Linear` gives the `GlobalModule` one learned layer,
+`input_embedding = nn.Linear(n_input, n_embed)`, from a spot's expression vector to its token.
+On synth_spot that is 253 genes → 64 dimensions, 16,256 parameters. It is trained together with
+the transformer and the decoder, by the same reconstruction loss.
 
-- Config value, validator (regression, node level), checkpoint tag (`emb-linear`), and the
-  `get_model_output` path (`GlobalModel` calls `create_gex_embedding` directly; route it through
-  the module so the learned map is used).
-- Tests:
-  - the map is trained (gradient reaches it);
-  - hidden cells' values do not reach the predictions (all-masked rows map to one constant token);
-  - inference uses the same map;
-  - PCA, NMF and Precomputed are unchanged (harness IDENTICAL).
+**What a spot's token is, step by step:**
+
+1. **Masking.** The spot's expression is masked as in training: a hidden entry, or every entry
+   of a hidden spot, is set to −1.
+2. **The layer.** The token is `W · x + b`, a learned weighted sum of the spot's (masked) genes.
+3. **The transformer's input path,** unchanged from the joint model: its input LayerNorm
+   (`norm_input`), then the node positional encoding if any, then attention. A rotary encoding
+   rotates queries and keys, and a bias is added to the attention logits.
+
+**What that means for the disc task:**
+
+- **Visible spot:** its token is a learned summary of its own expression, with no information
+  from its neighbours.
+- **Hidden spot:** its input is all −1, so every hidden spot gets the *same* token
+  (`b − W · 1`). Only the positional encoding tells hidden spots apart. Without one (`lin_none`),
+  all hidden spots of a slide receive identical attention output and one shared prediction: the
+  slide-mean control.
+- **Gene masking (`lin_rope_gene`):** a hidden entry enters as −1, which no real `log1p_norm`
+  value takes (they are ≥ 0). A masked entry therefore pushes the token in a direction no
+  measurement does, and the layer can learn to discount it.
+
+**How it relates to the GCN.** The GCN computes
+`final_norm(GCN_layers(x) + LayerNorm(input_proj(x)))`. Its skip branch, `input_proj`, is exactly
+such a linear layer, with the same input and output sizes. The learned linear input is that
+branch *without* the message-passing branch. This is what makes A2 a fair comparison:
+
+| | GCN-only reference | joint model | global-only model |
+|---|---|---|---|
+| per-spot input | the same linear layer | the same linear layer | the same linear layer |
+| neighbourhood mixing | 2 GCN layers | 2 GCN layers | none |
+| attention over the slide | none | yes | yes |
+
+Each arm gets its context in only one way.
+
+**Why linear, not a deeper encoder.** The aim is to give the global side no capacity the local
+side lacks at the input; the transformer's own feed-forward layers add the nonlinearity after
+attention. If A2 shows the global-only model far below the smoother, a deeper input (an MLP) is
+one follow-up, but not before we know.
+
+**Why not keep PCA.** Its 64 directions are fixed by the variance of one masked validation slide,
+not by what helps reconstruction. On the rescaled synth_spot about 45% of the deviation variance
+sits in the pure-noise ZINB genes. On a disc-masked slide the contrast between hidden (all −1) and
+visible rows is likely a leading component. So a frozen PCA probably spends much of its capacity
+on noise and on "hidden or not". `pca_rope` stays in A2 to show what learning the input buys.
+
+**Implementation:**
+- Both training and inference go through `GlobalModule.gex_embedding(batch)`. Training passes the
+  masked batch, `GlobalModel.get_model_output` the clean one.
+- The other inputs (PCA, NMF, Precomputed) behave exactly as before.
+- The config validator accepts only inputs the module can build: None, PCA, NMF, Precomputed,
+  Linear. The `scvi` value named in old docstrings is refused.
+- Only the global-only checkpoint name carries `emb-linear_`. A `CombinedModel` ignores
+  `type_gex_embedding`, so its name is unchanged, and PCA/NMF/Precomputed names are unchanged too.
+
+**Verified by tests:**
+- the layer is built and receives gradient;
+- the hidden spots' values never reach a prediction, while a visible spot's value does;
+- inference maps the clean input through the same layer;
+- the validator and the checkpoint tag behave as described;
+- PCA and LocalModel runs are unchanged (harness IDENTICAL).
+
+Four mutations, each caught. Not run on data.
 
 ### A2 — the global-only sweep
 
