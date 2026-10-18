@@ -33,6 +33,12 @@ Why the global component struggles to learn, and the experiments that separate t
 `GlobalModel`'s input, the local modules' embeddings, the dual decoder's loss weighting or the
 training loop, and update its status table in the same commit as the work it describes.
 
+How to separate the local and the global component -- the decoder structure of the dual model
+(a context-only global embedding, different targets per head, one prediction from two parts) and
+losses on the embeddings -- is proposed in [`.claude/decoder_plan.md`](.claude/decoder_plan.md),
+with the same layout. Read it before touching the decoders, `DualDecoderCombinedModule` or the
+per-head losses, and update its status table in the same commit as the work it describes.
+
 ## Common commands
 
 This project uses `hatch` as the primary project manager (also works with `uv` or `pip`; see `docs/installation.md`).

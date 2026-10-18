@@ -730,6 +730,30 @@ with 0.
 **Cost.** entmax and top-k take the dense path and form every S × S map: ~300 MB per layer at
 4,299 cells and 4 heads, plus entmax's 50 bisection steps (2–4× the dense step time, estimated).
 
+**Read 2026-10-18** (`/home/lehnerl/Arbeit/results/global_only_new/legnini_attention`; one seed):
+- Every arm reconstructs at the slide mean: 0.495–0.511 centred cosine against the slide mean's
+  0.497 and the 40 µm kernel's 0.594 (deeper than 60 µm: ~0.46 against the 100 µm kernel's 0.541).
+  The attention mechanism does not matter for reconstruction. The sparse backends work as built
+  (effective keys 0.7–2% of the open keys, against 5–7% dense) and change nothing.
+- Hidden cells deeper than 60 µm put almost nothing on the hidden cells around them, peak at
+  120–250 µm (the visible ring past the 125 µm disc) and send 55% of their attention beyond 250 µm;
+  even hidden cells at the rim take 92% of their gradient influence from more than 60 µm away. The
+  predictions are slide-wide averages, which is why they sit at the slide mean.
+- The first flow maps were not readable. The plotted slide was the control organoid (slide4_A2-3);
+  the SHH organoid (slide4_B2-2) was only in the tables. Rebuilding the four evaluation disc draws
+  offline (exact: patch grids and hidden counts matched) showed: the structure beyond distance is
+  real (untrained twins ~0), whether a key was visible explains ~18% of it, and no rule fits both
+  test organoids -- not key cell type, same type, sequencing depth, density at the edge, the token's
+  PCs, nor a 2-D offset rule from RoPE. In the SHH organoid the floor plate, the SHH source, is
+  avoided (fitted pull −1.2 to −2.6). The flow was rewritten (the bullet above).
+- The Leiden clusters are Legnini et al. 2023's SHH-patterned neural tube: c13 floor plate (FOXA2,
+  SHH), c02 p3/pMN progenitors (NKX2.2, OLIG2), c06 motor neurons (ISL1, CHAT), c07–c10 dorsal
+  progenitors (PAX7, MSX2). A real long-range morphogen setting: distance to an SHH source sets
+  identity.
+- Next: re-evaluate with the rewritten flow; read attention biologically only after a model beats
+  the local kernel; programme masking on the SHH readouts (PTCH1, GLI1, HHIP are in the panel, but
+  the gene set is the user's call).
+
 ## Test matrix
 
 The axes, all independent:

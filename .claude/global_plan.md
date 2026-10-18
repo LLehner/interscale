@@ -640,16 +640,51 @@ model is asked to predict, or combining near and far information.
 - Previous rounds: the 3b conclusions hold on the rescaled data (local blind beyond 290 µm, global
   reaches but does not pass the smoother, encoding matters, residual decoder no help).
 
+**Next** (superseded by the second read below; kept for the record): the 0g analyses, an objective
+a smoother cannot satisfy, and a legnini attention sweep were proposed here; all three are built
+(0g; programme masking P; attention_plan.md stage 9) and the second read below reads them.
+
+## Results of the second read (2026-10-18; one seed per arm)
+
+Files: `/home/lehnerl/Arbeit/results/global_only_new/<sweep>/results.md`. The synth_spot models are
+the first read's, bit-identical (PCA arms within 0.006): every new number comes from the 0g
+analyses. `global_only` and `staged_training` again ended during evaluation (job limit): `joint_rope`
+and `l2g_res` are trained but not evaluated, six staged arms never ran.
+
+**synth_spot.**
+- First gene group where a model beats the best reference (the per-bin maximum over six): the
+  response genes beyond the GCN's reach. scVI + Fourier +0.035 (290–500 µm) and +0.036 (beyond
+  500 µm); the joint model's global head +0.015 and +0.033; long-range responses alone, scVI +
+  Fourier 0.831 vs 0.801 at 290–500 µm. Sources, by contrast, sit far below the smoother (they are
+  smooth Gaussians it reconstructs well). Worth 3 seeds before it is a result.
+- Blend test: PCA + RoPE averaged with the 400 µm kernel beats both in the deep field (0.456 vs
+  0.448 at 290–500 µm, 0.429 vs 0.413 beyond 500 µm): modest complementary information.
+- The disc task cannot test the programmes built for global context: short-range receivers score
+  ~0 for every model and reference (a hidden receiver loses its sender with it), sparse responses
+  0.04–0.09 vs 0.19 (the receptor is hidden too). Hence programme masking (below).
+- Position baseline: on source distances it lifts the smoother from 0.435 to 0.524; embeddings add
+  at most ~0.02 beyond `smoother+position` net of their untrained twins. The first read's "tokens
+  know more than the predictions use" was mostly position.
+- Planted pairs still ~0.5 under the corrected 10 µm tolerance: no sender selection.
+- Noise genes ~0 everywhere (the control works); `is_spatial=False` is not pure noise (it holds the
+  slide-level condition and batch genes).
+
+**legnini** (attention_plan.md stage 9): every arm at the slide mean (~0.50 vs 0.497; the 40 µm
+kernel 0.594). Predictions are broad averages: hidden cells at the disc rim take 92% of their
+gradient influence from more than 60 µm away. The attention mechanism changes nothing (0.495–0.511).
+
+**What it changed.** The question moved from "beat the smoother on disc reconstruction" to
+evaluations that can show communication at all: programme masking (built), the rewritten patch flow
+(built), and separating local from global by structure and objective (`decoder_plan.md`, proposed).
+
 **Next.**
-- Built 2026-10-18 (0g), rerun of all four sweeps pending: the blend test, the position baseline
-  (patches at 500, 1000 and 2500 µm, not single coordinates, at the user's suggestion), and head
-  scores per gene group by depth with sender/receiver/source/response roles. The rerun also
-  refreshes the planted-pair numbers and finishes C3's two arms.
-- An objective or evaluation a smoother cannot satisfy (larger holes, long-range programmes in the deep field).
-- A legnini sweep for attention: where cells and clusters attend, and how sparse attention and
-  attention biases change it. Built 2026-10-18 as attention_plan.md stage 9
-  (`slurm/legnini_attention.py`: GlobalModel on PCA with RoPE; base, distance + expression bias,
-  entmax, top-16, top-64; patch and cluster attention flow). Not run.
+- Run `slurm/response_masking.py` (programme masking, 5 arms); smoke first.
+- Redo `MODE = "evaluate"` for `joint_rope` (global_only) and `l2g_res` (staged_training); train
+  C3's six missing arms in a separate job with a longer limit.
+- Re-evaluate the legnini sweep with the rewritten flow (`MODE = "evaluate"`).
+- legnini programme masking: which genes form the hidden set is the user's call (the panel has the
+  SHH readouts PTCH1, GLI1, HHIP; `var` carries no annotations).
+- `decoder_plan.md`: restructure the decoder and the dual model so that local and global separate.
 
 ## Programme masking: what drives a response (built 2026-10-18)
 

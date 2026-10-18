@@ -12,6 +12,26 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Programme masking: `dataset.mask_genes` (gene names or `var` selectors such as `"role=response"`)
+  hides exactly that gene set in the selected cells under `mask_strategy: gene`
+  (`mask_percentage` is then the share of cells; discs select cells for it); resolved by
+  `geome_dataloader.gene_set_mask_kwargs`, checkpoint tag `gs<rate>-<selectors>`. For its evaluation:
+  `masked_probing.FittedReferences` (ridge references fitted on training graphs -- the cell's own
+  visible genes, plus kernel means of the visible genes around it, plus position -- penalty chosen on
+  held-out graphs), `draw_masks(kind="gene_set")`, `collect_head_predictions(fitted_references=...)`
+  and `receptive_field.response_influence` (a planted sender's rank in its receiver's predicted
+  response genes among cells as far away).
+- `evaluation.attention_flow`: where the cells of a patch draw their predictions from -- gradient
+  influence (own input left out) and attention rollout with the residual path -- against the same
+  model on the slide with the visible cells' expression permuted; summary metrics, flow fields,
+  source maps and label heatmaps (`plot_flow_field`, `plot_source_maps`, `plot_label_flow`).
+- Attention backends `entmax` (alpha-entmax, alpha learned per head; needs the `entmax` package) and
+  `topk` (softmax over each query's k best keys), and the attention bias `pe.bias: [expression]`
+  (a learned profile over each key's rank by expression distance, read from the masked input).
+- Evaluation additions: a position feature set for the probes (`masked_probing.position_features`,
+  `combined_features`; the bar becomes `smoother+position`), head scores per gene group and depth
+  (`score_heads` → `by_group_depth`), and blends of each head with a reference
+  (`masked_probing.blend_heads`).
 - `main_sweep(..., prepare_adata=...)`: a function called on the AnnData once a sweep trial has read
   it, before the model is built -- e.g. to compute an embedding into `obsm` that the model reads through
   `type_gex_embedding: Precomputed`.
@@ -97,6 +117,9 @@ and this project adheres to [Semantic Versioning][].
 
 ### Changed
 
+- Attention records carry the mask's open keys (`open`), and `attention_by_query` and the online
+  attention diagnostics read open keys from it rather than from weights above 0, which a sparse
+  normaliser breaks. `_spatial_weights.graph_edges` carries every further column of the edges.
 - A precomputed embedding's checkpoint tag carries its `obsm` key (`emb-pre-<key>-<fill>_`, letters and
   digits only), so two embeddings never share a checkpoint.
 - The in-training attention diagnostics read the val graphs under their own masks
