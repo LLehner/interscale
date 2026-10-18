@@ -53,6 +53,10 @@ COUNTS = {"n_cells": "hidden spots", "n_hidden": "hidden entries"}
 REFERENCE_PREFIX = "ref_"
 #: The feature set of model-free averages of the visible cells (``masked_probing.SMOOTHER``).
 SMOOTHER = "smoother"
+#: The feature set of a cell's place on its slide (``masked_probing.POSITION``).
+POSITION = "position"
+#: The model-free probe feature sets, shown once as references in the summary.
+PROBE_REFERENCES = (SMOOTHER, POSITION, f"{SMOOTHER}+{POSITION}", "majority")
 #: Attention metrics kept per head as well as for the mean over heads.
 PER_HEAD_METRICS = ("visible_lift", "span_rel", "effective_rel")
 
@@ -62,8 +66,11 @@ NOTES = {
     "(µm to the nearest visible spot); higher is better, the bar is the best reference",
     "heads_sce_by_depth": "raw SCE (1 - cosine) on hidden spots, by depth; lower is better",
     "heads_by_group": "centred cosine pooled over each gene group's hidden entries",
+    "heads_group_by_depth": "centred cosine pooled over each gene group's hidden entries, by depth; rows per group: "
+    "the hidden entries' count, every head, every reference (ref_*)",
     "context_labels": "balanced accuracy of a label probe from hidden spots, by depth; smoother = references as "
-    "features, smoother+E - smoother = what E knows beyond them; NaN = one class in the bin",
+    "features, position = the spot's place on its slide (offset, patches), smoother+position+E - "
+    "smoother+position = what E knows beyond both; NaN = one class in the bin",
     "source_distances": "centred cosine of the z-scored source distances predicted from hidden spots, by depth",
     "representations": "linear CKA (1: the same up to rotation and scale) and participation ratio, by query group",
     "attention_by_query": "masked pass, per layer and head (mean: over heads), by query depth: visible_lift, "
@@ -84,8 +91,10 @@ One section per arm and analysis, `## <arm> | <analysis>`; a later section repla
 with the same header. `<arm>_untrained` is the arm's model at initialisation: only a gain over it is
 learned. Hidden spots lie in seeded discs; depth is the distance to the nearest visible spot, and
 the GCN's reach is about 290 µm (more at slide edges). Bars: the best `ref_*` reference for head
-scores, `smoother` for probes, 1 for every metric relative to uniform weights, 0.5 for matched ranks.
-What each analysis answers: `.claude/linear_probing_docs.md` in the InterScale fork."""
+scores, `smoother+position` (else `smoother`) for probes, 1 for every metric relative to uniform
+weights, 0.5 for matched ranks. `blend_<head>` averages a head with one reference: above both, the
+head holds something the reference lacks. What each analysis answers:
+`.claude/linear_probing_docs.md` in the InterScale fork."""
 
 
 # ------------------------------------------------------------------------------- column order
@@ -172,6 +181,13 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         groups = tables["heads_by_group"]
         columns = _head_columns(groups, "_cosine")
         out["heads_by_group"] = groups.set_index("group")[list(columns)].rename(columns=columns)
+    if "heads_by_group_depth" in tables:
+        groups = tables["heads_by_group_depth"]
+        columns = _head_columns(groups.drop(columns="n_genes", errors="ignore"), "_cosine")
+        long = groups.melt(id_vars=["group", "depth_um"], value_vars=list(columns), var_name="head")
+        long["head"] = long["head"].map(columns)
+        # Groups in their order, within each the count, the model heads, then the references.
+        out["heads_group_by_depth"] = _pivot(long, ["group", "head"], "depth_um")
     if "context_labels" in tables:
         labels = tables["context_labels"]
         labels = labels[labels["metric"] == "balanced_accuracy"]
@@ -218,6 +234,7 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         "heads_by_depth",
         "heads_per_gene",
         "heads_by_group",
+        "heads_by_group_depth",
         "context_labels",
         "source_distances",
         "representations",
@@ -306,17 +323,20 @@ def read_sections(path) -> dict[tuple[str, str], pd.DataFrame]:
     return sections
 
 
-def write_report(path, *, title: str = "Evaluation report", arms: list[str] | None = None) -> str:
+def write_report(
+    path, *, title: str = "Evaluation report", arms: list[str] | None = None, groups: list[str] | None = None
+) -> str:
     """Rewrite the results file: header, the summary over its arms, then every section once.
 
     ``arms`` orders the arms (e.g. the sweep's, each followed by its ``_untrained`` twin); arms in
-    the file but not in the list follow in order of appearance. Returns the summary as text.
+    the file but not in the list follow in order of appearance. ``groups`` limits the summary's
+    gene-group tables to those groups; the sections keep every group. Returns the summary as text.
     """
     path = Path(path)
     sections = read_sections(path)
     present = list(dict.fromkeys(arm for arm, _ in sections))
     order = [arm for arm in (arms or []) if arm in present] + [arm for arm in present if arm not in (arms or [])]
-    summary = render_summary(summary_tables(sections, order))
+    summary = render_summary(summary_tables(sections, order, groups))
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     text = f"# {title}\n\n{LEGEND}\n\n# Summary\n\n_Rebuilt {stamp} from {len(order)} arms: {', '.join(order)}._\n\n"
     text += summary + "\n# Sections\n\n"
@@ -364,7 +384,11 @@ def _heads_summary(per_arm: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
 
 
 def _gain_summary(per_arm: dict[str, pd.DataFrame], target: str | None = None) -> pd.DataFrame | None:
-    """Per arm, each model embedding and its gain over the smoother, by depth; the smoother (and floor) once."""
+    """Per arm, each model embedding and its gain over each model-free bar, by depth; the bars (and floor) once.
+
+    The bars are ``smoother``, ``position`` and ``smoother+position`` as far as they were probed;
+    the gain over a bar is ``<bar>+<embedding>`` minus ``<bar>``.
+    """
     rows, reference = [], []
     for arm, table in per_arm.items():
         if target is not None:
@@ -373,16 +397,51 @@ def _gain_summary(per_arm: dict[str, pd.DataFrame], target: str | None = None) -
             table = table.xs(target, level=0)
         if not reference:
             reference = [
-                table.loc[name].rename(("reference", name)) for name in (SMOOTHER, "majority") if name in table.index
+                table.loc[name].rename(("reference", name)) for name in PROBE_REFERENCES if name in table.index
             ]
         for embedding in ("global", "local"):
             if embedding not in table.index:
                 continue
             rows.append(table.loc[embedding].rename((arm, embedding)))
-            if f"{SMOOTHER}+{embedding}" in table.index and SMOOTHER in table.index:
-                gain = table.loc[f"{SMOOTHER}+{embedding}"] - table.loc[SMOOTHER]
-                rows.append(gain.rename((arm, f"{embedding}: gain over smoother")))
+            for bar in (SMOOTHER, POSITION, f"{SMOOTHER}+{POSITION}"):
+                if f"{bar}+{embedding}" in table.index and bar in table.index:
+                    gain = table.loc[f"{bar}+{embedding}"] - table.loc[bar]
+                    rows.append(gain.rename((arm, f"{embedding}: gain over {bar}")))
     return _rows(reference + rows, ["arm", "row"])
+
+
+def _group_depth_summary(per_arm: dict[str, pd.DataFrame], groups: list[str] | None) -> pd.DataFrame | None:
+    """Rows ``(group, arm, head)``: per gene group the count and the best reference once, every arm's heads.
+
+    ``best`` is the highest reference in each depth bin (not always the same one), ``slide_mean``
+    the floor without position. ``groups`` keeps those groups, in that order; None keeps all.
+    """
+    rows = {}
+    for arm, table in per_arm.items():
+        for group in table.index.get_level_values("group").unique():
+            if groups is not None and group not in groups:
+                continue
+            part = table.xs(group, level="group")
+            found = rows.setdefault(group, {"shared": [], "heads": []})
+            for head, values in part.iterrows():
+                name = str(head)
+                if name not in COUNTS and not name.startswith(REFERENCE_PREFIX):
+                    found["heads"].append(values.rename((group, arm, name)))
+            if not found["shared"]:
+                for count in (h for h in part.index if str(h) in COUNTS):
+                    found["shared"].append(part.loc[count].rename((group, "count", COUNTS[str(count)])))
+                references = part.loc[[h for h in part.index if str(h).startswith(REFERENCE_PREFIX)]]
+                if len(references):
+                    found["shared"].append(references.max().rename((group, "reference", "best")))
+                if "ref_slide_mean" in part.index:
+                    found["shared"].append(part.loc["ref_slide_mean"].rename((group, "reference", "slide_mean")))
+    order = [g for g in (groups or rows) if g in rows]
+    ordered_rows = []
+    for group in order:
+        counts = [r for r in rows[group]["shared"] if r.name[1] == "count"]
+        references = [r for r in rows[group]["shared"] if r.name[1] != "count"]
+        ordered_rows += counts + rows[group]["heads"] + references
+    return _rows(ordered_rows, ["group", "arm", "head"])
 
 
 def _select(per_arm: dict[str, pd.DataFrame], level: str, value, keep: list[str]) -> pd.DataFrame | None:
@@ -402,8 +461,11 @@ def _select(per_arm: dict[str, pd.DataFrame], level: str, value, keep: list[str]
     return table[ordered(table.columns)].dropna(axis=1, how="all")
 
 
-def summary_tables(sections, arms: list[str]) -> list[tuple[str, pd.DataFrame]]:
-    """The cross-arm tables of the summary, from the sections of ``arms``; missing analyses are skipped."""
+def summary_tables(sections, arms: list[str], groups: list[str] | None = None) -> list[tuple[str, pd.DataFrame]]:
+    """The cross-arm tables of the summary, from the sections of ``arms``; missing analyses are skipped.
+
+    ``groups`` limits the gene-group tables to those groups (None: every group).
+    """
     out = []
 
     def add(title, table):
@@ -418,7 +480,14 @@ def summary_tables(sections, arms: list[str]) -> list[tuple[str, pd.DataFrame]]:
         "raw SCE on hidden spots by depth, lower is better",
         _heads_summary(_per_arm(sections, "heads_sce_by_depth", arms)),
     )
-    add("centred cosine per gene group on hidden spots", _heads_summary(_per_arm(sections, "heads_by_group", arms)))
+    by_group = _per_arm(sections, "heads_by_group", arms)
+    if groups is not None:
+        by_group = {arm: table.loc[[g for g in groups if g in table.index]] for arm, table in by_group.items()}
+    add("centred cosine per gene group on hidden spots", _heads_summary(by_group))
+    add(
+        "centred cosine per gene group on hidden spots by depth; best = the highest reference per bin",
+        _group_depth_summary(_per_arm(sections, "heads_group_by_depth", arms), groups),
+    )
     labels = _per_arm(sections, "context_labels", arms)
     targets = list(dict.fromkeys(t for table in labels.values() for t in table.index.get_level_values(0)))
     for target in targets:

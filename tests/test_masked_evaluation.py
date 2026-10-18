@@ -5,8 +5,10 @@ Pinned here, on synthetic arrays and toy modules:
 * the shared row statistics read 1 for uniform weights (span, effective cells, distance profile),
   and a planted sender ranks 1 among distance-matched cells while a distance kernel ranks 0.5;
 * the probe pass gathers each cell's depth and any extra feature set in probe row order; the
-  smoother set is the references side by side and never reads a hidden value; the label and
-  covariate probes score by depth, their pooled rows unchanged; the heads score genes by cosine;
+  smoother set is the references side by side and never reads a hidden value; the position set is
+  the same wherever a slide lies, one patch per scale, reads no expression and gives a probe what
+  position alone says; the label and covariate probes score by depth, their pooled rows unchanged;
+  the heads score genes by cosine;
 * ``attention_by_query`` reads the maps a masked step returns, gives exactly uniform attention 1
   against every uniform reference and 0.5 on planted pairs, and touches no generator;
 * ``receptive_field`` estimates the Jacobian norms it claims, reads no influence where a GCN cannot
@@ -28,7 +30,9 @@ from torch_geometric.data import Batch, Data
 from interscale.evaluation import _spatial_weights as sw
 from interscale.evaluation.masked_probing import (
     HeadPredictions,
+    combined_features,
     feature_sets,
+    position_features,
     probe_covariates,
     probe_labels,
     reference_predictions,
@@ -267,6 +271,90 @@ def test_feature_sets_add_the_smoother_to_each_model_embedding():
     assert {"local+global", "smoother+local", "smoother+global", "smoother+local+global"} <= set(sets)
     assert "smoother+pe" not in sets and sets["smoother+local+global"].shape == (3, 6)
     assert set(feature_sets(ProbeBatchFeatures(embeddings={"global": np.zeros((3, 2))}))) == {"global"}
+
+
+def test_the_position_is_the_same_wherever_a_slide_lies_one_patch_per_scale_and_no_expression():
+    first, moved = _lattice_graph(6, 0), _lattice_graph(6, 1)
+    moved.pos = moved.pos + torch.tensor([300.0, -70.0])  # the same lattice elsewhere, other expression
+    batch = Batch.from_data_list([first, moved])
+    position = position_features(spatial_unit_um=UNIT, patch_um=(20.0, 60.0), max_offset_um=25.0)
+    found = position(batch, torch.zeros(batch.num_nodes, G, dtype=torch.bool))["position"]
+    # offset (2) + distance (1) + 2 * ceil(25 / 20) = 4 patches a side + 2 * ceil(25 / 60) = 2 a side
+    assert found.shape == (72, 3 + 16 + 4)
+    assert torch.equal(found[:36], found[36:]), "two copies of a slide, placed apart, differ"
+    offset = found[:36, :2]
+    assert torch.allclose(offset.mean(0), torch.zeros(2), atol=1e-5)  # relative to the centroid
+    assert torch.allclose(found[:36, 2], offset.norm(dim=1))
+    assert torch.allclose(offset[1] - offset[0], torch.tensor([0.0, UNIT]))  # in µm
+    assert (found[:, 3:19].sum(1) == 1).all() and (found[:, 19:].sum(1) == 1).all()
+    # The 60 µm grid has 2 x 2 patches around the centroid: the quadrants.
+    quadrant = found[:36, 19:].argmax(1)
+    expected = (offset[:, 0] >= 0).long() * 2 + (offset[:, 1] >= 0).long()
+    assert torch.equal(quadrant, expected)
+
+    changed = batch.clone()
+    changed.x = torch.rand_like(batch.x)
+    assert torch.equal(position(changed, torch.ones_like(batch.x, dtype=torch.bool))["position"], found)
+
+    # Beyond max_offset_um a cell falls into the border patch rather than out of the grid.
+    narrow = position_features(spatial_unit_um=UNIT, patch_um=(20.0,), max_offset_um=5.0)
+    clipped = narrow(batch, torch.zeros(batch.num_nodes, G, dtype=torch.bool))["position"]
+    assert clipped.shape == (72, 3 + 4) and (clipped[:, 3:].sum(1) == 1).all()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"), [({"patch_um": (0.0,)}, "positive"), ({"max_offset_um": 0.0}, "max_offset")]
+)
+def test_the_position_needs_positive_sizes(kwargs, match):
+    options = {"spatial_unit_um": UNIT, "patch_um": (20.0,), "max_offset_um": 25.0} | kwargs
+    with pytest.raises(ValueError, match=match):
+        position_features(**options)
+
+
+def test_a_probe_on_the_position_reads_a_label_fixed_by_place_but_not_one_drawn_per_slide():
+    def slides(seed):
+        datas = []
+        rng = np.random.default_rng(seed)
+        for k in range(6):
+            data = _disc(_lattice_graph(8, seed * 10 + k), (3, 3), 2.5)
+            data.pos = data.pos + torch.tensor(rng.uniform(-500, 500, 2), dtype=torch.float32)
+            # One-hot, as annotations reach the graphs: the upper half of every slide, and one
+            # class per slide drawn at random.
+            data.fixed = torch.nn.functional.one_hot((torch.arange(64) % 8 >= 4).long(), 2).float()
+            data.drawn = torch.nn.functional.one_hot(torch.full((64,), int(rng.integers(0, 2))), 2).float()
+            datas.append(data)
+        return datas
+
+    position = position_features(spatial_unit_um=UNIT, patch_um=(40.0,), max_offset_um=40.0)
+    common = {
+        "prediction_task": "regression",
+        "prediction_level": "node",
+        "embeddings": ("global",),
+        "gene_index": {},
+        "categorical_targets": ("fixed", "drawn"),
+        "obs_targets": (),
+        "mask_strategy": "node",
+        "batch_size": 3,
+        "device": torch.device("cpu"),
+        "extra_features": combined_features(position, smoother_features(spatial_unit_um=UNIT, kernels_um=(20.0,))),
+    }
+    module = _global_module()
+    train, test = collect_features(module, slides(0), **common), collect_features(module, slides(1), **common)
+    assert {"position", "smoother"} <= set(train.embeddings)
+    labels = probe_labels(train, test, ["fixed", "drawn"])
+    accuracy = labels[labels["metric"] == "balanced_accuracy"].set_index(["target", "feature_set"])["value"]
+    assert accuracy[("fixed", "position")] > 0.95
+    assert accuracy[("drawn", "position")] < 0.7
+    assert {"smoother+position", "smoother+position+global"} <= set(accuracy.loc["fixed"].index)
+
+
+def test_feature_sets_put_the_position_beside_the_smoother_as_one_bar():
+    features = ProbeBatchFeatures(embeddings={k: np.zeros((3, 2)) for k in ("global", "smoother", "position")})
+    sets = feature_sets(features)
+    assert {"smoother+global", "smoother+position", "smoother+position+global"} <= set(sets)
+    assert "position+global" not in sets and sets["smoother+position+global"].shape == (3, 6)
+    alone = feature_sets(ProbeBatchFeatures(embeddings={k: np.zeros((3, 2)) for k in ("global", "position")}))
+    assert set(alone) == {"global", "position", "position+global"}
 
 
 def _depth_features(n, seed):

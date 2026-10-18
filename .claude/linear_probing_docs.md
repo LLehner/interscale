@@ -9,16 +9,19 @@ one of three passes:
 - **clean**: nothing hidden. Every cell sees its own expression, a regime training never shows.
 - **unmasked output**: `get_model_output` hides nothing, so a head is scored on values it was given.
 
-Status as of 2026-10-17. *Current* means used by `slurm/global_only.py` and the sweeps after it.
+Status as of 2026-10-18. *Current* means used by `slurm/global_only.py` and the sweeps after it.
 
 ## Current
 
 | Task | What it answers | Where | Pass |
 |---|---|---|---|
 | Head scores by depth | How well each decoder head fills in hidden spots: centred cosine and raw SCE per cell, per gene (cosine), per programme, and by depth (µm to the nearest visible spot) | `masked_probing.collect_head_predictions`, `score_heads(gene_metrics=("cosine",))` | masked |
+| Head scores per gene group and depth | The same centred cosine pooled over each gene group's hidden entries, per depth bin: whether the genes that carry context (receivers, responses) are filled in deep in the hidden area, apart from noise genes no model can predict. Groups from config (`GENE_GROUP_KEYS`: var columns or `a/b` combinations, named `<key>=<value>`) | `score_heads(gene_groups=..., depth_bins_um=...)` → `by_group_depth` | masked |
 | References | The bar a head must clear: averages of the visible spots (slide mean, Gaussian kernels, k nearest, oracle label mean). No model involved | `masked_probing.reference_predictions` | masked |
+| Blend test | Each model head averaged with one reference (`BLEND_REFERENCE`, the 400 µm kernel), as `blend_<head>`. Above both: the head holds something the reference lacks. A plain average, so the one with larger deviations from the centre counts for more | `masked_probing.blend_heads` | masked |
 | Label and distance probes by depth | What a hidden spot's embedding says about its context (region, states, distances to sources), per depth bin | `probe_labels`, `probe_covariates` with `depth_bins_um` | masked |
 | Smoother feature set | The same probes on the references used as features. `smoother+<embedding>` minus `smoother` is what the embedding knows beyond a smoother of the visible spots | `masked_probing.smoother_features` (via `collect_features(extra_features=...)`) | masked |
+| Position feature set | The same probes on where a spot lies and nothing else: its offset from its slide's centroid, its distance from it, and a one-hot of the patch it falls in on grids of several sizes (`POSITION_PATCHES_UM`). What position alone says, which an encoding hands the model without learning. The model-free bar is `smoother+position`; `smoother+position+<embedding>` minus it is what the embedding knows beyond both | `masked_probing.position_features`, combined with the smoother by `combined_features` | masked (positions are never hidden) |
 | Representations | Linear CKA between embeddings and the smoother (is the global token a smoother? a copy of the local one?), and each set's participation ratio (do hidden tokens collapse?), by depth | `representations.representation_table` | masked |
 | Attention by query | Where hidden spots look, per layer, head and depth bin, against uniform attention: attention on visible spots over their share of the keys (`visible_lift`), `span_rel`, `effective_rel`, mass beyond radii, CLS mass, the Performer's TV to softmax | `attention_diagnostics.attention_by_query` → `by_query` | masked |
 | Attention profile | Attention per distance bin over uniform weights (1 = uniform): the shape of what a head looks at | same → `profile` | masked |
@@ -31,7 +34,12 @@ Status as of 2026-10-17. *Current* means used by `slurm/global_only.py` and the 
 
 ### Reading them
 
-- The bar is the best reference or the smoother, never zero.
+- The bar is the best reference, or `smoother+position` for probes, never zero.
+- Judge the context genes, not the average gene: on synth_spot 160 of 253 genes are noise, which
+  dilutes every pooled number. Read `heads_group_by_depth` for `role=receiver`, `role=response`
+  (and `role=sender`/`role=source`) in the deep bins. `is_spatial=False` is not pure noise: it holds
+  the slide-level condition and batch genes, which the slide mean predicts; `role=noise` is the
+  negative control.
 - Depth: about 80% of a 500 µm disc's spots lie within 290 µm of a visible spot, so pooled numbers
   mostly describe the rim. Read the deep bins.
 - "Beyond 290 µm the GCN is blind" holds in the interior only. On the 100 µm lattice, k-NN 8 edges

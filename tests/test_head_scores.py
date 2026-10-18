@@ -5,7 +5,8 @@ scores how well each head passes the cell's own values through. Pinned here: dis
 evaluation passes come from a private generator and hide whole discs; the head predictions are the
 step's own two halves, row-aligned with a per-cell depth into the hidden area that equals the
 distance to the nearest visible cell; and the scores read planted predictions correctly per gene,
-per group and per depth.
+per group, per depth and per group and depth; a blend of two heads with independent errors scores
+above both.
 """
 
 import numpy as np
@@ -17,6 +18,7 @@ from torch_geometric.data import Data
 
 from interscale.evaluation.masked_probing import (
     HeadPredictions,
+    blend_heads,
     collect_head_predictions,
     draw_masks,
     score_heads,
@@ -311,3 +313,51 @@ def test_without_a_center_or_a_depth_the_optional_parts_are_left_out():
     assert not any("centred" in c for c in tables["cells"].columns)
     with pytest.raises(ValueError, match="depth"):
         score_heads(pred, [f"g{j}" for j in range(G)], depth_bins_um=[0, 100])
+
+
+def test_each_group_is_scored_by_depth_and_its_all_row_is_the_pooled_group_score():
+    pred, true = _planted()
+    genes = [f"g{j}" for j in range(G)]
+    center = true.mean(0)
+    groups = {"a": genes[:3], "b": genes[3:], "none": ["unknown"]}
+    tables = score_heads(pred, genes, center=center, gene_groups=groups, depth_bins_um=[0, 100, 500])
+    table = tables["by_group_depth"]
+    assert set(table["group"]) == {"a", "b"}  # a group without a scored gene is left out
+    pooled = table[table["depth_um"] == "all"].set_index("group")
+    by_group = tables["by_group"].set_index("group")
+    for column in ("n_hidden", "global_cosine", "local_cosine"):
+        assert np.allclose(pooled[column], by_group.loc[pooled.index, column])
+    deep = table[table["depth_um"] != "all"]
+    assert np.allclose(deep["global_cosine"], 1.0)
+    depth = tables["by_depth"].set_index("depth_um")
+    for (group, depth_um), n_hidden in deep.set_index(["group", "depth_um"])["n_hidden"].items():
+        assert n_hidden == 3 * depth.loc[depth_um, "n_cells"]  # every gene of a wholly hidden cell
+    assert "by_group_depth" not in score_heads(pred, genes, center=center, gene_groups=groups)
+    assert "by_group_depth" not in score_heads(pred, genes, center=center, depth_bins_um=[0, 100, 500])
+
+
+def test_a_blend_of_two_heads_with_independent_errors_scores_above_both():
+    rng = np.random.default_rng(1)
+    pred, true = _planted()
+    pred.heads = {
+        "global": true + rng.normal(scale=0.5, size=true.shape),
+        "ref_kernel": true + rng.normal(scale=0.5, size=true.shape),
+        "ref_slide_mean": np.tile(true.mean(0), (len(true), 1)),
+    }
+    blended = blend_heads(pred, "ref_kernel")
+    assert set(blended.heads) == {"global", "ref_kernel", "ref_slide_mean", "blend_global"}
+    assert np.allclose(blended.heads["blend_global"], 0.5 * (pred.heads["global"] + pred.heads["ref_kernel"]))
+    assert blended.true is pred.true and "blend_global" not in pred.heads
+    cells = score_heads(blended, [f"g{j}" for j in range(G)], center=true.mean(0))["cells"].iloc[0]
+    assert cells["blend_global_cosine_centred"] > max(
+        cells["global_cosine_centred"], cells["ref_kernel_cosine_centred"]
+    )
+    # A blend with itself changes nothing; the weight is the reference's share.
+    same = blend_heads(HeadPredictions(heads={"global": true, "ref_a": true}, true=true, hidden=pred.hidden), "ref_a")
+    assert np.allclose(same.heads["blend_global"], true)
+    alone = blend_heads(pred, "ref_kernel", weight=1.0)
+    assert np.allclose(alone.heads["blend_global"], pred.heads["ref_kernel"])
+    with pytest.raises(ValueError, match="no head"):
+        blend_heads(pred, "ref_missing")
+    with pytest.raises(ValueError, match="weight"):
+        blend_heads(pred, "ref_kernel", weight=1.5)

@@ -100,20 +100,103 @@ def draw_masks(data_list, kind: str, rate: float, seed: int, radius: float | Non
 
 #: The feature set :func:`smoother_features` adds.
 SMOOTHER = "smoother"
+#: The feature set :func:`position_features` adds.
+POSITION = "position"
 #: The model embeddings that get a ``smoother+<name>`` set when the smoother was collected.
 MODEL_EMBEDDINGS = ("local", "global", "local+global")
 
 
 def feature_sets(features: ProbeBatchFeatures) -> dict[str, np.ndarray]:
-    """The collected representations, plus ``local+global`` and ``smoother+<embedding>`` where possible."""
+    """The collected representations, plus the combinations the probes compare.
+
+    ``local+global``; ``smoother+<embedding>`` with the smoother; with the position as well, the
+    model-free bar ``smoother+position`` and ``smoother+position+<embedding>``; with the position
+    alone, ``position+<embedding>``. An embedding knows more than the bar where bar+embedding beats it.
+    """
     sets = dict(features.embeddings)
     if "local" in sets and "global" in sets:
         sets["local+global"] = np.concatenate([sets["local"], sets["global"]], axis=1)
+    models = [name for name in MODEL_EMBEDDINGS if name in sets]
     if SMOOTHER in sets:
-        for name in MODEL_EMBEDDINGS:
-            if name in sets:
-                sets[f"{SMOOTHER}+{name}"] = np.concatenate([sets[SMOOTHER], sets[name]], axis=1)
+        for name in models:
+            sets[f"{SMOOTHER}+{name}"] = np.concatenate([sets[SMOOTHER], sets[name]], axis=1)
+    if POSITION in sets:
+        bar = f"{SMOOTHER}+{POSITION}" if SMOOTHER in sets else POSITION
+        if SMOOTHER in sets:
+            sets[bar] = np.concatenate([sets[SMOOTHER], sets[POSITION]], axis=1)
+        for name in models:
+            sets[f"{bar}+{name}"] = np.concatenate([sets[bar], sets[name]], axis=1)
     return sets
+
+
+def combined_features(*functions):
+    """One ``extra_features`` function for :func:`~interscale.evaluation.online_probes.collect_features` from several."""
+
+    def features(batch, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+        out = {}
+        for function in functions:
+            out.update(function(batch, hidden))
+        return out
+
+    return features
+
+
+def position_features(*, spatial_unit_um: float, patch_um: tuple[float, ...], max_offset_um: float):
+    """A model-free feature set for the probes: where a cell lies on its slide, and nothing else.
+
+    Returns a function for :func:`~interscale.evaluation.online_probes.collect_features`'s
+    ``extra_features``. Coordinates are taken relative to the centroid of the cell's graph, so slides
+    placed anywhere share one frame. Each cell gets, as :data:`POSITION`:
+
+    * its offset from the centroid in µm (x, y) and its distance from it;
+    * per size ``p`` in ``patch_um``, a one-hot of the square patch of side ``p`` it falls in, on a
+      grid centred on the centroid that covers ``max_offset_um`` in every direction (cells beyond
+      fall into the border patches).
+
+    A linear probe on the patches is a lookup of the average label per area, learned on the
+    training slides: what position alone says about a hidden cell, at several scales. The
+    positional encoding hands a model at least this much without any learning, so an embedding
+    knows more than position only where ``smoother+position+<embedding>`` beats ``smoother+position``.
+    No expression enters.
+
+    Parameters
+    ----------
+    spatial_unit_um
+        µm per unit of ``pos``.
+    patch_um
+        Patch sides in µm, e.g. ``(500, 1000, 2500)``.
+    max_offset_um
+        The largest distance of a cell from its graph's centroid along either axis, over every
+        graph the features are collected for, in µm. Fixes the number of patches, so every graph
+        and split gets the same columns.
+    """
+    patches = [float(p) for p in patch_um]
+    if any(p <= 0 for p in patches):
+        raise ValueError(f"patch sides must be positive, got {patch_um}.")
+    if not max_offset_um > 0:
+        raise ValueError(f"max_offset_um must be positive, got {max_offset_um}.")
+    half = [int(np.ceil(float(max_offset_um) / p)) for p in patches]
+
+    def features(batch, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+        pos = getattr(batch, "pos", None)
+        if pos is None:
+            raise ValueError("the position features need coordinates, but the graphs carry no `pos`.")
+        pos = pos[:, :2].double() * float(spatial_unit_um)
+        graph = batch.batch
+        n_graphs = int(graph.max()) + 1
+        sums = torch.zeros(n_graphs, 2, dtype=pos.dtype, device=pos.device).index_add_(0, graph, pos)
+        counts = torch.bincount(graph, minlength=n_graphs).to(pos.dtype)
+        offset = pos - (sums / counts[:, None])[graph]
+        parts = [offset, offset.norm(dim=1, keepdim=True)]
+        for p, h in zip(patches, half, strict=True):
+            n = 2 * h
+            cell = (torch.floor(offset / p).long() + h).clamp(0, n - 1)
+            one_hot = torch.zeros(len(pos), n * n, dtype=pos.dtype, device=pos.device)
+            one_hot[torch.arange(len(pos), device=pos.device), cell[:, 0] * n + cell[:, 1]] = 1.0
+            parts.append(one_hot)
+        return {POSITION: torch.cat(parts, dim=1).float()}
+
+    return features
 
 
 def smoother_features(*, spatial_unit_um: float, kernels_um: tuple[float, ...] = (), k_nearest: tuple[int, ...] = ()):
@@ -409,6 +492,8 @@ def probe_covariates(
 
 #: Name prefix of the reference predictors among the heads of a :class:`HeadPredictions`.
 REFERENCE_PREFIX = "ref_"
+#: Name prefix of the blends of a model head with a reference (:func:`blend_heads`).
+BLEND_PREFIX = "blend_"
 
 
 @dataclass
@@ -661,6 +746,34 @@ def collect_head_predictions(
     )
 
 
+def blend_heads(pred: HeadPredictions, reference: str, *, weight: float = 0.5) -> HeadPredictions:
+    """``pred`` with each model head also blended with a reference: ``blend_<head>``.
+
+    ``blend_<head> = (1 - weight) * head + weight * reference``, entry by entry. A blend that scores
+    above both the head and the reference means the head holds something the reference lacks, and
+    the other way round; a blend between the two means one only adds noise to the other. A plain
+    average: under the centred cosine the one whose deviations from the centre are larger counts
+    for more.
+
+    Parameters
+    ----------
+    pred
+        From :func:`collect_head_predictions`, with ``reference`` among its heads.
+    reference
+        A reference's head name, e.g. ``"ref_kernel_400um"``.
+    weight
+        The reference's share, in [0, 1].
+    """
+    if reference not in pred.heads:
+        raise ValueError(f"no head {reference!r} to blend with; the heads are {sorted(pred.heads)}.")
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError(f"weight must lie in [0, 1], got {weight}.")
+    models = [h for h in pred.heads if not h.startswith((REFERENCE_PREFIX, BLEND_PREFIX))]
+    ref = pred.heads[reference]
+    blends = {f"{BLEND_PREFIX}{h}": (1.0 - weight) * pred.heads[h] + weight * ref for h in models}
+    return HeadPredictions(heads=pred.heads | blends, true=pred.true, hidden=pred.hidden, depth_um=pred.depth_um)
+
+
 def _r2(pred: np.ndarray, true: np.ndarray) -> float:
     """``1 - SSE / SST`` around the mean of ``true``; NaN with fewer than two values or no spread."""
     if len(true) < 2:
@@ -718,9 +831,11 @@ def score_heads(
         per gene, its hidden entries' count and each head's ``gene_metrics``. ``"by_group"`` (with
         ``gene_groups``): per group, the cosine pooled over all its hidden entries, and with ``r2``
         among the ``gene_metrics`` the mean of its genes' R². ``"by_depth"`` (with
-        ``depth_bins_um``): the ``"cells"`` columns per depth bin. With both a ``local`` and a
-        ``global`` head, each table also carries ``global - local`` columns: positive is the global
-        head better for R², r and cosine, negative for SCE.
+        ``depth_bins_um``): the ``"cells"`` columns per depth bin. ``"by_group_depth"`` (with both):
+        per group and depth (``"all"``, then each bin of wholly hidden cells), the hidden entries'
+        count and each head's pooled centred cosine (``<head>_cosine``). With both a ``local`` and a
+        ``global`` head, each table but ``"by_group_depth"`` also carries ``global - local`` columns:
+        positive is the global head better for R², r and cosine, negative for SCE.
     """
     unknown = sorted(set(gene_metrics) - set(GENE_METRICS))
     if unknown:
@@ -766,14 +881,18 @@ def score_heads(
     per_gene = pd.DataFrame(rows)
     tables["per_gene"] = per_gene
 
+    group_columns = {}
     if gene_groups:
         position = {g: i for i, g in enumerate(genes)}
-        offset = center if center is not None else 0.0
+        group_columns = {
+            group: cols
+            for group, members in gene_groups.items()
+            if (cols := [position[g] for g in members if g in position])
+        }
+    offset = center if center is not None else 0.0
+    if group_columns:
         rows = []
-        for group, members in gene_groups.items():
-            cols = [position[g] for g in members if g in position]
-            if not cols:
-                continue
+        for group, cols in group_columns.items():
             keep = np.zeros_like(hidden)
             keep[:, cols] = hidden[:, cols]
             in_group = per_gene["gene"].isin([genes[c] for c in cols])
@@ -795,9 +914,28 @@ def score_heads(
         deep = scored & (pred.depth_um > 0)
         bins = pd.cut(pd.Series(pred.depth_um), bins=list(depth_bins_um), right=True)
         rows = []
+        depth_rows = [("all", np.ones(len(true), bool))]
         for interval in bins.cat.categories:
             in_bin = deep & (bins == interval).to_numpy()
             if in_bin.any():
                 rows.append({"depth_um": str(interval), **cell_columns(in_bin)})
+                depth_rows.append((str(interval), in_bin))
         tables["by_depth"] = pd.DataFrame(rows)
+
+        if group_columns:
+            # The groups' pooled cosine per depth bin: whether the genes that carry the context
+            # (receivers, responses) are filled in deep inside the hidden area, apart from noise.
+            rows = []
+            for group, cols in group_columns.items():
+                for depth, cells in depth_rows:
+                    keep = np.zeros_like(hidden)
+                    keep[:, cols] = hidden[:, cols]
+                    keep[~cells] = False
+                    if not keep.any():
+                        continue
+                    row = {"group": group, "depth_um": depth, "n_genes": len(cols), "n_hidden": int(keep.sum())}
+                    for name, p in heads.items():
+                        row[f"{name}_cosine"] = _pooled_cosine(p - offset, true - offset, keep)
+                    rows.append(row)
+            tables["by_group_depth"] = pd.DataFrame(rows)
     return tables

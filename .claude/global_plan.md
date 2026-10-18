@@ -22,7 +22,7 @@ user runs smoke, sweeps and evaluation on the cluster.
 
 ## Status
 
-Last updated 2026-10-18 (A2, B and C3 run and read).
+Last updated 2026-10-18 (A2, B and C3 run and read; 0g built).
 
 | stage | state | verified by | date |
 |---|---|---|---|
@@ -32,6 +32,7 @@ Last updated 2026-10-18 (A2, B and C3 run and read).
 | 0d — masked-pass evaluation: probes by depth with a smoother set, attention by query, untrained twin | **implemented, unverified** — `collect_features` gathers each cell's depth and any extra feature set in probe row order (subsampled graphs included); `smoother_features` is the references side by side and never reads a hidden value; `probe_labels`/`probe_covariates` score by depth with their pooled rows unchanged, a single-class bin NaN; `score_heads(gene_metrics=("cosine",))`; `attention_by_query` reads the maps a masked step returns, gives exactly uniform attention 1 against every uniform reference and 0.5 on planted pairs, touches no generator; `attention_diagnostics(masked=...)` and `probe.attention_masked` (default on) for the callback. Script: relevance, gene ranks, loadings and R² dropped; untrained twin as `<arm>_untrained`. Checked on stub data with untrained toy models (all 7 arms, twins, headline, W&B summary, smoke readouts). Mutations: see 0e | 2026-10-17 |
 | 0e — receptive field and representations | **implemented, unverified** — `receptive_field`: Hutchinson estimate within 10% of the exact squared Jacobian norm (correlation > 0.95), queries on subsampled graphs read their own row, a GCN reads exactly 0 beyond its hops while a transformer and a dual decoder's global head do not, planted pairs ranked on influence, no generator touched, parameters and `gex_embedding` restored; `representation_table`: CKA 1 under rotation and scale and low for unrelated sets, participation ratio counts directions, wide sets reduced. 15 mutations across 0d and 0e, each caught; full suite passes | 2026-10-17 |
 | 0f — one results file per sweep | **implemented, unverified** — `evaluation.report`: `append_sections` appends an arm's compact tables as `## <arm> | <analysis>` sections (CSV, index columns counted in the fence) to `RESULTS_DIR/results.md`; `read_sections` reads them back, the later section winning; `write_report` rewrites the file with the cross-arm summary on top (counts and references once, gains over the smoother, untrained twins under their arms). `global_only.py` writes nothing else. 6 tests, 7 mutations caught; checked on stub data (7 arms + twins, 3,515 lines, summary in the first ~700) | 2026-10-17 |
+| 0g — position baseline, gene groups by depth, blend test | **implemented, unverified** — `masked_probing.position_features` (offset from the slide centroid, its norm, one-hot patches per size; identical for a slide placed anywhere, no expression enters, cells beyond the grid clipped to its border), `combined_features`, `feature_sets` adds `smoother+position` and `smoother+position+<E>`; `score_heads` → `by_group_depth` (its `all` rows equal `by_group`); `blend_heads` (`blend_<head>`). Report: `heads_group_by_depth` sections, summary per group by depth (count, best reference, slide mean once; `write_report(groups=...)` limits the summary's group tables), label and distance summaries with the gain over `smoother+position`. Scripts: `GENE_GROUP_KEYS`, `SUMMARY_GENE_GROUPS`, `POSITION_PATCHES_UM`, `BLEND_REFERENCE` in `sweep_common.py`; all four sweeps set to `MODE = "sweep"` for the rerun. 9 tests, 8 mutations caught (a ninth showed a redundant sort, removed); 822 tests pass; checked end to end on a generated stub synth_spot (6 slides per condition, 20 × 20) with untrained GlobalModel, CombinedModel and LocalModel | 2026-10-18 |
 | A1 — learned linear input for the global-only model | **implemented, unverified** — `type_gex_embedding: Linear` builds `input_embedding` (an `nn.Linear`; the transformer's input LayerNorm normalises it), trained with the transformer; training maps the masked batch and inference (`GlobalModel.get_model_output`) the clean one, both through `GlobalModule.gex_embedding`; hidden cells' values never reach a prediction, visible ones do; the validator accepts only buildable inputs; `emb-linear` in the global-only checkpoint name only. 4 mutations, each caught; 735 tests pass; harness IDENTICAL (its GlobalModel/PCA and LocalModel cases included). **Not run on data** | 2026-10-15 |
 | A2 — global-only sweep (input × encoding) and a local-only reference | **RUN 2026-10-18**, read: see "Results of the first sweeps". set up — `notebooks_and_scripts/slurm/global_only.{py,yaml}`, `global_only_sweep.yaml`; 7 arms validate with their model types, checkpoint names distinct; script checked on stub data (preflight, one W&B sweep per model type, stale-file guard, head tables and W&B summary for single- and dual-head arms). Evaluation switched to 0d/0e on 2026-10-17; the machinery moved to `slurm/sweep_common.py`, shared with the B and C3 sweeps | 2026-10-17 |
 | B1 — local-embedding variants under one global model (scVI joint, scVI frozen, frozen random GCN, 1-layer GCN) | not started | | |
@@ -637,13 +638,15 @@ model is asked to predict, or combining near and far information.
 - Previous rounds: the 3b conclusions hold on the rescaled data (local blind beyond 290 µm, global
   reaches but does not pass the smoother, encoding matters, residual decoder no help).
 
-**Next (proposed, not started).**
-- Blend test: average each global head with the 400 µm smoother; a blend above both means the
-  model holds signal the smoother lacks.
-- A coordinates-only probe baseline to separate position from learned content.
-- Gene-group scores by depth: 160 of 253 genes are unpredictable background, which dilutes the overall cosine.
+**Next.**
+- Built 2026-10-18 (0g), rerun of all four sweeps pending: the blend test, the position baseline
+  (patches at 500, 1000 and 2500 µm, not single coordinates, at the user's suggestion), and head
+  scores per gene group by depth with sender/receiver/source/response roles. The rerun also
+  refreshes the planted-pair numbers and finishes C3's two arms.
 - An objective or evaluation a smoother cannot satisfy (larger holes, long-range programmes in the deep field).
-- Rerun evaluation for the planted-pair fix; finish C3's two arms.
+- A legnini sweep for attention: where cells and clusters attend, and how attention biases
+  (learned distance bias with per-head temperature, entmax, learned pairwise gates) change it.
+  Proposed 2026-10-18, under discussion.
 
 ## Order and decision points
 

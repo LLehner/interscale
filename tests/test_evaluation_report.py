@@ -266,3 +266,96 @@ def test_depth_labels_are_ordered_by_their_lower_edge():
     ]
     assert deepest(["visible", "(0.0, 150.0]", "(290.0, 500.0]"]) == "(290.0, 500.0]"
     assert deepest(["visible"]) is None
+
+
+def _group_depth(shift=0.0):
+    """``score_heads``' per-group, per-depth table for one arm: groups A and noise, a model head and two references."""
+    rows = []
+    for group, base in (("A", 0.4), ("noise", 0.0)):
+        for k, depth in enumerate(["all", *BINS]):
+            rows.append(
+                {
+                    "group": group,
+                    "depth_um": depth,
+                    "n_genes": 3,
+                    "n_hidden": 30 - k,
+                    "global_cosine": base + shift,
+                    "blend_global_cosine": base + shift + 0.05,
+                    "ref_slide_mean_cosine": base - 0.2,
+                    "ref_kernel_400um_cosine": base - 0.1 * k,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_group_scores_by_depth_compact_to_rows_per_group_and_head(tmp_path):
+    compact = compact_tables({"heads_by_group_depth": _group_depth()})["heads_group_by_depth"]
+    assert list(compact.columns) == ["all", *BINS]
+    heads = ["n_hidden", "global", "blend_global", "ref_slide_mean", "ref_kernel_400um"]
+    assert list(compact.index) == [(g, h) for g in ("A", "noise") for h in heads]
+    assert compact.loc[("A", "n_hidden"), BINS[1]] == 28
+    path = tmp_path / "results.md"
+    append_sections(path, "a", {"heads_group_by_depth": compact})
+    back = read_sections(path)[("a", "heads_group_by_depth")]
+    np.testing.assert_allclose(back.to_numpy(dtype=float), compact.to_numpy(dtype=float))
+    assert list(back.index.names) == ["group", "head"]
+
+
+def test_the_summary_shows_each_group_by_depth_with_the_best_reference_once(tmp_path):
+    path = tmp_path / "results.md"
+    append_sections(path, "a", compact_tables(_raw() | {"heads_by_group_depth": _group_depth(0.0)}))
+    append_sections(path, "b", compact_tables(_raw() | {"heads_by_group_depth": _group_depth(0.3)}))
+    tables = dict(summary_tables(read_sections(path), ["a", "b"]))
+    table = next(
+        t for title, t in tables.items() if title.startswith("centred cosine per gene group on hidden spots by depth")
+    )
+    assert list(table.index) == [
+        (g, arm, head)
+        for g in ("A", "noise")
+        for arm, head in (
+            ("count", "hidden entries"),
+            ("a", "global"),
+            ("a", "blend_global"),
+            ("b", "global"),
+            ("b", "blend_global"),
+            ("reference", "best"),
+            ("reference", "slide_mean"),
+        )
+    ]
+    best = table.loc[("A", "reference", "best")]
+    assert best["all"] == pytest.approx(0.4) and best[BINS[2]] == pytest.approx(0.2)  # the kernel, then the mean
+    assert table.loc[("noise", "b", "global"), "all"] == pytest.approx(0.3)
+
+    kept = dict(summary_tables(read_sections(path), ["a", "b"], groups=["noise"]))
+    table = next(
+        t for title, t in kept.items() if title.startswith("centred cosine per gene group on hidden spots by depth")
+    )
+    assert set(table.index.get_level_values("group")) == {"noise"}
+    pooled = next(t for title, t in kept.items() if title == "centred cosine per gene group on hidden spots")
+    assert list(pooled.columns) == ["noise"]
+
+
+def test_the_summary_reads_the_gain_over_smoother_and_position_together(tmp_path):
+    raw = _raw()
+    extra = []
+    for depth in ("all", BINS[0]):
+        for feature_set, value in (("position", 0.65), ("smoother+position", 0.75), ("smoother+position+global", 0.8)):
+            extra.append(
+                {
+                    "target": "region",
+                    "feature_set": feature_set,
+                    "metric": "balanced_accuracy",
+                    "value": value,
+                    "depth_um": depth,
+                    "n": 9,
+                }
+            )
+    raw["context_labels"] = pd.concat([raw["context_labels"], pd.DataFrame(extra)], ignore_index=True)
+    path = tmp_path / "results.md"
+    append_sections(path, "a", compact_tables(raw))
+    labels = next(t for title, t in summary_tables(read_sections(path), ["a"]) if title.startswith("label 'region'"))
+    references = [row for arm, row in labels.index if arm == "reference"]
+    assert references == ["smoother", "position", "smoother+position", "majority"]
+    assert labels.loc[("a", "global: gain over smoother+position"), "all"] == pytest.approx(0.05)
+    assert labels.loc[("a", "global: gain over smoother"), "all"] == pytest.approx(0.1)
+    assert ("a", "global: gain over position") not in labels.index  # position+global was not probed
