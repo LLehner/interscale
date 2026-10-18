@@ -255,6 +255,26 @@ def test_other_weights_give_the_weighted_sum_and_it_is_what_val_loss_reports(wei
     assert plan.logged["val_loss"].item() == pytest.approx(expected.item(), abs=1e-6)
 
 
+def test_each_head_logs_its_own_masked_sce_beside_the_combined_one():
+    """The combined metric is the mean of the two halves; a frozen head drags it, the per-head ones do not."""
+    from interscale.train.losses import scaled_cosine_error
+
+    module = _module().eval()
+    plan = _plan(module)
+    batch = _batch()
+    plan._step(batch, "val")
+    out = module._common_step(batch, "regression", "node")
+    n = len(out.y_pred) // 2
+    for name, rows in (("local", slice(0, n)), ("global", slice(n, None))):
+        m = out.entry_mask[rows].float()
+        scored = m.any(dim=1)
+        expected = scaled_cosine_error((out.y_pred[rows] * m)[scored], (out.y_true[rows] * m)[scored], 1.0).mean()
+        assert plan.logged[f"val_masked_scaled_cosine_error_{name}"].item() == pytest.approx(expected.item(), abs=1e-6)
+    heads = [plan.logged[f"val_masked_scaled_cosine_error_{h}"].item() for h in ("local", "global")]
+    assert plan.logged["val_masked_scaled_cosine_error"].item() == pytest.approx(sum(heads) / 2, abs=1e-5)
+    assert heads[0] != heads[1]
+
+
 def _grads(module):
     return {name: (p.grad if p.grad is not None else torch.zeros_like(p)) for name, p in module.named_parameters()}
 

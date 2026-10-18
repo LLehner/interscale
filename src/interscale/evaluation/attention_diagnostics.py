@@ -325,7 +325,7 @@ def attention_by_query(
     radii_um: Sequence[float] = (),
     distance_bins_um: Sequence[float] = (),
     edges: pd.DataFrame | None = None,
-    tolerance_um: float = 50.0,
+    tolerance_um: float = 10.0,
     max_graphs: int = 0,
 ) -> dict[str, pd.DataFrame]:
     """The raw attention of a masked pass, by how deep each query lies in the hidden area.

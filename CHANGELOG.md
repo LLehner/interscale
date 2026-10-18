@@ -144,6 +144,11 @@ and this project adheres to [Semantic Versioning][].
 
 ### Fixed
 
+- A dual decoder now logs each head's masked scaled cosine error (`<mode>_masked_scaled_cosine_error_local` /
+  `_global`). The combined metric is the mean of both halves, so with one head frozen it said nothing about
+  the head that trains.
+- The planted-pair matched rank compares senders with cells within 10 µm of their distance to the
+  receiver (was 50 µm), so lattice neighbours no longer rank against the diagonals.
 - Spatial blocks alone (`mask_percentage` 0) left the model input unmasked.
 - Sweep trials seed before building the model; the efficiency monitor measures training memory only;
   the directional Fourier bias has its own checkpoint tag.

@@ -112,7 +112,7 @@ def receptive_field(
     n_projections: int = 2,
     edges: pd.DataFrame | None = None,
     edge_queries: int = 16,
-    tolerance_um: float = 50.0,
+    tolerance_um: float = 10.0,
     seed: int = 0,
     max_graphs: int = 0,
 ) -> dict[str, pd.DataFrame]:

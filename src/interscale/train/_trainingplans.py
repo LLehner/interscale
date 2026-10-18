@@ -611,6 +611,8 @@ class TrainingPlan(pl.LightningModule):
             if separate_losses.get(key) is not None:
                 self._log_scalar(f"{mode}_{key}", separate_losses[key], sync_dist)
 
+        self._log_head_sce(y_pred, y_true, entry_mask, mode, sync_dist)
+
         # Metrics are computed from the combined predictions, as before.
         loss = self._compute_and_log_metrics(
             y_pred,
@@ -633,6 +635,25 @@ class TrainingPlan(pl.LightningModule):
 
         assert not torch.isnan(loss), "loss is NaN"
         return loss
+
+    def _log_head_sce(self, y_pred, y_true, entry_mask, mode: str, sync_dist: bool) -> None:
+        """``<mode>_masked_scaled_cosine_error_{local,global}``: each head's SCE on the masked entries.
+
+        A dual decoder's step output stacks the local and the global half, so the combined
+        ``<mode>_masked_scaled_cosine_error`` is their mean: with one head frozen at a random
+        initialisation (SCE ~ 1) it reads about half-way between the two and says nothing about
+        the head that trains. These two are each head's own score, raw (not centred).
+        """
+        if entry_mask is None:
+            return
+        n = len(y_pred) // 2
+        for name, rows in (("local", slice(0, n)), ("global", slice(n, None))):
+            mask = entry_mask[rows].to(y_pred.dtype)
+            scored = mask.any(dim=1)
+            if not scored.any():
+                continue
+            sce = scaled_cosine_error((y_pred[rows] * mask)[scored], (y_true[rows] * mask)[scored], self.sce_gamma)
+            self._log_scalar(f"{mode}_masked_scaled_cosine_error_{name}", sce.mean(), sync_dist)
 
     def _forward_views(self, batch):
         """Run the module once per view an auxiliary term asked for, and merge them.

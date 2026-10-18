@@ -172,6 +172,25 @@ def test_a_planted_sender_ranks_one_and_a_distance_kernel_one_half():
     assert np.isnan(ranks[0].item()) and ranks[1].item() == 1.0
 
 
+def test_the_default_tolerance_keeps_a_lattice_neighbour_from_ranking_against_the_diagonals():
+    """On the 100 um lattice a +-50 um tolerance compares a 100 um sender with the 141 um diagonals, which a
+    distance kernel ranks below it: the planted pair read 1.0 for weights that know only distance."""
+    dist = torch.tensor([[0.0, 100, 100, 100, 100, 141, 141, 141, 141]], dtype=torch.float64)
+    keep = torch.ones(1, 9, dtype=torch.bool)
+    kernel = torch.exp(-dist / 100.0)
+    exclude = torch.zeros(1, 9, dtype=torch.bool)
+    rows, senders = torch.tensor([0]), torch.tensor([1])
+    assert sw.matched_ranks(kernel, dist, keep, rows, senders, exclude, 50.0).item() > 0.7
+    assert sw.matched_ranks(kernel, dist, keep, rows, senders, exclude, 10.0).item() == 0.5
+    import inspect
+
+    from interscale.evaluation.attention_diagnostics import attention_by_query
+    from interscale.evaluation.receptive_field import receptive_field
+
+    for function in (attention_by_query, receptive_field):
+        assert inspect.signature(function).parameters["tolerance_um"].default == 10.0
+
+
 def test_planted_edges_are_found_by_their_positions_in_a_graph_of_any_order():
     edges = pd.DataFrame({"sender": [10, 11, 99], "receiver": [12, 10, 10], "range_class": ["short", "long", "long"]})
     names = torch.tensor([13.0, 11.0, 12.0])  # positions 12, 10 and 11, plus one

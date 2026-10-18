@@ -611,12 +611,14 @@ model is asked to predict, or combining near and far information.
   for multi-slide data; prefer Precomputed.
 - The learned linear input without RoPE fails: `lin_none` 0.153, `lin_fourier` 0.146, below the
   slide mean; `lin_fourier`'s loss stays at `lin_none`'s. With PCA or scVI input Fourier works (0.41).
-- **Metric bug:** `val_masked_scaled_cosine_error` averages both heads of a dual model, so it
+- **Metric bug (fixed 2026-10-18):** `val_masked_scaled_cosine_error` averages both heads of a dual model, so it
   reads ~0.57 for `frozen_local` (frozen local head ~1) and 0.553 in `l2g` phase 0. Training is
-  unaffected; do not read the metric when a head is frozen. To fix.
-- **Evaluation bug:** planted-pair ranks for short-range pairs are inflated (untrained GCN 0.86):
+  unaffected; do not read the combined metric when a head is frozen; a dual decoder now also logs
+  `<mode>_masked_scaled_cosine_error_{local,global}` (earlier runs lack them).
+- **Evaluation bug (fixed 2026-10-18):** planted-pair ranks for short-range pairs are inflated (untrained GCN 0.86):
   the ±50 µm distance tolerance mixes 100 µm neighbours and 141 µm diagonals on the 100 µm lattice.
-  To fix with a tighter tolerance. The other classes sit at ~0.5 in every model: no sender selection.
+  Default tolerance now 10 µm (no longer lattice-neighbour vs diagonal); rerun `MODE = "evaluate"` to
+  refresh the numbers, and note a 10 µm tolerance suits the 100 µm lattice, not irregular data. The other classes sit at ~0.5 in every model: no sender selection.
 - The residual decoder hurts again in the deep field (`joint_res` 0.389 vs `joint` 0.438 at 290–500 µm).
 - Without RoPE, visible spots attend almost only to hidden tokens (identical mask tokens act as a
   sink); the CLS gets ~0.
@@ -641,7 +643,7 @@ model is asked to predict, or combining near and far information.
 - A coordinates-only probe baseline to separate position from learned content.
 - Gene-group scores by depth: 160 of 253 genes are unpredictable background, which dilutes the overall cosine.
 - An objective or evaluation a smoother cannot satisfy (larger holes, long-range programmes in the deep field).
-- Fix the two bugs above; finish C3's two arms.
+- Rerun evaluation for the planted-pair fix; finish C3's two arms.
 
 ## Order and decision points
 
