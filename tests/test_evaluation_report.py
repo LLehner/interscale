@@ -364,37 +364,29 @@ def test_the_summary_reads_the_gain_over_smoother_and_position_together(tmp_path
 def test_the_patch_flow_compacts_and_gets_summary_tables(tmp_path):
     summary = pd.DataFrame(
         [
-            {"layer": layer, "group": group, "metric": metric, "value": value, "n_sources": 9}
-            for layer, value in (("l0", 0.2), ("l1", 0.5), ("influence", 0.1))
-            for group in ("hidden", "visible")
-            for metric in ("kl_distance", "self_mass", "beyond_distance")
+            {"kind": kind, "metric": metric, "value": value}
+            for kind, value in (("influence", 0.5), ("rollout", 0.2))
+            for metric in ("shift_um", "kl_null", "kl_null_floor", "reach_um")
         ]
     )
     labels = pd.DataFrame(
         [
-            {
-                "layer": "l0",
-                "group": "hidden",
-                "query_label": a,
-                "key_label": b,
-                "mass": 0.5,
-                "lift_uniform": 1.0,
-                "lift_distance": 2.0 * a + b,
-            }
+            {"kind": "rollout", "query_label": a, "key_label": b, "observed": 0.5, "null_mean": 0.25, "null_std": 0.05}
             for a in (0, 1)
             for b in (0, 1)
         ]
     )
     compact = compact_tables({"flow_summary": summary, "flow_labels": labels})
-    assert list(compact["flow_summary"].columns) == ["visible", "hidden"]
-    assert compact["flow_summary"].loc[("l1", "kl_distance"), "hidden"] == pytest.approx(0.5)
-    assert compact["flow_labels"].loc[("l0", "hidden", "lift_distance", 1), 0] == pytest.approx(2.0)
+    assert list(compact["flow_summary"].columns) == ["reach_um", "kl_null", "kl_null_floor", "shift_um"]
+    assert compact["flow_summary"].loc["rollout", "kl_null"] == pytest.approx(0.2)
+    assert compact["flow_labels"].loc[("rollout", "log2_ratio", 1), 0] == pytest.approx(1.0)
+    assert compact["flow_labels"].loc[("rollout", "z", 0), 1] == pytest.approx(5.0)
     path = tmp_path / "results.md"
     append_sections(path, "base", compact)
     append_sections(path, "topk", compact)
     tables = dict(summary_tables(read_sections(path), ["base", "topk"]))
-    kl = next(t for title, t in tables.items() if title.startswith("patch flow by layer: KL"))
-    assert list(kl.index) == [(arm, layer) for arm in ("base", "topk") for layer in ("l0", "l1", "influence")]
+    flow = next(t for title, t in tables.items() if title.startswith("patch flow against"))
+    assert list(flow.index) == [(arm, kind) for arm in ("base", "topk") for kind in ("influence", "rollout")]
 
 
 def test_the_response_influence_compacts_and_gets_a_summary_table(tmp_path):

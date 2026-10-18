@@ -681,16 +681,23 @@ the mass on them takes a logit advantage of log((N − r)/r) ≈ 6.
   `attention_by_query` and `head_statistics` read the keys a query may attend to from it instead of
   from weights above 0, which a sparse normaliser breaks. Dense numbers are unchanged apart from
   keys whose softmax weight underflowed to 0.
-- **`evaluation.attention_flow.patch_flow`:** a grid of square patches per slide; per layer
-  (head-mean map) and for the receptive field of sampled hidden cells (`influence`), the weight the
-  queries of each source patch put on each target patch, against the uniform expectation (more
-  cells receive more) and against a distance kernel fitted to the same map (what is left once "near
-  gets more" is accounted for). Per source patch: KL of the observed target distribution from each,
-  the share kept in the source, the share on targets above twice their distance expectation.
-  Queries in two groups (hidden, visible); discs redrawn over several seeds so most patches serve
-  as hidden sources. The same by label (query label × key label), e.g. clusters. Maps
-  (`plot_patch_flow`) of the source patches whose flow departs most from the distance kernel
-  (`interesting_sources`).
+- **`evaluation.attention_flow.patch_flow`** (rewritten 2026-10-18, after the first legnini read
+  showed the first version not interpretable: raw per-layer attention, and a distance kernel blind
+  to which keys were hidden, so the maps showed where the discs fell): where the cells of each
+  source patch draw their predictions from, as two measures -- `influence`, the gradient flow on
+  their predicted hidden entries through each cell's visible entries (one backward pass per probe
+  for the whole patch; a query's own input left out, unbiased by a random-half split), and
+  `rollout`, attention composed over the layers with the residual path, CLS, hidden inputs and the
+  query itself left out. The null is the same trained model on the slide with the visible cells'
+  expression permuted among them (positions, masks, densities, encodings kept): everything
+  geometric survives it, so observed against null is what depends on the tissue's arrangement.
+  Summary per measure: reach (µm), share from the own patch, KL from the null and centre-of-mass
+  shift, each next to the floor permutations reach among themselves, and the share more than 2
+  null SDs above it. Figures: a flow field (arrows to the centre of mass of what each patch draws
+  from, and of what it draws beyond the null), maps of evenly spread source patches (share, log2
+  observed / permuted), and label heatmaps (observed, permuted, log2 ratio with stars), as the
+  user's earlier `attention_test.py` did for cell types. A random network already depends on
+  content, so every number is read against the arm's untrained twin.
 - **Script** `notebooks_and_scripts/slurm/legnini_attention.{py,yaml}`, `legnini_attention_sweep.yaml`
   on `sweep_common.py`, which gained `PREPROCESS`, `SLIDE_KEY`, `REQUIRE_KNN_GRAPH`, `ATTENTION = None`
   (the arms choose the backend) and the `FLOW_*` settings (off by default: the synth_spot sweeps

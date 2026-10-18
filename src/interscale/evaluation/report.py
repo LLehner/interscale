@@ -57,6 +57,19 @@ SMOOTHER = "smoother"
 POSITION = "position"
 #: The model-free probe feature sets, shown once as references in the summary.
 PROBE_REFERENCES = (SMOOTHER, POSITION, f"{SMOOTHER}+{POSITION}", "majority")
+#: The flow summary's metrics, in reading order (``attention_flow.flow_summary``).
+FLOW_METRICS = (
+    "reach_um",
+    "reach_null_um",
+    "self_share",
+    "self_share_null",
+    "kl_null",
+    "kl_null_floor",
+    "shift_um",
+    "shift_floor_um",
+    "above_null",
+    "n_sources",
+)
 #: Attention metrics kept per head as well as for the mean over heads.
 PER_HEAD_METRICS = ("visible_lift", "span_rel", "effective_rel")
 
@@ -81,15 +94,13 @@ NOTES = {
     "prediction), span_rel and effective_rel against uniform weights",
     "erf_profile": "influence per distance bin (µm) over uniform weights (1: uniform)",
     "erf_edges": "planted pairs: the sender's rank in the receiver's influence among visible spots as far (0.5: blind)",
-    "flow_summary": "attention (per layer, head mean) and influence flow between patches, over source patches by "
-    "query group: KL of the observed target distribution from uniform and from a distance kernel (0: explained "
-    "by it), the share kept in the source patch against both, and the share on targets above twice their "
-    "distance expectation",
-    "flow_labels": "attention flow by label (query label x key label, e.g. clusters): mass = share of the query "
-    "label's attention, lift_uniform / lift_distance = observed over uniform / distance-kernel expectation",
-    "response_edges": "programme masking: the planted sender's rank in its receiver's predicted response genes among "
-    "cells as far from the receiver (0.5: blind to the sender), per programme and range class (program any)",
-    "response_profile": "programme masking: the sampled receivers' influence per distance bin (µm) over uniform weights",
+    "flow_summary": "where the cells of a patch draw their predictions from -- influence (gradient flow) and "
+    "rollout (attention composed over layers with the residual path) -- against the slide with the visible "
+    "cells' expression permuted: reach in µm, share kept in the source patch, KL from the permutations and "
+    "the centre-of-mass shift (each next to the floor permutations reach among themselves), share of the "
+    "flow more than 2 null SDs above the permutations",
+    "flow_labels": "the same by label (query label drawing from key label): observed share, permuted share, "
+    "log2 observed / permuted and z against the permutations",
     "training": "the last epoch's throughput and peak memory, the final validation metrics",
     "phases": "staged training, each phase's end: drift_<component> = relative weight change (0: frozen), "
     "and the phase's last validation losses",
@@ -238,15 +249,21 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         )
     if "flow_summary" in tables:
         flow = tables["flow_summary"]
-        out["flow_summary"] = _pivot(flow, ["layer", "metric"], "group")
+        table = flow.pivot_table(index="kind", columns="metric", values="value", aggfunc="first", sort=False)
+        table.columns.name = None
+        out["flow_summary"] = table[[m for m in FLOW_METRICS if m in table.columns]]
     if "flow_labels" in tables:
-        labels = tables["flow_labels"].melt(
-            id_vars=["layer", "group", "query_label", "key_label"],
-            value_vars=["mass", "lift_uniform", "lift_distance"],
+        labels = tables["flow_labels"].copy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            labels["log2_ratio"] = np.log2(labels["observed"] / labels["null_mean"])
+            labels["z"] = (labels["observed"] - labels["null_mean"]) / labels["null_std"]
+        long = labels.melt(
+            id_vars=["kind", "query_label", "key_label"],
+            value_vars=["observed", "null_mean", "log2_ratio", "z"],
             var_name="measure",
         )
-        table = _pivot(labels, ["layer", "group", "measure", "query_label"], "key_label")
-        out["flow_labels"] = table.sort_index(level=["layer", "group", "measure"], sort_remaining=False)
+        table = _pivot(long, ["kind", "measure", "query_label"], "key_label")
+        out["flow_labels"] = table.sort_index(level=["kind", "measure"], sort_remaining=False)
     if "response_edges" in tables:
         out["response_edges"] = (
             tables["response_edges"]
@@ -616,13 +633,17 @@ def summary_tables(sections, arms: list[str], groups: list[str] | None = None) -
             "programme masking: planted sender's rank in its receiver's predicted response among cells as far (0.5: blind)",
             pd.concat(rows).unstack("range_class"),
         )
-    flow = _per_arm(sections, "flow_summary", arms)
-    for metric, what in (
-        ("kl_distance", "KL of the flow from a distance kernel (0: distance explains where it goes)"),
-        ("beyond_distance", "share of the flow on patches above twice their distance expectation"),
-        ("self_mass", "share of the flow kept in the source patch"),
-    ):
-        add(f"patch flow by layer: {what}", _select(flow, "metric", metric, ["layer"]))
+    parts = []
+    for arm, table in _per_arm(sections, "flow_summary", arms).items():
+        part = table.copy()
+        part.index = pd.MultiIndex.from_tuples([(arm, kind) for kind in part.index], names=["arm", "kind"])
+        parts.append(part)
+    if parts:
+        add(
+            "patch flow against the expression-permuted slide: reach (µm), self share, KL and centre-of-mass shift "
+            "with their permutation floors, share above the null",
+            pd.concat(parts),
+        )
     rows = [table["value"].rename(arm) for arm, table in _per_arm(sections, "training", arms).items()]
     if rows:
         add("training: the last epoch's throughput and peak memory, the final validation metrics", pd.DataFrame(rows))
