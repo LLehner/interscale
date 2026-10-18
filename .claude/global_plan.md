@@ -22,7 +22,7 @@ user runs smoke, sweeps and evaluation on the cluster.
 
 ## Status
 
-Last updated 2026-10-17 (Stage C built).
+Last updated 2026-10-18 (A2, B and C3 run and read).
 
 | stage | state | verified by | date |
 |---|---|---|---|
@@ -33,12 +33,12 @@ Last updated 2026-10-17 (Stage C built).
 | 0e — receptive field and representations | **implemented, unverified** — `receptive_field`: Hutchinson estimate within 10% of the exact squared Jacobian norm (correlation > 0.95), queries on subsampled graphs read their own row, a GCN reads exactly 0 beyond its hops while a transformer and a dual decoder's global head do not, planted pairs ranked on influence, no generator touched, parameters and `gex_embedding` restored; `representation_table`: CKA 1 under rotation and scale and low for unrelated sets, participation ratio counts directions, wide sets reduced. 15 mutations across 0d and 0e, each caught; full suite passes | 2026-10-17 |
 | 0f — one results file per sweep | **implemented, unverified** — `evaluation.report`: `append_sections` appends an arm's compact tables as `## <arm> | <analysis>` sections (CSV, index columns counted in the fence) to `RESULTS_DIR/results.md`; `read_sections` reads them back, the later section winning; `write_report` rewrites the file with the cross-arm summary on top (counts and references once, gains over the smoother, untrained twins under their arms). `global_only.py` writes nothing else. 6 tests, 7 mutations caught; checked on stub data (7 arms + twins, 3,515 lines, summary in the first ~700) | 2026-10-17 |
 | A1 — learned linear input for the global-only model | **implemented, unverified** — `type_gex_embedding: Linear` builds `input_embedding` (an `nn.Linear`; the transformer's input LayerNorm normalises it), trained with the transformer; training maps the masked batch and inference (`GlobalModel.get_model_output`) the clean one, both through `GlobalModule.gex_embedding`; hidden cells' values never reach a prediction, visible ones do; the validator accepts only buildable inputs; `emb-linear` in the global-only checkpoint name only. 4 mutations, each caught; 735 tests pass; harness IDENTICAL (its GlobalModel/PCA and LocalModel cases included). **Not run on data** | 2026-10-15 |
-| A2 — global-only sweep (input × encoding) and a local-only reference | **set up, not run** — `notebooks_and_scripts/slurm/global_only.{py,yaml}`, `global_only_sweep.yaml`; 7 arms validate with their model types, checkpoint names distinct; script checked on stub data (preflight, one W&B sweep per model type, stale-file guard, head tables and W&B summary for single- and dual-head arms). Evaluation switched to 0d/0e on 2026-10-17; the machinery moved to `slurm/sweep_common.py`, shared with the B and C3 sweeps | 2026-10-17 |
+| A2 — global-only sweep (input × encoding) and a local-only reference | **RUN 2026-10-18**, read: see "Results of the first sweeps". set up — `notebooks_and_scripts/slurm/global_only.{py,yaml}`, `global_only_sweep.yaml`; 7 arms validate with their model types, checkpoint names distinct; script checked on stub data (preflight, one W&B sweep per model type, stale-file guard, head tables and W&B summary for single- and dual-head arms). Evaluation switched to 0d/0e on 2026-10-17; the machinery moved to `slurm/sweep_common.py`, shared with the B and C3 sweeps | 2026-10-17 |
 | B1 — local-embedding variants under one global model (scVI joint, scVI frozen, frozen random GCN, 1-layer GCN) | not started | | |
-| B2 — embedding sweep | **set up, not run** — two sweeps in `slurm/`, each computing its embedding itself whenever it reads the data (`PREPARE_ADATA`, also passed to `main_sweep(prepare_adata=...)`), 64 wide (= n_embed), fitted on the training slides: `global_pca.*` (PCA of log1p_norm into `obsm['X_pca']`) and `global_scvi.*` (scvi-tools SCVI on the raw counts, latent mean, into `obsm['X_scvi']`). Arms per sweep: learned fill + RoPE, -1 fill, no encoding, Fourier. Computed once per process and saved under `RESULTS_DIR/embeddings/`, so training, twins and a later evaluation job see the same embedding. Checked end to end on stub data | 2026-10-17 |
+| B2 — embedding sweep | **RUN 2026-10-18** (PCA and scVI, separate sweeps `global_pca`, `global_scvi`), read: see "Results of the first sweeps". set up — two sweeps in `slurm/`, each computing its embedding itself whenever it reads the data (`PREPARE_ADATA`, also passed to `main_sweep(prepare_adata=...)`), 64 wide (= n_embed), fitted on the training slides: `global_pca.*` (PCA of log1p_norm into `obsm['X_pca']`) and `global_scvi.*` (scvi-tools SCVI on the raw counts, latent mean, into `obsm['X_scvi']`). Arms per sweep: learned fill + RoPE, -1 fill, no encoding, Fourier. Computed once per process and saved under `RESULTS_DIR/embeddings/`, so training, twins and a later evaluation job see the same embedding. Checked end to end on stub data | 2026-10-17 |
 | C1 — per-head loss weights and module freezing | **implemented, unverified** — `optim.loss_weights` (default 0.5 / 0.5 = the old stacked loss, same code path, harness IDENTICAL) and `optim.frozen`; the weighted sum is what `<mode>_loss` reports; a head with weight 0 sends no gradient; frozen components are out of the optimizer, unchanged after steps, in eval at every training step, and get their own `requires_grad` back | 2026-10-17 |
 | C2 — staged training driver (phases: local → global, fine-tune, alternating) | **implemented, unverified** — `optim.schedule` presets and `custom` phases; `train()` runs the phases with their epochs (exact split), learning rates, warm-ups and cosines; an end-to-end run on toy data trains each component only in its phases, carries the weights over, redraws masks every phase, checkpoints and saves once; one W&B run with a continuing step; `copy_local_from` takes a trained LocalModel as phase 1. 28 mutations across C1 and C2, each caught; 779 tests pass; harness IDENTICAL. **Not run on data** | 2026-10-17 |
-| C3 — staged-training sweep | **set up, not run** — `slurm/staged_training.{py,yaml}`, `staged_training_sweep.yaml`: 9 arms of A2's `joint_rope` model: `joint`, `joint_res`, `l2g_res`, `l2g_ft_res`, `alt4_res`, `altc4_res`, `l2g`, `frozen_local` (GCN frozen at initialisation, global loss only), `global_loss_only`; untrained twins for the two baselines only. Readout per phase: `phase_summaries_` (drift per component, last validation losses) into the results file's `phases` section | 2026-10-17 |
+| C3 — staged-training sweep | **RUN 2026-10-18**, 7 of 9 arms evaluated (`frozen_local` trained but not evaluated, `global_loss_only` did not run), read: see "Results of the first sweeps". set up — `slurm/staged_training.{py,yaml}`, `staged_training_sweep.yaml`: 9 arms of A2's `joint_rope` model: `joint`, `joint_res`, `l2g_res`, `l2g_ft_res`, `alt4_res`, `altc4_res`, `l2g`, `frozen_local` (GCN frozen at initialisation, global loss only), `global_loss_only`; untrained twins for the two baselines only. Readout per phase: `phase_summaries_` (drift per component, last validation losses) into the results file's `phases` section | 2026-10-17 |
 | guard — hidden cells' precomputed embeddings (`precomputed_mask_fill`: learned / −1) | **implemented, unverified** — see Stage A, "Fixed inputs for debugging". 10 mutations caught; 748 tests pass; harness IDENTICAL. **Not run on data** | 2026-10-17 |
 
 ## What we know (rounds 1–3b)
@@ -550,6 +550,98 @@ Readouts:
 **Predictions.** If H-C holds, `local_then_global`'s global head beats `joint`'s in the deep field,
 and the coupled alternation either helps (the GCN learns tokens that serve global) or collapses
 back to the joint result.
+
+## Results of the first sweeps (run 2026-10-18; one seed per arm)
+
+Files: `/home/lehnerl/Arbeit/results/global_only_sweeps/<sweep>/results.md` (`global_only`,
+`global_pca`, `global_scvi`, `staged_training`). `global_only` and `staged_training` lack their
+summary (the job ended early); rebuild with `write_report`. 6,251 hidden test spots; the deepest
+bin (>500 µm) has only 135, so differences under ~0.02 there are noise. Metric: centred cosine on
+hidden spots, overall / 290–500 µm / >500 µm.
+
+| model | all | 290–500 | >500 |
+|---|---|---|---|
+| best smoother (Gaussian, 400 µm) | 0.465 | 0.448 | 0.413 |
+| slide mean | 0.260 | 0.256 | 0.261 |
+| joint (A2 `joint_rope` = C3 `joint`), global head | 0.459 | 0.438 | 0.418 |
+| joint, local head | 0.333 | 0.060 | −0.020 |
+| global only, precomputed PCA + RoPE (`pre_pca_rope`) | 0.442 | 0.433 | 0.413 |
+| global only, scVI + Fourier (`scvi_fourier`) | 0.414 | 0.404 | 0.378 |
+| global only, learned linear + RoPE (`lin_rope`) | 0.384 | 0.383 | 0.370 |
+| global only, in-pipeline PCA + RoPE (`pca_rope`) | 0.309 | 0.305 | 0.272 |
+| best staged schedule (`altc4_res`) | 0.451 | 0.436 | 0.416 |
+
+**Verdict.** Nothing passes the best smoother on gene prediction. H-A (the GCN's embedding limits
+global) and H-C (joint training holds global back) are not supported: every variant lands at
+global validation loss 0.545–0.57, a random frozen GCN included. The remaining lever is what the
+model is asked to predict, or combining near and far information.
+
+**Positive.**
+- The global head fills the GCN's blind area: at 290–500 µm 0.438 vs the local head's 0.060; at
+  >500 µm it equals the best smoother. Untrained twins sit at ~0.005, so it is learned.
+- The round-2 floor problem is gone (0.46 vs slide mean 0.26); raw SCE (0.074) is close to the
+  smoother's (0.071), so the magnitude is fine now (0c stays deferred).
+- A fixed PCA input is a strong global-only baseline (`pre_pca_rope`), beating the learned linear
+  input and the in-pipeline PCA.
+- Tokens carry more than the predictions use: scVI tokens beat the smoother on source distances
+  (0.459 vs 0.435 overall; 0.532 vs 0.429 at >500 µm), and PCA + Fourier adds +0.066 over the
+  smoother for region at >500 µm. So the decoder or objective may be the bottleneck, not the representation.
+- Two strategies reach similar scores: `pre_pca_fourier` ignores everything within 2 mm of a deep
+  hidden spot and reads 3–4 mm away, `pre_pca_rope` reads the nearest ring (0.5–1 mm); 0.413 vs 0.442.
+- Training is bit-reproducible (A2 `joint_rope` and C3 `joint`, separate runs, identical losses).
+
+**Global vs local.**
+- Near visible spots the local head is slightly better (0.486 vs 0.475) and the global head
+  mostly copies it (CKA 0.93 at the rim; 0.13 at 290–500 µm; 0.015 beyond).
+- Beyond the GCN's reach the local head is blind: receptive field exactly 0 beyond 500 µm, probes
+  collapse (source distances −0.14, region 0.53 vs 0.43 and 0.94 for global).
+- The global head relays inward: its attention goes to nearby hidden tokens (12× uniform at
+  0–300 µm); its influence sits on the nearest visible ring. A two-step smoother.
+- Joint training barely changes the GCN (local head 0.333 vs GCN alone 0.327).
+- Global-only models are flat with depth (PCA 0.451 → 0.413) while smoothers drop (0.481 → 0.413):
+  relatively strongest deep in the holes. Global-only PCA matches the joint global head beyond
+  290 µm; the GCN only adds detail near the rim (0.475 vs 0.451).
+
+**Noteworthy: bugs and surprises.**
+- Incomplete runs: C3 stopped during `frozen_local`'s evaluation (trained), `global_loss_only`
+  never ran. Rerun `MODE = "evaluate"` with `EVAL_ARMS = ["frozen_local"]`, and run `global_loss_only`.
+- The in-pipeline PCA (`type_gex_embedding: PCA`) is fitted on the first batch, one masked
+  validation slide, so it misses slide- and condition-level genes (batch 0.02, condition 0.30 vs
+  0.985 and 0.984 for the precomputed PCA) and halves throughput (CPU each step). Not a good input
+  for multi-slide data; prefer Precomputed.
+- The learned linear input without RoPE fails: `lin_none` 0.153, `lin_fourier` 0.146, below the
+  slide mean; `lin_fourier`'s loss stays at `lin_none`'s. With PCA or scVI input Fourier works (0.41).
+- **Metric bug:** `val_masked_scaled_cosine_error` averages both heads of a dual model, so it
+  reads ~0.57 for `frozen_local` (frozen local head ~1) and 0.553 in `l2g` phase 0. Training is
+  unaffected; do not read the metric when a head is frozen. To fix.
+- **Evaluation bug:** planted-pair ranks for short-range pairs are inflated (untrained GCN 0.86):
+  the ±50 µm distance tolerance mixes 100 µm neighbours and 141 µm diagonals on the 100 µm lattice.
+  To fix with a tighter tolerance. The other classes sit at ~0.5 in every model: no sender selection.
+- The residual decoder hurts again in the deep field (`joint_res` 0.389 vs `joint` 0.438 at 290–500 µm).
+- Without RoPE, visible spots attend almost only to hidden tokens (identical mask tokens act as a
+  sink); the CLS gets ~0.
+- `pre_pca_rope`'s untrained twin already reads region at 0.585 (others ~0.5): part of its probe
+  gains is architectural.
+
+**Neutral comparison.**
+- Inputs, overall: precomputed PCA 0.442 > scVI 0.40–0.41 > learned linear 0.384 > in-pipeline PCA 0.309.
+  RoPE beats Fourier for PCA (0.442 vs 0.413), Fourier slightly beats RoPE for scVI (0.414 vs
+  0.396); no encoding gives about the slide mean (0.24–0.27). Learned vs −1 fill: 0.442 vs 0.427 (PCA), 0.396 vs 0.395 (scVI).
+- Schedules: none beats joint (0.459); the others 0.424–0.452, with weaker local heads (0.27–0.30
+  vs 0.333). Alternating settles: GCN drift per local phase 0.39 → 0.07, transformer 0.25 → 0.12.
+  `frozen_local`'s global validation loss (0.571) equals the precomputed PCA arm with the −1 fill (0.570).
+- Probes: region from hidden spots up to 0.96 (+0.01 over the smoother, +0.03 for PCA + Fourier);
+  the short-range receptor state, M9 stripe and M10 cone stay at chance for all, smoother included.
+- Previous rounds: the 3b conclusions hold on the rescaled data (local blind beyond 290 µm, global
+  reaches but does not pass the smoother, encoding matters, residual decoder no help).
+
+**Next (proposed, not started).**
+- Blend test: average each global head with the 400 µm smoother; a blend above both means the
+  model holds signal the smoother lacks.
+- A coordinates-only probe baseline to separate position from learned content.
+- Gene-group scores by depth: 160 of 253 genes are unpredictable background, which dilutes the overall cosine.
+- An objective or evaluation a smoother cannot satisfy (larger holes, long-range programmes in the deep field).
+- Fix the two bugs above; finish C3's two arms.
 
 ## Order and decision points
 
