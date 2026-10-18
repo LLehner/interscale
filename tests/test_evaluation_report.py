@@ -359,3 +359,39 @@ def test_the_summary_reads_the_gain_over_smoother_and_position_together(tmp_path
     assert labels.loc[("a", "global: gain over smoother+position"), "all"] == pytest.approx(0.05)
     assert labels.loc[("a", "global: gain over smoother"), "all"] == pytest.approx(0.1)
     assert ("a", "global: gain over position") not in labels.index  # position+global was not probed
+
+
+def test_the_patch_flow_compacts_and_gets_summary_tables(tmp_path):
+    summary = pd.DataFrame(
+        [
+            {"layer": layer, "group": group, "metric": metric, "value": value, "n_sources": 9}
+            for layer, value in (("l0", 0.2), ("l1", 0.5), ("influence", 0.1))
+            for group in ("hidden", "visible")
+            for metric in ("kl_distance", "self_mass", "beyond_distance")
+        ]
+    )
+    labels = pd.DataFrame(
+        [
+            {
+                "layer": "l0",
+                "group": "hidden",
+                "query_label": a,
+                "key_label": b,
+                "mass": 0.5,
+                "lift_uniform": 1.0,
+                "lift_distance": 2.0 * a + b,
+            }
+            for a in (0, 1)
+            for b in (0, 1)
+        ]
+    )
+    compact = compact_tables({"flow_summary": summary, "flow_labels": labels})
+    assert list(compact["flow_summary"].columns) == ["visible", "hidden"]
+    assert compact["flow_summary"].loc[("l1", "kl_distance"), "hidden"] == pytest.approx(0.5)
+    assert compact["flow_labels"].loc[("l0", "hidden", "lift_distance", 1), 0] == pytest.approx(2.0)
+    path = tmp_path / "results.md"
+    append_sections(path, "base", compact)
+    append_sections(path, "topk", compact)
+    tables = dict(summary_tables(read_sections(path), ["base", "topk"]))
+    kl = next(t for title, t in tables.items() if title.startswith("patch flow by layer: KL"))
+    assert list(kl.index) == [(arm, layer) for arm in ("base", "topk") for layer in ("l0", "l1", "influence")]

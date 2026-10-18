@@ -92,6 +92,7 @@ def head_statistics(
     pos_um: torch.Tensor | None = None,
     radii_um: Sequence[float] = (),
     reference: torch.Tensor | None = None,
+    allowed: torch.Tensor | None = None,
 ) -> dict[tuple[str, int, int], list[np.ndarray]]:
     """Per-cell statistics of one pass's maps: ``{(metric, layer, head): [values per cell query]}``.
 
@@ -111,6 +112,10 @@ def head_statistics(
         Radii for the mass beyond them.
     reference
         Like ``maps``: the exact attention a backend estimates, for the TV distance; or None.
+    allowed
+        ``[B, S + 1, S + 1]``, True where a query may attend to a key (the recorded mask's
+        ``open``). Without it a key is open where the exact map's weight is above 0, which a sparse
+        backend (entmax, top-k) breaks: it puts exact zeros on open keys.
     """
     n_layers, n_rows, length, _ = maps.shape
     n_graphs, seq_len = padding.shape
@@ -143,8 +148,11 @@ def head_statistics(
                 mass = on_cells.sum(-1)
                 kept = mass > MIN_CELL_MASS
                 share = on_cells / mass.clamp_min(MIN_CELL_MASS)[:, None]
-                # The keys a query can attend to: a weight above 0 in the exact map.
-                open_keys = (queries if exact is None else exact)[:, cells] > 0
+                # The keys a query can attend to: the mask's, else a weight above 0 in the exact map.
+                if allowed is not None:
+                    open_keys = allowed[b][cells][:, cells].to(queries.device)
+                else:
+                    open_keys = (queries if exact is None else exact)[:, cells] > 0
                 n_open = open_keys.sum(-1).double().clamp_min(1.0)
                 stats = {
                     "cls_mass": queries[:, seq_len],
@@ -288,6 +296,7 @@ def attention_diagnostics(
                         pos_um=pos_um,
                         radii_um=radii_um,
                         reference=entry.get("reference"),
+                        allowed=entry.get("open"),
                     )
                     for key, values in found.items():
                         per_cell[key].extend(values)
@@ -407,6 +416,9 @@ def attention_by_query(
                     continue
                 maps, reference = entry["maps"], entry.get("reference")
                 dev = maps.device
+                # The keys a query may attend to, from the mask when it was recorded: a sparse
+                # backend's zeros are not blocked keys.
+                allowed = entry.get("open")
                 padding = entry["src_padding_mask"][0].bool().to(dev)
                 seq_len = padding.shape[0]
                 spots = (~padding).nonzero().squeeze(1)  # the cells' token positions, CLS left out
@@ -423,7 +435,8 @@ def attention_by_query(
                     for head in range(n_heads):
                         rows = maps[layer, head][spots].double()  # [n, S + 1]
                         exact = rows if reference is None else reference[layer, head][spots].double()
-                        attn, open_keys = rows[:, spots], exact[:, spots] > 0
+                        attn = rows[:, spots]
+                        open_keys = allowed[0][spots][:, spots].to(dev) if allowed is not None else exact[:, spots] > 0
                         stats = row_statistics(attn, dist, open_keys, radii_um)
                         cell_mass = torch.where(open_keys, attn, torch.zeros_like(attn)).sum(1)
                         visible_keys = open_keys & ~hid[None, :]
@@ -445,7 +458,8 @@ def attention_by_query(
 
                     mean_rows = maps[layer].mean(0)[spots].double()
                     mean_exact = mean_rows if reference is None else reference[layer].mean(0)[spots].double()
-                    mean_attn, mean_open = mean_rows[:, spots], mean_exact[:, spots] > 0
+                    mean_attn = mean_rows[:, spots]
+                    mean_open = allowed[0][spots][:, spots].to(dev) if allowed is not None else mean_exact[:, spots] > 0
                     if n_bins:
                         weight_in, uniform_in = distance_profile(mean_attn, dist, mean_open, distance_bins_um)
                         defined = torch.isfinite(weight_in).all(1).cpu().numpy()

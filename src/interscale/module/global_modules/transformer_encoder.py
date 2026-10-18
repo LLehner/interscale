@@ -280,7 +280,15 @@ class TransformerNodeEncoderHook(GlobalModule):
             )
 
         if self._attention_record is not None:
-            self._attention_record.append({"index_nodes": index_nodes, "src_padding_mask": src_padding_mask.detach()})
+            entry = {"index_nodes": index_nodes, "src_padding_mask": src_padding_mask.detach()}
+            if not isinstance(attention_mask, StructuredMask):
+                # Which keys each query may attend to, from the mask itself: a sparse backend
+                # (entmax, top-k) puts exact zeros on open keys, so a weight of 0 does not mean
+                # blocked. [B, S + 1, S + 1], the first head's (every head is blocked alike).
+                blocked = attention_mask if attention_mask.dtype == torch.bool else torch.isneginf(attention_mask)
+                n_graphs = src_padding_mask.shape[0]
+                entry["open"] = ~blocked.view(n_graphs, -1, *blocked.shape[1:])[:, 0].detach()
+            self._attention_record.append(entry)
         return GlobalInput(padded_emb, src_padding_mask, index_nodes, attention_mask, rotary)
 
     @contextmanager
@@ -290,6 +298,7 @@ class TransformerNodeEncoderHook(GlobalModule):
         Yields a list. Each pass through :meth:`common_step_local_to_global` and :meth:`forward`
         appends ``{"index_nodes", "src_padding_mask", "maps", "reference", "token_cosine"}``: ``maps`` is
         ``[layers, B * heads, S + 1, S + 1]``, every layer's map from its explicit path, detached;
+        ``open`` (dense masks only) is ``[B, S + 1, S + 1]``, True where a query may attend to a key;
         with ``reference``, ``"reference"`` holds the same for the attention a backend estimates
         (the Performer's exact softmax on the same queries, keys and biases), or None where a
         backend estimates nothing. ``token_cosine`` is ``[layers, B]``: per layer and sequence, the

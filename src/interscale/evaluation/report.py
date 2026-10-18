@@ -81,6 +81,12 @@ NOTES = {
     "prediction), span_rel and effective_rel against uniform weights",
     "erf_profile": "influence per distance bin (µm) over uniform weights (1: uniform)",
     "erf_edges": "planted pairs: the sender's rank in the receiver's influence among visible spots as far (0.5: blind)",
+    "flow_summary": "attention (per layer, head mean) and influence flow between patches, over source patches by "
+    "query group: KL of the observed target distribution from uniform and from a distance kernel (0: explained "
+    "by it), the share kept in the source patch against both, and the share on targets above twice their "
+    "distance expectation",
+    "flow_labels": "attention flow by label (query label x key label, e.g. clusters): mass = share of the query "
+    "label's attention, lift_uniform / lift_distance = observed over uniform / distance-kernel expectation",
     "training": "the last epoch's throughput and peak memory, the final validation metrics",
     "phases": "staged training, each phase's end: drift_<component> = relative weight change (0: frozen), "
     "and the phase's last validation losses",
@@ -227,6 +233,17 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
             .set_index(["head", "range_class"])[["value", "n_pairs"]]
             .rename(columns={"value": "matched_rank"})
         )
+    if "flow_summary" in tables:
+        flow = tables["flow_summary"]
+        out["flow_summary"] = _pivot(flow, ["layer", "metric"], "group")
+    if "flow_labels" in tables:
+        labels = tables["flow_labels"].melt(
+            id_vars=["layer", "group", "query_label", "key_label"],
+            value_vars=["mass", "lift_uniform", "lift_distance"],
+            var_name="measure",
+        )
+        table = _pivot(labels, ["layer", "group", "measure", "query_label"], "key_label")
+        out["flow_labels"] = table.sort_index(level=["layer", "group", "measure"], sort_remaining=False)
     if "training" in tables:
         out["training"] = tables["training"].set_index("metric")[["value"]]
     known = {
@@ -244,6 +261,8 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         "erf_by_query",
         "erf_profile",
         "erf_edges",
+        "flow_summary",
+        "flow_labels",
         "training",
     }
     out.update({name: table for name, table in tables.items() if name not in known})
@@ -572,6 +591,13 @@ def summary_tables(sections, arms: list[str], groups: list[str] | None = None) -
             "receptive field, planted pairs: sender's rank in the receiver's influence among visible spots as far (0.5: blind)",
             pd.concat(rows).unstack("range_class"),
         )
+    flow = _per_arm(sections, "flow_summary", arms)
+    for metric, what in (
+        ("kl_distance", "KL of the flow from a distance kernel (0: distance explains where it goes)"),
+        ("beyond_distance", "share of the flow on patches above twice their distance expectation"),
+        ("self_mass", "share of the flow kept in the source patch"),
+    ):
+        add(f"patch flow by layer: {what}", _select(flow, "metric", metric, ["layer"]))
     rows = [table["value"].rename(arm) for arm, table in _per_arm(sections, "training", arms).items()]
     if rows:
         add("training: the last epoch's throughput and peak memory, the final validation metrics", pd.DataFrame(rows))
