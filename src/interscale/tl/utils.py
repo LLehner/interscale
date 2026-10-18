@@ -90,7 +90,9 @@ def _positional_encoding_tag(cfg) -> str:
 
 
 def _attention_tag(cfg) -> str:
-    """``attn-<kind>[-hd<head_dim>][-cqk]_`` when the global component uses a non-default attention, else ``""``.
+    """``attn-<kind>[<settings>][-hd<head_dim>][-cqk]_`` when the global component uses a non-default attention, else ``""``.
+
+    ``<settings>``: ``-a<alpha>`` (``l`` when learned) for entmax, ``-k<k>`` for top-k.
 
     Part of the checkpoint prefix for the same reason as :func:`_positional_encoding_tag`: an
     attention sweep's arms would otherwise overwrite each other's checkpoints. Empty for dense
@@ -104,7 +106,14 @@ def _attention_tag(cfg) -> str:
     center = bool(attention.get("center_qk", False))
     if kind == "dense" and head_dim == 0 and not center:
         return ""
-    return f"attn-{kind}" + (f"-hd{head_dim}" if head_dim > 0 else "") + ("-cqk" if center else "") + "_"
+    settings = ""
+    if kind == "entmax":
+        entmax = attention.get("entmax", {})
+        learn = bool(entmax.get("learn_alpha", True))
+        settings = f"-a{float(entmax.get('alpha', 1.5)):g}" + ("l" if learn else "")
+    elif kind == "topk":
+        settings = f"-k{int(attention.get('topk', {}).get('k', 32))}"
+    return f"attn-{kind}{settings}" + (f"-hd{head_dim}" if head_dim > 0 else "") + ("-cqk" if center else "") + "_"
 
 
 def _embedding_tag(cfg) -> str:

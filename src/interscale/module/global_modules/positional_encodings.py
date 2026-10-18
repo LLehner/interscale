@@ -38,6 +38,7 @@ import torch
 from torch import nn
 from torch_geometric.utils import scatter
 
+from interscale.tl.masking import MASK_VALUE
 from interscale.tl.padding import pad_like
 from interscale.tl.positional import laplacian_pe, laplacian_spectrum, point_set_diameter, random_walk_pe
 
@@ -305,6 +306,66 @@ class LinearDistanceBias(nn.Module):
         """``(knots [2] in µm, values [heads, 2])`` -- the line at 0 and ``max_dist``, as for ``profile``."""
         knots = torch.tensor([0.0, float(max_dist)])
         return knots, self.slope.detach().cpu()[:, None] * (knots / 1000.0)
+
+
+class ExpressionBias(nn.Module):
+    """A learned function of how alike two cells' expression is, one per head, added to their logit.
+
+    Feature similarity as ``scanpy.pp.neighbors`` sees it on the expression itself: for each query,
+    every key is ranked by the Euclidean distance between their expression vectors (rank 1 the
+    nearest), and ``b_h(log2(1 + rank))`` is piecewise linear between ``num_kernels`` knots over
+    ``[0, log2(1 + max_rank)]``, flat beyond -- a learned kNN-in-expression prior, scale-free, so
+    one profile serves slides of any size and depth of sequencing.
+
+    It reads the input the model is given, never the truth: a hidden entry (``MASK_VALUE``) leaves
+    the distance, which is taken over the genes visible in both cells, as the root mean squared
+    difference per shared gene. A pair with no gene visible in both -- every pair with a wholly
+    hidden cell -- carries one learned value per head, ``unknown``, instead, so a hidden cell's true
+    expression can reach no bias. Table and ``unknown`` start at zero: switching the bias on changes
+    nothing at step 0. Distances are formed by matrix products, ``O(S^2)`` memory, in float64.
+    """
+
+    def __init__(self, n_heads: int, num_kernels: int, max_rank: int):
+        super().__init__()
+        self.num_kernels = int(num_kernels)
+        self.max_log_rank = math.log2(1.0 + float(max_rank))
+        self.table = nn.Parameter(torch.zeros(int(n_heads), self.num_kernels))
+        self.unknown = nn.Parameter(torch.zeros(int(n_heads)))
+
+    def extra_repr(self) -> str:
+        return f"num_kernels={self.num_kernels}, max_rank={2**self.max_log_rank - 1:.0f}"
+
+    @staticmethod
+    def distances(x: torch.Tensor, visible: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``[B, S, G]`` values and visibility to ``(rms distance [B, S, S], known [B, S, S])`` over the shared genes."""
+        x, m = x.double() * visible.double(), visible.double()
+        x2 = x * x
+        shared = m @ m.transpose(-1, -2)
+        d2 = x2 @ m.transpose(-1, -2) + m @ x2.transpose(-1, -2) - 2.0 * (x @ x.transpose(-1, -2))
+        known = shared > 0.5
+        rms = (d2.clamp(min=0.0) / shared.clamp(min=1.0)).sqrt()
+        return rms.masked_fill(~known, float("inf")), known
+
+    def ranks(self, x: torch.Tensor, visible: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(rank [B, S, S], known [B, S, S])``: each key's place among the query's known keys by distance, 0 = itself."""
+        rms, known = self.distances(x, visible)
+        rank = rms.argsort(dim=-1).argsort(dim=-1)
+        return rank, known
+
+    def forward(self, x: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
+        """``[B, S, G]`` padded input and visibility to ``[B, heads, S, S]`` biases."""
+        with torch.no_grad():
+            rank, known = self.ranks(x, visible)
+            last = self.num_kernels - 1
+            t = (torch.log2(1.0 + rank.to(x.dtype)) * (last / self.max_log_rank)).clamp(max=last)
+        bias = _knot_lookup(self.table, t).to(x.dtype)  # [B, S, S, heads]
+        bias = torch.where(known.unsqueeze(-1), bias, self.unknown.to(x.dtype))
+        return bias.permute(0, 3, 1, 2)
+
+    def profile(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(knots [K] as ranks, values [heads, K])`` -- each head's bias at each knot."""
+        knots = torch.linspace(0.0, self.max_log_rank, self.num_kernels).exp2() - 1.0
+        return knots, self.table.detach().cpu().clone()
 
 
 #: Floor of the balancing scale of low-rank bias factors (:func:`balanced_factors`).
@@ -669,6 +730,14 @@ def _validate_distance(pe):
         raise ValueError(f"pe.distance.max_dist must be >= 0 (0 derives it from the data), got {pe.distance.max_dist}.")
 
 
+def _validate_expression(pe):
+    e = pe.expression
+    if e.num_kernels < 2:
+        raise ValueError(f"pe.expression.num_kernels must be >= 2 (the two ends), got {e.num_kernels}.")
+    if e.max_rank < 1:
+        raise ValueError(f"pe.expression.max_rank must be >= 1, got {e.max_rank}.")
+
+
 def _validate_rope(pe):
     r = pe.rope
     if r.kind not in ROPE_KINDS:
@@ -762,6 +831,11 @@ def _build_distance(pe, n_heads):
             "built directly from the config needs max_dist set, or resolve_distance_range(cfg, adata) first."
         )
     return DistanceBias(n_heads, int(pe.distance.num_kernels), float(pe.distance.max_dist))
+
+
+@register_pe("expression", kind="bias", requires="x", validate=_validate_expression)
+def _build_expression(pe, n_heads):
+    return ExpressionBias(n_heads, int(pe.expression.num_kernels), int(pe.expression.max_rank))
 
 
 @register_pe(
@@ -946,6 +1020,12 @@ class AttentionBias(nn.Module):
                 return (padded,)
             # The exact path: the matrix-product shortcut loses ~µm on coordinates of a few mm.
             return (torch.cdist(padded, padded, compute_mode="donot_use_mm_for_euclid_dist"),)
+        if key == "x":
+            # The input as the model is given it: a hidden entry is MASK_VALUE, never its value.
+            # Padding rows come out all-invisible.
+            x = batched_data.x.to(device=device, dtype=dtype)
+            visible = (x != MASK_VALUE).to(dtype)
+            return pad_like(x * visible, batch, index_nodes, seq_len), pad_like(visible, batch, index_nodes, seq_len)
         if key == "spectral_pe":
             vecs, vals = getattr(batched_data, key, None), getattr(batched_data, "spectral_eigval", None)
             if vecs is None or vals is None:

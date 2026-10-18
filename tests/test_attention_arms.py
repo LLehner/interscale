@@ -246,11 +246,15 @@ def test_the_script_writes_the_file(base, tmp_path):
         == {
             "dense",
             "dense_fourier",
+            "entmax",
+            "entmax_fourier",
             "exphormer",
             "exphormer_fourier",
             "linear",
             "performer",
             "performer_fourier",
+            "topk",
+            "topk_fourier",
         }
     )
     assert parsed["sweep_config"]["parameters"]["optim.seed"]["values"] == [3]

@@ -279,6 +279,7 @@ def test_the_registry_holds_the_encodings_built_so_far():
         "lap": ("node", "lap_pe", True),
         "rw": ("node", "rw_pe", True),
         "distance": ("bias", "pos", False),
+        "expression": ("bias", "x", False),
         "spectral": ("bias", "spectral_pe", True),
         "fourier": ("bias", "pos", False),
         "rope": ("rotary", "pos", False),
@@ -286,6 +287,7 @@ def test_the_registry_holds_the_encodings_built_so_far():
     # The forms each bias can be handed to an attention backend in (attention_plan.md).
     assert {name: sorted(spec.forms) for name, spec in PE_REGISTRY.items() if spec.kind == "bias"} == {
         "distance": ["dense", "pairs"],
+        "expression": ["dense"],
         "spectral": ["dense", "factors", "pairs"],
         "fourier": ["dense", "factors", "pairs"],
     }

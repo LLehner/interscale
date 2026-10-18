@@ -82,6 +82,15 @@ def get_global_component_cfg(cfg, global_component_name):
         pe.distance.kind = "profile"
         pe.distance.num_kernels = 16
         pe.distance.max_dist = 0.0
+        # A learned bias per head as a function of how alike two cells' expression is: each key's
+        # rank among the query's keys by Euclidean distance of their expression (the kNN view of
+        # scanpy.pp.neighbors on the expression), piecewise linear in log2(1 + rank) between
+        # `num_kernels` knots up to rank `max_rank`, flat beyond. Read from the masked input over
+        # the genes visible in both cells; a pair with a wholly hidden cell gets one learned value
+        # per head, so no hidden value reaches it. Dense attention backends only.
+        pe.expression = CN()
+        pe.expression.num_kernels = 16
+        pe.expression.max_rank = 4096
         # A learned filter of the neighbour graph's spectrum per head: the bias between two cells is
         # sum_i h_h(lambda_i) * N * v_i[j] * v_i[l] over the k lowest non-trivial eigenpairs of the
         # normalised Laplacian LapPE uses -- a learned diffusion kernel, so distances run along the
@@ -168,5 +177,18 @@ def get_global_component_cfg(cfg, global_component_name):
         att.exphormer.graph_edges = True
         att.exphormer.resample = False
         att.exphormer.edge_type = "bias"
+        # `entmax`: dense attention normalised by alpha-entmax instead of softmax -- sparse maps with
+        # exact zeros, softmax at alpha -> 1 and sparsemax at 2 (needs the `entmax` package).
+        # `learn_alpha` learns one alpha per head as 1 + sigmoid(a), starting at `alpha` (then in
+        # [1.01, 2)); otherwise `alpha` is fixed. `n_iter` bisection steps. Carries dense biases,
+        # RoPE and the long-range mask.
+        att.entmax = CN()
+        att.entmax.alpha = 1.5
+        att.entmax.learn_alpha = True
+        att.entmax.n_iter = 50
+        # `topk`: dense attention over each query's `k` highest-scoring open keys only (content,
+        # biases and mask included), softmax among them: a hard budget of k keys per query.
+        att.topk = CN()
+        att.topk.k = 32
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

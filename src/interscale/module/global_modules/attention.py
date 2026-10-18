@@ -267,10 +267,81 @@ class DenseAttention(ProjectedAttention):
             weights = torch.baddbmm(mask, q_scaled, k.transpose(-2, -1))
         else:
             weights = torch.bmm(q_scaled, k.transpose(-2, -1))
-        weights = torch.softmax(weights, dim=-1)
+        weights = self._normalise(weights)
         if self.training and self.dropout > 0.0:
             weights = F.dropout(weights, p=self.dropout)
         return torch.bmm(weights, v), (weights if need_weights else None)
+
+    def _normalise(self, scores: torch.Tensor) -> torch.Tensor:
+        """``[B * heads, L, L]`` logits (``-inf`` where blocked) to attention weights over the last axis."""
+        return torch.softmax(scores, dim=-1)
+
+
+class EntmaxAttention(DenseAttention):
+    """Dense attention normalised by alpha-entmax instead of softmax: sparse maps with exact zeros.
+
+    alpha-entmax (Peters et al. 2019) is softmax at alpha -> 1 and sparsemax at alpha = 2; in
+    between, a key whose logit falls more than a threshold below the best gets weight exactly 0, and
+    the threshold tightens as alpha grows. Each head has its own alpha, learned
+    (``learn_alpha``) as ``1 + sigmoid(a)`` -- in (1, 2), as in Correia et al. 2019 -- or fixed.
+    Computed by bisection (the ``entmax`` package), which takes ``-inf`` for blocked keys and gives
+    alpha its gradient. A key at weight 0 sends no gradient to its logit.
+    """
+
+    #: The lowest alpha the learned form reaches: at alpha -> 1 the bisection's exponent 1 / (alpha - 1) blows up.
+    MIN_ALPHA = 1.01
+
+    def __init__(self, *args, alpha: float = 1.5, learn_alpha: bool = True, n_iter: int = 50, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n_iter = int(n_iter)
+        if learn_alpha:
+            # alpha = 1 + sigmoid(a): no RNG draw, every head starts at the configured alpha.
+            start = math.log((alpha - 1.0) / (2.0 - alpha))
+            self.alpha_logit = nn.Parameter(torch.full((self.num_heads,), start))
+        else:
+            self.register_buffer("fixed_alpha", torch.full((self.num_heads,), float(alpha)))
+
+    def alpha(self) -> torch.Tensor:
+        """``[heads]``: each head's alpha."""
+        if hasattr(self, "alpha_logit"):
+            return (1.0 + torch.sigmoid(self.alpha_logit)).clamp(min=self.MIN_ALPHA)
+        return self.fixed_alpha
+
+    def extra_repr(self) -> str:
+        values = ", ".join(f"{a:.3f}" for a in self.alpha().detach().cpu().tolist())
+        return f"{super().extra_repr()}, alpha=[{values}], learned={hasattr(self, 'alpha_logit')}"
+
+    def _normalise(self, scores: torch.Tensor) -> torch.Tensor:
+        from entmax import entmax_bisect
+
+        n_rows = scores.shape[0]
+        alpha = self.alpha().to(scores.dtype).repeat(n_rows // self.num_heads).view(n_rows, 1, 1)
+        return entmax_bisect(scores, alpha=alpha, dim=-1, n_iter=self.n_iter)
+
+
+class TopKAttention(DenseAttention):
+    """Dense attention over each query's ``k`` highest-scoring open keys only, softmax among them.
+
+    A hard attention budget: every other key gets weight exactly 0, so a query mixes at most ``k``
+    keys -- exactly ``k`` are kept, ties at the cut broken by ``topk``'s order, which matters: tokens
+    of hidden cells are identical and many keys lie at equal distances on a lattice. The cut is taken
+    on the full logits -- content, biases and the mask's ``-inf`` -- and gradients flow through the
+    kept logits. With ``k`` at or above the number of open keys it is dense softmax attention.
+    """
+
+    def __init__(self, *args, k: int = 32, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.k = int(k)
+
+    def extra_repr(self) -> str:
+        return f"{super().extra_repr()}, k={self.k}"
+
+    def _normalise(self, scores: torch.Tensor) -> torch.Tensor:
+        if self.k < scores.shape[-1]:
+            kept = torch.zeros_like(scores, dtype=torch.bool)
+            kept.scatter_(-1, scores.topk(self.k, dim=-1).indices, True)
+            scores = scores.masked_fill(~kept, float("-inf"))
+        return torch.softmax(scores, dim=-1)
 
 
 def orthogonal_gaussian(num_features: int, dim: int, generator: torch.Generator) -> torch.Tensor:
@@ -617,6 +688,67 @@ def _build_dense(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias
     if head_dim * num_heads == embed_dim:
         return None  # torch's vendored attention, exactly as before backends existed
     return DenseAttention(embed_dim, num_heads, head_dim, dropout=dropout)
+
+
+def _validate_entmax(attention_cfg):
+    entmax = attention_cfg.get("entmax", None)
+    if entmax is None:
+        raise ValueError("attention.kind 'entmax' needs the attention.entmax block.")
+    alpha, learn = float(entmax.alpha), bool(entmax.learn_alpha)
+    if learn and not EntmaxAttention.MIN_ALPHA <= alpha < 2.0:
+        raise ValueError(
+            f"attention.entmax.alpha starts a learned alpha = 1 + sigmoid(a), so it must lie in "
+            f"[{EntmaxAttention.MIN_ALPHA}, 2), got {alpha}."
+        )
+    if not learn and not EntmaxAttention.MIN_ALPHA <= alpha <= 2.0:
+        raise ValueError(f"attention.entmax.alpha must lie in [{EntmaxAttention.MIN_ALPHA}, 2], got {alpha}.")
+    if int(entmax.n_iter) < 1:
+        raise ValueError(f"attention.entmax.n_iter must be >= 1, got {entmax.n_iter}.")
+    try:
+        import entmax as _  # noqa: F401
+    except ImportError:
+        raise ValueError("attention.kind 'entmax' needs the `entmax` package (pip install entmax).") from None
+
+
+@register_attention(
+    "entmax",
+    validate=_validate_entmax,
+    mask="dense",
+    bias_forms=frozenset({"dense"}),
+    rotary=True,
+    training_maps=True,
+)
+def _build_entmax(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
+    entmax = attention_cfg.entmax
+    return EntmaxAttention(
+        embed_dim,
+        num_heads,
+        head_dim,
+        dropout=dropout,
+        alpha=float(entmax.alpha),
+        learn_alpha=bool(entmax.learn_alpha),
+        n_iter=int(entmax.n_iter),
+    )
+
+
+def _validate_topk(attention_cfg):
+    topk = attention_cfg.get("topk", None)
+    if topk is None:
+        raise ValueError("attention.kind 'topk' needs the attention.topk block.")
+    if int(topk.k) < 1:
+        raise ValueError(f"attention.topk.k must be >= 1, got {topk.k}.")
+
+
+@register_attention(
+    "topk",
+    validate=_validate_topk,
+    mask="dense",
+    bias_forms=frozenset({"dense"}),
+    rotary=True,
+    training_maps=True,
+)
+def _build_topk(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
+    return TopKAttention(embed_dim, num_heads, head_dim, dropout=dropout, k=int(attention_cfg.topk.k))
 
 
 def _validate_performer(attention_cfg):
