@@ -694,9 +694,10 @@ the mass on them takes a logit advantage of log((N − r)/r) ≈ 6.
 - **Script** `notebooks_and_scripts/slurm/legnini_attention.{py,yaml}`, `legnini_attention_sweep.yaml`
   on `sweep_common.py`, which gained `PREPROCESS`, `SLIDE_KEY`, `REQUIRE_KNN_GRAPH`, `ATTENTION = None`
   (the arms choose the backend) and the `FLOW_*` settings (off by default: the synth_spot sweeps
-  are unchanged). The script preprocesses the raw file, adds `obsm['X_pca']` (64 PCs of log1p_norm,
-  fitted on the training samples) and `obs['cluster']` (k-means, 12 clusters on the first 20 PCs;
-  an evaluation-only label -- `leidenalg` is not installed in interscale_env), and evaluates at
+  are unchanged). The script preprocesses the raw file -- log1p_norm in `X` and its layer; every step
+  reads log1p_norm (the user, 2026-10-18), raw counts are only a record -- adds `obsm['X_pca']` (64
+  PCs of log1p_norm, fitted on the training samples) and `obs['cluster']` (Leiden, resolution 1, on
+  the 15-NN graph of every cell's first 20 PCs; an evaluation-only label), and evaluates at
   legnini's scale: discs of 125 µm over 30% of each sample, depth bins 0/15/30/60 µm, kernels of
   15/40/100 µm, blends with the 40 µm kernel, position patches of 100/250/500 µm, flow on 100 µm
   patches over four disc draws, labelled by cluster. 400 epochs (4,000 steps).
