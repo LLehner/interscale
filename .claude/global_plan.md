@@ -644,9 +644,10 @@ model is asked to predict, or combining near and far information.
   scores per gene group by depth with sender/receiver/source/response roles. The rerun also
   refreshes the planted-pair numbers and finishes C3's two arms.
 - An objective or evaluation a smoother cannot satisfy (larger holes, long-range programmes in the deep field).
-- A legnini sweep for attention: where cells and clusters attend, and how attention biases
-  (learned distance bias with per-head temperature, entmax, learned pairwise gates) change it.
-  Proposed 2026-10-18, under discussion.
+- A legnini sweep for attention: where cells and clusters attend, and how sparse attention and
+  attention biases change it. Built 2026-10-18 as attention_plan.md stage 9
+  (`slurm/legnini_attention.py`: GlobalModel on PCA with RoPE; base, distance + expression bias,
+  entmax, top-16, top-64; patch and cluster attention flow). Not run.
 
 ## Order and decision points
 

@@ -20,8 +20,9 @@ invariants. Read it before touching the transformer's input path (`common_step_l
 `pad_batch`, the attention mask), and update its status table in the same commit as the work it
 describes.
 
-Alternative attention mechanisms (Performer, Exphormer-style sparse attention, global tokens) are
-planned in [`.claude/attention_plan.md`](.claude/attention_plan.md), with the same layout. Read it
+Alternative attention mechanisms (Performer, Exphormer-style sparse attention, entmax and top-k
+normalisers, an expression-similarity bias, global tokens) are planned in
+[`.claude/attention_plan.md`](.claude/attention_plan.md), with the same layout. Read it
 before touching the attention layers (`transformer_encoder_layer.py`, `transformer_utils.py`), the
 per-batch attention inputs of `common_step_local_to_global`, or the bias forms, and update its
 status table in the same commit as the work it describes.

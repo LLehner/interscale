@@ -32,6 +32,7 @@ a real state.
 | 6 — fused exact attention (SDPA) | not started | | |
 | 7 — inducing points (optional) | not started | | |
 | 8 — beyond the window (whole slides; FlexAttention) | not planned in detail | | |
+| 9 — sparse normalisers (entmax, top-k), expression bias, attention flow; legnini sweep | **implemented, unverified** — entmax is alpha-entmax of the dense logits with one alpha per head (learned as 1 + sigmoid(a) from 1.5, or fixed), exact zeros, never weight on a blocked key; top-k keeps exactly k keys per query (ties at the cut no longer stretch the budget) and is dense softmax when k covers every key; the expression bias ranks keys by RMS expression distance over the genes both cells show, gives every pair with a wholly hidden cell one learned value per head, ignores padding, starts at zero; through a real GlobalModule no hidden value reaches a prediction under either backend with distance + expression biases. Attention records carry the mask's open keys, so diagnostics and the flow no longer read a sparse backend's zeros as blocked keys. `evaluation.attention_flow`: uniform attention is explained by both expectations (KL 0, exact uniform sums), attention by distance alone by the distance expectation only, label flows sum to 1, masks survive the disc draws. 10 mutations, each caught (3 had first survived and led to stronger tests); 848 tests pass; harness IDENTICAL; the legnini script smoke-trained (all 5 arms) and evaluated (with twins, maps) on a legnini-shaped stub on the CPU. **Not run on data** | 2026-10-18 |
 
 ## In short
 
@@ -642,16 +643,95 @@ blockers sit outside the attention code:
   Euclidean-radius mask would be simpler but contradicts the 2026-10-03 decision that the mask
   covers exactly what the GNN mixed.
 
+### 9 — sparse attention, an expression bias and attention flow: the legnini attention sweep (2026-10-18)
+
+**Asked (the user, 2026-10-18):** on legnini, see which cells and clusters attend where, and how the
+attention mechanism changes that and the reconstruction; give attention a bias so the model does
+not look at every cell of the slide. Decided with the user: a GlobalModel on a fixed PCA token (so
+attention is the only route to context, and the long-range mask is moot), entmax from the `entmax`
+package, discs of 125 µm, a distance + expression-similarity bias instead of a per-head
+temperature, and of the gating variants only top-k.
+
+**Why no temperature arm.** A fixed temperature per head, `softmax(s / tau_h)`, is a rescaling of
+that head's query projection, `(q / tau_h) . k`: it can change how fast a head sharpens, not what it
+can express. Score differences have to come from somewhere -- the content, a bias -- and the bias
+is what creates them. The lead needed is large: with N ≈ 4,300 keys and r ≈ 10 relevant ones, half
+the mass on them takes a logit advantage of log((N − r)/r) ≈ 6.
+
+**Built:**
+
+- **`attention.kind: entmax`** (`EntmaxAttention`, a `DenseAttention` with another normaliser):
+  alpha-entmax of the logits by bisection (`entmax.entmax_bisect`), sparse with exact zeros; softmax
+  at alpha → 1, sparsemax at 2. `attention.entmax.alpha` (start, 1.5), `learn_alpha` (one alpha per
+  head as 1 + sigmoid(a), in [1.01, 2)), `n_iter`. A key at weight 0 sends its logit no gradient.
+  Tag `attn-entmax-a1.5l`.
+- **`attention.kind: topk`** (`TopKAttention`): softmax over each query's `attention.topk.k`
+  highest-scoring open keys (content, biases and mask included), exactly k of them -- ties at the
+  cut broken by index, which matters: hidden cells' tokens are identical and many keys lie at equal
+  distances. Gradients flow through the kept logits. Tag `attn-topk-k<k>`.
+- **`pe.bias: [expression]`** (`ExpressionBias`): for each query, every key's rank by the Euclidean
+  distance of their expression (the kNN view of `scanpy.pp.neighbors` on the expression itself, not
+  a PCA), as a learned profile per head over log2(1 + rank), `pe.expression.{num_kernels, max_rank}`.
+  Rank, not distance, so one profile serves every sample whatever its depth. It reads the masked
+  input: the distance is the RMS difference per gene visible in both cells, and a pair with a wholly
+  hidden cell gets one learned value per head (`unknown`) -- no hidden value can reach it. Dense
+  backends only (dense, entmax, top-k). Its effect is therefore on visible queries, i.e. on the
+  context the first layer gathers; hidden queries can only up- or down-weight hidden keys as a whole.
+- **Open keys from the mask.** Attention records now carry `open` (the mask, before any normaliser);
+  `attention_by_query` and `head_statistics` read the keys a query may attend to from it instead of
+  from weights above 0, which a sparse normaliser breaks. Dense numbers are unchanged apart from
+  keys whose softmax weight underflowed to 0.
+- **`evaluation.attention_flow.patch_flow`:** a grid of square patches per slide; per layer
+  (head-mean map) and for the receptive field of sampled hidden cells (`influence`), the weight the
+  queries of each source patch put on each target patch, against the uniform expectation (more
+  cells receive more) and against a distance kernel fitted to the same map (what is left once "near
+  gets more" is accounted for). Per source patch: KL of the observed target distribution from each,
+  the share kept in the source, the share on targets above twice their distance expectation.
+  Queries in two groups (hidden, visible); discs redrawn over several seeds so most patches serve
+  as hidden sources. The same by label (query label × key label), e.g. clusters. Maps
+  (`plot_patch_flow`) of the source patches whose flow departs most from the distance kernel
+  (`interesting_sources`).
+- **Script** `notebooks_and_scripts/slurm/legnini_attention.{py,yaml}`, `legnini_attention_sweep.yaml`
+  on `sweep_common.py`, which gained `PREPROCESS`, `SLIDE_KEY`, `REQUIRE_KNN_GRAPH`, `ATTENTION = None`
+  (the arms choose the backend) and the `FLOW_*` settings (off by default: the synth_spot sweeps
+  are unchanged). The script preprocesses the raw file, adds `obsm['X_pca']` (64 PCs of log1p_norm,
+  fitted on the training samples) and `obs['cluster']` (k-means, 12 clusters on the first 20 PCs;
+  an evaluation-only label -- `leidenalg` is not installed in interscale_env), and evaluates at
+  legnini's scale: discs of 125 µm over 30% of each sample, depth bins 0/15/30/60 µm, kernels of
+  15/40/100 µm, blends with the 40 µm kernel, position patches of 100/250/500 µm, flow on 100 µm
+  patches over four disc draws, labelled by cluster. 400 epochs (4,000 steps).
+
+| arm | attention | bias |
+|---|---|---|
+| `base` | dense softmax | none |
+| `dist_expr` | dense softmax | distance (16 knots over 0–400 µm) + expression rank |
+| `entmax` | alpha-entmax, alpha learned per head from 1.5 | none |
+| `topk_16` | top-16 | none |
+| `topk_64` | top-64 | none |
+
+All with RoPE, centred queries/keys, centred SCE, a learned mask fill, and an untrained twin each.
+
+**What to read.** Head scores by depth against the kernels and the blend (does any arm beat the
+40 µm kernel, does a blend beat both?); the flow summary per arm against its untrained twin (KL from
+the distance kernel: does attention go anywhere distance does not explain; does sparse attention
+keep more in the source patch?); the cluster lift matrices (which clusters' hidden cells attend to
+which, beyond distance); the maps in `RESULTS_DIR/flow/`. With 2 influence queries per patch and
+draw the influence KL is noisy and biased upwards: compare it across arms and with the twin, not
+with 0.
+
+**Cost.** entmax and top-k take the dense path and form every S × S map: ~300 MB per layer at
+4,299 cells and 4 heads, plus entmax's 50 bisection steps (2–4× the dense step time, estimated).
+
 ## Test matrix
 
 The axes, all independent:
 
 | axis | values |
 |---|---|
-| backend | dense, performer, linear, exphormer, (fused), (inducing) |
+| backend | dense, entmax, topk, performer, linear, exphormer, (fused), (inducing) |
 | add-ons | `global_tokens` 0 / 1 / 4, `null_key` |
 | node encodings | none, naive, sinusoidal, lap, rw, and combinations |
-| biases | none, distance (`profile`, `linear`), fourier, spectral |
+| biases | none, distance (`profile`, `linear`), fourier, spectral, expression |
 | rotary | none, rope (`axial`, `mixed`) |
 | width | `model.n_embed`, `n_heads`, `attention.head_dim`, `num_layers`, plus `performer.num_features` and `exphormer.degree` |
 | model | `GlobalModel`, `CombinedModel` (single or dual decoder), long-range mask on / off |
