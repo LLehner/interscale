@@ -64,25 +64,29 @@ from torch_geometric.loader import DataLoader
 from interscale.evaluation.online_probes import ProbeBatchFeatures, _rng_untouched
 from interscale.evaluation.online_probes import hidden_depth as _hidden_depth
 from interscale.tl.geome_utils import label_codes
-from interscale.tl.masking import sample_block_mask
+from interscale.tl.masking import sample_block_mask, sample_gene_set_mask
 
-MASK_KINDS = ("entries", "cells", "blocks")
+MASK_KINDS = ("entries", "cells", "blocks", "gene_set")
 
 
-def draw_masks(data_list, kind: str, rate: float, seed: int, radius: float | None = None) -> None:
+def draw_masks(data_list, kind: str, rate: float, seed: int, radius: float | None = None, columns=None) -> None:
     """Hide entries or whole cells of every graph in ``data_list``, in place, from a private generator.
 
     Writes ``data.gene_mask`` ``[N, G]`` and ``data.mask`` ``[N]`` (its row-wise OR), the attributes
     the gene-masking pipeline reads; under ``mask_strategy="node"`` the model reads ``data.mask``,
     which for ``"cells"`` and ``"blocks"`` hides the same cells. ``"cells"`` hides every gene of a
     hidden cell. ``"blocks"`` hides every gene of the cells in discs of ``radius`` (in the units of
-    ``data.pos``) until ``rate`` of each graph's cells lie in one. The global torch generator is
-    not touched.
+    ``data.pos``) until ``rate`` of each graph's cells lie in one. ``"gene_set"`` hides the gene
+    ``columns`` -- and nothing else -- in each cell with probability ``rate`` (1.0: every cell), as
+    ``dataset.mask_genes`` does in training; read it with ``mask_strategy="gene"``. The global torch
+    generator is not touched.
     """
     if kind not in MASK_KINDS:
         raise ValueError(f"kind must be one of {MASK_KINDS}, got {kind!r}.")
     if kind == "blocks" and not (radius is not None and radius > 0 and 0 < rate < 1):
         raise ValueError(f"'blocks' needs a radius > 0 and a rate in (0, 1), got radius {radius} and rate {rate}.")
+    if kind == "gene_set" and (columns is None or not len(columns) or not 0 < rate <= 1):
+        raise ValueError(f"'gene_set' needs columns and a cell rate in (0, 1], got {columns} and {rate}.")
     gen = torch.Generator().manual_seed(int(seed))
     for data in data_list:
         n, g = data.x.shape
@@ -90,6 +94,8 @@ def draw_masks(data_list, kind: str, rate: float, seed: int, radius: float | Non
             gene_mask = torch.rand(n, g, generator=gen) < rate
         elif kind == "cells":
             gene_mask = (torch.rand(n, generator=gen) < rate)[:, None].expand(n, g).clone()
+        elif kind == "gene_set":
+            gene_mask = sample_gene_set_mask(n, g, columns, rate, generator=gen)
         else:
             if getattr(data, "pos", None) is None:
                 raise ValueError("'blocks' are drawn over cell coordinates, but a graph has no `pos`.")
@@ -626,6 +632,166 @@ def reference_predictions(
     return out
 
 
+def _reference_parts(batch, hidden: torch.Tensor, *, spatial_unit_um: float, kernels_um, position) -> dict:
+    """Per cell, model-free inputs of the fitted references, in batch node order (float64).
+
+    ``own``: the cell's visible values (a hidden entry reads 0); ``context``: Gaussian-kernel means
+    of the visible values of the other cells of its graph, one block of genes per bandwidth;
+    ``position``: :func:`position_features` (or absent). No hidden value enters any of them.
+    """
+    x = batch.x.double()
+    parts = {"own": torch.where(hidden, torch.zeros_like(x), x)}
+    if kernels_um:
+        refs = reference_predictions(
+            batch.x, hidden, batch.pos, batch.batch, spatial_unit_um=spatial_unit_um, kernels_um=tuple(kernels_um)
+        )
+        parts["context"] = torch.cat([refs[f"ref_kernel_{s:g}um"] for s in kernels_um], dim=1)
+    if position is not None:
+        parts["position"] = position(batch, hidden)[POSITION].double()
+    return parts
+
+
+#: The fitted references and the input parts each one reads.
+FITTED_REFERENCES = {
+    "ref_own": ("own",),
+    "ref_own+context": ("own", "context"),
+    "ref_own+context+position": ("own", "context", "position"),
+}
+
+
+class FittedReferences:
+    """Ridge references fitted on training graphs: what a hidden entry's own cell, surroundings and place say.
+
+    The visible-average references (:func:`reference_predictions`) need the hidden gene to be
+    visible somewhere nearby. When a gene set is hidden in every cell -- a signalling programme's
+    responses, say -- nothing nearby shows it, and the bar for a model becomes what the visible
+    *other* genes predict. Three ridge regressions per hidden gene, fit on training graphs carrying
+    their masks and applied to any graph with the same masking:
+
+    * ``ref_own`` -- the cell's own visible genes: within-cell co-expression, no space (a receptor
+      marks a responder; an identity gene tracks a pathway readout).
+    * ``ref_own+context`` -- plus Gaussian-kernel means of the visible genes of the surrounding
+      cells at each bandwidth: a fixed multi-scale linear view of the drivers around the cell.
+    * ``ref_own+context+position`` -- plus :func:`position_features`.
+
+    A model knows more than fixed kernels of its inputs only where it beats ``ref_own+context``.
+    Call the instance as ``(batch, hidden) -> {name: [N, G]}`` (``collect_head_predictions``'s
+    ``fitted_references``); genes never hidden in training are predicted as their training mean.
+
+    Parameters
+    ----------
+    train_data
+        Training graphs carrying ``pos`` and the masks to fit under (``gene_mask``).
+    spatial_unit_um
+        µm per unit of ``pos``.
+    kernels_um
+        Bandwidths of the context, µm.
+    position
+        A :func:`position_features` function, or None to leave the position reference out.
+    alphas
+        Candidate ridge penalties (on standardised features). Each reference takes the one with the
+        lowest squared error on held-out training graphs (``folds`` groups of whole graphs) and is
+        then refit on every training graph, so a wide feature set cannot lose to a narrower one by
+        overfitting. The choice is in ``alpha_``.
+    folds
+        Groups of training graphs for that choice (at most one per graph).
+    device
+        Where the features are computed.
+    """
+
+    def __init__(
+        self,
+        train_data,
+        *,
+        spatial_unit_um: float,
+        kernels_um=(),
+        position=None,
+        alphas=(0.1, 1.0, 10.0, 100.0, 1e3, 1e4),
+        folds: int = 3,
+        device="cpu",
+    ):
+        self.spatial_unit_um, self.kernels_um, self.position = float(spatial_unit_um), tuple(kernels_um), position
+        names = [n for n, parts in FITTED_REFERENCES.items() if position is not None or "position" not in parts]
+        names = [n for n in names if kernels_um or "context" not in FITTED_REFERENCES[n]]
+        chunks, targets, hidden_rows, graph_of = {}, [], [], []
+        graphs = list(train_data)
+        loader = DataLoader(dataset=graphs, shuffle=False, batch_size=1, num_workers=0)
+        with torch.no_grad():
+            for g, batch in enumerate(loader):
+                batch = batch.to(device)
+                hidden = self._hidden(batch)
+                for part, value in self._parts(batch, hidden).items():
+                    chunks.setdefault(part, []).append(value.cpu().numpy().astype(np.float32))
+                targets.append(batch.x.double().cpu().numpy())
+                hidden_rows.append(hidden.cpu().numpy())
+                graph_of.append(np.full(batch.num_nodes, g))
+        parts = {k: np.concatenate(v) for k, v in chunks.items()}
+        y, rows, graph_of = np.concatenate(targets), np.concatenate(hidden_rows), np.concatenate(graph_of)
+        self.fill = y.mean(0)
+        self.target_columns = np.flatnonzero(rows.any(0))
+        fold_of = (np.arange(len(graphs)) % max(1, min(int(folds), len(graphs))))[graph_of]
+        self.models, self.alpha_ = {}, {}
+        for name in names:
+            x = np.concatenate([parts[p] for p in FITTED_REFERENCES[name]], axis=1)
+            self.alpha_[name] = self._choose_alpha(x, y, rows, fold_of, alphas)
+            self.models[name] = self._fit(x, y, rows, self.alpha_[name])
+
+    @staticmethod
+    def _hidden(batch) -> torch.Tensor:
+        gene_mask = getattr(batch, "gene_mask", None)
+        if gene_mask is not None:
+            return gene_mask.bool()
+        return batch.mask.bool()[:, None].expand_as(batch.x)
+
+    def _parts(self, batch, hidden):
+        return _reference_parts(
+            batch, hidden, spatial_unit_um=self.spatial_unit_um, kernels_um=self.kernels_um, position=self.position
+        )
+
+    def _choose_alpha(self, x, y, rows, fold, alphas) -> float:
+        """The penalty with the lowest squared error on held-out folds of whole training graphs."""
+        alphas = [float(a) for a in alphas]
+        if len(alphas) == 1 or len(np.unique(fold)) < 2:
+            return alphas[0]
+        errors = np.zeros(len(alphas))
+        for f in np.unique(fold):
+            held = fold == f
+            for k, alpha in enumerate(alphas):
+                for columns, scaler, ridge in self._fit(x[~held], y[~held], rows[~held], alpha):
+                    keep = held & rows[:, columns[0]]
+                    if keep.any():
+                        pred = ridge.predict(scaler.transform(x[keep])).reshape(int(keep.sum()), -1)
+                        errors[k] += float(((pred - y[keep][:, columns]) ** 2).sum())
+        return alphas[int(np.argmin(errors))]
+
+    def _fit(self, x, y, rows, alpha):
+        """``[(columns, scaler, ridge)]``: one multi-output fit per set of genes hidden in the same cells."""
+        fitted, done = [], set()
+        for g in self.target_columns:
+            if g in done:
+                continue
+            same = [c for c in self.target_columns if c not in done and np.array_equal(rows[:, c], rows[:, g])]
+            done.update(same)
+            keep = rows[:, g]
+            if keep.sum() < 2:
+                continue
+            scaler = StandardScaler().fit(x[keep])
+            ridge = Ridge(alpha=alpha).fit(scaler.transform(x[keep]), y[keep][:, same])
+            fitted.append((np.asarray(same), scaler, ridge))
+        return fitted
+
+    def __call__(self, batch, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+        parts = {k: v.cpu().numpy() for k, v in self._parts(batch, hidden).items()}
+        out = {}
+        for name, fitted in self.models.items():
+            x = np.concatenate([parts[p] for p in FITTED_REFERENCES[name]], axis=1)
+            pred = np.tile(self.fill, (len(x), 1))
+            for columns, scaler, ridge in fitted:
+                pred[:, columns] = ridge.predict(scaler.transform(x)).reshape(len(x), -1)
+            out[name] = torch.as_tensor(pred, dtype=torch.float64, device=batch.x.device)
+        return out
+
+
 def _model_heads(module, out) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     """The decoder heads in one step's output, by name, and the half of ``y_true``/``entry_mask`` they share."""
     from interscale.module.combined_module import DualDecoderCombinedModule
@@ -648,6 +814,7 @@ def collect_head_predictions(
     device,
     spatial_unit_um: float | None = None,
     references: dict | None = None,
+    fitted_references=None,
 ) -> HeadPredictions:
     """Run ``module`` over masked graphs and gather its decoder heads' predictions.
 
@@ -678,6 +845,8 @@ def collect_head_predictions(
         Keyword arguments of :func:`reference_predictions` -- ``kernels_um``, ``k_nearest``, and
         ``label_key``, the name of an annotation on the graphs for ``ref_label_mean`` -- to add the
         references as heads, or None for none. Needs ``spatial_unit_um`` and ``pos``.
+    fitted_references
+        A :class:`FittedReferences`, whose predictions join the heads, or None.
 
     Returns
     -------
@@ -731,6 +900,9 @@ def collect_head_predictions(
                         **options,
                     )
                     for name, value in refs.items():
+                        heads.setdefault(name, []).append(value[idx].cpu().numpy())
+                if fitted_references is not None:
+                    for name, value in fitted_references(batch, hidden).items():
                         heads.setdefault(name, []).append(value[idx].cpu().numpy())
     finally:
         module.train(was_training)

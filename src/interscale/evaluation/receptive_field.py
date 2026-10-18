@@ -331,3 +331,214 @@ def _influence(module, batch, queries, prediction_task, n_projections, direction
             result[name] = torch.stack(rows)
         del out, heads
     return result
+
+
+def _program_influence(module, batch, queries, gene_masks, prediction_task, n_projections, directions, model_heads):
+    """``{head: [Q, N]}``: each query's estimated influence of every cell, on the query's genes ``gene_masks`` only.
+
+    As :func:`_influence`, with the random direction of query ``q`` zero outside ``gene_masks[q]``
+    -- the response genes of the programme it is read for -- and, when the inputs are the
+    expression itself (``[N, G]``), a cell counted through its visible entries only: a hidden
+    entry is a constant the model was handed, not information.
+    """
+    hidden = getattr(batch, "gene_mask", None)
+    with torch.enable_grad(), _differentiable_inputs(module, batch) as captured:
+        out = module._common_step(batch, prediction_task, "node")
+        heads, _, _ = model_heads(module, out)
+        idx = out.view.padded_node_idx
+        if idx is None:
+            idx = torch.arange(batch.num_nodes, device=batch.x.device)
+        inputs = captured["inputs"]
+        visible = None
+        if hidden is not None and inputs.shape == hidden.shape:
+            visible = (~hidden.bool()).double()
+        position = torch.full((batch.num_nodes,), -1, dtype=torch.long)
+        position[idx.cpu()] = torch.arange(len(idx))
+        result = {}
+        for name, pred in heads.items():
+            rows = []
+            for q, genes in zip(queries, gene_masks, strict=True):
+                r = int(position[int(q)])
+                if r < 0 or not pred.requires_grad:
+                    rows.append(torch.full((batch.num_nodes,), float("nan"), dtype=torch.float64, device=inputs.device))
+                    continue
+                acc = torch.zeros(batch.num_nodes, dtype=torch.float64, device=inputs.device)
+                for _ in range(n_projections):
+                    w = torch.randn(pred.shape[1], generator=directions).to(device=pred.device, dtype=pred.dtype)
+                    w = w * torch.as_tensor(genes, device=pred.device, dtype=pred.dtype)
+                    (grad,) = torch.autograd.grad((pred[r] * w).sum(), inputs, retain_graph=True)
+                    squared = grad.double().pow(2)
+                    acc += (squared * visible).sum(1) if visible is not None else squared.sum(1)
+                rows.append(acc / n_projections)
+            result[name] = torch.stack(rows) if rows else None
+        del out, heads
+    return result
+
+
+def response_influence(
+    module,
+    data_list,
+    *,
+    prediction_task: str,
+    prediction_level: str,
+    device,
+    spatial_unit_um: float,
+    edges: pd.DataFrame,
+    edge_genes,
+    queries_per_program: int = 16,
+    n_projections: int = 2,
+    tolerance_um: float = 10.0,
+    distance_bins_um: Sequence[float] = (),
+    seed: int = 0,
+    max_graphs: int = 0,
+) -> dict[str, pd.DataFrame]:
+    """Does a receiver's predicted response depend on its planted sender? Read under a gene-set mask.
+
+    The graphs carry a ``gene_mask`` hiding a programme's response genes -- in every cell, say
+    (``masked_probing.draw_masks(kind="gene_set")``) -- so a response can only come from what
+    drives it. For each planted programme (``edges['program']``), up to ``queries_per_program``
+    receivers whose response genes ``edge_genes(program)`` are all hidden are sampled per graph;
+    the influence of every cell on the receiver's predicted response genes is estimated by gradient
+    (:func:`_program_influence`), and the planted sender is ranked among the cells about as far
+    from the receiver (:func:`~interscale.evaluation._spatial_weights.matched_ranks`): 0.5 is a
+    prediction blind to the sender but not to distance, 1 one that reads the sender above every
+    cell as far away. A model that predicts responses from their drivers ranks senders high; a
+    smoother of positions, or of the cell's own genes, does not.
+
+    Parameters
+    ----------
+    edges
+        Planted ``sender``, ``receiver``, ``range_class``, ``program`` pairs by position in the
+        AnnData the graphs were built from.
+    edge_genes
+        ``program -> [columns]``: the response genes a programme's receivers express.
+    distance_bins_um
+        Bins for the influence profile of the sampled receivers by distance (lift over uniform).
+    seed
+        Seeds the samples and the directions; no global generator is touched.
+
+    Returns
+    -------
+    dict
+        ``"edges"``: ``head, range_class, program, metric, value, n_pairs`` -- ``matched_rank`` per
+        programme, and per range class over its programmes (``program`` ``"any"``). ``"profile"``
+        (with ``distance_bins_um``): ``head, range_class, distance_um, lift, n_queries``.
+    """
+    from interscale.evaluation.masked_probing import _model_heads
+
+    if "regression" not in prediction_task or prediction_level != "node":
+        raise ValueError("response_influence reads reconstructed expression; it needs regression at node level.")
+    graphs = list(data_list)
+    if max_graphs > 0:
+        graphs = graphs[:max_graphs]
+    unit = float(spatial_unit_um)
+    rng = np.random.default_rng(seed)
+    directions = torch.Generator().manual_seed(int(seed))
+    sums: dict[tuple, np.ndarray] = {}
+    profile: dict[tuple, np.ndarray] = {}
+    n_bins = max(len(distance_bins_um) - 1, 0)
+
+    was_training = module.training
+    module.eval()
+    loader = DataLoader(dataset=graphs, shuffle=False, batch_size=1, num_workers=0)
+    try:
+        with _rng_untouched(device), _frozen_parameters(module):
+            for batch in loader:
+                batch = batch.to(device)
+                if getattr(batch, "pos", None) is None or getattr(batch, "gene_mask", None) is None:
+                    raise ValueError("response_influence needs graphs with `pos` and a `gene_mask`.")
+                hidden = batch.gene_mask.bool()
+                pairs = graph_edges(edges, batch.obs_names)
+                if not len(pairs):
+                    continue
+                # One query per (receiver, programme): the receiver's prediction read on that programme's genes.
+                queries, masks, query_class, query_of, picked = [], [], [], {}, []
+                for program, sub in pairs.groupby("program"):
+                    columns = list(edge_genes(str(program)))
+                    if not columns:
+                        continue
+                    covered = hidden[:, columns].all(dim=1).cpu().numpy()
+                    receivers = np.unique(sub["receiver"].to_numpy())
+                    receivers = _sample(receivers[covered[receivers]], queries_per_program, rng)
+                    genes = np.zeros(batch.x.shape[1], dtype=bool)
+                    genes[columns] = True
+                    for receiver in receivers:
+                        query_of[(int(receiver), str(program))] = len(queries)
+                        queries.append(int(receiver))
+                        masks.append(genes)
+                        query_class.append(str(sub["range_class"].iloc[0]))
+                    picked.append(sub[np.isin(sub["receiver"].to_numpy(), receivers)])
+                if not queries:
+                    continue
+                influence = _program_influence(
+                    module, batch, queries, masks, prediction_task, n_projections, directions, _model_heads
+                )
+                where = batch.pos.double() * unit
+                q = torch.as_tensor(queries, device=where.device)
+                dist = torch.cdist(where[q], where, compute_mode="donot_use_mm_for_euclid_dist")
+                keep = torch.ones_like(dist, dtype=torch.bool)
+                keep[torch.arange(len(q), device=q.device), q] = False  # a cell is not its own comparison
+                pairs = pd.concat(picked, ignore_index=True)
+                receivers = pairs["receiver"].to_numpy().astype(np.int64)
+                program_names = pairs["program"].astype(str).to_numpy()
+                classes = pairs["range_class"].astype(str).to_numpy()
+                rows = torch.as_tensor(
+                    [query_of[(int(r), p)] for r, p in zip(receivers, program_names, strict=True)], device=q.device
+                )
+                senders = torch.as_tensor(pairs["sender"].to_numpy().astype(np.int64), device=q.device)
+                # A receiver's other senders in the same programme are no comparison for any of them.
+                exclude = torch.zeros(len(pairs), batch.num_nodes, dtype=torch.bool, device=q.device)
+                same = (
+                    pairs.groupby(["receiver", "program"])["sender"].apply(lambda v: np.unique(v.to_numpy())).to_dict()
+                )
+                for k, key in enumerate(zip(receivers, program_names, strict=True)):
+                    exclude[k, torch.as_tensor(same[(int(key[0]), key[1])], device=q.device)] = True
+                query_class = np.asarray(query_class)
+                for head, weights in influence.items():
+                    if weights is None:
+                        continue
+                    ranks = matched_ranks(weights, dist, keep, rows, senders, exclude, tolerance_um).cpu().numpy()
+                    groups = [
+                        (c, p, (classes == c) & (program_names == p))
+                        for c, p in set(zip(classes, program_names, strict=True))
+                    ]
+                    groups += [(c, "any", classes == c) for c in np.unique(classes)]
+                    for key_class, key_program, pick in groups:
+                        ranked = pick & np.isfinite(ranks)
+                        acc = sums.setdefault((head, str(key_class), str(key_program)), np.zeros(2))
+                        acc += [ranks[ranked].sum(), ranked.sum()]
+                    if n_bins:
+                        weight_in, uniform_in = distance_profile(weights, dist, keep, distance_bins_um)
+                        defined = torch.isfinite(weight_in).all(1).cpu().numpy()
+                        weight_in, uniform_in = weight_in.cpu().numpy(), uniform_in.cpu().numpy()
+                        for c in np.unique(query_class):
+                            pick = (query_class == c) & defined
+                            if pick.any():
+                                acc = profile.setdefault((head, str(c)), np.zeros((3, n_bins)))
+                                acc += [weight_in[pick].sum(0), uniform_in[pick].sum(0), np.full(n_bins, pick.sum())]
+    finally:
+        module.train(was_training)
+
+    rows = [
+        {
+            "head": head,
+            "range_class": rc,
+            "program": prog,
+            "metric": "matched_rank",
+            "value": s / n if n else np.nan,
+            "n_pairs": int(n),
+        }
+        for (head, rc, prog), (s, n) in sorted(sums.items())
+    ]
+    out = {"edges": pd.DataFrame(rows, columns=["head", "range_class", "program", "metric", "value", "n_pairs"])}
+    if n_bins:
+        labels = bin_labels(distance_bins_um)
+        rows = []
+        for (head, rc), (weight, uniform, count) in sorted(profile.items()):
+            for b, label in enumerate(labels):
+                lift = weight[b] / uniform[b] if uniform[b] > 0 else np.nan
+                rows.append(
+                    {"head": head, "range_class": rc, "distance_um": label, "lift": lift, "n_queries": int(count[b])}
+                )
+        out["profile"] = pd.DataFrame(rows, columns=["head", "range_class", "distance_um", "lift", "n_queries"])
+    return out

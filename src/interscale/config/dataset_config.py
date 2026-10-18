@@ -52,6 +52,11 @@ def get_dataset_cfg(cfg):
     # 0, leaving the discs as the only targets. Fraction 0 (the default) draws no discs.
     cfg.dataset.mask_block_radius_um = 0.0
     cfg.dataset.mask_block_fraction = 0.0
+    # Programme masking (mask_strategy "gene" only): hide exactly these genes -- names or
+    # "<var column>=<value>" selectors, e.g. ["role=response", "role=receiver"] -- in the selected
+    # cells and nothing else. mask_percentage is then the share of cells (1.0: every cell), and
+    # discs, if on, select cells for it too. Empty: random entries, as before.
+    cfg.dataset.mask_genes = []
 
     # Optional per-cell annotations attached to every PyG Data object when set. All default to
     # None, which attaches nothing and leaves the graphs byte-identical to before.

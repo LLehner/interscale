@@ -87,6 +87,9 @@ NOTES = {
     "distance expectation",
     "flow_labels": "attention flow by label (query label x key label, e.g. clusters): mass = share of the query "
     "label's attention, lift_uniform / lift_distance = observed over uniform / distance-kernel expectation",
+    "response_edges": "programme masking: the planted sender's rank in its receiver's predicted response genes among "
+    "cells as far from the receiver (0.5: blind to the sender), per programme and range class (program any)",
+    "response_profile": "programme masking: the sampled receivers' influence per distance bin (µm) over uniform weights",
     "training": "the last epoch's throughput and peak memory, the final validation metrics",
     "phases": "staged training, each phase's end: drift_<component> = relative weight change (0: frozen), "
     "and the phase's last validation losses",
@@ -244,6 +247,14 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         )
         table = _pivot(labels, ["layer", "group", "measure", "query_label"], "key_label")
         out["flow_labels"] = table.sort_index(level=["layer", "group", "measure"], sort_remaining=False)
+    if "response_edges" in tables:
+        out["response_edges"] = (
+            tables["response_edges"]
+            .set_index(["head", "range_class", "program"])[["value", "n_pairs"]]
+            .rename(columns={"value": "matched_rank"})
+        )
+    if "response_profile" in tables:
+        out["response_profile"] = _pivot(tables["response_profile"], ["head", "range_class"], "distance_um", "lift")
     if "training" in tables:
         out["training"] = tables["training"].set_index("metric")[["value"]]
     known = {
@@ -263,6 +274,8 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         "erf_edges",
         "flow_summary",
         "flow_labels",
+        "response_edges",
+        "response_profile",
         "training",
     }
     out.update({name: table for name, table in tables.items() if name not in known})
@@ -589,6 +602,18 @@ def summary_tables(sections, arms: list[str], groups: list[str] | None = None) -
     if rows:
         add(
             "receptive field, planted pairs: sender's rank in the receiver's influence among visible spots as far (0.5: blind)",
+            pd.concat(rows).unstack("range_class"),
+        )
+    rows = []
+    for arm, table in _per_arm(sections, "response_edges", arms).items():
+        overall = table.xs("any", level="program")["matched_rank"]
+        overall.index = pd.MultiIndex.from_tuples(
+            [(arm, head, rc) for head, rc in overall.index], names=["arm", "head", "range_class"]
+        )
+        rows.append(overall)
+    if rows:
+        add(
+            "programme masking: planted sender's rank in its receiver's predicted response among cells as far (0.5: blind)",
             pd.concat(rows).unstack("range_class"),
         )
     flow = _per_arm(sections, "flow_summary", arms)

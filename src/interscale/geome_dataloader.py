@@ -14,7 +14,14 @@ VALID_SPLIT = {"node", "graph"}
 # TODO: Fix dataloader
 import torch
 
-from interscale.tl.masking import MASK_STRATEGIES, sample_block_mask, sample_gene_mask, sample_node_mask
+from interscale.tl.masking import (
+    MASK_STRATEGIES,
+    resolve_mask_genes,
+    sample_block_mask,
+    sample_gene_mask,
+    sample_gene_set_mask,
+    sample_node_mask,
+)
 
 
 def block_mask_kwargs(cfg) -> dict:
@@ -31,6 +38,17 @@ def block_mask_kwargs(cfg) -> dict:
     return {"mask_block_radius": radius, "mask_block_fraction": fraction}
 
 
+def gene_set_mask_kwargs(cfg, adata) -> dict:
+    """The gene-set argument of :class:`GraphAnnDataModule` from ``cfg.dataset.mask_genes``, resolved on ``adata.var``.
+
+    ``adata.var`` is read only when a gene set is configured.
+    """
+    selectors = list(cfg.dataset.get("mask_genes", []) or [])
+    if not selectors:
+        return {}
+    return {"mask_gene_columns": resolve_mask_genes(selectors, adata.var)}
+
+
 class GraphAnnDataModule(pl.LightningDataModule):
     """Lightning DataModule for graph data."""
 
@@ -44,6 +62,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
         learning_type: Literal["node", "graph"] = "node",
         mask_block_radius: float = 0.0,
         mask_block_fraction: float = 0.0,
+        mask_gene_columns: Sequence[int] | None = None,
     ):
         """Manages loading and sampling schemes before loading to GPU.
 
@@ -70,6 +89,10 @@ class GraphAnnDataModule(pl.LightningDataModule):
             `mask_block_radius` (`tl.masking.sample_block_mask`), on top of the strategy's own
             mask, redrawn with it. 0 draws no discs and consumes no random numbers. With discs,
             `mask_percentage` 0 under "node" skips the Bernoulli cells. Defaults to 0.0.
+        mask_gene_columns (Sequence[int], optional): Under `mask_strategy="gene"`, hide exactly these
+            gene columns in the selected cells (`dataset.mask_genes`, resolved by
+            `gene_set_mask_kwargs`) instead of random entries: a cell is selected with probability
+            `mask_percentage` -- per cell, not per entry -- or by a disc. Defaults to None.
 
         Raises
         ------
@@ -100,6 +123,11 @@ class GraphAnnDataModule(pl.LightningDataModule):
             )
         self.mask_block_radius = mask_block_radius
         self.mask_block_fraction = mask_block_fraction
+        if mask_gene_columns is not None and len(mask_gene_columns) and mask_strategy != "gene":
+            raise ValueError("mask_gene_columns hides a gene set, which needs mask_strategy 'gene'.")
+        self.mask_gene_columns = (
+            list(mask_gene_columns) if mask_gene_columns is not None and len(mask_gene_columns) else None
+        )
         self.first_time = True
 
     def _nodewise_setup(self, stage: str | None) -> None:
@@ -186,7 +214,15 @@ class GraphAnnDataModule(pl.LightningDataModule):
         With spatial blocks the cells in the discs are added to either: masked cells under "node",
         whole masked rows under "gene".
         """
-        if self.mask_strategy == "gene":
+        if self.mask_strategy == "gene" and self.mask_gene_columns is not None:
+            # A gene set: those genes in the selected cells, and nothing else -- discs select cells
+            # for it rather than hiding whole rows.
+            gene_mask = sample_gene_set_mask(
+                data.num_nodes, data.x.shape[1], self.mask_gene_columns, self.mask_percentage, self._sample_blocks(data)
+            )
+            data.gene_mask = gene_mask
+            data.mask = gene_mask.any(dim=1)
+        elif self.mask_strategy == "gene":
             gene_mask = sample_gene_mask(data.num_nodes, data.x.shape[1], self.mask_percentage)
             blocks = self._sample_blocks(data)
             if blocks is not None:

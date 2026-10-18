@@ -146,7 +146,8 @@ def _training_tag(cfg) -> str:
     long-range attention mask (``long_range_attention``, off by default). ``lrm`` was added on
     2026-10-14: checkpoints trained with the mask on before then carry no tag. ``sch-<schedule>``,
     ``lw<local>-<global>`` and ``frz-<components>``: a staged schedule, loss weights other than
-    the default 0.5 / 0.5, and frozen components (``train._schedule``).
+    the default 0.5 / 0.5, and frozen components (``train._schedule``). ``gs<cell rate>-<selectors>``:
+    a hidden gene set (``dataset.mask_genes``).
     """
     # Here, not at module level: interscale.train imports this module.
     from interscale.train._schedule import resolve_loss_weights, schedule_tag
@@ -169,6 +170,11 @@ def _training_tag(cfg) -> str:
         parts.append("frz-" + "-".join(sorted(cfg.optim.frozen)))
     if cfg.dataset.get("mask_block_fraction", 0.0) > 0:
         parts.append(f"blk{cfg.dataset.mask_block_radius_um:g}f{cfg.dataset.mask_block_fraction:g}")
+    gene_set = list(cfg.dataset.get("mask_genes", []) or [])
+    if gene_set:
+        # Letters, digits and dashes only: "role=response" -> "role-response".
+        names = "-".join(re.sub(r"[^A-Za-z0-9]+", "-", str(s)).strip("-") for s in gene_set)
+        parts.append(f"gs{float(cfg.dataset.mask_percentage):g}-{names}")
     return f"var-{'+'.join(parts)}_" if parts else ""
 
 

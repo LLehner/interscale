@@ -22,7 +22,7 @@ user runs smoke, sweeps and evaluation on the cluster.
 
 ## Status
 
-Last updated 2026-10-18 (A2, B and C3 run and read; 0g built).
+Last updated 2026-10-18 (A2, B and C3 run and read twice; 0g built; programme masking P built).
 
 | stage | state | verified by | date |
 |---|---|---|---|
@@ -33,6 +33,7 @@ Last updated 2026-10-18 (A2, B and C3 run and read; 0g built).
 | 0e — receptive field and representations | **implemented, unverified** — `receptive_field`: Hutchinson estimate within 10% of the exact squared Jacobian norm (correlation > 0.95), queries on subsampled graphs read their own row, a GCN reads exactly 0 beyond its hops while a transformer and a dual decoder's global head do not, planted pairs ranked on influence, no generator touched, parameters and `gex_embedding` restored; `representation_table`: CKA 1 under rotation and scale and low for unrelated sets, participation ratio counts directions, wide sets reduced. 15 mutations across 0d and 0e, each caught; full suite passes | 2026-10-17 |
 | 0f — one results file per sweep | **implemented, unverified** — `evaluation.report`: `append_sections` appends an arm's compact tables as `## <arm> | <analysis>` sections (CSV, index columns counted in the fence) to `RESULTS_DIR/results.md`; `read_sections` reads them back, the later section winning; `write_report` rewrites the file with the cross-arm summary on top (counts and references once, gains over the smoother, untrained twins under their arms). `global_only.py` writes nothing else. 6 tests, 7 mutations caught; checked on stub data (7 arms + twins, 3,515 lines, summary in the first ~700) | 2026-10-17 |
 | 0g — position baseline, gene groups by depth, blend test | **implemented, unverified** — `masked_probing.position_features` (offset from the slide centroid, its norm, one-hot patches per size; identical for a slide placed anywhere, no expression enters, cells beyond the grid clipped to its border), `combined_features`, `feature_sets` adds `smoother+position` and `smoother+position+<E>`; `score_heads` → `by_group_depth` (its `all` rows equal `by_group`); `blend_heads` (`blend_<head>`). Report: `heads_group_by_depth` sections, summary per group by depth (count, best reference, slide mean once; `write_report(groups=...)` limits the summary's group tables), label and distance summaries with the gain over `smoother+position`. Scripts: `GENE_GROUP_KEYS`, `SUMMARY_GENE_GROUPS`, `POSITION_PATCHES_UM`, `BLEND_REFERENCE` in `sweep_common.py`; all four sweeps set to `MODE = "sweep"` for the rerun. 9 tests, 8 mutations caught (a ninth showed a redundant sort, removed); 822 tests pass; checked end to end on a generated stub synth_spot (6 slides per condition, 20 × 20) with untrained GlobalModel, CombinedModel and LocalModel | 2026-10-18 |
+| P — programme masking: responses predicted from their drivers | **implemented, unverified** — `dataset.mask_genes` (names or `var` selectors such as `role=response`) hides exactly that gene set in the selected cells (`mask_percentage` per cell, 1.0 every cell; discs select cells for it) under `mask_strategy gene`; validator, checkpoint tag `gs<rate>-<selectors>`, both entrypoints. `masked_probing.FittedReferences`: ridge references fitted on training graphs -- `ref_own` (the cell's visible genes), `ref_own+context` (+ kernel means of the visible genes around it), `ref_own+context+position` -- penalty chosen on held-out training graphs; `draw_masks(kind="gene_set")`; `receptive_field.response_influence`: the planted sender's rank in its receiver's predicted response genes (its programme's only) among cells as far, a cell counting through its visible entries. Script `slurm/response_masking.{py,yaml}` + sweep yaml (local_gcn, lin_none, lin_rope, lin_fourier, joint_rope), `EVAL_MASK = "gene_set"` in `sweep_common.py`. 12 tests + 1 report test; 10 mutations caught (one first survived and led to a test); 861 tests pass; harness IDENTICAL; smoke-trained and evaluated on a generated stub synth_spot. **Not run on data** | 2026-10-18 |
 | A1 — learned linear input for the global-only model | **implemented, unverified** — `type_gex_embedding: Linear` builds `input_embedding` (an `nn.Linear`; the transformer's input LayerNorm normalises it), trained with the transformer; training maps the masked batch and inference (`GlobalModel.get_model_output`) the clean one, both through `GlobalModule.gex_embedding`; hidden cells' values never reach a prediction, visible ones do; the validator accepts only buildable inputs; `emb-linear` in the global-only checkpoint name only. 4 mutations, each caught; 735 tests pass; harness IDENTICAL (its GlobalModel/PCA and LocalModel cases included). **Not run on data** | 2026-10-15 |
 | A2 — global-only sweep (input × encoding) and a local-only reference | **RUN 2026-10-18**, read: see "Results of the first sweeps". set up — `notebooks_and_scripts/slurm/global_only.{py,yaml}`, `global_only_sweep.yaml`; 7 arms validate with their model types, checkpoint names distinct; script checked on stub data (preflight, one W&B sweep per model type, stale-file guard, head tables and W&B summary for single- and dual-head arms). Evaluation switched to 0d/0e on 2026-10-17; the machinery moved to `slurm/sweep_common.py`, shared with the B and C3 sweeps | 2026-10-17 |
 | B1 — local-embedding variants under one global model (scVI joint, scVI frozen, frozen random GCN, 1-layer GCN) | not started | | |
@@ -648,6 +649,42 @@ model is asked to predict, or combining near and far information.
   attention biases change it. Built 2026-10-18 as attention_plan.md stage 9
   (`slurm/legnini_attention.py`: GlobalModel on PCA with RoPE; base, distance + expression bias,
   entmax, top-16, top-64; patch and cluster attention flow). Not run.
+
+## Programme masking: what drives a response (built 2026-10-18)
+
+**Why (the user, 2026-10-18).** The disc task cannot test the programmes synth_spot was built for:
+a hidden receiver loses its sender and its own receptor with it, so short-range receivers score ~0
+for every model and reference, and sparse responses (0.04–0.09 vs 0.19) are capped by the hidden
+receptor; meanwhile a smoother of the visible spots around a disc explains most of what can be
+filled in. The second read of the sweeps (`/home/lehnerl/Arbeit/results/global_only_new`) showed
+the same limits once more: the gains over the smoother are a few hundredths on response genes, and
+on legnini every arm sat at the slide mean.
+
+**Task.** Hide every response gene (`var` role receiver or response) in every spot and nothing
+else; train and evaluate on that. A response can then only be predicted from what drives it: an
+adjacent sender, the distance to a source, a distant source together with the spot's own receptor.
+A smoother of the responses has nothing to average.
+
+**Bars, fitted on the training slides** (`FittedReferences`): the spot's own visible genes (a
+receptor marks a responder); plus Gaussian-kernel means of the visible genes around it at 150, 400,
+1000 and 2500 µm (a fixed linear view of the drivers at several scales); plus position. A model has
+learned more than fixed kernels of its inputs only where it beats `ref_own+context`. On the stub
+these bars are already strong (receivers 0.61, long-range responses 0.68, sparse 0.70).
+
+**Readouts.** Centred cosine per programme and per interaction (`M7>MC7/MC8/MC9`, ...), and for each
+planted programme the sender's rank in its receiver's predicted response among spots as far away
+(`response_edges`, 0.5 = blind to the sender) -- the test the disc task could never make.
+
+**Arms** (`response_masking_sweep.yaml`): `local_gcn` (drivers within two hops), `lin_none`
+(drivers anywhere, no position), `lin_rope`, `lin_fourier` (drivers anywhere, with position),
+`joint_rope`. Predictions: short-range receivers are a local problem (GCN ≈ context reference);
+long-range and sparse responses need distant sources -- only a global model with position can
+beat the context reference there, and its senders should rank above 0.5.
+
+**Legnini.** No annotations in `var` (`gene_ids`, `feature_types` only), but the panel has the SHH
+readouts (PTCH1, GLI1, HHIP), the ligand (SHH) and the ventral/dorsal identity genes. The same
+machinery runs with `mask_genes: [PTCH1, GLI1, HHIP]`; which genes form the hidden set is the
+user's call (not decided).
 
 ## Order and decision points
 

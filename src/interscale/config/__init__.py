@@ -130,11 +130,19 @@ def _validate_masking(cfg):
     if cfg.dataset.mask_strategy not in MASK_STRATEGIES:
         raise ValueError(f"dataset.mask_strategy must be one of {MASK_STRATEGIES}, got {cfg.dataset.mask_strategy!r}.")
 
+    gene_set = list(cfg.dataset.get("mask_genes", []) or [])
+    if gene_set and cfg.dataset.mask_strategy != "gene":
+        raise ValueError(
+            f"dataset.mask_genes {gene_set} hides a gene set, which needs mask_strategy 'gene' "
+            f"(got {cfg.dataset.mask_strategy!r})."
+        )
+
     if "regression" not in cfg.dataset.prediction_task:
         return
 
-    # Spatial blocks under "node" are targets of their own, so the Bernoulli cells may be off.
-    blocks_alone = cfg.dataset.get("mask_block_fraction", 0.0) > 0 and cfg.dataset.mask_strategy == "node"
+    # Spatial blocks under "node", or selecting the cells of a gene set, are targets of their own,
+    # so the Bernoulli cells may be off.
+    blocks_alone = cfg.dataset.get("mask_block_fraction", 0.0) > 0 and (cfg.dataset.mask_strategy == "node" or gene_set)
     if blocks_alone and cfg.dataset.mask_percentage == 0:
         return
     if not 0 < cfg.dataset.mask_percentage <= 1:
@@ -170,7 +178,8 @@ def _validate_block_mask(cfg):
         )
     if not cfg.dataset.spatial_unit_um > 0:
         raise ValueError(f"dataset.spatial_unit_um must be > 0, got {cfg.dataset.spatial_unit_um}.")
-    if cfg.dataset.mask_strategy == "gene" and cfg.dataset.mask_percentage == 0:
+    gene_set = list(cfg.dataset.get("mask_genes", []) or [])
+    if cfg.dataset.mask_strategy == "gene" and cfg.dataset.mask_percentage == 0 and not gene_set:
         raise ValueError(
             "Under mask_strategy gene every cell keeps at least one masked entry, so mask_percentage 0 would "
             "still mask one entry per cell. For the discs alone use mask_strategy node."

@@ -120,8 +120,9 @@ def graph_edges(edges: pd.DataFrame, obs_names, *, offset: int = 1) -> pd.DataFr
     """The planted ``edges`` inside one graph, as node indices of that graph.
 
     ``edges`` names cells by position in the AnnData the graphs were built from (``sender``,
-    ``receiver``, ``range_class``); ``prepare_geome_dataset`` names each graph's nodes by that position
-    plus ``offset``, and the graphs carry those names as ``obs_names``. Pairs leaving the graph go.
+    ``receiver``, ``range_class``, and any other column, carried along); ``prepare_geome_dataset``
+    names each graph's nodes by that position plus ``offset``, and the graphs carry those names as
+    ``obs_names``. Pairs leaving the graph go.
     """
     names = obs_names.detach().cpu().numpy() if isinstance(obs_names, torch.Tensor) else np.asarray(obs_names)
     position = np.rint(names.astype(np.float64)).astype(np.int64) - int(offset)
@@ -129,13 +130,15 @@ def graph_edges(edges: pd.DataFrame, obs_names, *, offset: int = 1) -> pd.DataFr
     sender = edges["sender"].to_numpy().astype(np.int64)
     receiver = edges["receiver"].to_numpy().astype(np.int64)
     inside = np.isin(sender, position) & np.isin(receiver, position)
-    return pd.DataFrame(
-        {
-            "sender": node.loc[sender[inside]].to_numpy(),
-            "receiver": node.loc[receiver[inside]].to_numpy(),
-            "range_class": edges["range_class"].astype(str).to_numpy()[inside],
-        }
-    )
+    out = {
+        "sender": node.loc[sender[inside]].to_numpy(),
+        "receiver": node.loc[receiver[inside]].to_numpy(),
+        "range_class": edges["range_class"].astype(str).to_numpy()[inside],
+    }
+    for column in edges.columns:
+        if column not in out:
+            out[column] = edges[column].to_numpy()[inside]
+    return pd.DataFrame(out)
 
 
 #: Planted pairs ranked at once in :func:`matched_ranks`: a few ``[pairs, N]`` temporaries per chunk.

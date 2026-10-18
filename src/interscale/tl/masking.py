@@ -17,6 +17,15 @@ Two granularities are available, selected by ``mask_strategy``:
     cell's remaining genes to condition on, so within-cell co-expression -- not just the
     population mean -- is available and rewarded.
 
+``"gene"`` with a gene set (``dataset.mask_genes``) -- programme masking
+    A fixed set of genes -- e.g. every response gene of a signalling programme -- is hidden in
+    the selected cells, and nothing else: each cell is selected with probability
+    ``mask_percentage`` (1.0: every cell), plus the cells in spatial blocks if those are on. The
+    loss is on the hidden entries, as under ``"gene"``. With the set hidden in every cell no
+    neighbour shows it either, so the programme can only be predicted from what drives it --
+    senders, sources, receptors, position -- which is what a model of cell-cell communication
+    should be able to do and a smoother of the programme itself cannot.
+
 Spatial blocks (``dataset.mask_block_fraction`` > 0) -- on top of either strategy
     Whole cells in discs of ``dataset.mask_block_radius_um`` (:func:`sample_block_mask`) are
     hidden as well: under ``"node"`` they join the masked cells, under ``"gene"`` every entry of
@@ -134,6 +143,67 @@ def sample_gene_mask(
         fill = torch.randint(num_genes, (int(empty_rows.sum()),), generator=generator)
         mask[empty_rows, fill] = True
     return mask
+
+
+def resolve_mask_genes(selectors, var) -> list[int]:
+    """The columns of ``var`` that ``dataset.mask_genes`` selects, in ``var`` order.
+
+    Each selector is a gene name (an index entry of ``var``) or ``"<column>=<value>"``, which takes
+    every gene whose ``var[column]`` reads ``value`` (compared as text). A selector matching nothing
+    raises, so a misspelt gene or value never shrinks the hidden set silently.
+
+    Parameters
+    ----------
+    selectors
+        ``dataset.mask_genes``.
+    var
+        ``adata.var``, in the column order of ``data.x``.
+    """
+    names = [str(g) for g in var.index]
+    position = {g: k for k, g in enumerate(names)}
+    chosen = set()
+    for selector in selectors:
+        selector = str(selector)
+        if "=" in selector:
+            column, value = selector.split("=", 1)
+            if column not in var.columns:
+                raise ValueError(f"dataset.mask_genes selector {selector!r}: var has no column {column!r}.")
+            hits = [k for k, v in enumerate(var[column].astype(str)) if v == value]
+        else:
+            hits = [position[selector]] if selector in position else []
+        if not hits:
+            raise ValueError(f"dataset.mask_genes selector {selector!r} matches no gene.")
+        chosen.update(hits)
+    return sorted(chosen)
+
+
+def sample_gene_set_mask(
+    num_nodes: int,
+    num_genes: int,
+    columns,
+    cell_rate: float,
+    blocks: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Hide the genes ``columns`` in a selection of cells: ``[num_nodes, num_genes]`` boolean.
+
+    A cell is selected with probability ``cell_rate`` (1.0: every cell, drawing nothing), or when
+    ``blocks`` ``[num_nodes]`` marks it. At least one cell is selected, so every graph contributes to
+    the loss.
+    """
+    if cell_rate >= 1.0:
+        cells = torch.ones(num_nodes, dtype=torch.bool)
+    elif cell_rate > 0:
+        cells = torch.rand(num_nodes, generator=generator) < cell_rate
+    else:
+        cells = torch.zeros(num_nodes, dtype=torch.bool)
+    if blocks is not None:
+        cells = cells | blocks
+    if not cells.any():
+        cells[torch.randint(num_nodes, (1,), generator=generator)] = True
+    genes = torch.zeros(num_genes, dtype=torch.bool)
+    genes[torch.as_tensor(list(columns), dtype=torch.long)] = True
+    return cells[:, None] & genes[None, :]
 
 
 def sample_block_mask(

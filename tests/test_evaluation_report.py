@@ -395,3 +395,34 @@ def test_the_patch_flow_compacts_and_gets_summary_tables(tmp_path):
     tables = dict(summary_tables(read_sections(path), ["base", "topk"]))
     kl = next(t for title, t in tables.items() if title.startswith("patch flow by layer: KL"))
     assert list(kl.index) == [(arm, layer) for arm in ("base", "topk") for layer in ("l0", "l1", "influence")]
+
+
+def test_the_response_influence_compacts_and_gets_a_summary_table(tmp_path):
+    edges = pd.DataFrame(
+        [
+            {"head": "global", "range_class": rc, "program": prog, "metric": "matched_rank", "value": v, "n_pairs": 4}
+            for rc, prog, v in (
+                ("short", "S1>R1", 0.9),
+                ("short", "any", 0.9),
+                ("sparse", "M12>MC16", 0.6),
+                ("sparse", "any", 0.6),
+            )
+        ]
+    )
+    profile = pd.DataFrame(
+        [
+            {"head": "global", "range_class": "short", "distance_um": d, "lift": 2.0, "n_queries": 3}
+            for d in ("(0.0, 300.0]", "(300.0, 500.0]")
+        ]
+    )
+    compact = compact_tables({"response_edges": edges, "response_profile": profile})
+    assert compact["response_edges"].loc[("global", "sparse", "M12>MC16"), "matched_rank"] == pytest.approx(0.6)
+    assert list(compact["response_profile"].columns) == ["(0.0, 300.0]", "(300.0, 500.0]"]
+    path = tmp_path / "results.md"
+    append_sections(path, "lin_rope", compact)
+    table = next(
+        t for title, t in summary_tables(read_sections(path), ["lin_rope"]) if title.startswith("programme masking")
+    )
+    assert list(table.columns) == ["short", "sparse"] and table.loc[("lin_rope", "global"), "short"] == pytest.approx(
+        0.9
+    )
