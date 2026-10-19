@@ -8,6 +8,13 @@ InterScale is a Python package for multi-scale cell interaction analysis in spat
 
 For the scientific motivation, model design rationale, and terminology behind this architecture (from the InterScale preprint — Drummer, Jiménez et al., bioRxiv 2026), see [`.claude/background.md`](.claude/background.md). Read it before working on model/module architecture, loss functions, or the interpretability/evaluation pipeline — it explains *why* the local/global split and dual-decoder design exist, not just what the code does.
 
+The three-week roadmap (2026-10-19 to 2026-11-08) is in [`.claude/roadmap.md`](.claude/roadmap.md):
+the project's goals (disease-specific interactions, how cell-type driven attention is, masking
+strategies, complexity vs tissue coverage, disentangling local and global, NicheNet priors) and the
+known problems of the global model, as tracks with a schedule and decision points. The designs stay
+in the plan files below. Read it before starting work on any of its tracks, and update its status
+table in the same commit as the work it describes.
+
 Work on contrastive / auxiliary losses for the global component is planned in
 [`.claude/contrastive_plan.md`](.claude/contrastive_plan.md). It carries the staged design, a
 status table, and an invariants checklist — read it before touching `train/losses.py`,
