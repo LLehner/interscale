@@ -454,6 +454,12 @@ class TransformerNodeEncoderHook(GlobalModule):
             I: torch.Tensor [N+1, N+1]
                 Self-attention relevance matrix with CLS token.
         """
+        if self.pooling is not None:
+            raise NotImplementedError(
+                "evaluate() reads the relevance of cell tokens, which a pooled model (model.global_component."
+                "parameters.pooling) does not have: its transformer runs on patches. Use the masked-pass "
+                "evaluation (_common_step) instead."
+            )
         # evaluation on single graph
         batched_data.batch = torch.Tensor(len(batched_data.obs_names) * [0])
         transformer_in, src_padding_mask, pad_index_nodes, attn_mask, rotary = self.common_step_local_to_global(

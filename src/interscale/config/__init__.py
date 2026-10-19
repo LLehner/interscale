@@ -462,6 +462,51 @@ def _validate_attention(cfg):
         )
 
 
+def _validate_pooling(cfg):
+    """``pooling`` (patch tokens): a known kind with a size, and nothing that reads cells one by one."""
+    from interscale.module.global_modules.pooling import POOL_FEATURES, POOLING_KINDS
+
+    params = cfg.model.global_component.get("parameters", None)
+    pooling = params.get("pooling", None) if params is not None else None
+    if pooling is None or pooling.get("kind", "none") == "none":
+        return
+    where = "model.global_component.parameters.pooling"
+    if pooling.kind not in POOLING_KINDS:
+        raise ValueError(f"{where}.kind must be one of {POOLING_KINDS}, got {pooling.kind!r}.")
+    if (pooling.size_um > 0) == (pooling.n_patches > 0):
+        raise ValueError(
+            f"{where}: give exactly one of size_um (the grid's side in um) and n_patches (patches per slide); "
+            f"got size_um {pooling.size_um} and n_patches {pooling.n_patches}."
+        )
+    if min(pooling.size_um, pooling.n_patches) < 0 or not 0 <= pooling.offset < 1:
+        raise ValueError(f"{where}: size_um and n_patches must not be negative, and offset must lie in [0, 1).")
+    unknown = sorted(set(pooling.features) - set(POOL_FEATURES))
+    if unknown:
+        raise ValueError(f"{where}.features names {unknown}; choose from {list(POOL_FEATURES)}.")
+    if cfg.dataset.get("spatial_key", None) is None:
+        raise ValueError(f"{where} places a patch at its cells' centroid, so it needs dataset.spatial_key.")
+    if params.get("long_range_attention", False):
+        raise ValueError(
+            f"{where} runs the transformer on patches, which have no neighbour graph to block: "
+            "set long_range_attention: false."
+        )
+    pe = params.get("pe", None)
+    if pe is not None:
+        bad = sorted(set(pe.get("node", [])) & {"lap", "rw"}) + sorted(set(pe.get("bias", [])) & {"spectral", "expression"})
+        if bad:
+            raise ValueError(
+                f"{where} cannot carry the encodings {bad}: they read the cell graph or each cell's expression, "
+                "which a patch has neither of. Use naive, sinusoidal, distance, fourier or rope."
+            )
+    attention = params.get("attention", None)
+    if attention is not None and attention.get("kind", "dense") == "exphormer":
+        raise ValueError(f"{where} has no cell graph for Exphormer's attention pattern; use another attention.kind.")
+    from interscale.train.losses import LOSSES_READING_ATTENTION
+
+    if cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION:
+        raise ValueError(f"{where}: optim.loss {cfg.optim.loss!r} reads cell-by-cell attention maps, which patches do not give.")
+
+
 def _validate(cfg):
     """Run every load-time check.
 
@@ -476,6 +521,7 @@ def _validate(cfg):
     _validate_probe(cfg)
     _validate_pe(cfg)
     _validate_attention(cfg)
+    _validate_pooling(cfg)
     _validate_sce(cfg)
     _validate_center_targets(cfg)
     _validate_global_residual(cfg)

@@ -144,6 +144,22 @@ def get_global_component_cfg(cfg, global_component_name):
         pe.rope.kind = "axial"
         pe.rope.min_wavelength = 50.0
         pe.rope.max_wavelength = 0.0
+        # Pooled tokens (`.claude/roadmap.md`, T1b): the transformer runs on patches of cells instead of single
+        # cells -- a patch token is the mean of its visible cells' tokens, placed at the patch's centroid --
+        # and every cell's global embedding is its patch's. S drops by 10-1000x (whole sections fit dense
+        # attention), a patch is a denoised unit, and its embedding cannot carry one cell's own token. The
+        # loss and the evaluation stay per cell. `kind`: `none` (the model from before pooling) or `grid`
+        # (squares by position alone). Give the grid either `size_um` (its side) or `n_patches` (about that
+        # many occupied squares per slide, so slides of different extent get the same S). `offset` shifts
+        # the grid by a fraction of its side. `features`: any of `count` (log number of visible cells) and
+        # `std` (spread of their tokens), each learned and starting at zero. Needs dataset.spatial_key; no
+        # long-range mask, no Laplacian/random-walk encodings, no spectral/expression bias.
+        pool = cfg.model.global_component.parameters.pooling = CN()
+        pool.kind = "none"
+        pool.size_um = 0.0
+        pool.n_patches = 0
+        pool.offset = 0.0
+        pool.features = []
         # The attention mechanism, see `.claude/attention_plan.md`. `kind`: any registered backend
         # (`module/global_modules/attention.py`): `dense` is softmax attention over every pair, the
         # model from before backends existed. `head_dim` sets the width of one attention head apart

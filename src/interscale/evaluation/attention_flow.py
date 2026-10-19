@@ -273,6 +273,8 @@ def patch_flow(
     unknown = sorted(set(kinds) - set(KINDS))
     if unknown:
         raise ValueError(f"kinds must come from {KINDS}, got {unknown}.")
+    if "rollout" in kinds and getattr(getattr(module, "global_module", module), "pooling", None) is not None:
+        raise ValueError("rollout composes attention over cell tokens, but a pooled model attends between patches; use kinds=('influence',).")
     draws = [list(d)[:max_graphs] if max_graphs > 0 else list(d) for d in draws]
     if not draws or any(len(d) != len(draws[0]) for d in draws):
         raise ValueError("every draw must hold the same graphs.")

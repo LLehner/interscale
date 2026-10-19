@@ -116,6 +116,22 @@ def _attention_tag(cfg) -> str:
     return f"attn-{kind}{settings}" + (f"-hd{head_dim}" if head_dim > 0 else "") + ("-cqk" if center else "") + "_"
 
 
+def _pooling_tag(cfg) -> str:
+    """``pool-grid<side>um`` / ``pool-grid-n<patches>`` (+ ``-o<offset>``, ``-<features>``) for pooled tokens, else ``""``.
+
+    Pooled runs differ from per-cell runs in every output, so an arm without this tag would overwrite
+    the checkpoint of the same model on cells (and of another patch size).
+    """
+    params = cfg.model.global_component.get("parameters", None)
+    pooling = params.get("pooling", None) if params is not None else None
+    if pooling is None or pooling.get("kind", "none") == "none":
+        return ""
+    size = f"n{int(pooling.n_patches)}" if pooling.n_patches > 0 else f"{float(pooling.size_um):g}um"
+    offset = f"-o{float(pooling.offset):g}" if pooling.offset else ""
+    features = "".join(f"-{f}" for f in pooling.features)
+    return f"pool-{pooling.kind}{'-' if size.startswith('n') else ''}{size}{offset}{features}_"
+
+
 def _embedding_tag(cfg) -> str:
     """The token input of a GlobalModel, for its checkpoint name.
 
@@ -213,6 +229,7 @@ def get_model_filename_prefix(cfg, local_component: bool, global_component: bool
             + _embedding_tag(cfg)
             + _positional_encoding_tag(cfg)
             + _attention_tag(cfg)
+            + _pooling_tag(cfg)
             + _training_tag(cfg)
         )
     elif local_component and global_component:
@@ -221,7 +238,13 @@ def get_model_filename_prefix(cfg, local_component: bool, global_component: bool
             file_name_prefix = file_name_prefix + f"{cfg.model.local_component.name}_"
         if cfg.model.global_component.name:
             file_name_prefix = file_name_prefix + f"{cfg.model.global_component.name}_"
-        file_name_prefix = file_name_prefix + _positional_encoding_tag(cfg) + _attention_tag(cfg) + _training_tag(cfg)
+        file_name_prefix = (
+            file_name_prefix
+            + _positional_encoding_tag(cfg)
+            + _attention_tag(cfg)
+            + _pooling_tag(cfg)
+            + _training_tag(cfg)
+        )
         if cfg.model.decoder.dual_decoder:
             file_name_prefix = "dual_" + file_name_prefix
     else:

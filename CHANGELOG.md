@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Pooled tokens (`model.global_component.parameters.pooling`, default `kind: none`): the transformer runs
+  on patches of cells instead of single cells. `kind: grid` groups cells into squares by position alone
+  (`size_um`, or `n_patches` for about that many per slide; `offset` shifts the grid); a patch token is the
+  mean of its *visible* cells' tokens at the patch's centroid (a learned token where none is visible; the
+  optional `features` `count` and `std` start at zero); every cell's global embedding is its patch's, laid
+  out as the per-cell output is, so decoders, losses and probes read one row per cell. S drops 10-1000x,
+  so whole sections fit dense attention. New `GlobalModule.step` (input step + transformer, pooling
+  included) replaces the two calls the three modules made; module `global_modules/pooling.py`. Checkpoint
+  tag `pool-grid<side>um` / `pool-grid-n<patches>`. The config refuses what a patch cannot carry (the
+  long-range mask, Laplacian/random-walk encodings, spectral/expression biases, Exphormer, an attention
+  loss); `evaluate()`, `attention_by_query`, `attention_diagnostics` and the rollout of `patch_flow` refuse
+  a pooled model (they read attention per cell).
 - `masked_probing.FittedReferences.state()` / `from_state(state, position)`: the ridge references of the
   programme evaluation can be saved and loaded (the `position` function is handed back in), so jobs that
   evaluate different models on the same training slides fit them once.

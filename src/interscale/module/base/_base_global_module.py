@@ -15,7 +15,13 @@ PRECOMPUTED_MASK_FILLS = ("learned", "minus_one")
 
 
 class GlobalModule(BaseModule):
-    def __init__(self, precomputed_mask_fill: str = "learned", programme_masking: bool = False, **base_module_kwargs):
+    def __init__(
+        self,
+        precomputed_mask_fill: str = "learned",
+        programme_masking: bool = False,
+        pooling=None,
+        **base_module_kwargs,
+    ):
         """``precomputed_mask_fill``: what a hidden cell's ``Precomputed`` embedding is replaced by.
 
         A precomputed embedding was made from the cell's own expression, which is the
@@ -27,8 +33,12 @@ class GlobalModule(BaseModule):
         gene``. A ``Precomputed`` embedding is then allowed, since one computed without those genes
         (``tl.check_embedding_genes`` verifies it when the graphs are built) holds none of the hidden
         values; no cell is replaced by the fill, as every cell keeps its visible genes.
+
+        ``pooling``: a :class:`~interscale.module.global_modules.pooling.PatchPooling`, or None. With it the
+        transformer runs on patches of cells (:meth:`step`); everything outside it still sees one row per cell.
         """
         super().__init__(**base_module_kwargs)
+        self.pooling = pooling
 
         self.registered_local_component = False
         self.registered_global_component = True
@@ -194,6 +204,52 @@ class GlobalModule(BaseModule):
         x = np.concatenate(rows, axis=0)
         self._fit_pca(x, deterministic=True)
         return len(x)
+
+    def wholly_hidden(self, batch_masked) -> torch.Tensor:
+        """``[N]`` bool: the cells whose every entry is hidden (cell masking and discs; under gene masking, a fully hidden row)."""
+        none = torch.zeros(batch_masked.x.shape[0], dtype=torch.bool, device=batch_masked.x.device)
+        if not self.masked_nodes:
+            return none
+        if self.mask_strategy == "gene":
+            gene_mask = getattr(batch_masked, "gene_mask", None)
+            return none if gene_mask is None else gene_mask.bool().all(dim=1)
+        return batch_masked.mask.bool()
+
+    def step(self, batched_data, emb: torch.Tensor):
+        """The transformer on the cell tokens ``emb`` ``[N, E]`` of a masked batch: ``(global_embedding, src_padding_mask, index_nodes, attention_mask, attn)``.
+
+        Without pooling this is ``common_step_local_to_global`` followed by ``forward``. With it the cell
+        tokens are first pooled into patch tokens, the transformer runs on the patches, and each cell gets
+        its patch's output, laid out as the cell-level output is (``pooling.cell_layout``) -- so the
+        decoders, the loss and every consumer read one row per cell either way. ``index_nodes`` then lists
+        every cell of each graph, and ``attn`` holds the patches' attention maps.
+        """
+        if self.pooling is None:
+            padded_emb, src_padding_mask, pad_index_nodes, attention_mask, rotary = self.common_step_local_to_global(
+                batched_data, emb
+            )
+            assert not torch.any(torch.isnan(padded_emb)), "padded_emb contains NaN values"
+            global_embedding, src_padding_mask, attn = self.forward(
+                padded_emb, src_padding_mask, attention_mask, rotary=rotary
+            )
+            assert not torch.any(torch.isnan(global_embedding)), "global_embedding contains NaN values"
+            return global_embedding, src_padding_mask, pad_index_nodes, attention_mask, attn
+
+        from interscale.module.global_modules.pooling import cell_layout
+
+        plan = self.pooling.plan(batched_data, max_patches=self.max_seq_len)
+        tokens, visible = self.pooling.pool(emb, self.wholly_hidden(batched_data), plan)
+        padded_emb, patch_padding, patch_index_nodes, attention_mask, rotary = self.common_step_local_to_global(
+            self.pooling.batch(plan, visible), tokens
+        )
+        assert not torch.any(torch.isnan(padded_emb)), "padded_emb contains NaN values"
+        out, patch_padding, attn = self.forward(padded_emb, patch_padding, attention_mask, rotary=rotary)
+        assert not torch.any(torch.isnan(out)), "global_embedding contains NaN values"
+        rows = gather_tokens(out, patch_padding)  # [P, E], patch 0 first: every patch was kept (max_seq_len checked)
+        global_embedding, cell_padding, index_nodes = cell_layout(
+            rows[plan.patch], out[-1], batched_data.batch.long(), int(batched_data.batch.max()) + 1
+        )
+        return global_embedding, cell_padding, index_nodes, attention_mask, attn
 
     def _pca_transform(self, embeddings):
         """Project onto the stored PCA basis: ``(X - mean_) @ components_.T``.
@@ -408,16 +464,7 @@ class GlobalModule(BaseModule):
         )
         assert not torch.any(torch.isnan(embedding)), "embedding contains NaN values"
 
-        padded_emb, src_padding_mask, pad_index_nodes, attention_mask, rotary = self.common_step_local_to_global(
-            batch_masked, embedding
-        )
-        assert not torch.any(torch.isnan(padded_emb)), "padded_emb contains NaN values"
-
-        global_embedding, src_padding_mask, attn_matrix = self.forward(
-            padded_emb, src_padding_mask, attention_mask, rotary=rotary
-        )
-        # global_embedding, src_padding_mask = self.forward(padded_emb, src_padding_mask, attention_mask)
-        assert not torch.any(torch.isnan(global_embedding)), "global_embedding contains NaN values"
+        global_embedding, src_padding_mask, pad_index_nodes, _, attn_matrix = self.step(batch_masked, embedding)
 
         y_pred = self.predict(global_embedding, src_padding_mask, prediction_level)
 
@@ -474,6 +521,7 @@ class GlobalModule(BaseModule):
         if module_name == "self-attn-transformer":
             from interscale.module.global_modules import TransformerNodeEncoderHook
             from interscale.module.global_modules.attention import attention_head_dim
+            from interscale.module.global_modules.pooling import build_pooling
             from interscale.module.global_modules.positional_encodings import build_positional_encodings
             from interscale.train.losses import LOSSES_READING_ATTENTION
 
@@ -494,6 +542,7 @@ class GlobalModule(BaseModule):
                 attention_seed=int(cfg.optim.get("seed", 0) or 0),
                 precomputed_mask_fill=params.get("precomputed_mask_fill", "learned"),
                 programme_masking=bool(list(cfg.dataset.get("mask_genes", []) or [])),
+                pooling=build_pooling(cfg, n_embed) if n_embed is not None else None,
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,
             )

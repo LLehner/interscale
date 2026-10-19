@@ -23,9 +23,9 @@ Last updated 2026-10-19.
 
 | track | question | state | verified by | date |
 |---|---|---|---|---|
-| T0 | infrastructure: seeds, per-arm evaluation, inputs, CosMx | proposed | | |
+| T0 | infrastructure: seeds, per-arm evaluation, inputs, CosMx | **implemented, unverified** (2026-10-19; CosMx deferred by the user) — seed axis, run selection for job arrays, per-run section files, timing, cached references, `Precomputed` under programme masking, `pca_fit: train`; 8 of 9 mutations caught or removed, harness IDENTICAL; the sweep script checked on a stub synth_spot with untrained models. **Not run on data** | 2026-10-19 |
 | T1 | does the global model learn communication at all | first read 2026-10-19: global arms with a position encoding beat the bar on ring programmes (one seed); sender ranks not interpretable; 3 seeds and fixes pending | `response_masking` run (5 arms + twins) | 2026-10-19 |
-| T1b | coarse-grained tokens: pool cells into patches or niches before the global model | proposed (asked for 2026-10-19; first check this week) | | |
+| T1b | coarse-grained tokens: pool cells into patches or niches before the global model | **grid pooling implemented, unverified** (2026-10-19) — `pooling.kind: grid` (`size_um` or `n_patches`), `count`/`std` features, 35 tests + an end-to-end run for GlobalModel and CombinedModel, mutation-checked, harness IDENTICAL; 5 pooled arms in `response_masking`. The `niche` assignment waits for the user's details; patch-level attention readouts not built. **Not run on data** | 2026-10-19 |
 | T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed | | |
 | T3 | masking strategies | proposed | | |
 | T4 | interpretation beyond raw attention; attention sinks | proposed | | |
@@ -114,6 +114,30 @@ Last updated 2026-10-19.
     therefore holds one donor per condition, so within a fold condition and donor are confounded.
 - **Housekeeping (K8).** Evaluate `joint_rope` (global_only) and `l2g_res` (staged_training). The
   round-3b rerun note in attention_plan.md is still uncommitted.
+
+**Built 2026-10-19** (library in the fork, scripts in `notebooks_and_scripts/slurm/`, which is not under
+version control; each library change has its own commit and a CHANGELOG line):
+- *Seeds.* `SEEDS` and `SEED_ARMS` in `sweep_common.py` expand an arm into runs `<arm>_s<seed>` (each sets
+  `optim.seed`, so checkpoints differ); the hidden cells and probes keep `EVAL_SEED`, so runs compare
+  paired. The report shows each arm with two or more seeds once as the mean, with the standard deviation
+  over seeds, every run's own value and the sender-rank spread in tables beside it
+  (`evaluation.report.average_over_seeds`). Untrained twins: one per architecture (first seed only).
+- *Per-run evaluation and job arrays.* `MODE = "list"` prepares the data, embeddings and fitted
+  references once and prints the runs with their array index; `ARRAY_TASK = True` makes job `i` train
+  and evaluate run `i` (`INTERSCALE_RUNS` / `INTERSCALE_MODE` override `RUNS` / `MODE` from the
+  environment); `MODE = "report"` merges. Every run writes its own `sections/<run>.md`
+  (`report.read_parts`, the newest file wins), so jobs never write one file together, and a single job
+  rebuilds `results.md` after every run, so one that ends early leaves a readable file.
+- *Time.* Each evaluation step is timed (a `timing` section and a summary table). The ridge references
+  of the programme evaluation, whose penalty search takes minutes on 24 slides, are fitted once and
+  saved (`FittedReferences.state`, `RESULTS_DIR/fits/`); the sender influence takes 8 receivers per
+  programme (was 16), the receptive-field and planted-pair queries 8; `FLOW_ARMS` limits the flow;
+  the synth_spot yamls train 100 epochs (legnini keeps 400, its slides are few); twins only for the
+  arms that matter; `response_masking` has no flow.
+- *Inputs.* `Precomputed` under programme masking: allowed when the embedding never saw a hidden gene,
+  recorded with `tl.record_embedding_genes` and checked by `prepare_geome_dataset`; the
+  `response_masking` script computes a PCA of the visible genes for the `pre_pca_*` arms. `pca_fit:
+  train` fits the in-pipeline PCA on the masked training slides (default unchanged).
 
 ### T1 — does the global model learn communication at all (W1; K1, K4, K5, K9)
 
@@ -242,6 +266,26 @@ More reasons, from what the sweeps showed:
 - Short-range structure (R1–R4, M11's 150 µm kernel) is lost below the patch size. That is the local
   component's job, so the combined arm is the one to read for it.
 - Borders of the grid: shifted grids at test time, or overlapping patches.
+
+**Built 2026-10-19** (`grid`; `.claude/roadmap.md` is the design, `CLAUDE.md` the invariants):
+- `GlobalModule.step` replaces the input step + transformer calls of the three modules; pooled it pools
+  the cell tokens of the (masked) batch, runs the transformer on a `PooledBatch`, and hands each cell its
+  patch's output in the per-cell layout. The token is pooled *before* the input LayerNorm, so a patch of
+  one visible cell is that cell's token (tested: with every cell its own patch the pooled model equals
+  the per-cell model to 1e-5, and its state differs by one parameter, the fill).
+- The grid starts at each slide's minimum corner (a slide's place in the scanner's coordinates does not
+  matter); `n_patches` finds each slide's side by bisection, so slides of different extent get the same S.
+- *Hidden cells.* A cell hidden whole weighs 0 in the mean; under programme masking no cell is hidden
+  whole, so every cell contributes its visible genes. Tested through the real model under cell and
+  gene-set masking: changing hidden values moves no prediction (also in a patch hidden entirely, which
+  becomes a position-only token), changing a visible cell moves its patch and, through attention, the rest.
+- *Refused, with the reason:* the long-range mask, `lap`/`rw` node encodings, spectral and expression
+  biases, Exphormer, an attention loss (config validator); `evaluate()`, `attention_by_query`,
+  `attention_diagnostics` and the rollout flow (they index attention by cell).
+- *Not built:* `niche` and `spatial_clusters` assignments (the user will give details), a patch-level
+  attention readout (patch-patch attention and flow), random grid offsets as augmentation.
+- *Arms in `response_masking`:* `lin_fourier_pool200` / `_pool300` / `_pool500`, `lin_rope_pool300`,
+  `joint_fourier_pool300` (no long-range mask: patches have no neighbour graph; the local head reads cells).
 
 **Run, W1 (synth_spot, programme masking, discs as the second readout).**
 - Arms: `lin_fourier` and `lin_rope` pooled on a grid of 200, 300 and 500 µm; `joint` pooled at the

@@ -110,6 +110,27 @@ Three concrete models subclass `BaseModel`, differing in which components they i
 
 `LocalModule.from_config` / `GlobalModule.from_config` (`module/base/`) look up `cfg.model.local_component.name` / `cfg.model.global_component.name` and instantiate the matching module class (`"GCN"`, `"GIN"`, `"SCVI"`; `"self-attn-transformer"`) — adding a new local/global component means adding a branch there plus a corresponding config file. `GlobalModule.from_config` requires `local_mask_hops`: the combined modules pass their local module's `receptive_field_hops` (one hop per message-passing layer) and `GlobalModel` passes 0, so the long-range mask always covers exactly what the local component mixed. The config only switches the mask on or off (`long_range_attention`). (`BaseModel._register_local_component` is dead code.)
 
+### Pooled tokens (`module/global_modules/pooling.py`)
+
+`model.global_component.parameters.pooling` (default `kind: none`, the per-cell model, no extra state)
+makes the transformer run on patches of cells (`.claude/roadmap.md`, T1b). `GlobalModule.step(batch_masked,
+cell_tokens)` is the one place that does the input step and the transformer: unpooled it is
+`common_step_local_to_global` + `forward`; pooled it builds the patch tokens (`PatchPooling.plan` / `pool`),
+runs the same two calls on a `PooledBatch` (the patches as nodes: centroids, graph index, no edges), and
+hands every cell its patch's output in the per-cell layout (`cell_layout`: left-padded, CLS last, cells in
+batch order, `index_nodes` = every cell). Everything outside it -- decoders, loss, `padded_node_idx`,
+probes, the receptive field -- therefore reads one row per cell, pooled or not. Invariants:
+
+- **A patch token holds visible cells only.** Cells hidden whole (`GlobalModule.wholly_hidden`: the node
+  mask, or a fully hidden row under gene masking) weigh 0; a patch with none gets one learned token. The
+  grid depends on positions alone, so a hidden value cannot decide a cell's patch; any other assignment
+  (`ASSIGNMENTS`) must read visible entries only.
+- **`max_seq_len` bounds patches, not cells** (`PatchPooling.plan` raises when a slide has more patches).
+- **Not available pooled:** the long-range mask, Laplacian/random-walk node encodings, spectral and expression
+  biases, Exphormer, the attention-entropy loss (the validator says so), and every readout that indexes
+  attention by cell (`evaluate()`, `attention_by_query`, `attention_diagnostics`, the rollout of `patch_flow`).
+  Head scores, probes, `receptive_field`, `response_influence` and the influence flow work.
+
 ### Module hierarchy (`interscale.module`)
 
 Mirrors the model hierarchy at the `pytorch_lightning`/`LightningModule` level:

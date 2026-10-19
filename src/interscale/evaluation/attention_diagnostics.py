@@ -203,6 +203,15 @@ def summarize(per_cell: dict[tuple[str, int, int], list[np.ndarray]]) -> dict[st
 
 
 @torch.no_grad()
+def _refuse_pooled(transformer, what: str) -> None:
+    """A pooled model's attention is between patches; these readouts index it by cell."""
+    if getattr(transformer, "pooling", None) is not None:
+        raise ValueError(
+            f"{what} reads one attention row per cell, but a pooled model (pooling.kind {transformer.pooling.kind!r}) "
+            "attends between patches. Its cell-level readouts are the head scores, the probes and the receptive field."
+        )
+
+
 def attention_diagnostics(
     module,
     data_list,
@@ -252,6 +261,7 @@ def attention_diagnostics(
             "attention diagnostics: this module has no transformer; nothing to read.", RuntimeWarning, stacklevel=2
         )
         return {}
+    _refuse_pooled(transformer, "attention diagnostics")
     graphs = list(data_list)
     if max_graphs > 0:
         graphs = graphs[:max_graphs]
@@ -389,6 +399,7 @@ def attention_by_query(
             "attention_by_query: this module has no transformer; nothing to read.", RuntimeWarning, stacklevel=2
         )
         return {}
+    _refuse_pooled(transformer, "attention_by_query")
     graphs = list(data_list)
     if max_graphs > 0:
         graphs = graphs[:max_graphs]
