@@ -358,6 +358,20 @@ def test_the_gcn_learns_through_the_pooled_tokens_in_the_dual_decoder_model():
     assert all(g is None or torch.count_nonzero(g) == 0 for g in local)  # the local decoder answers to the local loss
 
 
+def test_the_single_decoder_combined_model_pools_too():
+    cfg = _config("CombinedModel", pool=2 * SPACING)
+    cfg.model.decoder.dual_decoder = False
+    module = _build(cfg, "CombinedModel").module
+    batch = _batch([_lattice(6, seed=10)])
+    batch.mask = torch.zeros(36, dtype=torch.bool)
+    batch.mask[::4] = True
+    out = module._common_step(batch, "regression", "node")
+    assert out.y_pred.shape == (36, G) and out.view.local_embedding.shape == (36, E)
+    assert torch.equal(out.view.padded_node_idx, torch.arange(36))
+    out.y_pred.pow(2).mean().backward()
+    assert any(p.grad is not None and torch.count_nonzero(p.grad) > 0 for p in module.local_module.parameters())
+
+
 @pytest.mark.parametrize("attention", ["performer", "entmax", "topk"])
 def test_other_attention_backends_run_on_patches(attention):
     graphs = [_lattice(6, seed=7)]

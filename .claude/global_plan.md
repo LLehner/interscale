@@ -760,6 +760,14 @@ readouts (PTCH1, GLI1, HHIP), the ligand (SHH) and the ventral/dorsal identity g
 machinery runs with `mask_genes: [PTCH1, GLI1, HHIP]`; which genes form the hidden set is the
 user's call (not decided).
 
+**Updated 2026-10-19 for the three-week roadmap** (`roadmap.md`, T0 and T1b): `response_masking` now runs
+three seeds of `lin_fourier`, `joint_rope`, `joint_fourier` and `lin_fourier_pool300`, one of the rest;
+100 epochs; no patch flow; twins for three architectures; and 13 arms -- `joint_fourier`, `pre_pca_rope` and
+`pre_pca_fourier` (a PCA of the *visible* genes through `Precomputed`, now allowed under programme
+masking when the embedding's genes are recorded), and five pooled arms (the transformer on 200 / 300 /
+500 um patches). Each run writes its own sections; `MODE = "list"` / `ARRAY_TASK` / `MODE = "report"` give one
+job per run (see `sweep_common.py`).
+
 ## Order and decision points
 
 1. **Stage 0a + 0b** (needed to read any of A–C) and **A1**. Then sweep **A2**; it is the cheapest
