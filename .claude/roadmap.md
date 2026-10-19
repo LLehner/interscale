@@ -218,8 +218,9 @@ More reasons, from what the sweeps showed:
   | `CenterX/Y_global_px` | 47k–100k | 350–580 | 120–190 |
 
   Either way a whole section becomes 100–2,000 tokens, the size of legnini's 4.3k cells, so dense
-  attention (exact, with maps and attribution) runs without windows. synth_spot: 2,500 spots become
-  625 / 278 / 100 tokens at 200 / 300 / 500 µm. legnini: ~4,300 cells become ~100–400 tokens at
+  attention (exact, with maps and attribution) runs without windows. synth_spot (100 µm lattice): 2,500 spots
+  become 625 / 278 / 100 tokens at 200 / 300 / 500 µm, holding 4 / 9 / 25 spots each; 500 µm it is
+  (decided 2026-10-19: the smaller patches held too few spots). legnini: ~4,300 cells become ~100–400 tokens at
   50–100 µm.
 - **A tissue-level unit to interpret.** Patch-to-patch attention and influence, composition per
   patch for labels (T5), niche-level NicheNet pairs (T8).
@@ -284,13 +285,15 @@ More reasons, from what the sweeps showed:
   `attention_diagnostics` and the rollout flow (they index attention by cell).
 - *Not built:* `niche` and `spatial_clusters` assignments (the user will give details), a patch-level
   attention readout (patch-patch attention and flow), random grid offsets as augmentation.
-- *Arms in `response_masking`:* `lin_fourier_pool200` / `_pool300` / `_pool500`, `lin_rope_pool300`,
-  `joint_fourier_pool300` (no long-range mask: patches have no neighbour graph; the local head reads cells).
+- *Arms in `response_masking`:* `lin_fourier_pool500`, `lin_rope_pool500`, `joint_fourier_pool500`
+  (500 µm = 5 x 5 spots, about 100 tokens per slide; the joint arm has no long-range mask: patches have no
+  neighbour graph; its local head reads cells). 200 and 300 µm were dropped by the user's decision.
 
 **Run, W1 (synth_spot, programme masking, discs as the second readout).**
-- Arms: `lin_fourier` and `lin_rope` pooled on a grid of 200, 300 and 500 µm; `joint` pooled at the
-  same sizes with the additive un-pooling; the cell-level arms from the first read as references.
-  3 seeds of the main arms. `niche` pooling on W2 Monday–Tuesday, once the frozen local stage exists.
+- Arms: `lin_fourier` and `lin_rope` pooled on a 500 µm grid, and the joint model pooled the same way
+  (the local head reads cells, the global head the patches; the additive un-pooling is the sum of the
+  two heads' decoders of decoder_plan.md D3.1, not built); the cell-level arms from the first read as
+  references. 3 seeds of `lin_fourier_pool500`. `niche` pooling on W2 Monday–Tuesday, once the frozen local stage exists.
 - Read: programme scores against `ref_own+context` and against the cell-level global arms,
   especially the ring programmes (0.95/0.96 today) and the short-range receivers; steps/s and
   peak memory; patch-level attention maps; sender ranks once T4's attributions exist.
@@ -745,7 +748,8 @@ Drop first:
    resources in Python.
 7. **D1.** The read-out that is exact for one layer first (proposed), or the context query
    directly.
-8. **T1b.** Patch sizes (proposed: synth_spot 200/300/500 µm; legnini 50/100 µm; CosMx 100/200 µm),
+8. **T1b.** Patch sizes (synth_spot: 500 µm, decided 2026-10-19; legnini 50/100 µm proposed -- 10 and 38
+   cells per patch at the median; CosMx 100/200 µm proposed),
    `grid` first and `niche` second (proposed), and whether W1's other items may slip to W2 to make
    room (D1.1 + D3.1 and joint LSE already moved).
 9. **CosMx coordinates.** Is `obsm['spatial']` in µm? The two coordinate sources give token counts 4×

@@ -761,11 +761,11 @@ machinery runs with `mask_genes: [PTCH1, GLI1, HHIP]`; which genes form the hidd
 user's call (not decided).
 
 **Updated 2026-10-19 for the three-week roadmap** (`roadmap.md`, T0 and T1b): `response_masking` now runs
-three seeds of `lin_fourier`, `joint_rope`, `joint_fourier` and `lin_fourier_pool300`, one of the rest;
-100 epochs; no patch flow; twins for three architectures; and 13 arms -- `joint_fourier`, `pre_pca_rope` and
-`pre_pca_fourier` (a PCA of the *visible* genes through `Precomputed`, now allowed under programme
-masking when the embedding's genes are recorded), and five pooled arms (the transformer on 200 / 300 /
-500 um patches). Each run writes its own sections; `MODE = "list"` / `ARRAY_TASK` / `MODE = "report"` give one
+three seeds of `lin_fourier`, `joint_rope`, `joint_fourier` and `lin_fourier_pool500`, one of the rest
+(19 runs); 100 epochs; no patch flow; twins for three architectures; and 11 arms -- `joint_fourier`,
+`pre_pca_rope` and `pre_pca_fourier` (a PCA of the *visible* genes through `Precomputed`, now allowed under
+programme masking when the embedding's genes are recorded), and three pooled arms (the transformer on 500 um
+patches of 5 x 5 spots; 200 and 300 um held 4 and 9 spots and were dropped). Each run writes its own sections; `MODE = "list"` / `ARRAY_TASK` / `MODE = "report"` give one
 job per run (see `sweep_common.py`).
 
 ## Order and decision points
