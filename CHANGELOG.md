@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- The results file reads seeds: runs named `<arm>_s<seed>` are shown once in the summary as the mean over
+  their seeds (`<arm> [n seeds]`), with the standard deviation over seeds and every run's own value in
+  tables beside it (`evaluation.report.average_over_seeds`); the sections keep every run. Jobs that run
+  at the same time can each write their own file of sections (`<folder>/<arm>.md`) and
+  `write_report(..., parts=folder)` merges them, the newest winning; a `timing` analysis (seconds per
+  evaluation step) gets a summary table.
 - `type_gex_embedding: Precomputed` under programme masking: allowed with `mask_strategy: gene` when
   `dataset.mask_genes` hides a gene set, because an embedding computed from the other genes holds none
   of the hidden values. No cell is replaced by the mask fill then (every cell keeps its visible genes).

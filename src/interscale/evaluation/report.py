@@ -24,6 +24,10 @@ arms present, then every section once. Appends are single writes on an append-mo
 a rewrite racing an append from another process could drop that append, so rebuild the report when
 no job is writing.
 
+Runs of one arm at several seeds are named ``<arm>_s<seed>`` (``sweep_common.py``): the summary then
+shows each such arm once, as the mean over its seeds, with the standard deviation and the value per
+run in tables of their own (:func:`average_over_seeds`); the sections keep every run.
+
 :func:`compact_tables` turns the evaluation's tables (``masked_probing``, ``attention_diagnostics``,
 ``receptive_field``, ``representations``) into the compact wide tables the sections hold: one row
 per depth bin, feature set, layer or head, one column per depth group or distance bin. Tables it
@@ -35,6 +39,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -102,6 +107,7 @@ NOTES = {
     "flow_labels": "the same by label (query label drawing from key label): observed share, permuted share, "
     "log2 observed / permuted and z against the permutations",
     "training": "the last epoch's throughput and peak memory, the final validation metrics",
+    "timing": "seconds each step of the evaluation took",
     "phases": "staged training, each phase's end: drift_<component> = relative weight change (0: frozen), "
     "and the phase's last validation losses",
 }
@@ -372,17 +378,41 @@ def read_sections(path) -> dict[tuple[str, str], pd.DataFrame]:
     return sections
 
 
+def read_parts(folder, sections: dict | None = None) -> dict[tuple[str, str], pd.DataFrame]:
+    """``sections`` updated with the section files of ``folder``, oldest file first (so the newest wins).
+
+    Jobs that run at the same time write one file each (``<folder>/<arm>.md``, by
+    :func:`append_sections`) instead of appending to one shared file, so no write can interleave with
+    another; :func:`write_report` then merges them. A missing folder changes nothing.
+    """
+    merged = dict(sections or {})
+    folder = Path(folder)
+    if folder.is_dir():
+        for part in sorted(folder.glob("*.md"), key=lambda f: (f.stat().st_mtime, f.name)):
+            merged.update(read_sections(part))
+    return merged
+
+
 def write_report(
-    path, *, title: str = "Evaluation report", arms: list[str] | None = None, groups: list[str] | None = None
+    path,
+    *,
+    title: str = "Evaluation report",
+    arms: list[str] | None = None,
+    groups: list[str] | None = None,
+    parts=None,
 ) -> str:
     """Rewrite the results file: header, the summary over its arms, then every section once.
 
     ``arms`` orders the arms (e.g. the sweep's, each followed by its ``_untrained`` twin); arms in
     the file but not in the list follow in order of appearance. ``groups`` limits the summary's
-    gene-group tables to those groups; the sections keep every group. Returns the summary as text.
+    gene-group tables to those groups; the sections keep every group. ``parts`` is a folder of
+    per-arm section files (:func:`read_parts`) merged over the file's own sections. Returns the
+    summary as text.
     """
     path = Path(path)
     sections = read_sections(path)
+    if parts is not None:
+        sections = read_parts(parts, sections)
     present = list(dict.fromkeys(arm for arm, _ in sections))
     order = [arm for arm in (arms or []) if arm in present] + [arm for arm in present if arm not in (arms or [])]
     summary = render_summary(summary_tables(sections, order, groups))
@@ -395,6 +425,113 @@ def write_report(
     temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, path)
     return summary
+
+
+# ------------------------------------------------------------------------------- seeds
+
+#: An arm run at one seed: ``<arm>_s<seed>``.
+SEED_ARM = re.compile(r"^(?P<base>.+)_s(?P<seed>\d+)$")
+
+
+def seed_groups(arms: list[str]) -> dict[str, list[str]]:
+    """``{base: [arm runs]}`` for the arms present at two or more seeds, in the order of ``arms``."""
+    found: dict[str, list[str]] = {}
+    for arm in arms:
+        match = SEED_ARM.match(arm)
+        if match is not None:
+            found.setdefault(match["base"], []).append(arm)
+    return {base: runs for base, runs in found.items() if len(runs) >= 2}
+
+
+def _mean_sd(tables: list[pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Mean and sample standard deviation (``ddof=1``) over tables of one analysis, entry by entry.
+
+    Tables with the same index and columns are averaged entry by entry (text columns from the first);
+    otherwise rows are matched by index and only numeric columns are kept, each averaged over the runs
+    that have it.
+    """
+    first = tables[0]
+    with warnings.catch_warnings(), np.errstate(all="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
+        if all(t.index.equals(first.index) and list(t.columns) == list(first.columns) for t in tables):
+            numeric = [c for c in first.columns if all(pd.api.types.is_numeric_dtype(t[c]) for t in tables)]
+            stack = np.stack([t[numeric].to_numpy(dtype=float) for t in tables])
+            mean, sd = first.copy(), first.copy()
+            if numeric:
+                mean[numeric] = np.nanmean(stack, axis=0)
+                sd[numeric] = np.nanstd(stack, axis=0, ddof=1)
+            return mean, sd
+        big = pd.concat(tables, keys=range(len(tables)))
+        levels = list(range(1, big.index.nlevels))
+        grouped = big.groupby(level=levels, sort=False)
+        return grouped.mean(numeric_only=True), grouped.std(numeric_only=True, ddof=1)
+
+
+def average_over_seeds(sections, arms: list[str]):
+    """The sections plus, for every arm that ran at several seeds, its mean and its spread.
+
+    Returns ``(mean, sd, shown, groups)``: ``mean`` and ``sd`` are ``{(arm, analysis): table}``; the
+    groups appear in them as ``<base> [<n> seeds]``. ``shown`` lists the arms a summary reads, in the
+    order of ``arms`` with each seed group once, at its first run's place (arms at one seed and every
+    other arm keep their names), and ``groups`` is :func:`seed_groups`. ``sd`` holds the groups only.
+    """
+    groups = seed_groups(arms)
+    label = {base: f"{base} [{len(runs)} seeds]" for base, runs in groups.items()}
+    member = {run: base for base, runs in groups.items() for run in runs}
+    mean = dict(sections)  # the runs stay (nothing looks them up: they are not in `shown`); the groups' means are added
+    sd: dict = {}
+    for base, runs in groups.items():
+        for analysis in dict.fromkeys(a for (arm, a) in sections if arm in runs):
+            tables = [sections[(run, analysis)] for run in runs if (run, analysis) in sections]
+            if not tables:
+                continue
+            mean[(label[base], analysis)], sd[(label[base], analysis)] = _mean_sd(tables)
+    shown = []
+    for arm in arms:
+        name = label[member[arm]] if arm in member else arm
+        if name not in shown:
+            shown.append(name)
+    return mean, sd, shown, groups
+
+
+def _without_shared(table: pd.DataFrame | None) -> pd.DataFrame | None:
+    """A summary table without its count and reference rows: they hold no spread, and are shown once elsewhere."""
+    if table is None:
+        return None
+    keep = [i for i, row in enumerate(table.index) if (row[0] if isinstance(row, tuple) else row) not in ("count", "reference")]
+    return table.iloc[keep]
+
+
+def _seed_tables(sections, mean, sd, groups, shown, group_filter) -> list[tuple[str, pd.DataFrame]]:
+    """The spread of the key head scores over seeds, and each run's own value, beside the mean tables."""
+    out = []
+    spread = [a for a in shown if a in {k[0] for k in sd}]
+
+    def add(title, table):
+        if table is not None and len(table) and table.notna().any().any():
+            out.append((title, table))
+
+    n = ", ".join(f"{base}: {len(runs)}" for base, runs in groups.items())
+    cosine = _per_arm(sd, "heads_cosine_by_depth", spread)
+    add(f"centred cosine on hidden spots by depth: standard deviation over seeds ({n})", _without_shared(_heads_summary(cosine)))
+    by_group = _per_arm(sd, "heads_by_group", spread)
+    if group_filter is not None:
+        by_group = {arm: t.loc[[g for g in group_filter if g in t.index]] for arm, t in by_group.items()}
+    add("centred cosine per gene group: standard deviation over seeds", _without_shared(_heads_summary(by_group)))
+    runs = [run for members in groups.values() for run in members]
+    per_run = _heads_summary(_per_arm(sections, "heads_cosine_by_depth", runs))
+    if per_run is not None and "all" in per_run.columns:
+        add("centred cosine on all hidden spots, every run", _without_shared(per_run[["all"]]))
+    rows = []
+    for arm, table in _per_arm(sd, "response_edges", spread).items():
+        overall = table.xs("any", level="program")["matched_rank"]
+        overall.index = pd.MultiIndex.from_tuples(
+            [(arm, head, rc) for head, rc in overall.index], names=["arm", "head", "range_class"]
+        )
+        rows.append(overall)
+    if rows:
+        add("programme masking, sender's rank: standard deviation over seeds", pd.concat(rows).unstack("range_class"))
+    return out
 
 
 # ------------------------------------------------------------------------------- the summary
@@ -515,6 +652,12 @@ def summary_tables(sections, arms: list[str], groups: list[str] | None = None) -
 
     ``groups`` limits the gene-group tables to those groups (None: every group).
     """
+    if seed_groups(arms):
+        mean, sd, shown, found = average_over_seeds(sections, arms)
+        note = ", ".join(f"{base} [{len(runs)} seeds]" for base, runs in found.items())
+        tables = [(f"{title} (seeds averaged: {note})" if k == 0 else title, t) for k, (title, t) in enumerate(summary_tables(mean, shown, groups))]
+        return tables + _seed_tables(sections, mean, sd, found, shown, groups)
+
     out = []
 
     def add(title, table):
@@ -644,6 +787,9 @@ def summary_tables(sections, arms: list[str], groups: list[str] | None = None) -
             "with their permutation floors, share above the null",
             pd.concat(parts),
         )
+    rows = [table["seconds"].rename(arm) for arm, table in _per_arm(sections, "timing", arms).items() if "seconds" in table]
+    if rows:
+        add("evaluation: seconds per step", pd.DataFrame(rows))
     rows = [table["value"].rename(arm) for arm, table in _per_arm(sections, "training", arms).items()]
     if rows:
         add("training: the last epoch's throughput and peak memory, the final validation metrics", pd.DataFrame(rows))

@@ -17,6 +17,7 @@ from interscale.evaluation.report import (
     compact_tables,
     deepest,
     ordered,
+    read_parts,
     read_sections,
     summary_tables,
     write_report,
@@ -418,3 +419,111 @@ def test_the_response_influence_compacts_and_gets_a_summary_table(tmp_path):
     assert list(table.columns) == ["short", "sparse"] and table.loc[("lin_rope", "global"), "short"] == pytest.approx(
         0.9
     )
+
+
+# --------------------------------------------------------------------------- seeds
+
+
+def _edges(value):
+    return pd.DataFrame(
+        [
+            {"head": "global", "range_class": rc, "program": "any", "metric": "matched_rank", "value": value + d, "n_pairs": 4}
+            for rc, d in (("short", 0.0), ("sparse", 0.1))
+        ]
+    )
+
+
+def _seeded(tmp_path, runs):
+    path = tmp_path / "results.md"
+    for arm, shift in runs:
+        tables = _raw(shift=shift, attention=False) | {"response_edges": _edges(0.5 + shift)}
+        append_sections(path, arm, compact_tables(tables))
+    return path
+
+
+def test_arms_at_several_seeds_are_one_row_of_means_with_the_spread_beside_it(tmp_path):
+    from interscale.evaluation.report import seed_groups
+
+    runs = [("a_s1", 0.0), ("a_s2", 0.1), ("a_s3", 0.2), ("b_s1", 0.5), ("a_s1_untrained", -0.3)]
+    path = _seeded(tmp_path, runs)
+    arms = [arm for arm, _ in runs]
+    assert seed_groups(arms) == {"a": ["a_s1", "a_s2", "a_s3"]}  # b ran once; a twin is not a seed
+
+    tables = dict(summary_tables(read_sections(path), arms))
+    heads = next(t for title, t in tables.items() if title.startswith("centred cosine on hidden spots by depth (µm"))
+    rows = [r for r in heads.index if r[0] not in ("count", "reference")]
+    assert rows == [("a [3 seeds]", "global"), ("b_s1", "global"), ("a_s1_untrained", "global")]
+    # global_cosine_centred is 0.1 * depth_index + shift: the mean of the shifts 0, 0.1, 0.2 is 0.1.
+    assert heads.loc[("a [3 seeds]", "global"), BINS[1]] == pytest.approx(0.1 + 0.1)
+    assert heads.loc[("b_s1", "global"), BINS[1]] == pytest.approx(0.1 + 0.5)
+
+    spread = next(t for title, t in tables.items() if title.startswith("centred cosine on hidden spots by depth: standard"))
+    assert list(spread.index) == [("a [3 seeds]", "global")]
+    assert spread.loc[("a [3 seeds]", "global"), BINS[1]] == pytest.approx(0.1)  # ddof=1 over 0, 0.1, 0.2
+    runs_table = next(t for title, t in tables.items() if title.endswith("every run"))
+    assert [r[0] for r in runs_table.index] == ["a_s1", "a_s2", "a_s3"]
+    assert runs_table.loc[("a_s3", "global"), "all"] == pytest.approx(0.1 + 0.2)  # heads_cells: 0.1 + shift
+
+    ranks = next(t for title, t in tables.items() if title.startswith("programme masking, sender's rank: standard"))
+    assert ranks.loc[("a [3 seeds]", "global"), "short"] == pytest.approx(0.1)
+
+
+def test_the_rewrite_keeps_every_run_in_its_sections_and_the_note_names_the_seed_groups(tmp_path):
+    path = _seeded(tmp_path, [("a_s1", 0.0), ("a_s2", 0.2)])
+    summary = write_report(path, arms=["a_s1", "a_s2"])
+    text = path.read_text()
+    assert "## a_s1 | heads_cosine_by_depth" in text and "## a_s2 | heads_cosine_by_depth" in text
+    assert "a [2 seeds]" in summary and "seeds averaged: a [2 seeds]" in summary
+
+
+def test_without_two_seeds_nothing_changes(tmp_path):
+    path = _seeded(tmp_path, [("a_s1", 0.0), ("b_s1", 0.2)])
+    tables = summary_tables(read_sections(path), ["a_s1", "b_s1"])
+    assert not any("seeds" in title for title, _ in tables)
+    heads = next(t for title, t in tables if title.startswith("centred cosine on hidden spots by depth (µm"))
+    assert ("a_s1", "global") in heads.index and ("b_s1", "global") in heads.index
+
+
+def test_tables_that_do_not_line_up_are_averaged_where_they_overlap():
+    from interscale.evaluation.report import _mean_sd
+
+    one = pd.DataFrame({"v": [1.0, 3.0]}, index=pd.Index(["x", "y"], name="k"))
+    two = pd.DataFrame({"v": [3.0, 5.0]}, index=pd.Index(["y", "z"], name="k"))
+    mean, sd = _mean_sd([one, two])
+    assert mean.loc["x", "v"] == 1.0 and mean.loc["y", "v"] == 3.0 and mean.loc["z", "v"] == 5.0  # y: (3 + 3) / 2
+    assert np.isnan(sd.loc["x", "v"]) and sd.loc["y", "v"] == 0.0  # one run has no spread
+
+
+# --------------------------------------------------------------------------- parts and timing
+
+
+def test_per_arm_files_merge_into_the_report_and_the_newest_section_wins(tmp_path):
+    import os
+
+    parts = tmp_path / "sections"
+    parts.mkdir()
+    append_sections(parts / "a.md", "a", compact_tables(_raw(shift=0.0, attention=False)))
+    append_sections(parts / "b.md", "b", compact_tables(_raw(shift=0.2, attention=False)))
+    append_sections(parts / "a_older.md", "a", compact_tables(_raw(shift=0.7, attention=False)))  # an earlier run of a
+    path = tmp_path / "results.md"
+    append_sections(path, "a", compact_tables(_raw(shift=0.9, attention=False)))  # an even earlier one
+    os.utime(parts / "a_older.md", (1.0e9 - 10, 1.0e9 - 10))
+    os.utime(parts / "a.md", (1.0e9, 1.0e9))
+    os.utime(parts / "b.md", (1.0e9 + 10, 1.0e9 + 10))
+    summary = write_report(path, arms=["a", "b"], parts=parts)
+    found = read_sections(path)
+    assert {arm for arm, _ in found} == {"a", "b"}
+    # The newest file wins: the part a.md (0.1), not the older part (0.8) or the results file's own section (1.0).
+    assert found[("a", "heads_cosine_by_depth")].loc["all", "global"] == pytest.approx(0.1)
+    assert "global" in summary
+    assert read_parts(tmp_path / "nothing", {("x", "y"): 1}) == {("x", "y"): 1}  # a missing folder changes nothing
+
+
+def test_the_evaluation_time_is_a_table_of_seconds_per_step(tmp_path):
+    path = tmp_path / "results.md"
+    for arm, scale in (("a", 1.0), ("b", 2.0)):
+        append_sections(
+            path, arm, compact_tables({"timing": pd.DataFrame({"step": ["heads", "flow"], "seconds": [10.0 * scale, 60.0 * scale]}).set_index("step")})
+        )
+    table = next(t for title, t in summary_tables(read_sections(path), ["a", "b"]) if title.startswith("evaluation: seconds"))
+    assert table.loc["b", "flow"] == pytest.approx(120.0) and list(table.index) == ["a", "b"]
