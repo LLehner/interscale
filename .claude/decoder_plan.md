@@ -114,8 +114,11 @@ Give the heads different targets, so they are not competing for one signal:
 ## D4 — penalties on the embeddings, on top of D1–D3
 
 1. **Cross-covariance penalty** `||Cov(z_l, z_g)||_F^2` over a batch (the Barlow Twins cross term):
-   no linear redundancy, cheap. HSIC for the non-linear case; an adversarial predictor (gradient
-   reversal) or a CLUB mutual-information bound if needed -- more fragile.
+   no linear redundancy, cheap. Two stronger forms for the description's "orthogonality between
+   embedding subspaces": on uncentred embeddings, `||Z_l^T Z_g||_F^2` (orthogonal column spaces, not
+   just uncorrelated), and on the decoder weights, `||W_l^T W_g||_F^2` (a gene's loadings on the two
+   scales point apart). HSIC for the non-linear case; an adversarial predictor (gradient reversal) or
+   a CLUB mutual-information bound if needed -- more fragile.
 2. **The existing contrastive losses** (`contrastive_plan.md`, stages 1, 2, 2b: VICReg, context NCE,
    ring NCE) are implemented and **were never evaluated** on a task that can show communication.
    Ring NCE is scale separation as a loss (positive: the outer ring; negative: the GCN's own

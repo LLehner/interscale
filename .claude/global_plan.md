@@ -686,6 +686,44 @@ evaluations that can show communication at all: programme masking (built), the r
   SHH readouts PTCH1, GLI1, HHIP; `var` carries no annotations).
 - `decoder_plan.md`: restructure the decoder and the dual model so that local and global separate.
 
+## Results of programme masking, first read (run 2026-10-19; one seed per arm)
+
+File: `/home/lehnerl/Arbeit/results/response_masking/results.md`. Task: every response gene hidden in
+every spot (19,877 spots, 3 test slides); centred cosine over hidden entries. Bar: `ref_own+context`
+(ridge on the cell's own visible genes and kernel means of the visible genes around it).
+
+| arm | all | M7 rings | M8 rings | M3 | dense MC23 | short-range receivers |
+|---|---|---|---|---|---|---|
+| bar `ref_own+context` | 0.682 | 0.63 | 0.75 | 0.46 | 0.65 | 0.62 |
+| `lin_fourier` | **0.775** | 0.95 | 0.96 | 0.80 | 0.81 | 0.02 |
+| `joint_rope`, global head | 0.756 | 0.85 | 0.81 | 0.65 | 0.68 | 0.64 |
+| `lin_rope` | 0.708 | 0.82 | 0.88 | 0.65 | 0.68 | 0.01 |
+| `lin_none` | 0.407 | 0.44 | 0.45 | 0.52 | 0.66 | 0.01 |
+| `local_gcn` | 0.516 | 0.44 | 0.51 | 0.66 | 0.64 | 0.61 |
+
+- **First time a model passes the bar on a task built for global context.** The gain sits in the
+  ring programmes (response a function of distance to a source), which fixed kernels of the inputs
+  cannot express. Untrained twins are at ~0; `lin_none` equals `ref_own` (0.407 vs 0.405), so
+  without position a global-only model reads only the cell itself.
+- **The joint model combines the scales:** its global head reaches the short-range receivers
+  (0.64-0.68, via the GCN's tokens) and the ring programmes (0.85/0.81); global-only models score ~0
+  on short-range receivers.
+- **Fourier beats RoPE** for global-only models here (0.775 vs 0.708), the reverse of the disc task.
+- **Misses.** M11 > MC14/15 (150 um kernel solves it, bar 0.92): global-only 0.15, joint 0.57. The
+  mirror programmes MC1, MC2, MC4, MC6 (response copies the cell's own visible source): all below
+  `ref_own` (MC4: 0.36 vs 0.68). Direction programmes M9, M10: 0.1-0.3 for every arm and reference.
+  Sparse responses only match the bar (~0.9): the visible receptor gives the receiver away.
+- **The sender ranks (`response_edges`) are not interpretable yet.** `lin_fourier` ranks dense
+  senders at 0.76 and sparse ones at 0.55; the GCN ranks R1-R4's senders at 0.40 (below blind) while
+  predicting those responses at 0.61; global arms rank mid-range pairs at 0.05-0.24. Hypothesis, not
+  checked: the measure is a gradient magnitude (sensitivity, not contribution), and the token
+  LayerNorm divides gradients by the token's spread, so a high-expressing sender is less sensitive
+  than its neighbours. Use gradient x input or integrated gradients (roadmap T4) before reading it.
+- **Next:** 3 seeds of `lin_fourier`, `joint_rope`, `local_gcn`; a `joint_fourier` arm; the sender
+  ranks with attributions; sparse responses scored within receivers only; per-head distance prior
+  for M11; anisotropic Fourier bias for M9/M10; the additive decoder (decoder_plan D3.1) for the
+  mirror programmes. Schedule and decision points: [roadmap.md](roadmap.md).
+
 ## Programme masking: what drives a response (built 2026-10-18)
 
 **Why (the user, 2026-10-18).** The disc task cannot test the programmes synth_spot was built for:
