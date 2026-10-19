@@ -15,13 +15,18 @@ PRECOMPUTED_MASK_FILLS = ("learned", "minus_one")
 
 
 class GlobalModule(BaseModule):
-    def __init__(self, precomputed_mask_fill: str = "learned", **base_module_kwargs):
+    def __init__(self, precomputed_mask_fill: str = "learned", programme_masking: bool = False, **base_module_kwargs):
         """``precomputed_mask_fill``: what a hidden cell's ``Precomputed`` embedding is replaced by.
 
         A precomputed embedding was made from the cell's own expression, which is the
         reconstruction target, so a hidden cell must not hand it to the transformer.
         ``"learned"``: one trained vector shared by every hidden cell. ``"minus_one"``: every entry
         set to ``MASK_VALUE``, as masked expression is. See :meth:`hide_embeddings`.
+
+        ``programme_masking``: a gene set (``dataset.mask_genes``) is hidden under ``mask_strategy
+        gene``. A ``Precomputed`` embedding is then allowed, since one computed without those genes
+        (``tl.check_embedding_genes`` verifies it when the graphs are built) holds none of the hidden
+        values; no cell is replaced by the fill, as every cell keeps its visible genes.
         """
         super().__init__(**base_module_kwargs)
 
@@ -55,10 +60,11 @@ class GlobalModule(BaseModule):
                 raise ValueError(
                     f"precomputed_mask_fill must be one of {PRECOMPUTED_MASK_FILLS}, got {precomputed_mask_fill!r}."
                 )
-            if self.masked_nodes and self.mask_strategy == "gene":
+            if self.masked_nodes and self.mask_strategy == "gene" and not programme_masking:
                 raise ValueError(
                     "Precomputed embeddings cannot hide single genes: a cell's embedding encodes all of its "
-                    "expression. Use mask_strategy node (or spatial blocks)."
+                    "expression. Use mask_strategy node (or spatial blocks), or hide a gene set "
+                    "(dataset.mask_genes) with an embedding computed from the other genes."
                 )
             self.precomputed_mask_fill = precomputed_mask_fill
             if precomputed_mask_fill == "learned":
@@ -146,10 +152,7 @@ class GlobalModule(BaseModule):
             if isinstance(embeddings, torch.Tensor):
                 embeddings = embeddings.detach().cpu().numpy()
             if not bool(self.pca_fitted_):
-                self.pca.fit(embeddings)
-                self.pca_mean_.copy_(torch.as_tensor(self.pca.mean_, dtype=self.pca_mean_.dtype))
-                self.pca_components_.copy_(torch.as_tensor(self.pca.components_, dtype=self.pca_components_.dtype))
-                self.pca_fitted_.fill_(True)
+                self._fit_pca(embeddings)
             return self._pca_transform(embeddings)
         elif type == "NMF":
             if not hasattr(self.nmf, "components_"):
@@ -158,6 +161,39 @@ class GlobalModule(BaseModule):
                 return self.nmf.transform(embeddings)
         else:
             raise ValueError(f"Invalid embedding type: {type}")
+
+    def _fit_pca(self, embeddings, deterministic: bool = False) -> None:
+        """Fit the PCA basis on ``[n, n_input]`` ``embeddings`` and store it in the buffers.
+
+        ``deterministic`` fixes the solver's random state: sklearn's ``auto`` solver is randomized
+        above 500 rows and, with no state set, two fits of one matrix differ.
+        """
+        if deterministic:
+            self.pca.set_params(random_state=0)
+        self.pca.fit(embeddings)
+        self.pca_mean_.copy_(torch.as_tensor(self.pca.mean_, dtype=self.pca_mean_.dtype))
+        self.pca_components_.copy_(torch.as_tensor(self.pca.components_, dtype=self.pca_components_.dtype))
+        self.pca_fitted_.fill_(True)
+
+    def fit_pca_on_training(self, graphs) -> int:
+        """Fit the PCA basis once on the masked inputs of the training ``graphs``; the number of rows used.
+
+        ``model.global_component.parameters.pca_fit: train``. Each graph's input is corrupted as in
+        training (:meth:`_common_step_masking`, from the graph's current masks), so a hidden gene is
+        a constant column and adds no variance, and no hidden value enters the basis. A no-op for
+        a module without PCA tokens or whose basis is already fitted (a restored checkpoint).
+        """
+        from torch_geometric.data import Batch
+
+        if self.type_gex_embedding != "PCA" or bool(self.pca_fitted_):
+            return 0
+        rows = []
+        for graph in graphs:
+            masked, _, _ = self._common_step_masking(Batch.from_data_list([graph]))
+            rows.append(masked.x.detach().cpu().numpy())
+        x = np.concatenate(rows, axis=0)
+        self._fit_pca(x, deterministic=True)
+        return len(x)
 
     def _pca_transform(self, embeddings):
         """Project onto the stored PCA basis: ``(X - mean_) @ components_.T``.
@@ -362,8 +398,10 @@ class GlobalModule(BaseModule):
         # Mask nodes  - before GEX embedding because otherwise embedding contains information about masked nodes
         batch_masked, _, _ = self._common_step_masking(batch)
         # The cells whose own values the model must not see; a precomputed embedding of theirs is
-        # replaced too (`hide_embeddings`).
-        hidden = batch_masked.mask.bool() if self.masked_nodes else None
+        # replaced too (`hide_embeddings`). Under gene masking no cell is hidden whole: a
+        # precomputed embedding is then one made without the hidden genes (programme masking), and
+        # stays as it is.
+        hidden = batch_masked.mask.bool() if self.masked_nodes and self.mask_strategy != "gene" else None
         embedding = self.gex_embedding(batch_masked, hidden=hidden)
         assert embedding.shape == (batch_masked.x.shape[0], self.n_embed), (
             f"Mismatch: embedding.shape: {embedding.shape}, batch_masked.x.shape: {batch_masked.x.shape}"
@@ -455,6 +493,7 @@ class GlobalModule(BaseModule):
                 attention=attention,
                 attention_seed=int(cfg.optim.get("seed", 0) or 0),
                 precomputed_mask_fill=params.get("precomputed_mask_fill", "learned"),
+                programme_masking=bool(list(cfg.dataset.get("mask_genes", []) or [])),
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,
             )

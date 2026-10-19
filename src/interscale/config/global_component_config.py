@@ -29,6 +29,13 @@ def get_global_component_cfg(cfg, global_component_name):
         # minus_one: every entry -1 (MASK_VALUE), as masked expression. Gene masking is refused
         # with Precomputed (an embedding cannot hide single genes).
         cfg.model.global_component.parameters.precomputed_mask_fill = "learned"
+        # With PCA: which data the basis is fitted on. `first_batch` (the model from before this key):
+        # the first batch the module sees -- in practice the first, masked validation slide, because
+        # Lightning's sanity check runs before training -- which misses slide- and condition-level
+        # structure of the training slides. `train`: the masked inputs of every training slide, once,
+        # before training (deterministic solver). Prefer `Precomputed` with an embedding fitted on the
+        # training slides outside InterScale where the data allow it.
+        cfg.model.global_component.parameters.pca_fit = "first_batch"
 
         # Positional encodings, see `.claude/PE_plan.md`. An empty `node` list builds nothing and
         # is the model from before PEs existed. Node encodings are summed into each cell's token;

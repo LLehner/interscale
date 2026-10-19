@@ -6,6 +6,8 @@ import torch
 from geome import ann2data, iterables, transforms
 from yacs.config import CfgNode as CN
 
+from interscale.tl.embeddings import check_embedding_genes
+
 #: Names the pipeline builds itself. An ``extra_obs_keys`` entry may not shadow one of these:
 #: attaching an obs column called ``mask`` would replace the corruption mask with a label and the
 #: run would train against its own annotation without failing.
@@ -411,6 +413,8 @@ def prepare_geome_dataset(adata, cfg: CN):
         if obsm_key is not None:
             if obsm_key not in adata.obsm:
                 raise ValueError(f"Precomputed embeddings key '{obsm_key}' not found in adata.obsm")
+            # Under programme masking the embedding must not have seen the hidden genes.
+            check_embedding_genes(adata, cfg)
             fields["embeddings"] = [f"obsm/{obsm_key}"]
         # The same optional annotations the evaluation path attaches, resolved from the same
         # helper so the two cannot drift apart.

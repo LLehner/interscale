@@ -124,12 +124,15 @@ def _embedding_tag(cfg) -> str:
     ``Xpca``) with a learned or a -1 mask fill, so two embeddings never share a checkpoint (added
     2026-10-17: checkpoints made with Precomputed before then carry no tag, and their hidden cells'
     embeddings were not masked). Only the global-only prefix carries it: a CombinedModel ignores
-    ``type_gex_embedding``. PCA and NMF add nothing, so their names are unchanged.
+    ``type_gex_embedding``. PCA fitted on the training slides (``pca_fit: train``) is ``emb-pca-train_``;
+    PCA on the first batch and NMF add nothing, so their names are unchanged.
     """
     params = cfg.model.global_component.get("parameters", None)
     embedding = params.get("type_gex_embedding", None) if params is not None else None
     if embedding == "Linear":
         return "emb-linear_"
+    if embedding == "PCA" and params.get("pca_fit", "first_batch") == "train":
+        return "emb-pca-train_"
     if embedding == "Precomputed":
         fill = params.get("precomputed_mask_fill", "learned")
         key = re.sub(r"[^0-9A-Za-z]+", "", str(cfg.model.global_component.get("latent_obsm_key", None) or ""))

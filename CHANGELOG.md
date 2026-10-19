@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- `type_gex_embedding: Precomputed` under programme masking: allowed with `mask_strategy: gene` when
+  `dataset.mask_genes` hides a gene set, because an embedding computed from the other genes holds none
+  of the hidden values. No cell is replaced by the mask fill then (every cell keeps its visible genes).
+  `interscale.tl.record_embedding_genes(adata, key, genes)` stores which genes an embedding was made
+  from (`adata.uns["embedding_genes"]`); `prepare_geome_dataset` refuses an embedding that saw a hidden
+  gene or whose genes are unrecorded (`tl.check_embedding_genes`). Single hidden entries stay refused.
+- `model.global_component.parameters.pca_fit: train`: a GlobalModel's PCA tokens are fitted once, before
+  training, on the masked inputs of every training slide (deterministic solver), instead of on the first
+  batch the module sees (the first, masked validation slide). Default `first_batch` is unchanged;
+  checkpoint tag `emb-pca-train`.
 - Programme masking: `dataset.mask_genes` (gene names or `var` selectors such as `"role=response"`)
   hides exactly that gene set in the selected cells under `mask_strategy: gene`
   (`mask_percentage` is then the share of cells; discs select cells for it); resolved by

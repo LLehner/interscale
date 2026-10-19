@@ -492,7 +492,7 @@ def _validate_schedule(cfg):
 
 
 def _validate_precomputed_embedding(cfg):
-    """``Precomputed`` tokens need an obsm key, a known mask fill, and whole-cell masking."""
+    """``Precomputed`` tokens need an obsm key, a known mask fill, and whole-cell masking or a hidden gene set."""
     from interscale.module.base._base_global_module import PRECOMPUTED_MASK_FILLS
 
     params = cfg.model.global_component.get("parameters", None)
@@ -511,16 +511,19 @@ def _validate_precomputed_embedding(cfg):
             "type_gex_embedding Precomputed reads the embeddings from adata.obsm, but "
             "model.global_component.latent_obsm_key is unset."
         )
-    if cfg.dataset.mask_strategy == "gene":
+    if cfg.dataset.mask_strategy == "gene" and not list(cfg.dataset.get("mask_genes", []) or []):
         raise ValueError(
             "type_gex_embedding Precomputed cannot be combined with mask_strategy gene: a cell's embedding "
             "encodes all of its expression, so single hidden genes would still reach the model through it. "
-            "Use mask_strategy node (or spatial blocks)."
+            "Use mask_strategy node (or spatial blocks), or hide a gene set (dataset.mask_genes) with an "
+            "embedding computed from the other genes (interscale.tl.record_embedding_genes)."
         )
 
 
 #: The values ``GlobalModule`` builds a token input for (``scvi`` is named in old docstrings only).
 GEX_EMBEDDINGS = (None, "PCA", "NMF", "Precomputed", "Linear")
+#: Where the PCA basis is fitted (``pca_fit``): the first batch the module sees, or the training slides.
+PCA_FITS = ("first_batch", "train")
 
 
 def _validate_gex_embedding(cfg):
@@ -533,6 +536,11 @@ def _validate_gex_embedding(cfg):
         raise ValueError(
             f"model.global_component.parameters.type_gex_embedding must be one of {GEX_EMBEDDINGS}, got {value!r}."
         )
+    fit = params.get("pca_fit", "first_batch")
+    if fit not in PCA_FITS:
+        raise ValueError(f"model.global_component.parameters.pca_fit must be one of {PCA_FITS}, got {fit!r}.")
+    if fit == "train" and value != "PCA":
+        raise ValueError(f"pca_fit 'train' fits the PCA tokens, but type_gex_embedding is {value!r}.")
 
 
 def _validate_global_residual(cfg):

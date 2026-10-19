@@ -154,6 +154,25 @@ class NodeMaskingTrainingPlan:
                 **run,
             )
 
+    def _fit_input_pca(self, datamodule) -> None:
+        """``pca_fit: train``: fit a GlobalModel's PCA tokens on the training slides, before any step.
+
+        The masks of a split are drawn when the datamodule is set up, which Lightning does inside
+        ``fit``; a graph without one gets its first draw here (the same draw ``setup`` makes).
+        """
+        params = self._cfg.model.global_component.get("parameters", None)
+        if params is None or params.get("type_gex_embedding", None) != "PCA" or params.get("pca_fit", "first_batch") != "train":
+            return
+        if not hasattr(self.module, "fit_pca_on_training"):
+            return
+        graphs = list(datamodule.train_data)
+        for graph in graphs:
+            if getattr(graph, "mask", None) is None:
+                datamodule._assign_random_mask(graph)
+        rows = self.module.fit_pca_on_training(graphs)
+        if rows:
+            print(f"PCA tokens fitted on the masked inputs of {len(graphs)} training graphs ({rows} cells)")
+
     def _train_phase(
         self,
         phase,
@@ -191,6 +210,7 @@ class NodeMaskingTrainingPlan:
             self.batch_size = self._cfg.dataset.batch_size
             self.train_size = self._cfg.dataset.train_size
             self.validation_size = self._cfg.dataset.val_size
+            self._fit_input_pca(datamodule)
 
         # TODO: change steps per epoch to be based on datamodule
         # steps_per_epoch = math.ceil(len(train_ds) / cfg.dataset.batch_size)

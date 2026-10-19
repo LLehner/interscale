@@ -8,6 +8,7 @@ from .anchors import (
     local_reach_um,
     profile_by_distance,
 )
+from .embeddings import check_embedding_genes, embedding_genes, record_embedding_genes
 from .geome_utils import (
     check_split_independence,
     label_codes,
@@ -34,6 +35,9 @@ from .self_attn_relevance import SelfAttentionRelevance
 from .utils import check_and_update_cfg, local_reach_hops, set_full_reproducibility
 
 __all__ = [
+    "check_embedding_genes",
+    "embedding_genes",
+    "record_embedding_genes",
     "local_reach_hops",
     "prepare_geome_dataset",
     "warn_missing_categories",
