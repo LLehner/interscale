@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- `masked_probing.FittedReferences.state()` / `from_state(state, position)`: the ridge references of the
+  programme evaluation can be saved and loaded (the `position` function is handed back in), so jobs that
+  evaluate different models on the same training slides fit them once.
 - The results file reads seeds: runs named `<arm>_s<seed>` are shown once in the summary as the mean over
   their seeds (`<arm> [n seeds]`), with the standard deviation over seeds and every run's own value in
   tables beside it (`evaluation.report.average_over_seeds`); the sections keep every run. Jobs that run

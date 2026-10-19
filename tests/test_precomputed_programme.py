@@ -200,3 +200,55 @@ def test_the_graphs_are_not_built_from_an_embedding_that_saw_a_hidden_gene():
         build(["g1", "g2"])
     with pytest.raises(ValueError, match="does not say"):
         build(None)
+
+
+def test_a_real_run_trains_on_a_precomputed_embedding_under_programme_masking(tmp_path):
+    """Through ``train()``: the guard passes for an embedding of the other genes, the loss is on the hidden set only."""
+    import scanpy as sc
+
+    from interscale.config import load_config
+    from interscale.geome_dataloader import GraphAnnDataModule, gene_set_mask_kwargs
+    from interscale.model.global_model import GlobalModel
+    from interscale.tl import prepare_geome_dataset, record_embedding_genes
+
+    rng = np.random.default_rng(0)
+    samples = ["s1", "s2", "s3", "s4"]
+    n = 30 * len(samples)
+    adata = AnnData(X=np.abs(rng.normal(size=(n, G))).astype(np.float32) + 0.05)
+    adata.var_names = [f"g{k}" for k in range(G)]
+    adata.obsm["spatial"] = rng.uniform(0, 100, size=(n, 2))
+    adata.obs["sample"] = pd.Categorical(np.repeat(samples, 30))
+    adata.obs["split"] = pd.Categorical([{"s1": "train", "s2": "train", "s3": "val", "s4": "test"}[s] for s in adata.obs["sample"]])
+    adata.layers["log1p_norm"] = np.log1p(adata.X)
+    visible = [k for k in range(G) if k not in (2, 5)]  # the genes the config hides: g2 and g5
+    adata.obsm["X_emb"] = (adata.layers["log1p_norm"][:, visible] @ rng.normal(size=(len(visible), E))).astype(np.float32)
+    record_embedding_genes(adata, "X_emb", [f"g{k}" for k in visible])
+    h5ad = tmp_path / "pre.h5ad"
+    adata.write_h5ad(h5ad)
+    path = tmp_path / "pre.yaml"
+    path.write_text(
+        f"model:\n  n_embed: {E}\n  global_component:\n    name: self-attn-transformer\n    latent_obsm_key: X_emb\n"
+        "    parameters:\n      max_seq_len: 64\n      num_layers: 1\n      n_heads: 2\n      type_gex_embedding: Precomputed\n"
+        "  decoder:\n    type: linear\n  save: null\n"
+        "optim:\n  loss: SCELoss\n  sce_gamma: 1.0\n  lr: 0.01\n  seed: 42\n  accelerator: cpu\n  n_epochs: 2\n"
+        "  lr_warmup: 1\n  min_epochs: 2\n  early_stopping: False\n"
+        f"dataset:\n  h5ad_data: {h5ad}\n  name: pretest\n  prediction_task: regression\n  prediction_level: node\n"
+        "  layer_key: log1p_norm\n  sample_key: ['sample']\n  mask_strategy: gene\n  mask_percentage: 1.0\n"
+        "  mask_genes: ['g2', 'g5']\n  batch_size: 2\n  evaluate_test: False\n"
+        "  spatial_neigbors_kwargs:\n    radius: 25\n    library_key: sample\n"
+    )
+    cfg = load_config(str(path))
+    adata = sc.read_h5ad(cfg.dataset.h5ad_data)
+    GlobalModel._setup_anndata(
+        adata=adata, prediction_task="regression", layer_key="log1p_norm", sample_key_list=["sample"], prediction_obs=None
+    )
+    model = GlobalModel(adata, cfg=cfg)
+    pyg, _ = prepare_geome_dataset(adata, cfg)
+    dm = GraphAnnDataModule(
+        datas=pyg, num_workers=0, batch_size=2, mask_percentage=1.0, mask_strategy="gene", learning_type="node",
+        **gene_set_mask_kwargs(cfg, adata),
+    )
+    model.train(max_epochs=2, datamodule=dm, early_stopping=False, wandb_use=False)
+    assert model.is_trained_
+    losses = [row["val_loss"] for row in model.history_.history if "val_loss" in row]
+    assert losses and all(np.isfinite(losses))

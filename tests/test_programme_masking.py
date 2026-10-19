@@ -254,6 +254,29 @@ def test_no_hidden_value_reaches_a_fitted_reference():
     assert all(torch.equal(found[k], again[k]) for k in found)
 
 
+def test_a_fit_saved_and_loaded_predicts_exactly_what_the_fit_did(tmp_path):
+    """Jobs sharing one fit: the state goes through pickle, the position function is handed back in."""
+    import pickle
+
+    train = [_field_graph(7, s) for s in range(4)]
+    draw_masks(train, "gene_set", 1.0, seed=0, columns=[1, 2])
+    position = position_features(spatial_unit_um=UNIT, patch_um=(30.0,), max_offset_um=50.0)
+    refs = _fit(train, position=position)
+    path = tmp_path / "fit.pkl"
+    path.write_bytes(pickle.dumps(refs.state()))
+    loaded = FittedReferences.from_state(pickle.loads(path.read_bytes()), position=position)
+
+    data = _field_graph(7, 20)
+    draw_masks([data], "gene_set", 1.0, seed=0, columns=[1, 2])
+    batch = Batch.from_data_list([data])
+    hidden = batch.gene_mask.bool()
+    found, again = refs(batch, hidden), loaded(batch, hidden)
+    assert set(found) == set(again) and all(torch.equal(found[k], again[k]) for k in found)
+    assert loaded.alpha_ == refs.alpha_ and list(loaded.target_columns) == list(refs.target_columns)
+    with pytest.raises(ValueError, match="lacks"):
+        FittedReferences.from_state({"fill": refs.fill})
+
+
 def test_through_the_collection_every_fitted_reference_row_is_its_own_cell():
     train = [_field_graph(7, s) for s in range(3)]
     draw_masks(train, "gene_set", 1.0, seed=0, columns=[1, 2])

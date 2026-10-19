@@ -780,6 +780,29 @@ class FittedReferences:
             fitted.append((np.asarray(same), scaler, ridge))
         return fitted
 
+    #: What a fitted instance holds besides the ``position`` function (a closure, which a file cannot keep).
+    STATE = ("spatial_unit_um", "kernels_um", "fill", "target_columns", "models", "alpha_")
+
+    def state(self) -> dict:
+        """The fit as a plain dict of arrays and sklearn objects, for :func:`pickle` (see :meth:`from_state`)."""
+        return {name: getattr(self, name) for name in self.STATE}
+
+    @classmethod
+    def from_state(cls, state: dict, position=None) -> FittedReferences:
+        """An instance with the fit of :meth:`state`; ``position`` is the same :func:`position_features` function the fit used.
+
+        Lets jobs that evaluate different models on the same training slides share one fit: the ridge
+        regressions depend on the graphs, their masks and the settings only, never on a model.
+        """
+        missing = [name for name in cls.STATE if name not in state]
+        if missing:
+            raise ValueError(f"the saved fit lacks {missing}")
+        obj = cls.__new__(cls)
+        for name in cls.STATE:
+            setattr(obj, name, state[name])
+        obj.position = position
+        return obj
+
     def __call__(self, batch, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
         parts = {k: v.cpu().numpy() for k, v in self._parts(batch, hidden).items()}
         out = {}
