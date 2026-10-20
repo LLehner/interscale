@@ -724,6 +724,68 @@ every spot (19,877 spots, 3 test slides); centred cosine over hidden entries. Ba
   for M11; anisotropic Fourier bias for M9/M10; the additive decoder (decoder_plan D3.1) for the
   mirror programmes. Schedule and decision points: [roadmap.md](roadmap.md).
 
+## Results of programme masking, second read (run 2026-10-19/20; three seeds, 100 epochs)
+
+File: `/home/lehnerl/Arbeit/results/response_masking/results.md` (19 runs and 3 untrained twins, written
+by `response_masking.py` as set up in roadmap.md T0). Same task and bar as the first read (`ref_own+context`
+0.682). Seeds: sd 0.003-0.017 on the overall score, median per-programme sd 0.008 (largest 0.066), so
+differences above ~0.03 are real. Centred cosine on the hidden entries; overall = over all hidden spots.
+
+| arm | overall | short-range receivers | long-range responses | sparse responses |
+|---|---|---|---|---|
+| bar `ref_own+context` | 0.682 | 0.616 | 0.692 | 0.796 |
+| `local_gcn` | 0.510 | 0.586 | 0.471 | 0.767 |
+| `lin_none` | 0.405 | 0.015 | 0.421 | 0.758 |
+| `lin_rope` | 0.709 | 0.009 | 0.806 | 0.774 |
+| `lin_fourier` (3 seeds) | 0.764 ± 0.003 | 0.011 | 0.893 | 0.782 |
+| `joint_rope`, global head (3) | 0.748 ± 0.011 | 0.638 | 0.785 | 0.777 |
+| **`joint_fourier`, global head (3)** | **0.820 ± 0.005** | 0.644 | 0.884 | 0.780 |
+| `pre_pca_rope` / `pre_pca_fourier` | 0.340 / 0.419 | 0.012 / 0.009 | 0.344 / 0.479 | 0.592 / 0.624 |
+| `lin_fourier_pool500` (3) | 0.616 ± 0.017 | 0.168 | 0.788 | **0.069** |
+| `lin_rope_pool500` | 0.466 | 0.214 | 0.606 | 0.097 |
+| `joint_fourier_pool500`, global (local) head | 0.626 (0.498) | 0.249 (0.586) | 0.787 (0.457) | **0.082** (0.757) |
+
+**What it shows.**
+- **First robust positive.** `joint_fourier`'s global head is 0.138 above the bar over three seeds and far
+  above its own local head (0.506): the long-range responses 0.884 against 0.692 (bar) and 0.463 (GCN),
+  and the rings (M7, M8) 0.93 / 0.93 against 0.63 / 0.75 (bar) and 0.44 / 0.49 (local). Fourier beats RoPE
+  in every arm (joint 0.820 vs 0.748, global-only 0.764 vs 0.709). A blend with the bar no longer adds to
+  the joint head (0.804 < 0.820): it holds what the references know.
+- **But per programme the models do not beat the bar overall.** Equal weight over the 25 planted
+  programmes: `joint_fourier` 0.628 against the bar's 0.685; it beats the bar by more than 0.05 on 3, ties
+  on 12, loses on 9 (`lin_fourier`: 4 / 10 / 10). The overall score is carried by the rings, which hold
+  most of the hidden entries.
+- **Where it loses, and the likely reason.**
+  - *Mirror programmes* (response copies the cell's own visible source: MC1, MC2, MC4, MC6): 0.54 / 0.41 /
+    0.27 / 0.47 against `ref_own` 0.84 / 0.68 / 0.68 / 0.67, in every NN arm, the GCN alone included. A
+    linear read of the cell's own genes beats the 64-dim embedding: the own-cell skip is the candidate fix
+    (decoder_plan.md D3.1).
+  - *M11 > MC14/15* (single source spots, response within 500 µm): `joint_fourier` 0.54, GCN 0.35, global-only
+    0.16, bar 0.92 (a 150 µm kernel). The near-source scale is not learned.
+  - *Sparse threshold programmes* (M16, M17, M20): at or below `ref_own` (0.64 / 0.44 / 0.57 against 0.67 /
+    0.58 / 0.53). Pooled over all cells this is dominated by "is the cell a receiver", which the visible
+    receptor gives away; whether the models know the distance to the source needs scoring within receivers.
+  - *Directional* (M9, M10): 0.08-0.18 in every arm and reference. The Fourier bias used is isotropic.
+- **PCA of the visible genes is a poor token here** (0.34 / 0.42, against 0.76 for the learned linear
+  input): the 64 leading components keep variance (45% of it sits in noise genes) and drop the sparse
+  receptor and sender signals. The disc task's best global-only input does not carry over.
+- **Pooling at 500 µm (5 x 5 spots, ~100 tokens).** The ring and long-range programmes survive (0.79
+  against 0.89 per cell), short-range receivers rise a little in the global head (0.17-0.25, a patch holds
+  sender and receiver) but the sparse responses collapse to 0.07-0.08: a patch token is shared, so the
+  global head cannot know which cell is the receiver (the joint arm's *local* head, which reads cells,
+  has 0.757 on the same genes). The cell's own genes are what pooling removes, so the same own-cell skip
+  is the fix here. Cost: training cells/s x1.5-1.6, peak GPU memory 5.5x (global-only) and 3.5x (joint)
+  smaller, at S = 2,500; at 50-100k cells that is the difference between running and not.
+- **Sender ranks are still unreadable** (0.35-0.57; the GCN, which predicts R1-R4 at 0.59 from its
+  neighbours' senders, ranks them 0.41). The measure is a gradient magnitude; roadmap T4 replaces it.
+- **Time.** Training 0.8-1.8 s per epoch (2-3 min per run); evaluation 30-60 s per run (head scores 5-7 s;
+  sender influence 5 s GCN, 23 s global-only, 50 s joint, 9-21 s pooled; the references 61 s once). The
+  whole 19-run sweep is minutes as an array. 100 epochs cost about 0.01 against 200 (`lin_fourier` 0.764
+  against 0.775; `joint_rope` global 0.748 against 0.756).
+
+**Provisional base model (DP1): `joint_fourier`**, pending the attribution instrument (T4) and the
+own-cell skip.
+
 ## Programme masking: what drives a response (built 2026-10-18)
 
 **Why (the user, 2026-10-18).** The disc task cannot test the programmes synth_spot was built for:
