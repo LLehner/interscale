@@ -673,6 +673,8 @@ def _select(per_arm: dict[str, pd.DataFrame], level: str, value, keep: list[str]
 
 #: How far a programme's score must lie from the bar's to count as a win or a loss rather than a tie.
 TIE_MARGIN = 0.05
+#: ``bar="best"``: every programme is compared with the highest of the references on it.
+BEST_REFERENCE = "best"
 
 
 def _versus_bar(per_arm: dict[str, pd.DataFrame], bar: str, prefix: str, margin: float) -> pd.DataFrame | None:
@@ -682,13 +684,16 @@ def _versus_bar(per_arm: dict[str, pd.DataFrame], bar: str, prefix: str, margin:
     than ``margin`` above or below the bar's on that programme, a tie anything between. The means
     weigh every programme alike, which a pooled score does not: that one is carried by the programmes
     holding most of the hidden entries. ``best`` and ``worst`` name the programmes of the largest gain and loss.
+    ``bar`` is a column of the head scores, or :data:`BEST_REFERENCE` for the highest reference on each programme
+    (picked on the same scores, so a hard bar).
     """
     rows = []
     for arm, table in per_arm.items():
         programmes = [g for g in table.index if str(g).startswith(prefix)]
-        if bar not in table.columns or not programmes:
+        references = [c for c in table.columns if str(c).startswith(REFERENCE_PREFIX)]
+        if not programmes or (bar != BEST_REFERENCE and bar not in table.columns):
             continue
-        reference = table.loc[programmes, bar]
+        reference = table.loc[programmes, references].max(axis=1) if bar == BEST_REFERENCE else table.loc[programmes, bar]
         heads = [
             c
             for c in table.columns
@@ -732,9 +737,10 @@ def summary_tables(
     """The cross-arm tables of the summary, from the sections of ``arms``; missing analyses are skipped.
 
     ``groups`` limits the gene-group tables to those groups (None: every group). ``bar`` names the
-    reference (a column of the head scores, e.g. ``ref_own+context``) every programme -- a group
-    named ``programmes<...>`` -- is compared with, for the tables of wins, ties and losses
-    (:func:`_versus_bar`, ``margin`` apart); None leaves them out.
+    reference (a column of the head scores, e.g. ``ref_own+context``, or ``"best"`` for the highest
+    reference on each programme) every programme -- a group named ``programmes<...>`` -- is compared
+    with, for the tables of wins, ties and losses (:func:`_versus_bar`, ``margin`` apart); None leaves
+    them out.
     """
     if seed_groups(arms):
         mean, sd, shown, found = average_over_seeds(sections, arms)
@@ -765,7 +771,8 @@ def summary_tables(
         by_group = {arm: table.loc[[g for g in groups if g in table.index]] for arm, table in by_group.items()}
     add("centred cosine per gene group on hidden spots", _heads_summary(by_group))
     if bar is not None:
-        what = f"programmes ('{programmes}...') against the bar {bar}: wins / ties / losses by more than {margin:g}"
+        bar_name = "the best reference on each" if bar == BEST_REFERENCE else f"the bar {bar}"
+        what = f"programmes ('{programmes}...') against {bar_name}: wins / ties / losses by more than {margin:g}"
         add(
             f"{what}; means weigh every programme alike",
             _versus_bar(_per_arm(sections, "heads_by_group", arms), bar, programmes, margin),

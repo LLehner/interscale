@@ -27,9 +27,10 @@ and this project adheres to [Semantic Versioning][].
   cosine over a group's hidden entries in those cells alone (the response where there is one to predict,
   apart from telling who responds).
 - The summary counts, per programme and with every programme weighing the same, the wins, ties and losses
-  of each head against a bar (`write_report(bar="ref_own+context", programmes="interaction=")`, ties within
-  0.05) for all cells and within receivers, names the best and worst programme, and shows the attribution's
-  completeness gap; the pooled score is carried by the programmes with the most hidden entries.
+  of each head against a bar (`write_report(bar="ref_own+context", programmes="interaction=")`, or
+  `bar="best"` for the highest reference on each programme; ties within 0.05) for all cells and within
+  receivers, names the best and worst programme, and shows the attribution's completeness gap; the pooled
+  score is carried by the programmes with the most hidden entries.
 - Pooled tokens (`model.global_component.parameters.pooling`, default `kind: none`): the transformer runs
   on patches of cells instead of single cells. `kind: grid` groups cells into squares by position alone
   (`size_um`, or `n_patches` for about that many per slide; `offset` shifts the grid); a patch token is the

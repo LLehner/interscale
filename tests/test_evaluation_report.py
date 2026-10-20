@@ -446,6 +446,18 @@ def test_every_programme_is_counted_as_a_win_a_tie_or_a_loss_against_the_bar(tmp
     wider = _versus_bar({"arm": table}, "ref_own+context", "interaction=", 0.5)
     assert wider.loc[("arm", "global"), ["wins", "ties", "losses"]].tolist() == [0, 5, 0]
 
+    # "best": against the highest reference on each programme (here ref_own where it is above ref_own+context).
+    own = [0.60, 0.40, 0.40, 0.10, 0.10]
+    two = _programmes(model, bar)
+    two["ref_own"] = [*own, 0.1, 0.1]
+    best = _versus_bar({"arm": two}, "best", "interaction=", 0.05)
+    # per programme the bar is max(own, own+context) = 0.60, 0.40, 0.40, 0.40, 0.60 and the model 0.70, 0.45, 0.35, 0.34, 0.20
+    assert best.loc[("arm", "global"), ["wins", "ties", "losses"]].tolist() == [1, 2, 2]
+    assert best.loc[("arm", "global"), "bar mean"] == pytest.approx(np.mean([0.60, 0.40, 0.40, 0.40, 0.60]))
+    assert best.loc[("arm", "global"), "best"] == "P1 +0.10"  # against ref_own's 0.60, not own+context's 0.40
+    no_references = _programmes(model, bar).drop(columns=["ref_own", "ref_own+context"])
+    assert _versus_bar({"arm": no_references}, "best", "interaction=", 0.05) is None
+
     # A blend is not a head; a NaN score is left out of the counts.
     with_blend = _programmes([0.7, np.nan, 0.35, 0.34, 0.2], bar, extra={"blend_global": [0.5] * 7})
     result = _versus_bar({"arm": with_blend}, "ref_own+context", "interaction=", 0.05)
