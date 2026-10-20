@@ -24,7 +24,7 @@ Last updated 2026-10-20.
 | track | question | state | verified by | date |
 |---|---|---|---|---|
 | T0 | infrastructure: seeds, per-arm evaluation, inputs, CosMx | **implemented, unverified** (2026-10-19; CosMx deferred by the user) — seed axis, run selection for job arrays, per-run section files, timing, cached references, `Precomputed` under programme masking, `pca_fit: train`; every mutation caught (two survivors led to a stronger test and a simplification), harness IDENTICAL; the sweep script checked on a stub synth_spot with untrained models. **Not run on data** | 2026-10-19 |
-| T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; sender ranks unreadable (gradient magnitude) → replaced 2026-10-20 by an integrated-gradients attribution, sparse programmes also scored within their receivers, per-programme wins/ties/losses in the report (**built, not yet run: the 19 checkpoints await `MODE = "evaluate"`**). Details in global_plan.md | `response_masking` run (11 arms, 19 runs, 3 twins) | 2026-10-20 |
+| T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; legnini programme masking built 2026-10-20 (`legnini_programme`, decided gene set in legnini_plan.md; not run); sender ranks unreadable (gradient magnitude) → replaced 2026-10-20 by an integrated-gradients attribution, sparse programmes also scored within their receivers, per-programme wins/ties/losses in the report (**built, not yet run: the 19 checkpoints await `MODE = "evaluate"`**). Details in global_plan.md | `response_masking` run (11 arms, 19 runs, 3 twins) | 2026-10-20 |
 | T1b | coarse-grained tokens: pool cells into patches or niches before the global model | **grid pooling implemented, unverified** (2026-10-19) — `pooling.kind: grid` (`size_um` or `n_patches`), `count`/`std` features, 39 tests, an end-to-end run for GlobalModel and CombinedModel, every mutation caught (one survivor led to a stronger test), harness IDENTICAL; 5 pooled arms in `response_masking`. The `niche` assignment waits for the user's details; patch-level attention readouts not built. **Not run on data** | 2026-10-19 |
 | T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed | | |
 | T3 | masking strategies | proposed | | |
@@ -162,11 +162,17 @@ inputs cannot. Every later track builds on the model chosen here (DP1).
 - **Build: visible keys only** (discs). Wholly hidden cells are queries but never keys (K5).
 - **legnini.**
   - Re-evaluate the attention sweep with the rewritten flow.
-  - Programme masking on the SHH readouts: `PTCH1`, `GLI1` and `HHIP` hidden in every cell, `SHH`
-    visible. The gene set is your call (see the decisions below).
-  - Arms: `local_gcn`, `joint_rope`, global-only PCA + RoPE, and the same with the distance prior.
+  - Programme masking, **decided 2026-10-20**: the whole dorsoventral identity code (15 genes) is the main
+    task and the SHH readouts `PTCH1`, `GLI1`, `HHIP` are the positive control, hidden together in every
+    cell; `SHH`, `FOXA1`, `SMO`, `GLI2`, `GLI3` and `BMP4` stay visible. The genes, why each was chosen,
+    and where the paper and the manuscript mention them are in [legnini_plan.md](legnini_plan.md).
+    Built as `legnini_programme` (7 runs: `local_gcn`, `lin_fourier`, `joint_fourier` at 3 seeds, and the
+    pooled 100 µm `lin_fourier_pool100` and `joint_fourier_pool100`); not yet run. The earlier idea of
+    PCA + RoPE arms with the distance prior is dropped.
   - Positive control: the readouts' predictions should draw on the floor plate (c13, SHH) more
-    than distance alone explains.
+    than distance alone explains. **Weak in this data** (legnini_plan.md): in the SHH test organoid PTCH1
+    and GLI1 correlate slightly positively with the distance to SHH+ cells, while FOXA2 (-0.41), NKX2.2
+    (-0.19), PAX6 (+0.33) and IRX3 (+0.27) are ordered around the source as the paper describes.
 - **First read of `response_masking`, 2026-10-19** (one seed per arm; details in
   [global_plan.md](global_plan.md)). Global models with a position encoding beat the bar
   (`ref_own+context`, 0.682) for the first time: `lin_fourier` 0.775, `joint_rope` global head
@@ -744,9 +750,10 @@ Drop first:
 
 ## Decisions for you
 
-1. **legnini programme set.** Proposed: `PTCH1`, `GLI1`, `HHIP` (direct SHH targets), with `SHH`
-   visible. A second arm: the ventral identity genes `NKX2.2`, `NKX6.1`, `OLIG2`. Optionally
-   `MSX2` as a BMP4 readout, the dorsal control.
+1. **legnini programme set.** *Decided 2026-10-20:* the whole identity code as the main task, the SHH
+   readouts as a positive control ([legnini_plan.md](legnini_plan.md)). Open within it: FOXA2 (hidden, since
+   the paper finds it spreading non-cell-autonomously around SHH+ cells) and CHAT (no source in the paper
+   or the manuscript) are my choices; both are one line in the script's gene table.
 2. **CosMx setup.**
    - Label: `cell_type_coarse` (9 types) or `CellTypes_max` (14).
    - Graph radius: the manuscript used 60, 110 and 150.

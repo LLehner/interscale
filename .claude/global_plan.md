@@ -682,8 +682,8 @@ evaluations that can show communication at all: programme masking (built), the r
 - Redo `MODE = "evaluate"` for `joint_rope` (global_only) and `l2g_res` (staged_training); train
   C3's six missing arms in a separate job with a longer limit.
 - Re-evaluate the legnini sweep with the rewritten flow (`MODE = "evaluate"`).
-- legnini programme masking: which genes form the hidden set is the user's call (the panel has the
-  SHH readouts PTCH1, GLI1, HHIP; `var` carries no annotations).
+- legnini programme masking: the hidden set was decided on 2026-10-20 (legnini_plan.md; the panel has the
+  SHH readouts PTCH1, GLI1, HHIP; `var` carries no annotations, so the script writes `role` and `program`).
 - `decoder_plan.md`: restructure the decoder and the dual model so that local and global separate.
 
 ## Results of programme masking, first read (run 2026-10-19; one seed per arm)
@@ -819,8 +819,10 @@ beat the context reference there, and its senders should rank above 0.5.
 
 **Legnini.** No annotations in `var` (`gene_ids`, `feature_types` only), but the panel has the SHH
 readouts (PTCH1, GLI1, HHIP), the ligand (SHH) and the ventral/dorsal identity genes. The same
-machinery runs with `mask_genes: [PTCH1, GLI1, HHIP]`; which genes form the hidden set is the
-user's call (not decided).
+machinery runs with `mask_genes: [PTCH1, GLI1, HHIP]`. *Decided 2026-10-20:* the hidden set is the whole
+dorsoventral identity code (15 genes, the main task) together with the three readouts (the positive control),
+selected by `var['role']`; the genes, the reasons and the sources are in `legnini_plan.md`, and
+`legnini_programme.py` runs it (5 arms, 7 runs; not run yet).
 
 **Updated 2026-10-19 for the three-week roadmap** (`roadmap.md`, T0 and T1b): `response_masking` now runs
 three seeds of `lin_fourier`, `joint_rope`, `joint_fourier` and `lin_fourier_pool500`, one of the rest
