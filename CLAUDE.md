@@ -15,6 +15,11 @@ known problems of the global model, as tracks with a schedule and decision point
 in the plan files below. Read it before starting work on any of its tracks, and update its status
 table in the same commit as the work it describes.
 
+What each test showed -- what worked and what does not -- is logged in [`.claude/notes.md`](.claude/notes.md).
+It is append-only: after reading a new test, add a dated entry at the end with a short title saying what the
+test was about, then its **What worked** and **What doesn't work** points; never overwrite or edit an earlier
+entry (a correction is a new entry).
+
 Work on contrastive / auxiliary losses for the global component is planned in
 [`.claude/contrastive_plan.md`](.claude/contrastive_plan.md). It carries the staged design, a
 status table, and an invariants checklist — read it before touching `train/losses.py`,
