@@ -237,7 +237,8 @@ def test_queries_the_transformer_left_out_are_not_in_the_check():
     random.seed(3)
     ranked, found = _rank(module, data, edges, steps=4, queries_per_program=25)
     check = found["check"].set_index(["head", "program"])
-    assert 15 <= check.loc[("global", "any"), "n_queries"] < 24  # 24 receivers asked; the cells pad_batch dropped have no row
+    # 24 receivers asked; the cells pad_batch dropped have no row.
+    assert 15 <= check.loc[("global", "any"), "n_queries"] < 24
     assert np.isfinite(check["value"]).all() and np.isfinite(ranked)
 
 
@@ -263,7 +264,8 @@ def test_the_baseline_is_the_cell_the_contributions_are_measured_from():
     high, _ = _attribute(head, data, [CENTRE], baseline=torch.full((G,), 3.0))["local"]
     assert (low[0] >= 0).all() and (high[0] <= 0).all()  # inputs lie between 0 and 3
     default, _ = _attribute(head, data, [CENTRE])["local"]
-    assert torch.equal(default, _attribute(head, data, [CENTRE], baseline=data.x.mean(0))["local"][0])  # the graph's mean
+    from_mean, _ = _attribute(head, data, [CENTRE], baseline=data.x.mean(0))["local"]
+    assert torch.equal(default, from_mean)  # the default is the graph's mean
     assert not torch.equal(default, low)
     with pytest.raises(ValueError, match="baseline holds 3 genes"):
         _attribute(head, data, [CENTRE], baseline=torch.zeros(3))
@@ -385,7 +387,8 @@ def test_a_cell_the_transformer_left_out_has_no_row():
 def test_response_influence_reads_both_heads_of_a_dual_decoder_and_checks_the_sum():
     module = _dual()
     data = _lattice(9)
-    edges = pd.concat([_edges([(CENTRE + 3, CENTRE)], range_class="far"), _edges([(CENTRE + 1, CENTRE)], range_class="near")])
+    far, near = _edges([(CENTRE + 3, CENTRE)], range_class="far"), _edges([(CENTRE + 1, CENTRE)], range_class="near")
+    edges = pd.concat([far, near])
     _, found = _rank(module, data, edges, steps=8)
     ranks = found["edges"].set_index(["head", "range_class", "program"])["value"]
     assert ranks[("local", "far", "P>R")] == pytest.approx(0.5)  # three steps: past the GCN, nothing to rank

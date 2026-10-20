@@ -693,7 +693,10 @@ def _versus_bar(per_arm: dict[str, pd.DataFrame], bar: str, prefix: str, margin:
         references = [c for c in table.columns if str(c).startswith(REFERENCE_PREFIX)]
         if not programmes or (bar != BEST_REFERENCE and bar not in table.columns):
             continue
-        reference = table.loc[programmes, references].max(axis=1) if bar == BEST_REFERENCE else table.loc[programmes, bar]
+        if bar == BEST_REFERENCE:
+            reference = table.loc[programmes, references].max(axis=1)
+        else:
+            reference = table.loc[programmes, bar]
         heads = [
             c
             for c in table.columns

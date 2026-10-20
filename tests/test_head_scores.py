@@ -401,7 +401,8 @@ def test_scoring_within_the_cells_that_respond_reads_the_response_where_there_is
     with pytest.raises(ValueError, match="shape"):
         score_heads(pred, genes, center=np.zeros(3), gene_groups={"r": ["r"]}, group_cells={"r": receivers[:5]})
     assert "by_group_cells" not in score_heads(pred, genes, center=np.zeros(3), gene_groups={"r": ["r"]})
-    nothing = score_heads(pred, genes, center=np.zeros(3), gene_groups={"r": ["r"]}, group_cells={"r": ~receivers & False})
+    nobody = np.zeros(len(receivers), bool)
+    nothing = score_heads(pred, genes, center=np.zeros(3), gene_groups={"r": ["r"]}, group_cells={"r": nobody})
     assert nothing["by_group_cells"].empty
 
 

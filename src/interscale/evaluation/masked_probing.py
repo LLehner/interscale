@@ -1181,7 +1181,9 @@ def score_heads(
         for group, cells in group_cells.items():
             cells = np.asarray(cells, dtype=bool)
             if cells.shape != (len(true),):
-                raise ValueError(f"group_cells[{group!r}] has shape {cells.shape}; the predictions have {len(true)} cells.")
+                raise ValueError(
+                    f"group_cells[{group!r}] has shape {cells.shape}; the predictions have {len(true)} cells."
+                )
             keep = np.zeros_like(hidden)
             keep[:, group_columns[group]] = hidden[:, group_columns[group]]
             keep[~cells] = False

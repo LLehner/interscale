@@ -423,7 +423,7 @@ def test_the_response_influence_compacts_and_gets_a_summary_table(tmp_path):
 
 def _programmes(model, bar, extra=None):
     """``heads_by_group`` with five programmes, a pooled role and a noise group; ``model`` and ``bar`` per programme."""
-    names = ["interaction=P1", "interaction=P2", "interaction=P3", "interaction=P4", "interaction=P5", "role=response", "role=noise"]
+    names = [f"interaction=P{k}" for k in range(1, 6)] + ["role=response", "role=noise"]
     columns = {"n_hidden": [10] * 7, "global": [*model, 0.5, 0.0], "ref_own+context": [*bar, 0.4, 0.0], "ref_own": [0.1] * 7}
     return pd.DataFrame({**columns, **(extra or {})}, index=pd.Index(names, name="group"))
 
