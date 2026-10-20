@@ -12,6 +12,24 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Sender attribution: `receptive_field.response_influence(measure="attribution")` ranks a planted sender
+  by its *contribution* to its receiver's predicted response -- integrated gradients (Gauss-Legendre,
+  `steps` points) from a baseline cell (`baseline`: a `[G]` expression, e.g. the training mean; default the
+  graph's mean; a model without a GCN moves from its graph's mean token), the net contribution of each
+  cell summed over its visible entries, on the summed response genes of the programme. A hidden entry does
+  not move, and the passes along the path replay one random state (`pad_batch` subsamples long graphs with
+  Python's `random`). The new `check` table gives `completeness_gap`: the share of the response's change from
+  the baseline that the contributions fail to add up to, per programme and over all. The squared gradient
+  stays as `measure="gradient"` (reach, not use).
+- Scoring within the cells that respond: `HeadPredictions.cells` (the graphs' `obs_names` of each row),
+  `masked_probing.group_receivers` (the rows that are receivers of the programme a gene group holds, from
+  the planted edges) and `score_heads(group_cells=...)`, whose `by_group_cells` table is the pooled centred
+  cosine over a group's hidden entries in those cells alone (the response where there is one to predict,
+  apart from telling who responds).
+- The summary counts, per programme and with every programme weighing the same, the wins, ties and losses
+  of each head against a bar (`write_report(bar="ref_own+context", programmes="interaction=")`, ties within
+  0.05) for all cells and within receivers, names the best and worst programme, and shows the attribution's
+  completeness gap; the pooled score is carried by the programmes with the most hidden entries.
 - Pooled tokens (`model.global_component.parameters.pooling`, default `kind: none`): the transformer runs
   on patches of cells instead of single cells. `kind: grid` groups cells into squares by position alone
   (`size_um`, or `n_patches` for about that many per slide; `offset` shifts the grid); a patch token is the
@@ -147,6 +165,11 @@ and this project adheres to [Semantic Versioning][].
   running the granularity/rate ablation.
 
 ### Changed
+
+- `receptive_field.response_influence` defaults to `measure="attribution"` (it was the squared gradient).
+  Ranks from the squared gradient were not a measure of use -- a mean-aggregating GCN weighs its neighbours
+  alike, and ranked its own planted senders at 0.41 while predicting their responses at 0.59 -- and are not
+  comparable with the attribution's. `measure="gradient"` gives the old numbers.
 
 - Attention records carry the mask's open keys (`open`), and `attention_by_query` and the online
   attention diagnostics read open keys from it rather than from weights above 0, which a sparse

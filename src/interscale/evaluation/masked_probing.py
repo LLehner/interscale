@@ -525,12 +525,17 @@ class HeadPredictions:
         ``[N]`` distance from each wholly hidden cell to the nearest cell of its graph with any
         visible entry, in µm; 0 for every other cell and ``inf`` in a graph hidden completely.
         None when the graphs carry no ``pos``.
+    cells
+        ``[N]`` the name of each row's cell as its graph carries it (``obs_names``: the cell's
+        position in the AnnData plus the dataset's offset), to find a row again in ``adata.obs``
+        (:func:`group_receivers`). None when the graphs carry none.
     """
 
     heads: dict[str, np.ndarray]
     true: np.ndarray
     hidden: np.ndarray
     depth_um: np.ndarray | None = None
+    cells: np.ndarray | None = None
 
 
 def _weighted_mean(w: torch.Tensor, xv: torch.Tensor, vis: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
@@ -883,7 +888,7 @@ def collect_head_predictions(
     was_training = module.training
     module.eval()
     heads: dict[str, list[np.ndarray]] = {}
-    chunks = {"true": [], "hidden": [], "depth_um": []}
+    chunks = {"true": [], "hidden": [], "depth_um": [], "cells": []}
     loader = DataLoader(dataset=data_list, shuffle=False, batch_size=batch_size, num_workers=0)
     try:
         with _rng_untouched(device), torch.no_grad():
@@ -898,6 +903,9 @@ def collect_head_predictions(
                     heads.setdefault(name, []).append(value.cpu().numpy())
                 chunks["true"].append(y_true.cpu().numpy())
                 chunks["hidden"].append(entry_mask.bool().cpu().numpy())
+                names = getattr(batch, "obs_names", None)
+                if isinstance(names, torch.Tensor):
+                    chunks["cells"].append(names[idx].double().cpu().numpy())
 
                 gene_mask = getattr(batch, "gene_mask", None) if mask_strategy == "gene" else None
                 hidden = batch.mask.bool()[:, None].expand_as(batch.x) if gene_mask is None else gene_mask.bool()
@@ -938,6 +946,7 @@ def collect_head_predictions(
         true=cat("true"),
         hidden=cat("hidden"),
         depth_um=cat("depth_um"),
+        cells=cat("cells"),
     )
 
 
@@ -966,7 +975,60 @@ def blend_heads(pred: HeadPredictions, reference: str, *, weight: float = 0.5) -
     models = [h for h in pred.heads if not h.startswith((REFERENCE_PREFIX, BLEND_PREFIX))]
     ref = pred.heads[reference]
     blends = {f"{BLEND_PREFIX}{h}": (1.0 - weight) * pred.heads[h] + weight * ref for h in models}
-    return HeadPredictions(heads=pred.heads | blends, true=pred.true, hidden=pred.hidden, depth_um=pred.depth_um)
+    return HeadPredictions(
+        heads=pred.heads | blends, true=pred.true, hidden=pred.hidden, depth_um=pred.depth_um, cells=pred.cells
+    )
+
+
+def group_receivers(
+    pred: HeadPredictions,
+    edges: pd.DataFrame,
+    edge_genes,
+    gene_groups: dict[str, list[str]],
+    genes: list[str],
+    *,
+    offset: int = 1,
+) -> dict[str, np.ndarray]:
+    """``{group: [N] bool}``: which rows of ``pred`` are receivers of the programme a gene group holds.
+
+    A group stands for a programme when the genes of it that are hidden (a group also holds the
+    programme's visible source and receptor genes) are exactly the response genes of at least one
+    planted programme (``edge_genes(program)``, the columns, as for
+    :func:`~interscale.evaluation.receptive_field.response_influence`); its receivers are the receivers
+    of all such programmes. A group of other genes -- a role pooled over programmes, noise -- is left
+    out, as is one with no planted receiver among the rows. The rows are found again through
+    ``pred.cells``.
+
+    Parameters
+    ----------
+    pred
+        From :func:`collect_head_predictions`, which fills ``cells``.
+    edges
+        Planted ``receiver`` and ``program`` pairs by position in the AnnData the graphs were built from.
+    edge_genes
+        ``program -> [columns]``.
+    gene_groups, genes
+        As for :func:`score_heads`.
+    offset
+        What the graphs add to a cell's position to name it (``tl.geome_utils.prepare_geome_dataset``).
+    """
+    if pred.cells is None:
+        raise ValueError("the predictions carry no cell names; collect them from graphs with `obs_names`.")
+    position = np.rint(pred.cells).astype(np.int64) - int(offset)
+    index = {g: k for k, g in enumerate(genes)}
+    hidden = set(np.flatnonzero(pred.hidden.any(axis=0)).tolist())
+    programmes = {str(p): sorted(int(c) for c in edge_genes(str(p))) for p in edges["program"].unique()}
+    out = {}
+    for group, members in gene_groups.items():
+        columns = sorted(index[g] for g in members if g in index and index[g] in hidden)
+        found = [p for p, response in programmes.items() if response and response == columns]
+        if not found:
+            continue
+        receivers = edges.loc[edges["program"].astype(str).isin(found), "receiver"].to_numpy().astype(np.int64)
+        rows = np.isin(position, receivers)
+        if rows.any():
+            out[group] = rows
+    return out
 
 
 def _r2(pred: np.ndarray, true: np.ndarray) -> float:
@@ -995,6 +1057,7 @@ def score_heads(
     gene_groups: dict[str, list[str]] | None = None,
     depth_bins_um: list[float] | None = None,
     gene_metrics: tuple[str, ...] = ("r2", "pearson"),
+    group_cells: dict[str, np.ndarray] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Score every head of one pass -- the model's and the references -- on its hidden entries.
 
@@ -1016,6 +1079,10 @@ def score_heads(
     gene_metrics
         What the per-gene table holds, from :data:`GENE_METRICS`: ``r2``, ``pearson`` (Pearson r),
         and ``cosine``, the centred cosine pooled over the gene's hidden entries (needs ``center``).
+    group_cells
+        ``{group: [N] bool}`` the rows (cells) a group is also scored on alone, e.g. the receivers
+        of a programme (:func:`group_receivers`), for the ``"by_group_cells"`` table. A group not
+        in ``gene_groups`` is an error.
 
     Returns
     -------
@@ -1028,7 +1095,10 @@ def score_heads(
         among the ``gene_metrics`` the mean of its genes' R². ``"by_depth"`` (with
         ``depth_bins_um``): the ``"cells"`` columns per depth bin. ``"by_group_depth"`` (with both):
         per group and depth (``"all"``, then each bin of wholly hidden cells), the hidden entries'
-        count and each head's pooled centred cosine (``<head>_cosine``). With both a ``local`` and a
+        count and each head's pooled centred cosine (``<head>_cosine``). ``"by_group_cells"`` (with
+        ``group_cells``): per group, the pooled cosine over its hidden entries in the flagged cells
+        alone, with their count (``n_cells``): the response where there is one to predict, apart from
+        telling which cells respond (``"by_group"`` scores both at once). With both a ``local`` and a
         ``global`` head, each table but ``"by_group_depth"`` also carries ``global - local`` columns:
         positive is the global head better for R², r and cosine, negative for SCE.
     """
@@ -1102,6 +1172,28 @@ def score_heads(
                 row["global - local_cosine"] = row["global_cosine"] - row["local_cosine"]
             rows.append(row)
         tables["by_group"] = pd.DataFrame(rows)
+
+    if group_cells:
+        unknown = sorted(set(group_cells) - set(group_columns))
+        if unknown:
+            raise ValueError(f"group_cells names groups that gene_groups lacks: {unknown}.")
+        rows = []
+        for group, cells in group_cells.items():
+            cells = np.asarray(cells, dtype=bool)
+            if cells.shape != (len(true),):
+                raise ValueError(f"group_cells[{group!r}] has shape {cells.shape}; the predictions have {len(true)} cells.")
+            keep = np.zeros_like(hidden)
+            keep[:, group_columns[group]] = hidden[:, group_columns[group]]
+            keep[~cells] = False
+            if not keep.any():
+                continue
+            row = {"group": group, "n_cells": int(keep.any(axis=1).sum()), "n_hidden": int(keep.sum())}
+            for name, p in heads.items():
+                row[f"{name}_cosine"] = _pooled_cosine(p - offset, true - offset, keep)
+            if both:
+                row["global - local_cosine"] = row["global_cosine"] - row["local_cosine"]
+            rows.append(row)
+        tables["by_group_cells"] = pd.DataFrame(rows)
 
     if depth_bins_um is not None:
         if pred.depth_um is None:

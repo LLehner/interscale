@@ -84,6 +84,8 @@ NOTES = {
     "(µm to the nearest visible spot); higher is better, the bar is the best reference",
     "heads_sce_by_depth": "raw SCE (1 - cosine) on hidden spots, by depth; lower is better",
     "heads_by_group": "centred cosine pooled over each gene group's hidden entries",
+    "heads_by_group_cells": "the same, over the hidden entries of the cells that respond (a programme's "
+    "receivers) alone: the response where there is one to predict, apart from telling which cells respond",
     "heads_group_by_depth": "centred cosine pooled over each gene group's hidden entries, by depth; rows per group: "
     "the hidden entries' count, every head, every reference (ref_*)",
     "context_labels": "balanced accuracy of a label probe from hidden spots, by depth; smoother = references as "
@@ -99,6 +101,12 @@ NOTES = {
     "prediction), span_rel and effective_rel against uniform weights",
     "erf_profile": "influence per distance bin (µm) over uniform weights (1: uniform)",
     "erf_edges": "planted pairs: the sender's rank in the receiver's influence among visible spots as far (0.5: blind)",
+    "response_edges": "programme masking: the planted sender's rank in its receiver's attribution (integrated "
+    "gradients on the summed response genes) among cells as far from the receiver (0.5: blind to the sender)",
+    "response_profile": "programme masking: attribution of the sampled receivers per distance bin (µm) over "
+    "uniform weights (1: uniform)",
+    "response_check": "programme masking: share of the response's change from the baseline cell that the "
+    "contributions fail to add up to (0: they add up; over 0.1: the integration is too coarse)",
     "flow_summary": "where the cells of a patch draw their predictions from -- influence (gradient flow) and "
     "rollout (attention composed over layers with the residual path) -- against the slide with the visible "
     "cells' expression permuted: reach in µm, share kept in the source patch, KL from the permutations and "
@@ -193,7 +201,8 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
 
     Known inputs: ``heads_cells``, ``heads_by_depth``, ``heads_by_group``, ``context_labels``,
     ``source_distances``, ``representations``, ``attention_by_query``, ``attention_profile``,
-    ``attention_edges``, ``erf_by_query``, ``erf_profile``, ``erf_edges`` and ``training``. The
+    ``attention_edges``, ``erf_by_query``, ``erf_profile``, ``erf_edges``, ``heads_by_group_cells``,
+    ``response_edges``, ``response_profile``, ``response_check`` and ``training``. The
     per-gene head scores are left out (``heads_by_group`` summarises them); any other table passes
     through unchanged.
     """
@@ -207,6 +216,10 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         groups = tables["heads_by_group"]
         columns = _head_columns(groups, "_cosine")
         out["heads_by_group"] = groups.set_index("group")[list(columns)].rename(columns=columns)
+    if "heads_by_group_cells" in tables:
+        groups = tables["heads_by_group_cells"]
+        columns = _head_columns(groups, "_cosine")
+        out["heads_by_group_cells"] = groups.set_index("group")[list(columns)].rename(columns=columns)
     if "heads_by_group_depth" in tables:
         groups = tables["heads_by_group_depth"]
         columns = _head_columns(groups.drop(columns="n_genes", errors="ignore"), "_cosine")
@@ -278,6 +291,12 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         )
     if "response_profile" in tables:
         out["response_profile"] = _pivot(tables["response_profile"], ["head", "range_class"], "distance_um", "lift")
+    if "response_check" in tables:
+        out["response_check"] = (
+            tables["response_check"]
+            .set_index(["head", "program"])[["value", "n_queries"]]
+            .rename(columns={"value": "completeness_gap"})
+        )
     if "training" in tables:
         out["training"] = tables["training"].set_index("metric")[["value"]]
     known = {
@@ -285,6 +304,7 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         "heads_by_depth",
         "heads_per_gene",
         "heads_by_group",
+        "heads_by_group_cells",
         "heads_by_group_depth",
         "context_labels",
         "source_distances",
@@ -299,6 +319,7 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         "flow_labels",
         "response_edges",
         "response_profile",
+        "response_check",
         "training",
     }
     out.update({name: table for name, table in tables.items() if name not in known})
@@ -400,14 +421,17 @@ def write_report(
     arms: list[str] | None = None,
     groups: list[str] | None = None,
     parts=None,
+    bar: str | None = None,
+    programmes: str = "interaction=",
 ) -> str:
     """Rewrite the results file: header, the summary over its arms, then every section once.
 
     ``arms`` orders the arms (e.g. the sweep's, each followed by its ``_untrained`` twin); arms in
     the file but not in the list follow in order of appearance. ``groups`` limits the summary's
     gene-group tables to those groups; the sections keep every group. ``parts`` is a folder of
-    per-arm section files (:func:`read_parts`) merged over the file's own sections. Returns the
-    summary as text.
+    per-arm section files (:func:`read_parts`) merged over the file's own sections. ``bar`` and
+    ``programmes`` add the tables of programmes won, tied and lost against a reference
+    (:func:`summary_tables`). Returns the summary as text.
     """
     path = Path(path)
     sections = read_sections(path)
@@ -415,7 +439,7 @@ def write_report(
         sections = read_parts(parts, sections)
     present = list(dict.fromkeys(arm for arm, _ in sections))
     order = [arm for arm in (arms or []) if arm in present] + [arm for arm in present if arm not in (arms or [])]
-    summary = render_summary(summary_tables(sections, order, groups))
+    summary = render_summary(summary_tables(sections, order, groups, bar=bar, programmes=programmes))
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     text = f"# {title}\n\n{LEGEND}\n\n# Summary\n\n_Rebuilt {stamp} from {len(order)} arms: {', '.join(order)}._\n\n"
     text += summary + "\n# Sections\n\n"
@@ -647,15 +671,79 @@ def _select(per_arm: dict[str, pd.DataFrame], level: str, value, keep: list[str]
     return table[ordered(table.columns)].dropna(axis=1, how="all")
 
 
-def summary_tables(sections, arms: list[str], groups: list[str] | None = None) -> list[tuple[str, pd.DataFrame]]:
+#: How far a programme's score must lie from the bar's to count as a win or a loss rather than a tie.
+TIE_MARGIN = 0.05
+
+
+def _versus_bar(per_arm: dict[str, pd.DataFrame], bar: str, prefix: str, margin: float) -> pd.DataFrame | None:
+    """Rows ``(arm, head)``: on how many programmes the head beats, ties or loses to ``bar``.
+
+    The programmes are the groups whose name starts with ``prefix``; a win or a loss is a score more
+    than ``margin`` above or below the bar's on that programme, a tie anything between. The means
+    weigh every programme alike, which a pooled score does not: that one is carried by the programmes
+    holding most of the hidden entries. ``best`` and ``worst`` name the programmes of the largest gain and loss.
+    """
+    rows = []
+    for arm, table in per_arm.items():
+        programmes = [g for g in table.index if str(g).startswith(prefix)]
+        if bar not in table.columns or not programmes:
+            continue
+        reference = table.loc[programmes, bar]
+        heads = [
+            c
+            for c in table.columns
+            if c not in COUNTS and not str(c).startswith((REFERENCE_PREFIX, "blend_"))
+        ]
+        for head in heads:
+            score = table.loc[programmes, head]
+            valid = (score.notna() & reference.notna()).to_numpy()
+            if not valid.any():
+                continue
+            gain = (score - reference)[valid].round(9)  # a difference of exactly the margin is a tie, not float noise
+            best, worst = gain.idxmax(), gain.idxmin()
+            rows.append(
+                {
+                    "arm": arm,
+                    "head": head,
+                    "programmes": int(valid.sum()),
+                    "wins": int((gain > margin).sum()),
+                    "ties": int((gain.abs() <= margin).sum()),
+                    "losses": int((gain < -margin).sum()),
+                    "mean": float(score[valid].mean()),
+                    "bar mean": float(reference[valid].mean()),
+                    "best": f"{str(best)[len(prefix):]} {gain[best]:+.2f}",
+                    "worst": f"{str(worst)[len(prefix):]} {gain[worst]:+.2f}",
+                }
+            )
+    if not rows:
+        return None
+    return pd.DataFrame(rows).set_index(["arm", "head"])
+
+
+def summary_tables(
+    sections,
+    arms: list[str],
+    groups: list[str] | None = None,
+    *,
+    bar: str | None = None,
+    programmes: str = "interaction=",
+    margin: float = TIE_MARGIN,
+) -> list[tuple[str, pd.DataFrame]]:
     """The cross-arm tables of the summary, from the sections of ``arms``; missing analyses are skipped.
 
-    ``groups`` limits the gene-group tables to those groups (None: every group).
+    ``groups`` limits the gene-group tables to those groups (None: every group). ``bar`` names the
+    reference (a column of the head scores, e.g. ``ref_own+context``) every programme -- a group
+    named ``programmes<...>`` -- is compared with, for the tables of wins, ties and losses
+    (:func:`_versus_bar`, ``margin`` apart); None leaves them out.
     """
     if seed_groups(arms):
         mean, sd, shown, found = average_over_seeds(sections, arms)
         note = ", ".join(f"{base} [{len(runs)} seeds]" for base, runs in found.items())
-        tables = [(f"{title} (seeds averaged: {note})" if k == 0 else title, t) for k, (title, t) in enumerate(summary_tables(mean, shown, groups))]
+        options = {"bar": bar, "programmes": programmes, "margin": margin}
+        tables = [
+            (f"{title} (seeds averaged: {note})" if k == 0 else title, t)
+            for k, (title, t) in enumerate(summary_tables(mean, shown, groups, **options))
+        ]
         return tables + _seed_tables(sections, mean, sd, found, shown, groups)
 
     out = []
@@ -676,6 +764,16 @@ def summary_tables(sections, arms: list[str], groups: list[str] | None = None) -
     if groups is not None:
         by_group = {arm: table.loc[[g for g in groups if g in table.index]] for arm, table in by_group.items()}
     add("centred cosine per gene group on hidden spots", _heads_summary(by_group))
+    if bar is not None:
+        what = f"programmes ('{programmes}...') against the bar {bar}: wins / ties / losses by more than {margin:g}"
+        add(
+            f"{what}; means weigh every programme alike",
+            _versus_bar(_per_arm(sections, "heads_by_group", arms), bar, programmes, margin),
+        )
+        add(
+            f"{what}, scored within their receivers alone",
+            _versus_bar(_per_arm(sections, "heads_by_group_cells", arms), bar, programmes, margin),
+        )
     add(
         "centred cosine per gene group on hidden spots by depth; best = the highest reference per bin",
         _group_depth_summary(_per_arm(sections, "heads_group_by_depth", arms), groups),
@@ -775,6 +873,16 @@ def summary_tables(sections, arms: list[str], groups: list[str] | None = None) -
         add(
             "programme masking: planted sender's rank in its receiver's predicted response among cells as far (0.5: blind)",
             pd.concat(rows).unstack("range_class"),
+        )
+    rows = []
+    for arm, table in _per_arm(sections, "response_check", arms).items():
+        overall = table.xs("any", level="program")["completeness_gap"]
+        rows.append(overall.rename(arm))
+    if rows:
+        add(
+            "programme masking, attribution: share of the response's change from the baseline the contributions "
+            "fail to add up to (0: complete; over 0.1: too few integration steps)",
+            pd.DataFrame(rows),
         )
     parts = []
     for arm, table in _per_arm(sections, "flow_summary", arms).items():

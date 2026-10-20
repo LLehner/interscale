@@ -830,6 +830,29 @@ programme masking when the embedding's genes are recorded), and three pooled arm
 patches of 5 x 5 spots; 200 and 300 um held 4 and 9 spots and were dropped). Each run writes its own sections; `MODE = "list"` / `ARRAY_TASK` / `MODE = "report"` give one
 job per run (see `sweep_common.py`).
 
+**Updated 2026-10-20 for the evaluation fix** (roadmap T1 and T4; training is unchanged). The second read found
+three things the sweep's evaluation could not say, so three things changed in how it reports:
+
+1. *Sender ranks.* The squared gradient is a sensitivity, so a mean-aggregating GCN ranked its own senders
+   0.41 while predicting their responses at 0.59. `response_influence` now defaults to integrated gradients
+   from the training-mean cell on the summed response genes of a programme (`RESPONSE_MEASURE = "attribution"`,
+   `RESPONSE_STEPS = 5`); a cell's weight is the size of its net contribution, the planted sender is still
+   ranked among cells as far from the receiver, and `response_check` reports the share of the response's
+   change the contributions fail to add up to (below 0.1 is fine). Read a rank against the **untrained twin**
+   (random weights already rank dense and short-range senders at ~0.6 on the stub, because senders deviate
+   most from the baseline), not against 0.5.
+2. *Sparse programmes.* Every programme with planted receivers is also scored within them
+   (`heads_by_group_cells`): the pooled score mixes "which cells respond" with "how strongly", and the sparse
+   responses (1.4% receivers) are dominated by the first.
+3. *Per-programme comparison.* The summary counts, with every programme weighing the same, the wins, ties and
+   losses of each head against `ref_own+context` (`PROGRAMME_BAR`, ties within 0.05), for all cells and within
+   receivers, and names the best and worst programme.
+
+To read it: copy the fork's `main` and the updated `sweep_common.py` / `response_masking.py` to the cluster,
+then `INTERSCALE_MODE=evaluate` for the 19 checkpoints (the saved references are reused; the sender step costs
+about 2.5x the old gradient step) and `INTERSCALE_MODE=report`. The old sender-rank tables (gradient
+magnitudes) are replaced by the newer sections, and are not comparable with them.
+
 ## Order and decision points
 
 1. **Stage 0a + 0b** (needed to read any of A–C) and **A1**. Then sweep **A2**; it is the cheapest

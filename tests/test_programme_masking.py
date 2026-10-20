@@ -8,8 +8,10 @@ Pinned here:
 * fitted references -- ``ref_own`` reads within-cell co-expression, ``ref_own+context`` a field of
   the surrounding cells, neither reads a hidden value, genes never hidden fall back to their mean,
   and through ``collect_head_predictions`` every reference row is its own cell;
-* response influence -- a planted sender ranks 1 among cells as far from its receiver, a distance
-  kernel 0.5, a cell counts through its visible entries only, and no generator is touched.
+* response influence -- by squared gradient (``measure="gradient"``; the attribution is pinned in
+  ``test_attribution.py``) a planted sender ranks 1 among cells as far from its receiver, a distance
+  kernel 0.5; by either measure a cell counts through its visible entries only, a receiver is read on
+  its programme's response genes only, and no generator is touched.
 """
 
 from types import SimpleNamespace
@@ -297,6 +299,7 @@ def test_through_the_collection_every_fitted_reference_row_is_its_own_cell():
     rows = [int(np.flatnonzero((data.x.numpy() == row).all(1))[0]) for row in heads.true]
     assert len(rows) == 30 and len(set(rows)) == 30  # a subsample of the 49 cells
     assert np.allclose(heads.heads["ref_own"], direct[rows])
+    assert np.array_equal(heads.cells, data.obs_names.numpy()[rows])  # each row names its cell, in the model's order
 
 
 # --------------------------------------------------------------------------- response influence
@@ -333,6 +336,7 @@ def _influence(module, data, edges, **kwargs):
         "edge_genes": lambda program: [5],
         "n_projections": 4,
         "tolerance_um": 1.0,  # the same lattice distance only: steps are 10 um here
+        "measure": "gradient",  # what these tests were written for; test_attribution.py pins the attribution
     }
     return response_influence(module, [data], **(options | kwargs))
 
@@ -358,7 +362,8 @@ def test_a_planted_sender_ranks_one_and_a_distance_kernel_one_half():
     assert n == 81
 
 
-def test_a_cell_counts_through_its_visible_entries_only():
+@pytest.mark.parametrize("measure", ["gradient", "attribution"])
+def test_a_cell_counts_through_its_visible_entries_only(measure):
     data = _lattice(9, 0)
     draw_masks([data], "gene_set", 1.0, seed=0, columns=[5])
     planted = torch.zeros(81, 81)
@@ -366,15 +371,16 @@ def test_a_cell_counts_through_its_visible_entries_only():
     edges = pd.DataFrame({"sender": [43], "receiver": [40], "range_class": ["mid"], "program": ["P>R"]})
     # The head reads the sender's *hidden* gene 5 straight from the unmasked input: no visible entry carries it.
     leaking = _Planted(planted, driver=5, out=[5], leak=True)
-    found = _influence(leaking, data, edges)["edges"].set_index(["range_class", "program"])
+    found = _influence(leaking, data, edges, measure=measure)["edges"].set_index(["range_class", "program"])
     assert found.loc[("mid", "P>R"), "value"] == pytest.approx(0.5), "influence through a hidden entry counted"
 
 
-def test_receivers_without_their_response_hidden_are_not_queried():
+@pytest.mark.parametrize("measure", ["gradient", "attribution"])
+def test_receivers_without_their_response_hidden_are_not_queried(measure):
     data = _lattice(9, 0)
     draw_masks([data], "gene_set", 1.0, seed=0, columns=[4])  # gene 5, the programme's response, stays visible
     edges = pd.DataFrame({"sender": [43], "receiver": [40], "range_class": ["mid"], "program": ["P>R"]})
-    found = _influence(_Planted(torch.eye(81), driver=0, out=[5]), data, edges)["edges"]
+    found = _influence(_Planted(torch.eye(81), driver=0, out=[5]), data, edges, measure=measure)["edges"]
     assert found.empty
 
 
@@ -399,10 +405,11 @@ class _TwoProgrammes(torch.nn.Module):
         return SimpleNamespace(y_pred=y, y_true=batch.x, entry_mask=hidden, view=SimpleNamespace(padded_node_idx=None))
 
 
-def test_a_receiver_is_read_on_its_programmes_response_genes_only():
+@pytest.mark.parametrize("measure", ["gradient", "attribution"])
+def test_a_receiver_is_read_on_its_programmes_response_genes_only(measure):
     data = _lattice(9, 0)
     draw_masks([data], "gene_set", 1.0, seed=0, columns=[4, 5])
     edges = pd.DataFrame({"sender": [43], "receiver": [40], "range_class": ["mid"], "program": ["P>R"]})
     module = _TwoProgrammes(receiver=40, sender=43, distractor=37, n=81)  # 43 and 37: three steps either side
-    found = _influence(module, data, edges)["edges"].set_index(["range_class", "program"])
+    found = _influence(module, data, edges, measure=measure)["edges"].set_index(["range_class", "program"])
     assert found.loc[("mid", "P>R"), "value"] == pytest.approx(1.0), "another programme's sender leaked in"

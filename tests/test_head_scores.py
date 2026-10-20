@@ -10,6 +10,7 @@ above both.
 """
 
 import numpy as np
+import pandas as pd
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -21,6 +22,7 @@ from interscale.evaluation.masked_probing import (
     blend_heads,
     collect_head_predictions,
     draw_masks,
+    group_receivers,
     score_heads,
 )
 
@@ -344,7 +346,9 @@ def test_a_blend_of_two_heads_with_independent_errors_scores_above_both():
         "ref_kernel": true + rng.normal(scale=0.5, size=true.shape),
         "ref_slide_mean": np.tile(true.mean(0), (len(true), 1)),
     }
+    pred.cells = np.arange(len(true), dtype=float) + 1
     blended = blend_heads(pred, "ref_kernel")
+    assert np.array_equal(blended.cells, pred.cells)  # the rows keep their names
     assert set(blended.heads) == {"global", "ref_kernel", "ref_slide_mean", "blend_global"}
     assert np.allclose(blended.heads["blend_global"], 0.5 * (pred.heads["global"] + pred.heads["ref_kernel"]))
     assert blended.true is pred.true and "blend_global" not in pred.heads
@@ -361,3 +365,81 @@ def test_a_blend_of_two_heads_with_independent_errors_scores_above_both():
         blend_heads(pred, "ref_missing")
     with pytest.raises(ValueError, match="weight"):
         blend_heads(pred, "ref_kernel", weight=1.5)
+
+
+def test_scoring_within_the_cells_that_respond_reads_the_response_where_there_is_one():
+    n, genes = 40, ["a", "b", "r"]
+    receivers = np.arange(n) < 10
+    true = np.zeros((n, 3))
+    true[receivers, 2] = 3.0
+    hidden = np.zeros((n, 3), bool)
+    hidden[:, 2] = True  # the response gene is hidden in every cell, receiver or not
+    hidden[:, 0] = True  # and gene a too, which a second group holds with it
+    exact = true.copy()
+    blind = np.zeros((n, 3))
+    blind[:, 2] = 3.0  # predicts the response everywhere: it cannot tell who responds
+    pred = HeadPredictions(heads={"global": blind, "local": exact}, true=true, hidden=hidden)
+    tables = score_heads(
+        pred,
+        genes,
+        center=np.zeros(3),
+        gene_groups={"r": ["r"], "ab": ["a", "b"], "ar": ["a", "r"]},
+        group_cells={"r": receivers, "ar": receivers},
+    )
+    everywhere = tables["by_group"].set_index("group")
+    within = tables["by_group_cells"].set_index("group")
+    assert everywhere.loc["r", "local_cosine"] == pytest.approx(1.0)
+    assert everywhere.loc["r", "global_cosine"] == pytest.approx(0.5)  # sqrt(10 / 40): mass where nothing responds
+    assert within.loc["r", "global_cosine"] == pytest.approx(1.0)  # right in size and direction among receivers
+    assert within.loc["r", "global - local_cosine"] == pytest.approx(0.0)
+    assert within.loc["r", "n_cells"] == 10 and within.loc["r", "n_hidden"] == 10
+    assert within.loc["ar", "n_cells"] == 10 and within.loc["ar", "n_hidden"] == 20  # cells, not entries
+    assert list(within.index) == ["r", "ar"]  # a group without flagged cells is not a row
+
+    with pytest.raises(ValueError, match="lacks"):
+        score_heads(pred, genes, center=np.zeros(3), gene_groups={"r": ["r"]}, group_cells={"s": receivers})
+    with pytest.raises(ValueError, match="shape"):
+        score_heads(pred, genes, center=np.zeros(3), gene_groups={"r": ["r"]}, group_cells={"r": receivers[:5]})
+    assert "by_group_cells" not in score_heads(pred, genes, center=np.zeros(3), gene_groups={"r": ["r"]})
+    nothing = score_heads(pred, genes, center=np.zeros(3), gene_groups={"r": ["r"]}, group_cells={"r": ~receivers & False})
+    assert nothing["by_group_cells"].empty
+
+
+def test_receivers_are_found_again_through_the_cell_names_and_only_for_groups_that_are_a_programme():
+    positions = np.array([7, 2, 5, 9, 0, 3])  # a subsample of the cells, in the model's order; named position + 1
+    genes = ["src_m", "resp_m", "src_s", "resp_s1", "resp_s2", "noise"]
+    hidden = np.zeros((6, 6), bool)
+    hidden[:, [1, 3, 4]] = True  # the response genes only; a group's source genes stay visible
+    pred = HeadPredictions(
+        heads={"global": np.zeros((6, 6))},
+        true=np.zeros((6, 6)),
+        hidden=hidden,
+        cells=(positions + 1).astype(float),
+    )
+    edges = pd.DataFrame(
+        {
+            "sender": [1, 1, 1, 1],
+            "receiver": [2, 5, 8, 0],  # 8 is not among the rows
+            "program": ["S3>R3/R4", "S4>R3/R4", "S4>R3/R4", "M>MC"],
+            "range_class": "short",
+        }
+    )
+    response = {"S3>R3/R4": [3, 4], "S4>R3/R4": [3, 4], "M>MC": [1]}
+    groups = {
+        "interaction=S3/S4>R3/R4": ["src_s", "resp_s1", "resp_s2"],  # two programmes respond with these genes
+        "interaction=M>MC": ["src_m", "resp_m"],
+        "role=response": ["resp_m", "resp_s1", "resp_s2"],  # pooled over programmes: no programme responds with all
+        "role=noise": ["noise"],  # nothing hidden in it
+        "interaction=orphan": ["resp_s1"],  # a gene no programme responds with alone
+    }
+    found = group_receivers(pred, edges, response.__getitem__, groups, genes)
+    assert set(found) == {"interaction=S3/S4>R3/R4", "interaction=M>MC"}
+    assert found["interaction=S3/S4>R3/R4"].tolist() == [False, True, True, False, False, False]
+    assert found["interaction=M>MC"].tolist() == [False, False, False, False, True, False]
+    shifted = group_receivers(pred, edges, response.__getitem__, groups, genes, offset=0)  # names 8, 3, 6, 10, 1, 4
+    assert shifted["interaction=S3/S4>R3/R4"].tolist() == [True, False, False, False, False, False]
+    assert "interaction=M>MC" not in shifted  # its one receiver (0) is not among the rows: no group
+    with pytest.raises(ValueError, match="no cell names"):
+        group_receivers(
+            HeadPredictions(heads={}, true=pred.true, hidden=pred.hidden), edges, response.__getitem__, groups, genes
+        )

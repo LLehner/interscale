@@ -19,16 +19,16 @@ The terms used below:
 
 ## Status
 
-Last updated 2026-10-19.
+Last updated 2026-10-20.
 
 | track | question | state | verified by | date |
 |---|---|---|---|---|
 | T0 | infrastructure: seeds, per-arm evaluation, inputs, CosMx | **implemented, unverified** (2026-10-19; CosMx deferred by the user) — seed axis, run selection for job arrays, per-run section files, timing, cached references, `Precomputed` under programme masking, `pca_fit: train`; every mutation caught (two survivors led to a stronger test and a simplification), harness IDENTICAL; the sweep script checked on a stub synth_spot with untrained models. **Not run on data** | 2026-10-19 |
-| T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; sender ranks still unreadable → T4. Details in global_plan.md | `response_masking` run (11 arms, 19 runs, 3 twins) | 2026-10-20 |
+| T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; sender ranks unreadable (gradient magnitude) → replaced 2026-10-20 by an integrated-gradients attribution, sparse programmes also scored within their receivers, per-programme wins/ties/losses in the report (**built, not yet run: the 19 checkpoints await `MODE = "evaluate"`**). Details in global_plan.md | `response_masking` run (11 arms, 19 runs, 3 twins) | 2026-10-20 |
 | T1b | coarse-grained tokens: pool cells into patches or niches before the global model | **grid pooling implemented, unverified** (2026-10-19) — `pooling.kind: grid` (`size_um` or `n_patches`), `count`/`std` features, 39 tests, an end-to-end run for GlobalModel and CombinedModel, every mutation caught (one survivor led to a stronger test), harness IDENTICAL; 5 pooled arms in `response_masking`. The `niche` assignment waits for the user's details; patch-level attention readouts not built. **Not run on data** | 2026-10-19 |
 | T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed | | |
 | T3 | masking strategies | proposed | | |
-| T4 | interpretation beyond raw attention; attention sinks | proposed | | |
+| T4 | interpretation beyond raw attention; attention sinks | **sender attribution built, unverified on data** (2026-10-20) — `response_influence(measure="attribution")`: integrated gradients from the training-mean cell on a programme's summed response genes, completeness check, hidden entries fixed, one random state along the path; 16 + 6 tests, 31 mutations caught. Not built: the other methods of the table below, the null key and registers, the permuted-slide baseline. **Not run on data** | 2026-10-20 |
 | T5 | how cell-type driven attention is | proposed | | |
 | T6 | complexity vs tissue coverage ([attention_plan.md](attention_plan.md) stages 6, 8) | proposed | | |
 | T7 | disease-specific interactions | proposed | | |
@@ -405,6 +405,17 @@ switch, with a checkpoint tag and a leakage test through the real model.
 
 This is the quantitative analysis of attention-based interpretation that the description asks for.
 The design goes into `attribution_plan.md`.
+
+**Built 2026-10-20 (the part programme masking needed).** The squared-gradient sender rank was a
+sensitivity, not a use: a mean-aggregating GCN weighs its neighbours alike, so it ranked its own senders
+0.41 while predicting their responses at 0.59. `receptive_field.response_influence` now defaults to
+integrated gradients (`measure="attribution"`): the target is one receiver's summed predicted response
+genes, the baseline is the training-mean cell (a model without a GCN moves from its graph's mean token),
+a hidden entry does not move, and `steps` Gauss-Legendre points integrate the path (5 in the sweeps; a
+ReLU network lands 1-3% off completeness, reported as `response_check`). A cell's weight is the size of its
+net contribution; the planted sender is ranked against cells at the same distance as before. On toy heads a
+uniform aggregator ranks its sender 0.5 by gradient and 1.0 by attribution; a cell the head is very
+sensitive to but that sits at the baseline ranks 1.0 by gradient and 0.0 by attribution. See `tests/test_attribution.py`.
 
 - **One target for every method:** one cell's predicted programme (that programme's response
   genes, centred), as `response_influence` already uses. Never a summed LayerNorm output.

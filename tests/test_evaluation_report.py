@@ -421,6 +421,84 @@ def test_the_response_influence_compacts_and_gets_a_summary_table(tmp_path):
     )
 
 
+def _programmes(model, bar, extra=None):
+    """``heads_by_group`` with five programmes, a pooled role and a noise group; ``model`` and ``bar`` per programme."""
+    names = ["interaction=P1", "interaction=P2", "interaction=P3", "interaction=P4", "interaction=P5", "role=response", "role=noise"]
+    columns = {"n_hidden": [10] * 7, "global": [*model, 0.5, 0.0], "ref_own+context": [*bar, 0.4, 0.0], "ref_own": [0.1] * 7}
+    return pd.DataFrame({**columns, **(extra or {})}, index=pd.Index(names, name="group"))
+
+
+def test_every_programme_is_counted_as_a_win_a_tie_or_a_loss_against_the_bar(tmp_path):
+    from interscale.evaluation.report import _versus_bar
+
+    #           P1: +0.30 win   P2: +0.05 tie (the margin is inclusive)   P3: -0.05 tie   P4: -0.06 loss   P5: -0.40 loss
+    model = [0.70, 0.45, 0.35, 0.34, 0.20]
+    bar = [0.40, 0.40, 0.40, 0.40, 0.60]
+    table = _programmes(model, bar)
+    result = _versus_bar({"arm": table}, "ref_own+context", "interaction=", 0.05)
+    row = result.loc[("arm", "global")]
+    assert (row["programmes"], row["wins"], row["ties"], row["losses"]) == (5, 1, 2, 2)
+    assert row["mean"] == pytest.approx(np.mean(model)) and row["bar mean"] == pytest.approx(np.mean(bar))
+    assert row["best"] == "P1 +0.30" and row["worst"] == "P5 -0.40"
+    assert list(result.index) == [("arm", "global")]  # counts, references and the pooled groups are no heads or programmes
+    assert _versus_bar({"arm": table}, "ref_missing", "interaction=", 0.05) is None
+    assert _versus_bar({"arm": table}, "ref_own+context", "program=", 0.05) is None
+    wider = _versus_bar({"arm": table}, "ref_own+context", "interaction=", 0.5)
+    assert wider.loc[("arm", "global"), ["wins", "ties", "losses"]].tolist() == [0, 5, 0]
+
+    # A blend is not a head; a NaN score is left out of the counts.
+    with_blend = _programmes([0.7, np.nan, 0.35, 0.34, 0.2], bar, extra={"blend_global": [0.5] * 7})
+    result = _versus_bar({"arm": with_blend}, "ref_own+context", "interaction=", 0.05)
+    assert list(result.index) == [("arm", "global")] and result.loc[("arm", "global"), "programmes"] == 4
+
+
+def test_the_summary_compares_programmes_with_the_bar_only_when_asked_and_also_within_receivers(tmp_path):
+    path = tmp_path / "results.md"
+    bar = [0.4] * 5
+    sections = {
+        "heads_by_group": _programmes([0.7, 0.4, 0.4, 0.1, 0.1], bar),
+        "heads_by_group_cells": _programmes([0.9, 0.9, 0.4, 0.4, 0.4], bar),
+    }
+    append_sections(path, "arm", sections)
+    titles = [t for t, _ in summary_tables(read_sections(path), ["arm"])]
+    assert not any("against the bar" in t for t in titles)
+    tables = dict(summary_tables(read_sections(path), ["arm"], bar="ref_own+context"))
+    everywhere = next(t for title, t in tables.items() if "against the bar" in title and "receivers" not in title)
+    within = next(t for title, t in tables.items() if "against the bar" in title and "within their receivers" in title)
+    assert everywhere.loc[("arm", "global"), ["wins", "ties", "losses"]].tolist() == [1, 2, 2]
+    assert within.loc[("arm", "global"), ["wins", "ties", "losses"]].tolist() == [2, 3, 0]
+
+
+def test_the_within_receiver_scores_and_the_attribution_check_compact_and_reach_the_summary(tmp_path):
+    cells = pd.DataFrame(
+        {
+            "group": ["interaction=P1", "interaction=P2"],
+            "n_cells": [12, 30],
+            "n_hidden": [24, 60],
+            "global_cosine": [0.9, 0.4],
+            "ref_own+context_cosine": [0.5, 0.5],
+        }
+    )
+    check = pd.DataFrame(
+        [
+            {"head": "global", "program": prog, "metric": "completeness_gap", "value": v, "n_queries": n}
+            for prog, v, n in (("P1", 0.02, 8), ("any", 0.03, 16))
+        ]
+    )
+    compact = compact_tables({"heads_by_group_cells": cells, "response_check": check})
+    assert list(compact["heads_by_group_cells"].columns) == ["n_cells", "n_hidden", "global", "ref_own+context"]
+    assert compact["heads_by_group_cells"].loc["interaction=P2", "global"] == pytest.approx(0.4)
+    assert compact["response_check"].loc[("global", "any"), "completeness_gap"] == pytest.approx(0.03)
+    path = tmp_path / "results.md"
+    append_sections(path, "arm", compact)
+    assert "centred cosine pooled over the hidden entries of the cells that respond" not in path.read_text()
+    assert "the same, over the hidden entries of the cells that respond" in path.read_text()  # the section's note
+    table = next(
+        t for title, t in summary_tables(read_sections(path), ["arm"]) if "contributions fail to add up" in title
+    )
+    assert table.loc["arm", "global"] == pytest.approx(0.03)
+
+
 # --------------------------------------------------------------------------- seeds
 
 
@@ -466,6 +544,18 @@ def test_arms_at_several_seeds_are_one_row_of_means_with_the_spread_beside_it(tm
 
     ranks = next(t for title, t in tables.items() if title.startswith("programme masking, sender's rank: standard"))
     assert ranks.loc[("a [3 seeds]", "global"), "short"] == pytest.approx(0.1)
+
+
+def test_the_programme_comparison_is_made_on_the_means_over_seeds(tmp_path):
+    path = tmp_path / "results.md"
+    bar = [0.4] * 5
+    for arm, shift in (("a_s1", 0.0), ("a_s2", 0.2)):
+        model = [0.55 + shift, 0.4 + shift, 0.4, 0.4, 0.4]
+        append_sections(path, arm, {"heads_by_group": _programmes(model, bar)})
+    tables = dict(summary_tables(read_sections(path), ["a_s1", "a_s2"], bar="ref_own+context"))
+    versus = next(t for title, t in tables.items() if "against the bar" in title)
+    # The first seed alone wins one programme and ties four; the mean scores (P1 0.65, P2 0.50) win two.
+    assert versus.loc[("a [2 seeds]", "global"), ["wins", "ties", "losses"]].tolist() == [2, 3, 0]
 
 
 def test_the_rewrite_keeps_every_run_in_its_sections_and_the_note_names_the_seed_groups(tmp_path):
