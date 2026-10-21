@@ -56,6 +56,9 @@ FLOAT_FORMAT = "%.4g"
 COUNTS = {"n_cells": "hidden spots", "n_hidden": "hidden entries"}
 #: The model's own heads among the head-score columns; every other column is a reference.
 REFERENCE_PREFIX = "ref_"
+#: The reference that reads the planted drivers (``masked_probing.ORACLE_REFERENCE``): a bar for the task, shown beside
+#: the others but never "the best reference", which a model is compared with.
+ORACLE_REFERENCE = "ref_oracle"
 #: The feature set of model-free averages of the visible cells (``masked_probing.SMOOTHER``).
 SMOOTHER = "smoother"
 #: The feature set of a cell's place on its slide (``masked_probing.POSITION``).
@@ -112,6 +115,14 @@ NOTES = {
     "same weights; largest absolute difference (max_abs: the expected tensor's scale; inf: blocked entries differ)",
     "readout_edges": "the planted sender's rank among cells as far from its receiver, per way of reading attention "
     "(attention_check.READOUTS) and range class (0.5: blind to the sender; read against the untrained twin)",
+    "redundancy": "ridge R² of one representation from another, fitted on the training slides and scored on the test "
+    "slides, per query group (the group's own cells): global <- local near 1 = the global tokens hold nothing the local "
+    "ones do not; <- smoother and <- pe = what a spatial average of the visible expression, or the position alone, gives",
+    "attribution_shares": "share of the variance of a head's prediction over its hidden entries that each part supplies "
+    "(cov_share, sums to 1 over the parts; negative = it works against the others), by gene group and depth; heads "
+    "without parts are not listed",
+    "attribution_norms": "the norm of each part's centred prediction over that of the whole head (parts that cancel "
+    "sum to more than 1)",
     "readout_pairs": "the number of planted pairs behind each rank of readout_edges (a rank of few pairs is noise)",
     "readout_agreement": "mean Spearman correlation between two readouts' scores over a query's cells",
     "readout_span": "each readout's score-weighted distance to the query (span_um) and its share within each radius",
@@ -211,7 +222,7 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     ``source_distances``, ``representations``, ``attention_by_query``, ``attention_profile``,
     ``attention_edges``, ``erf_by_query``, ``erf_profile``, ``erf_edges``, ``heads_by_group_cells``,
     ``response_edges``, ``response_profile``, ``response_check``, ``attention_check``, ``readout_edges``,
-    ``readout_agreement``, ``readout_span`` and ``training``. The
+    ``readout_agreement``, ``readout_span``, ``redundancy``, ``attribution_shares`` and ``training``. The
     per-gene head scores are left out (``heads_by_group`` summarises them); any other table passes
     through unchanged.
     """
@@ -306,6 +317,13 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
             .set_index(["head", "program"])[["value", "n_queries"]]
             .rename(columns={"value": "completeness_gap"})
         )
+    if "redundancy" in tables:
+        red = tables["redundancy"]
+        out["redundancy"] = _pivot(red.assign(pair=red["target"] + " <- " + red["source"]), "pair", "query", "r2")
+    if "attribution_shares" in tables:
+        shares = tables["attribution_shares"]
+        out["attribution_shares"] = _pivot(shares, ["head", "part", "group"], "depth_um", "cov_share")
+        out["attribution_norms"] = _pivot(shares, ["head", "part", "group"], "depth_um", "norm_ratio")
     if "attention_check" in tables:
         out["attention_check"] = tables["attention_check"].set_index(["layer", "check", "quantity"])
     if "readout_edges" in tables:
@@ -339,6 +357,8 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         "response_profile",
         "response_check",
         "attention_check",
+        "redundancy",
+        "attribution_shares",
         "readout_edges",
         "readout_pairs",
         "readout_agreement",
@@ -663,9 +683,13 @@ def _group_depth_summary(per_arm: dict[str, pd.DataFrame], groups: list[str] | N
             if not found["shared"]:
                 for count in (h for h in part.index if str(h) in COUNTS):
                     found["shared"].append(part.loc[count].rename((group, "count", COUNTS[str(count)])))
-                references = part.loc[[h for h in part.index if str(h).startswith(REFERENCE_PREFIX)]]
+                references = part.loc[
+                    [h for h in part.index if str(h).startswith(REFERENCE_PREFIX) and h != ORACLE_REFERENCE]
+                ]
                 if len(references):
                     found["shared"].append(references.max().rename((group, "reference", "best")))
+                if ORACLE_REFERENCE in part.index:
+                    found["shared"].append(part.loc[ORACLE_REFERENCE].rename((group, "reference", "oracle")))
                 if "ref_slide_mean" in part.index:
                     found["shared"].append(part.loc["ref_slide_mean"].rename((group, "reference", "slide_mean")))
     order = [g for g in (groups or rows) if g in rows]
@@ -713,7 +737,7 @@ def _versus_bar(per_arm: dict[str, pd.DataFrame], bar: str, prefix: str, margin:
     rows = []
     for arm, table in per_arm.items():
         programmes = [g for g in table.index if str(g).startswith(prefix)]
-        references = [c for c in table.columns if str(c).startswith(REFERENCE_PREFIX)]
+        references = [c for c in table.columns if str(c).startswith(REFERENCE_PREFIX) and c != ORACLE_REFERENCE]
         if not programmes or (bar != BEST_REFERENCE and bar not in table.columns):
             continue
         if bar == BEST_REFERENCE:
@@ -807,6 +831,15 @@ def summary_tables(
             f"{what}, scored within their receivers alone",
             _versus_bar(_per_arm(sections, "heads_by_group_cells", arms), bar, programmes, margin),
         )
+    every_group = _per_arm(sections, "heads_by_group", arms)
+    if any(ORACLE_REFERENCE in table.columns for table in every_group.values()):
+        what = (
+            f"programmes ('{programmes}...') against the oracle (a ridge on the true drivers): "
+            f"wins / ties / losses by more than {margin:g}"
+        )
+        add(
+            f"{what}; means weigh every programme alike", _versus_bar(every_group, ORACLE_REFERENCE, programmes, margin)
+        )
     add(
         "centred cosine per gene group on hidden spots by depth; best = the highest reference per bin",
         _group_depth_summary(_per_arm(sections, "heads_group_by_depth", arms), groups),
@@ -839,6 +872,34 @@ def summary_tables(
         table = pd.concat(parts)
         add("representations by query group: linear CKA and participation ratio", table[ordered(table.columns)])
 
+    parts = []
+    for arm, table in _per_arm(sections, "redundancy", arms).items():
+        part = table.copy()
+        part.index = pd.MultiIndex.from_tuples([(arm, pair) for pair in part.index], names=["arm", "ridge R²"])
+        parts.append(part)
+    if parts:
+        table = pd.concat(parts)
+        add(
+            "redundancy: ridge R² of one representation from another (fitted on the training slides), by query group; "
+            "global <- local near 1 = the global tokens add nothing to the local ones",
+            table[ordered(table.columns)],
+        )
+    parts = []
+    for arm, table in _per_arm(sections, "attribution_shares", arms).items():
+        if "all" not in table.index.get_level_values("group"):
+            continue
+        part = table.xs("all", level="group")
+        part.index = pd.MultiIndex.from_tuples(
+            [(arm, head, name) for head, name in part.index], names=["arm", "head", "part"]
+        )
+        parts.append(part)
+    if parts:
+        table = pd.concat(parts)
+        add(
+            "attribution: share of the variance of a head's prediction over all genes that each of its parts supplies, "
+            "by depth (sums to 1 over the parts)",
+            table[ordered(table.columns)],
+        )
     attention = _per_arm(sections, "attention_by_query", arms)
     means = _select(attention, "head", "mean", ["layer", "metric"])
     for metric, what in (

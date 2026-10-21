@@ -79,6 +79,11 @@ class StepOutput:
         ``[N, F]`` boolean, laid out as ``entry_mask``: the entries each head's loss is restricted to,
         when that is fewer than the masked ones (``optim.regime_loss`` gives each head the hidden cells of
         its regime). ``None``: the loss uses ``entry_mask``. The metrics always use ``entry_mask``.
+    parts
+        ``{head: {part: [N, F]}}`` for a head whose prediction is the sum of named parts, in the rows of that head's
+        ``y_pred`` (the half of a stacked dual output): a global-only model with the own-cell skip (``context`` and
+        ``own_cell``), the global head of a residual dual decoder (``local``, detached, and ``global``). ``None``
+        where no head has more than one part. What ``masked_probing.attribution_shares`` reads.
     views
         One :class:`ViewOutput` per forward pass. Length 1 until the two-view stage.
     """
@@ -87,6 +92,7 @@ class StepOutput:
     y_true: torch.Tensor
     entry_mask: torch.Tensor | None = None
     loss_mask: torch.Tensor | None = None
+    parts: dict[str, dict[str, torch.Tensor]] | None = None
     views: list[ViewOutput] = field(default_factory=list)
 
     @property

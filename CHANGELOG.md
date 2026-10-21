@@ -12,6 +12,17 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- The oracle reference `ref_oracle` for synthetic data: `masked_probing.oracle_features` turns the true drivers in `obs` (distances
+  to sources as Gaussian bumps with an indicator for missing values, flags, one-hot categoricals, and a key's features also
+  gated by a boolean column) into the `drivers` of `FittedReferences`, which fits one more ridge on them and the cell's own
+  visible genes. The report lists it beside the references, leaves it out of "the best reference", and adds a wins / ties /
+  losses table against it. `FittedReferences.from_state(..., drivers=)`.
+- Yardsticks for the separation of the two components: `representations.redundancy_table` (ridge R² of `global` from `local`,
+  `local` from `global`, `global` from `smoother` and `pe`, per query group, fitted on the training split and scored on the test
+  split) and `masked_probing.attribution_shares` (each part's `cov_share` and `norm_ratio` of a head that is a sum of named
+  parts). `StepOutput.parts`, `HeadPredictions.parts`, `GlobalModule.predict_parts`. New report sections `redundancy`,
+  `attribution_shares`, `attribution_norms` with summary tables.
+
 - Regime-assigned losses (`optim.regime_loss`, default `kind: none`): each head of the dual decoder is trained on the
   hidden cells of its regime -- `near` (a visible cell within `depth_um` of the cell hidden whole) for the local head,
   `deep` beyond for the global one (`local_cells`, `global_cells`: `near`, `deep` or `all`). The metrics keep every

@@ -168,6 +168,7 @@ class DualDecoderCombinedModule(BaseModule):
             batch_masked
         )
         loss_mask = None
+        parts = None
 
         # Predict from global embedding (one row per cell the padding kept)
         y_pred_global = self.predict_global(global_embedding, src_padding_mask, prediction_level)
@@ -188,13 +189,19 @@ class DualDecoderCombinedModule(BaseModule):
 
             # Both branches gathered by the SAME index, so row i of each is the same cell.
             y_pred_local = self.predict_local(local_embedding, padded_node_idx)
+            y_pred_global_decoded = y_pred_global
             y_pred_global = self.combine_global(y_pred_local, y_pred_global)
+            if self.global_residual:
+                # The global head is the local prediction plus what its decoder adds: two parts to attribute.
+                parts = {"global": {"local": y_pred_local.detach(), "global": y_pred_global_decoded}}
 
             if entry_mask is None:
                 # Node-level classification: the masked cells are the supervision targets, so
                 # both halves stay restricted to them. Only reconstruction scores every cell.
                 keep = batch.mask[padded_node_idx].bool()
                 y_pred_local, y_pred_global, y_true = y_pred_local[keep], y_pred_global[keep], y_true[keep]
+                if parts is not None:
+                    parts = {"global": {name: part[keep] for name, part in parts["global"].items()}}
 
             assert y_pred_local.shape == y_pred_global.shape, (
                 f"Local and global predictions differ in shape: "
@@ -234,6 +241,7 @@ class DualDecoderCombinedModule(BaseModule):
             y_true=y_true_combined,
             entry_mask=entry_mask_combined,
             loss_mask=loss_mask,
+            parts=parts,
             views=[
                 ViewOutput(
                     local_embedding=local_embedding,

@@ -238,7 +238,13 @@ queries against uniform attention, distance profiles, planted pairs against dist
 (`evaluation.report`: sections appended per arm, a cross-arm summary on top). The relevance rollout (`tl/self_attn_relevance.py`)
 backpropagates the summed output after an affine LayerNorm, a degenerate target, so `_attn_matrix`,
 `cls_horizontal`/`cls_vertical` and everything built on them (`downstream_regression`,
-`net_streams`, `flow_control`, `graph_classification`) are not interpretable. `generate_relevance(output,
+`net_streams`, `flow_control`, `graph_classification`) are not interpretable. Two yardsticks read how well the two
+components separate: `representations.redundancy_table` (ridge R² of one embedding from another, fitted on the training
+slides per query group) and `masked_probing.attribution_shares` (each named part's share of a head's variance; the parts
+come from `StepOutput.parts`, set by a global-only model with the own-cell skip and by a residual dual decoder -- a module
+that makes a head a sum of parts must put them there, in the rows of that head's `y_pred`). `ref_oracle`
+(`oracle_features`, sweep settings `ORACLE_KEYS` / `ORACLE_GATES`) is a ridge on the true drivers of a synthetic dataset:
+a bar for the task, listed beside the references but never counted as "the best reference". `generate_relevance(output,
 target=...)` traces a given target instead; `evaluation.attention_check` checks the attention against torch's
 stock modules on real inputs (`check_attention`) and compares seven readouts of it against planted pairs
 (`attention_readouts`); a masked pass hooks its maps inside `TransformerNodeEncoderHook.hooking_attention()`.

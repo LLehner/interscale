@@ -477,6 +477,30 @@ class GlobalModule(BaseModule):
 
     #     return y_true, adjusted_mask_idx
 
+    def predict_parts(self, global_embedding, src_padding_mask, prediction_level, own_embedding=None, node_idx=None):
+        """The named parts whose sum is :meth:`predict`: ``context`` (the decoder on the transformer's tokens) and, under ``own_cell_skip``, ``own_cell``.
+
+        Same arguments as :meth:`predict`.
+        """
+        ## Graph-level prediction: get cls_token from last position
+        if "graph" in prediction_level:
+            if self.own_cell_skip:
+                raise ValueError("own_cell_skip is a per-cell term; a graph-level prediction has none.")
+            return {"context": self.decoder(gather_cls(global_embedding))}
+        ## Node-level prediction: remove cls_token from last position
+        elif "node" in prediction_level:
+            parts = {"context": self.decoder(gather_tokens(global_embedding, src_padding_mask))}
+            if self.own_cell_skip:
+                if own_embedding is None or node_idx is None:
+                    raise ValueError(
+                        "own_cell_skip needs the cells' own tokens and their node index to predict: pass "
+                        "own_embedding and node_idx."
+                    )
+                parts["own_cell"] = F.linear(own_embedding[node_idx].to(parts["context"].dtype), self.own_skip_weight)
+            return parts
+        else:
+            raise Exception("Choose a valid prediction tasks (graph or node).")
+
     def predict(self, global_embedding, src_padding_mask, prediction_level, own_embedding=None, node_idx=None):
         """Predict with the decoder.
 
@@ -494,24 +518,12 @@ class GlobalModule(BaseModule):
             ``[N_kept]`` batch-global node index of each kept token (``_process_batch_for_metrics``'s
             ``padded_node_idx``), bringing ``own_embedding`` into token order. Required with it.
         """
-        ## Graph-level prediction: get cls_token from last position
-        if "graph" in prediction_level:
-            if self.own_cell_skip:
-                raise ValueError("own_cell_skip is a per-cell term; a graph-level prediction has none.")
-            return self.decoder(gather_cls(global_embedding))
-        ## Node-level prediction: remove cls_token from last position
-        elif "node" in prediction_level:
-            y_pred = self.decoder(gather_tokens(global_embedding, src_padding_mask))
-            if self.own_cell_skip:
-                if own_embedding is None or node_idx is None:
-                    raise ValueError(
-                        "own_cell_skip needs the cells' own tokens and their node index to predict: pass "
-                        "own_embedding and node_idx."
-                    )
-                y_pred = y_pred + F.linear(own_embedding[node_idx].to(y_pred.dtype), self.own_skip_weight)
-            return y_pred
-        else:
-            raise Exception("Choose a valid prediction tasks (graph or node).")
+        y_pred, *rest = self.predict_parts(
+            global_embedding, src_padding_mask, prediction_level, own_embedding, node_idx
+        ).values()
+        for part in rest:
+            y_pred = y_pred + part
+        return y_pred
 
     def _common_step(self, batch, prediction_task: str, prediction_level: Literal["node", "graph"]):
         """Shared step between train, val and test.
@@ -551,15 +563,19 @@ class GlobalModule(BaseModule):
             )
 
         # The cells' own tokens reach the prediction around the transformer under `own_cell_skip`.
-        y_pred = self.predict(
+        parts = self.predict_parts(
             global_embedding, src_padding_mask, prediction_level, own_embedding=embedding, node_idx=padded_node_idx
         )
+        y_pred, *rest = parts.values()
+        for part in rest:
+            y_pred = y_pred + part
         if padded_node_idx is not None and entry_mask is None:
             # Node-level classification: the masked cells ARE the supervision targets, so
             # both loss and metrics stay restricted to them. Only reconstruction moved to
             # scoring every cell.
             keep = batch.mask[padded_node_idx].bool()
             y_pred, y_true = y_pred[keep], y_true[keep]
+            parts = {name: part[keep] for name, part in parts.items()}
 
         assert len(y_pred) == len(y_true), "y_pred and y_true are not consistent"
         assert not torch.any(torch.isnan(y_pred)), "y_pred contains NaN values"
@@ -569,6 +585,7 @@ class GlobalModule(BaseModule):
             y_pred=y_pred,
             y_true=y_true,
             entry_mask=entry_mask,
+            parts={"global": parts} if len(parts) > 1 else None,
             views=[
                 ViewOutput(
                     global_embedding=global_embedding,

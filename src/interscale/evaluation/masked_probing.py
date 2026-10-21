@@ -232,6 +232,99 @@ def smoother_features(*, spatial_unit_um: float, kernels_um: tuple[float, ...] =
     return features
 
 
+def _flag(column: pd.Series, name: str) -> np.ndarray | None:
+    """``column`` as a 0/1 float vector when it is boolean (also as the strings "True" / "False"), else None."""
+    if column.dtype == bool:
+        return column.to_numpy(dtype=np.float64)
+    if isinstance(column.dtype, pd.CategoricalDtype) or column.dtype == object:
+        levels = {str(v).lower() for v in column.dropna().unique()}
+        if levels <= {"true", "false", "1", "0"}:
+            return column.astype(str).str.lower().isin(["true", "1"]).to_numpy(dtype=np.float64)
+        return None
+    values = column.dropna().unique()
+    if len(values) <= 2 and set(values.tolist()) <= {0, 1}:
+        return column.fillna(0.0).to_numpy(dtype=np.float64)
+    return None
+
+
+def _driver_block(column: pd.Series, name: str, n_basis: int) -> np.ndarray:
+    """``[n, D]`` float64 features of one driver column.
+
+    A flag is itself; another categorical is one-hot; a number becomes ``n_basis`` Gaussian bumps (centres at
+    quantiles of its finite values, each as wide as the spacing of its neighbours, so a ridge can draw any smooth
+    function of it, steeper where the values are dense) and, where it has missing values (a driver that exists on
+    some slides only: 0 in the bumps), an indicator of them.
+    """
+    flag = _flag(column, name)
+    if flag is not None:
+        return flag[:, None]
+    if isinstance(column.dtype, pd.CategoricalDtype) or column.dtype == object:
+        return pd.get_dummies(column.astype(str)).to_numpy(dtype=np.float64)
+    x = column.to_numpy(dtype=np.float64)
+    finite = np.isfinite(x)
+    if not finite.any():
+        raise ValueError(f"driver {name!r} has no finite value.")
+    centres = np.unique(np.quantile(x[finite], np.linspace(0.0, 1.0, int(n_basis))))
+    gaps = np.diff(centres)
+    if len(centres) == 1:
+        width = np.ones(1)
+    else:
+        left, right = np.r_[gaps[0], gaps], np.r_[gaps, gaps[-1]]
+        width = np.maximum((left + right) / 2.0, 1e-12)
+    bumps = np.exp(-0.5 * ((np.where(finite, x, 0.0)[:, None] - centres[None]) / width[None]) ** 2)
+    bumps[~finite] = 0.0
+    if (~finite).any():
+        bumps = np.concatenate([bumps, (~finite).astype(np.float64)[:, None]], axis=1)
+    return bumps
+
+
+def oracle_features(
+    obs: pd.DataFrame, keys, *, gates: dict[str, str] | None = None, n_basis: int = 24, offset: int = 1
+):
+    """The true drivers of a synthetic dataset as a ``drivers(batch, hidden) -> [N, D]`` function for :class:`FittedReferences`.
+
+    ``keys`` name columns of ``obs`` that drive the planted signals: distances to the sources, flags (a cell is
+    exposed to a sender, lies in a stripe), receiver flags. Each becomes features by :func:`_driver_block`. A key
+    in ``gates`` (``{key: gate column}``, the gate a boolean column) also gets its features multiplied by the gate,
+    for a response that exists only where the gate is on (a sparse receiver at a distance from its source; a cone).
+    The features are the whole of ``obs``, computed once; a batch picks its cells' rows by ``batch.obs_names`` (a cell's
+    position in ``obs`` plus ``offset``, as ``prepare_geome_dataset`` names them). Nothing here reads expression.
+
+    This is a bar, not a model: a ridge on these features (``ref_oracle``) says what is learnable from the planted
+    drivers by a smooth, additive-in-basis function. Where it stays far below 1 on a noiseless programme the basis
+    is too coarse (raise ``n_basis``), not the task impossible.
+    """
+    gates = dict(gates or {})
+    keys = list(keys)
+    missing = [c for c in [*keys, *gates.values()] if c not in obs.columns]
+    if missing:
+        raise ValueError(f"obs lacks the driver columns {missing}.")
+    stray = sorted(set(gates) - set(keys))
+    if stray:
+        raise ValueError(f"gates name keys that are not drivers: {stray}.")
+    blocks = []
+    for key in keys:
+        block = _driver_block(obs[key], key, n_basis)
+        blocks.append(block)
+        if key in gates:
+            gate = _flag(obs[gates[key]], gates[key])
+            if gate is None:
+                raise ValueError(f"the gate {gates[key]!r} of {key!r} is not a boolean column.")
+            blocks.append(block * gate[:, None])
+    matrix = np.concatenate(blocks, axis=1).astype(np.float32)
+
+    def drivers(batch, hidden: torch.Tensor) -> torch.Tensor:
+        names = batch.obs_names
+        names = names.detach().cpu().numpy() if isinstance(names, torch.Tensor) else np.asarray(names)
+        rows = np.rint(names.astype(np.float64)).astype(np.int64) - int(offset)
+        if rows.min() < 0 or rows.max() >= len(matrix):
+            raise ValueError(f"the graph's cells point outside the {len(matrix)} rows of obs; wrong offset or data?")
+        return torch.as_tensor(matrix[rows], dtype=torch.float64, device=batch.x.device)
+
+    drivers.n_features = matrix.shape[1]
+    return drivers
+
+
 def _depth_rows(depth_um: np.ndarray | None, rows: np.ndarray, depth_bins_um) -> list[tuple[str, np.ndarray]]:
     """``("all", every row)``, then one ``(bin, rows)`` per non-empty depth bin of the wholly hidden rows.
 
@@ -529,6 +622,10 @@ class HeadPredictions:
         ``[N]`` the name of each row's cell as its graph carries it (``obs_names``: the cell's
         position in the AnnData plus the dataset's offset), to find a row again in ``adata.obs``
         (:func:`group_receivers`). None when the graphs carry none.
+    parts
+        ``{head: {part: [N, G]}}`` for a head whose prediction is the sum of named parts (``StepOutput.parts``: the own-cell
+        skip and the transformer's read-out; a residual dual decoder's local and global), rows as in ``heads``. What
+        :func:`attribution_shares` reads. None where no head has more than one part.
     """
 
     heads: dict[str, np.ndarray]
@@ -536,6 +633,7 @@ class HeadPredictions:
     hidden: np.ndarray
     depth_um: np.ndarray | None = None
     cells: np.ndarray | None = None
+    parts: dict[str, dict[str, np.ndarray]] | None = None
 
 
 def _weighted_mean(w: torch.Tensor, xv: torch.Tensor, vis: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
@@ -637,12 +735,15 @@ def reference_predictions(
     return out
 
 
-def _reference_parts(batch, hidden: torch.Tensor, *, spatial_unit_um: float, kernels_um, position) -> dict:
+def _reference_parts(
+    batch, hidden: torch.Tensor, *, spatial_unit_um: float, kernels_um, position, drivers=None
+) -> dict:
     """Per cell, model-free inputs of the fitted references, in batch node order (float64).
 
     ``own``: the cell's visible values (a hidden entry reads 0); ``context``: Gaussian-kernel means
     of the visible values of the other cells of its graph, one block of genes per bandwidth;
-    ``position``: :func:`position_features` (or absent). No hidden value enters any of them.
+    ``position``: :func:`position_features` (or absent); ``driver``: :func:`oracle_features` (or absent). No
+    hidden value enters any of them.
     """
     x = batch.x.double()
     parts = {"own": torch.where(hidden, torch.zeros_like(x), x)}
@@ -653,6 +754,8 @@ def _reference_parts(batch, hidden: torch.Tensor, *, spatial_unit_um: float, ker
         parts["context"] = torch.cat([refs[f"ref_kernel_{s:g}um"] for s in kernels_um], dim=1)
     if position is not None:
         parts["position"] = position(batch, hidden)[POSITION].double()
+    if drivers is not None:
+        parts["driver"] = drivers(batch, hidden).double()
     return parts
 
 
@@ -661,7 +764,11 @@ FITTED_REFERENCES = {
     "ref_own": ("own",),
     "ref_own+context": ("own", "context"),
     "ref_own+context+position": ("own", "context", "position"),
+    "ref_oracle": ("own", "driver"),
 }
+#: The reference that reads the planted drivers (:func:`oracle_features`): a bar for the task, not for a model. The
+#: report leaves it out of "the best reference".
+ORACLE_REFERENCE = "ref_oracle"
 
 
 class FittedReferences:
@@ -678,6 +785,10 @@ class FittedReferences:
     * ``ref_own+context`` -- plus Gaussian-kernel means of the visible genes of the surrounding
       cells at each bandwidth: a fixed multi-scale linear view of the drivers around the cell.
     * ``ref_own+context+position`` -- plus :func:`position_features`.
+    * ``ref_oracle`` (with ``drivers``) -- the cell's own visible genes plus the true drivers of the planted signals
+      (:func:`oracle_features`; synthetic data only). What a ridge on the truth reaches: where a model falls short of
+      it the model is the limit, where it falls short too the task cannot be solved from these inputs (or the basis
+      is too coarse).
 
     A model knows more than fixed kernels of its inputs only where it beats ``ref_own+context``.
     Call the instance as ``(batch, hidden) -> {name: [N, G]}`` (``collect_head_predictions``'s
@@ -693,6 +804,8 @@ class FittedReferences:
         Bandwidths of the context, µm.
     position
         A :func:`position_features` function, or None to leave the position reference out.
+    drivers
+        An :func:`oracle_features` function, or None to leave the oracle out.
     alphas
         Candidate ridge penalties (on standardised features). Each reference takes the one with the
         lowest squared error on held-out training graphs (``folds`` groups of whole graphs) and is
@@ -711,13 +824,16 @@ class FittedReferences:
         spatial_unit_um: float,
         kernels_um=(),
         position=None,
+        drivers=None,
         alphas=(0.1, 1.0, 10.0, 100.0, 1e3, 1e4),
         folds: int = 3,
         device="cpu",
     ):
         self.spatial_unit_um, self.kernels_um, self.position = float(spatial_unit_um), tuple(kernels_um), position
+        self.drivers = drivers
         names = [n for n, parts in FITTED_REFERENCES.items() if position is not None or "position" not in parts]
         names = [n for n in names if kernels_um or "context" not in FITTED_REFERENCES[n]]
+        names = [n for n in names if drivers is not None or "driver" not in FITTED_REFERENCES[n]]
         chunks, targets, hidden_rows, graph_of = {}, [], [], []
         graphs = list(train_data)
         loader = DataLoader(dataset=graphs, shuffle=False, batch_size=1, num_workers=0)
@@ -750,7 +866,12 @@ class FittedReferences:
 
     def _parts(self, batch, hidden):
         return _reference_parts(
-            batch, hidden, spatial_unit_um=self.spatial_unit_um, kernels_um=self.kernels_um, position=self.position
+            batch,
+            hidden,
+            spatial_unit_um=self.spatial_unit_um,
+            kernels_um=self.kernels_um,
+            position=self.position,
+            drivers=self.drivers,
         )
 
     def _choose_alpha(self, x, y, rows, fold, alphas) -> float:
@@ -793,8 +914,8 @@ class FittedReferences:
         return {name: getattr(self, name) for name in self.STATE}
 
     @classmethod
-    def from_state(cls, state: dict, position=None) -> FittedReferences:
-        """An instance with the fit of :meth:`state`; ``position`` is the same :func:`position_features` function the fit used.
+    def from_state(cls, state: dict, position=None, drivers=None) -> FittedReferences:
+        """An instance with the fit of :meth:`state`; ``position`` and ``drivers`` are the same functions the fit used.
 
         Lets jobs that evaluate different models on the same training slides share one fit: the ridge
         regressions depend on the graphs, their masks and the settings only, never on a model.
@@ -802,10 +923,15 @@ class FittedReferences:
         missing = [name for name in cls.STATE if name not in state]
         if missing:
             raise ValueError(f"the saved fit lacks {missing}")
+        needs = [n for n in state["models"] if "driver" in FITTED_REFERENCES.get(n, ())]
+        if needs and drivers is None:
+            raise ValueError(f"the saved fit holds {needs}, which read the true drivers: pass `drivers`.")
+        if drivers is not None and not needs:
+            raise ValueError("the saved fit holds no oracle, but `drivers` were given: it was fitted without them.")
         obj = cls.__new__(cls)
         for name in cls.STATE:
             setattr(obj, name, state[name])
-        obj.position = position
+        obj.position, obj.drivers = position, drivers
         return obj
 
     def __call__(self, batch, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -888,6 +1014,7 @@ def collect_head_predictions(
     was_training = module.training
     module.eval()
     heads: dict[str, list[np.ndarray]] = {}
+    part_chunks: dict[str, dict[str, list[np.ndarray]]] = {}
     chunks = {"true": [], "hidden": [], "depth_um": [], "cells": []}
     loader = DataLoader(dataset=data_list, shuffle=False, batch_size=batch_size, num_workers=0)
     try:
@@ -901,6 +1028,9 @@ def collect_head_predictions(
                     idx = torch.arange(batch.num_nodes, device=batch.x.device)
                 for name, value in found.items():
                     heads.setdefault(name, []).append(value.cpu().numpy())
+                for head, named in (out.parts or {}).items():
+                    for part, value in named.items():
+                        part_chunks.setdefault(head, {}).setdefault(part, []).append(value.detach().cpu().numpy())
                 chunks["true"].append(y_true.cpu().numpy())
                 chunks["hidden"].append(entry_mask.bool().cpu().numpy())
                 names = getattr(batch, "obs_names", None)
@@ -947,6 +1077,11 @@ def collect_head_predictions(
         hidden=cat("hidden"),
         depth_um=cat("depth_um"),
         cells=cat("cells"),
+        parts={
+            head: {part: np.concatenate(values) for part, values in named.items()}
+            for head, named in part_chunks.items()
+        }
+        or None,
     )
 
 
@@ -976,8 +1111,103 @@ def blend_heads(pred: HeadPredictions, reference: str, *, weight: float = 0.5) -
     ref = pred.heads[reference]
     blends = {f"{BLEND_PREFIX}{h}": (1.0 - weight) * pred.heads[h] + weight * ref for h in models}
     return HeadPredictions(
-        heads=pred.heads | blends, true=pred.true, hidden=pred.hidden, depth_um=pred.depth_um, cells=pred.cells
+        heads=pred.heads | blends,
+        true=pred.true,
+        hidden=pred.hidden,
+        depth_um=pred.depth_um,
+        cells=pred.cells,
+        parts=pred.parts,
     )
+
+
+#: The columns of :func:`attribution_shares`.
+SHARE_COLUMNS = ["head", "part", "group", "depth_um", "n_hidden", "norm_ratio", "cov_share"]
+
+
+def _centred_parts(parts: dict[str, np.ndarray], keep: np.ndarray) -> dict[str, np.ndarray]:
+    """Each part with its mean over the kept entries of every gene taken out, and everything outside ``keep`` zeroed."""
+    count = np.maximum(keep.sum(axis=0), 1)
+    out = {}
+    for name, part in parts.items():
+        mean = (part * keep).sum(axis=0) / count
+        out[name] = (part - mean) * keep
+    return out
+
+
+def attribution_shares(
+    pred: HeadPredictions,
+    genes: list[str],
+    *,
+    gene_groups: dict[str, list[str]] | None = None,
+    depth_bins_um: list[float] | None = None,
+) -> pd.DataFrame:
+    """How much of a head's variation across the hidden cells each of its parts supplies.
+
+    A head whose prediction is the sum of named parts (``pred.parts``: a global-only model's transformer read-out and its
+    own-cell skip; the local and the global part of a residual dual decoder; later the two parts of an additive decoder)
+    is taken apart. Over the hidden entries of a group of genes and a set of cells, each part is centred by its mean per
+    gene over those entries, so the centred parts add up to the centred prediction ``w``. Then, per part ``k``:
+
+    * ``norm_ratio`` -- ``||c_k|| / ||w||``: the size of the part against the whole. Parts that cancel make the ratios
+      sum to more than 1.
+    * ``cov_share`` -- ``<c_k, w> / ||w||^2``: the part's share of the whole's variance. It sums to 1 over the parts, and is
+      negative for a part that works against the others.
+
+    Groups: ``all`` (every gene), then each of ``gene_groups`` (e.g. the planted programmes); cells: ``all`` (every cell with a
+    hidden entry), then each depth bin of the wholly hidden cells (``depth_bins_um``; needs ``pred.depth_um``). A separated
+    model would give the global part the deep field and the long-range programmes, the local part the rim.
+
+    Returns
+    -------
+    pandas.DataFrame
+        :data:`SHARE_COLUMNS`, one row per head with parts, part, group and depth; empty when no head has parts.
+    """
+    if not pred.parts:
+        return pd.DataFrame(columns=SHARE_COLUMNS)
+    hidden = pred.hidden.astype(bool)
+    scored = hidden.any(axis=1)
+    position = {g: i for i, g in enumerate(genes)}
+    groups = {"all": list(range(hidden.shape[1]))}
+    for group, members in (gene_groups or {}).items():
+        if cols := [position[g] for g in members if g in position]:
+            groups[group] = cols
+    cell_sets = [("all", scored)]
+    if depth_bins_um is not None:
+        if pred.depth_um is None:
+            raise ValueError("depth_bins_um needs the depth of each cell; collect with spatial_unit_um and `pos`.")
+        bins = pd.cut(pd.Series(pred.depth_um), bins=list(depth_bins_um), right=True)
+        for interval in bins.cat.categories:
+            in_bin = scored & (pred.depth_um > 0) & (bins == interval).to_numpy()
+            if in_bin.any():
+                cell_sets.append((str(interval), in_bin))
+    rows = []
+    for head, named in pred.parts.items():
+        parts = {name: value.astype(np.float64) for name, value in named.items()}
+        for group, cols in groups.items():
+            for depth, cells in cell_sets:
+                keep = np.zeros_like(hidden)
+                keep[:, cols] = hidden[:, cols]
+                keep[~cells] = False
+                if not keep.any():
+                    continue
+                centred = _centred_parts(parts, keep)
+                whole = sum(centred.values())
+                size = float((whole**2).sum())
+                if size <= 0:
+                    continue
+                for name, c in centred.items():
+                    rows.append(
+                        {
+                            "head": head,
+                            "part": name,
+                            "group": group,
+                            "depth_um": depth,
+                            "n_hidden": int(keep.sum()),
+                            "norm_ratio": float(np.sqrt((c**2).sum() / size)),
+                            "cov_share": float((c * whole).sum() / size),
+                        }
+                    )
+    return pd.DataFrame(rows, columns=SHARE_COLUMNS)
 
 
 def group_receivers(
