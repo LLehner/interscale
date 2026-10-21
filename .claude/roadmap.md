@@ -19,16 +19,16 @@ The terms used below:
 
 ## Status
 
-Last updated 2026-10-20.
+Last updated 2026-10-21.
 
 | track | question | state | verified by | date |
 |---|---|---|---|---|
 | T0 | infrastructure: seeds, per-arm evaluation, inputs, CosMx | **implemented, unverified** (2026-10-19; CosMx deferred by the user) — seed axis, run selection for job arrays, per-run section files, timing, cached references, `Precomputed` under programme masking, `pca_fit: train`; every mutation caught (two survivors led to a stronger test and a simplification), harness IDENTICAL; the sweep script checked on a stub synth_spot with untrained models. **Not run on data** | 2026-10-19 |
 | T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; legnini programme masking built 2026-10-20 (`legnini_programme`, decided gene set in legnini_plan.md; not run); sender ranks unreadable (gradient magnitude) → replaced 2026-10-20 by an integrated-gradients attribution, sparse programmes also scored within their receivers, per-programme wins/ties/losses in the report (**built, not yet run: the 19 checkpoints await `MODE = "evaluate"`**). Details in global_plan.md | `response_masking` run (11 arms, 19 runs, 3 twins) | 2026-10-20 |
 | T1b | coarse-grained tokens: pool cells into patches or niches before the global model | **grid pooling implemented, unverified** (2026-10-19) — `pooling.kind: grid` (`size_um` or `n_patches`), `count`/`std` features, 39 tests, an end-to-end run for GlobalModel and CombinedModel, every mutation caught (one survivor led to a stronger test), harness IDENTICAL; 5 pooled arms in `response_masking`. The `niche` assignment waits for the user's details; patch-level attention readouts not built. **Not run on data** | 2026-10-19 |
-| T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed | | |
+| T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed; **re-masking before the transformer implemented, unverified** (2026-10-21, task 3 below) -- `remask: hidden`: a wholly hidden cell enters the transformer as one learned token instead of its GCN token; 16 tests, 8 mutations caught, harness IDENTICAL; sweep `remask_test` written (8 runs), **not run**. Moran's I split (task 1) and embedding dimensions vs genes (task 2) proposed | tests, harness | 2026-10-21 |
 | T3 | masking strategies | proposed | | |
-| T4 | interpretation beyond raw attention; attention sinks | **sender attribution built, unverified on data** (2026-10-20) — `response_influence(measure="attribution")`: integrated gradients from the training-mean cell on a programme's summed response genes, completeness check, hidden entries fixed, one random state along the path; 16 + 6 tests, 31 mutations caught. Not built: the other methods of the table below, the null key and registers, the permuted-slide baseline. **Not run on data** | 2026-10-20 |
+| T4 | interpretation beyond raw attention; attention sinks | **sender attribution built, unverified on data** (2026-10-20) — `response_influence(measure="attribution")`: integrated gradients from the training-mean cell on a programme's summed response genes, completeness check, hidden entries fixed, one random state along the path; 16 + 6 tests, 31 mutations caught. Not built: the other methods of the table below, the null key and registers, the permuted-slide baseline. **Not run on data**. **2026-10-21 (task 4 below): attention checked against torch, readouts compared, implemented, unverified on data**: the vendored attention equals torch's stock `nn.MultiheadAttention` and encoder layer (tests, every mask form); relevance fixed (heads averaged per graph, tensors on the output's device, a target can be given); `evaluation.attention_check` (`check_attention` on the real inputs, `attention_readouts`: 7 readouts against planted pairs); 40 tests; of 15 mutations 14 caught (2 after two more tests), the survivor a redundant gradient clear; sweep `attention_check` (evaluation only, on the `response_masking` checkpoints), **not run**. Label-free flow (task 5) proposed | 2026-10-21 |
 | T5 | how cell-type driven attention is | proposed | | |
 | T6 | complexity vs tissue coverage ([attention_plan.md](attention_plan.md) stages 6, 8) | proposed | | |
 | T7 | disease-specific interactions | proposed | | |
@@ -70,20 +70,35 @@ Last updated 2026-10-20.
   datasets with them). Their numbers come from an older model state, so they are redone with the
   current one.
 
+## Added 2026-10-21: five high-priority tasks
+
+Asked for on 2026-10-21, sorted into the tracks below (details there):
+
+| # | task | track | state | when |
+|---|---|---|---|---|
+| 1 | **Moran's I split:** how a gene's Moran's I changes as the neighbourhood grows; a fast decay marks local variability (a likely local interaction), a slow one global variability; group the genes so, and check whether the local or the global component picks each group up | T2 (a label-free yardstick for the scale assignment, real data included), feeds T10 D | proposed | build W1 Thu, run with the remask and decoder sweeps |
+| 2 | **Embedding dimensions and genes:** the most important dimensions of each learned embedding, the genes correlating with each, and whether a gene's expression and the dimension's value agree across cells and in space, especially for genes of interest | T2 (read-out of the separated components), T9 (the manuscript's gene programmes) | proposed | build W1 Fri |
+| 3 | **Re-masking before the transformer:** the dual model masks cells once, before the GCN; a hidden cell then hands the transformer its GCN token, built from its visible neighbours. Re-mask it before the transformer too | T2 (K2) | **built 2026-10-21**, sweep `remask_test` not run | run W1 Thu, read W1 Fri |
+| 4 | **Is attention computed correctly:** the module that takes the gradient into account (relevance), torch's attention against the custom one, averaging against gradient-based readouts | T4 (K10) | **built 2026-10-21**, sweep `attention_check` not run | run W1 Thu, read W2 Mon |
+| 5 | **Flow without annotation:** vector fields of sender→receiver dynamics in space that need no cell-type labels | T4 (K9), feeds T5, T8 | proposed | design W2 Mon after task 4's read, build W2 Tue |
+
+Tasks 1 and 2 answer the same question from two sides as T2's other readouts: which genes each component carries,
+read without synth_spot's planted design, so they also work on legnini and CosMx.
+
 ## Known problems of the global model, and the fix we try
 
 | # | problem (observed) | what we believe causes it | fix we try | track, week |
 |---|---|---|---|---|
 | K1 | Global never beats the best smoother at disc reconstruction (synth_spot 0.459 vs 0.465). On legnini it sits at the slide mean (0.50 vs 0.594 for the 40 µm kernel) | A plain average of the visible cells solves the disc task. On legnini attention cannot become local: the biases start at 0 and learned ≤ 0.03 | Programme masking on synth_spot and legnini; a distance prior with a length scale per head; targets split by scale (D2.1) | T1, T2; W1 |
-| K2 | Near visible cells the global head copies the local one (CKA 0.93 at the rim) | Both heads predict one target, and the cell's own token stays in the transformer's residual stream | A context-only global embedding (D1); an additive decoder (D3.1); each loss on the cells where its component has to work (D2.2); pooled tokens, whose embedding is shared by a patch and cannot carry one cell's own token (T1b) | T1b, T2; W1 |
+| K2 | Near visible cells the global head copies the local one (CKA 0.93 at the rim) | Both heads predict one target, and the cell's own token stays in the transformer's residual stream; a hidden cell's token is its GCN token, made of its visible neighbours | Re-masking before the transformer (task 3, built 2026-10-21): a hidden cell's token is one learned token, so its own residual stream holds nothing of its neighbourhood; a context-only global embedding (D1); an additive decoder (D3.1); each loss on the cells where its component has to work (D2.2); pooled tokens, whose embedding is shared by a patch and cannot carry one cell's own token (T1b) | T1b, T2; W1 |
 | K3 | The residual decoder hurts the deep field (0.389 vs 0.438 at 290–500 µm) | In the blind area the local prediction is a constant that the residual has to undo | Retire it in favour of D3.1; keep it as one baseline arm | T2; W1 |
 | K4 | No sender selection: planted pairs at ~0.5 for both attention and influence; attention is broad | No task so far needed a sender. With ~2,500 keys, a few relevant ones need a logit lead of ~6 | Tasks that need senders (programme masking); the distance prior; sparse normalisers and top-k retested there; a null key and registers | T1, T4; W1–W2 |
 | K5 | Hidden tokens collapse (token cosine 0.78–0.91 under discs) and act as a sink: without RoPE, visible cells attend almost only to them | Every wholly hidden cell gets the same input | Programme masking (no cell is wholly hidden); an option to use only visible cells as keys; a null key | T1, T3, T4; W1–W2 |
 | K6 | Inputs of the global-only model: the learned linear input fails without RoPE (0.15); the in-pipeline PCA is fitted on one masked validation slide (0.31); the best input, a precomputed PCA (0.44), is refused under gene masking | A linear map of a −1-filled row carries no position. The PCA is fitted on the wrong data. The leakage guard cannot know which genes an embedding saw | Allow `Precomputed` under programme masking when the embedding was computed without the hidden genes (recorded with the embedding and checked); fit the in-pipeline PCA on the training slides (opt-in) | T0; W1 |
 | K7 | Single seeds; differences of ±0.02 are unresolved (e.g. scVI + Fourier's +0.035 on response genes) | – | A seed axis in every sweep; 3 seeds for every arm a decision rests on; on CosMx, its three splits as folds | T0; all |
 | K8 | Evaluations die at the job limit (`global_only` and `staged_training`, twice) | Every arm is trained and evaluated in one job | One evaluation job per arm; evaluate `joint_rope` and `l2g_res`; drop C3's six missing arms (H-C is already rejected) unless you want them | T0; W1 |
-| K9 | legnini: the flow maps are not readable, the SHH source (floor plate) is avoided, and no rule transfers between the two test organoids | No model beats the local kernel, so there is no learned flow to read; there are only two test organoids | Re-evaluate with the rewritten flow; SHH programme masking; read flows only from a model above the kernel; rotate the test organoids as folds | T1, T4; W1–W2 |
-| K10 | The relevance rollout is degenerate, and so is everything built on `_attn_matrix` | It takes the gradient of a summed LayerNorm output | A valid target (one cell's predicted programme), checked in T4's benchmark; redo the manuscript's CLS and net-flow analyses with the methods that pass | T4, T9; W2–W3 |
+| K9 | legnini: the flow maps are not readable, the SHH source (floor plate) is avoided, and no rule transfers between the two test organoids | No model beats the local kernel, so there is no learned flow to read; there are only two test organoids; the label heatmaps need an annotation, and patch fields average senders and receivers of every programme together | Re-evaluate with the rewritten flow; SHH programme masking; read flows only from a model above the kernel; rotate the test organoids as folds; a label-free flow per programme from a validated attribution (task 5) | T1, T4; W1–W2 |
+| K10 | The relevance rollout is degenerate, and so is everything built on `_attn_matrix` | It takes the gradient of a summed LayerNorm output. Found 2026-10-21: it also averaged the heads over every graph of a batch together, and built its identity and mask on the CPU (fixed; `evaluate()` runs one graph, so no number made so far changes) | A valid target (one cell's predicted programme; `generate_relevance(..., target=)` since 2026-10-21), checked in T4's benchmark (`attention_check`); redo the manuscript's CLS and net-flow analyses with the methods that pass | T4, T9; W2–W3 |
 | K11 | Gene ranks come from an unmasked pass; the enrichment background is not stated | – | Gene scores from the masked pass (`score_heads` per gene); the panel as background | T2, T9; W3 |
 | K12 | Global's magnitudes are off under the centred SCE | The loss ignores scale | Nothing for now: raw SCE is at the smoother's (0.074 vs 0.071). 0c stays deferred unless a cosine reading needs it | – |
 | K13 | Whole sections (47k–100k cells) cannot run with dense per-cell attention; windows cut interactions at their borders | S² memory and compute in the number of cells | Pool cells into patches or niches first (T1b): S drops to ~100–2,000 and dense, exact attention fits; sparse and linear attention (T6) as the alternative | T1b, T6; W1–W2 |
@@ -357,6 +372,66 @@ Order:
    programmes.
 6. **D2.1, the targets split by scale:** the alternative if 3–5 do not separate the components.
 
+**Re-masking before the transformer (task 3, built 2026-10-21).** Cells are masked once, in the input
+(`_common_step_masking`), and the GCN mixes a hidden cell's visible neighbours into its token, which the
+transformer then carries in that cell's own residual stream: the global head of a hidden cell near a disc's rim
+can copy the local one. `model.global_component.parameters.remask: hidden` (GraphMAE's re-mask) replaces the
+token of every cell hidden whole by one learned token in `GlobalModule.step`, before the input LayerNorm and the
+position, so its global embedding is what attention gathers from other cells -- with the long-range mask on,
+from beyond the GCN's reach only. Visible cells keep their tokens; the local head is unchanged.
+- *Where it applies:* models with a local component (a `GlobalModel` tokenises the masked input itself and is
+  refused), under cell masking or discs. Refused with a hidden gene set (no cell is hidden whole: programme
+  masking has nothing to re-mask; its analogue is D1's context query for every cell), with random entries only,
+  and with pooling (a patch already leaves its hidden cells out). Checkpoint tag `rmk-hidden`.
+- *Verified by:* the transformer's gradient with respect to a hidden cell's own token is exactly 0 (and nonzero
+  without re-masking); with the long-range mask and one layer, no token within the GCN's two hops reaches a hidden
+  cell's global embedding while every token beyond does; no hidden value reaches a prediction; the token trains
+  through `train()`; off, the model gains no state and every other weight is initialised as before. 16 tests, 8
+  mutations caught, harness IDENTICAL.
+- *Sweep `remask_test`* (slurm folder; discs as in `staged_training`, its `joint` as the baseline): `joint` and
+  `joint_remask` (long-range mask on, 3 seeds each), `joint_nolrm` and `joint_nolrm_remask` (mask off, one seed);
+  twins of `joint` and `joint_remask`. **Read:** CKA local~global at the rim (should fall), the global head by
+  depth (with the mask on, a copying head drops at the rim and holds deep; the local head should not move),
+  visible lift and the receptive field of hidden spots.
+- *Caveat:* all hidden cells now share one key and value too, the sink of K5 (programme masking avoids it;
+  T1's visible-keys-only option would remove it).
+
+**Moran's I split (task 1).** Per gene, Moran's I over growing neighbourhoods (k-nearest neighbours at k = 4 ...
+256, or radii in µm -- a config list, per slide, averaged over the training slides), on the expression itself
+(no model). Its decay is the gene's length scale: ℓ_g, the neighbourhood size at which I falls to half its
+smallest-neighbourhood value, and the AUC over log size (the manuscript's Figs. 3C, 4I). Fast decay = local
+variability (a likely local interaction), slow or none = global (tissue-scale) variability. Genes are grouped by
+ℓ_g (thresholds or quantiles from the config, so dataset-agnostic), then each group is scored by component on the
+masked pass: per gene the local and the global head's centred cosine on its hidden entries (`score_heads`'
+per-gene table), and the share of its decoder variance on each embedding. Expected: local-scale genes go to the
+local head, global-scale genes to the global head.
+- *Sanity check first, on synth_spot:* the short-range receivers must come out local, the long-range responses
+  and region genes global, the noise genes with I ≈ 0 at every size.
+- *Two cautions.* For a smooth field I falls with the neighbourhood anyway; the class is the decay *scale*, not
+  its sign. A rising I means short-range anti-correlation (neighbours that exclude each other, e.g. alternating
+  senders and receivers), not more global variation, and is reported apart. A cell-type marker is spatially
+  variable through composition, so with labels the profile is also computed within each type (as T10 D).
+- *Where:* a function in `evaluation` (squidpy's `spatial_autocorr` per graph, or a sparse weights matrix per
+  neighbourhood), a `gene_scales` table and a per-group head table in the report; synth_spot first, then legnini
+  (pixel coordinates, `PIXEL_TO_UM`).
+
+**Embedding dimensions and genes (task 2).** For each learned embedding (local, global; also the pooled patch
+token), the most important dimensions -- `calculate_dim_importance` (standardised decoder loadings, on the
+`get_model_output` adata) and, model-agnostic, the variance each dimension explains of the head's prediction on
+the masked pass -- then, per top dimension:
+- *genes:* the genes most correlated with the dimension's value across cells (Spearman), from the masked pass's
+  embeddings and the true expression, so a hidden gene's correlation is what the embedding knows about it;
+- *expression space:* that correlation per gene of interest, against the untrained twin and a PCA of the visible
+  genes (a dimension that tracks a gene as well untrained only copies the input);
+- *coordinate space:* whether the dimension and the gene vary together in space -- Lee's L (bivariate Moran's I)
+  between the dimension's map and the gene's map at the gene's length scale from task 1, and the correlation of
+  the two kernel-smoothed maps; spatial maps of the dimension next to the gene's (synthetic data: predicted and
+  true side by side).
+- *Genes of interest* from the config (synth_spot: each programme's sender, receptor, response; legnini: SHH,
+  FOXA2, NKX2.2, NKX6.1, OLIG2, PAX6, IRX3, PTCH1, GLI1).
+- Read on the DP1 base model and on the remask and decoder arms: a separated model should put the local-scale
+  genes on local dimensions and the global-scale ones on global dimensions.
+
 - **Run.** Sweep 1 in W1 (D2.2, D1.1 + D3.1, joint LSE, the residual decoder as baseline). Sweep 2
   in W2 (D4, D2.1, D1.2 if needed). Both on synth_spot under programme masking, with the disc
   evaluation as a second readout, 3 seeds.
@@ -446,6 +521,54 @@ sensitive to but that sits at the baseline ranks 1.0 by gradient and 0.0 by attr
   attributions, and where sinks or approximations break that agreement.
 - **Then, in W3 (T9):** redo the manuscript's CLS scores, net flow and flow domains with the
   methods that pass.
+
+**Is attention computed correctly (task 4, built 2026-10-21).** The default attention is a vendored copy of
+torch's (`transformer_utils.multi_head_attention_forward_with_gradients`), edited so the map stays in the autograd
+graph and comes back per head; the relevance (`tl/self_attn_relevance.py`) hooks those maps for their gradients.
+- *Checked by tests:* the vendored attention equals torch's stock `nn.MultiheadAttention` with the same weights
+  (outputs, per-head maps, input gradients; boolean and float masks, key padding, both together, train and eval;
+  separate query/key and value tokens as under `center_qk`), and the custom layer torch's stock encoder layer; the
+  hooked gradient is autograd's gradient with respect to the map the layer used. So the attention itself is
+  computed correctly.
+- *Found and fixed:* the relevance averaged the heads over all `B × heads` maps of a batch together, mixing graphs
+  (latent: `evaluate()` runs one graph); it built its identity and masks on the CPU (it failed for a model on a GPU);
+  a target can now be given (`generate_relevance(output, target=...)`), the summed output stays the default.
+- *Found, left as they are (documented):* `average_attn_weights` is ignored (maps always per head, which every
+  reader expects); in training the returned map is the one after dropout (the attention-entropy loss reads it);
+  `evaluate()`'s unused `raw_attn[0]` is head 0, not a head mean; the input LayerNorm is applied twice (once
+  before the node encoding is added, once on token + encoding).
+- *Built:* `evaluation.attention_check`. `check_attention` recomputes every layer's attention of a masked pass from
+  the inputs the layer received, by the definition (map and output), by torch's stock attention (without RoPE)
+  and by torch's stock layer (without RoPE or centring). `attention_readouts` compares seven ways of reading it
+  for sampled queries -- head-mean attention of the last layer and of all layers, rollout with the residual path,
+  Chefer's rule 5 on the last layer and full relevance from the query's own target (½‖ŷ − μ‖² over its scored
+  entries), the same relevance from the summed output, and gradient × input at the tokens -- by the planted
+  sender's matched rank, their rank agreement and span. Masked passes may now hook their maps
+  (`hooking_attention`). 40 tests; of 15 mutations 14 are caught (two only after two more tests), the survivor removes a redundant gradient clear; harness IDENTICAL.
+- *Sweep `attention_check`* (slurm folder): evaluation only, on the 7 per-cell transformer arms of
+  `response_masking` (all seeds), twins of `lin_fourier`, `lin_rope` and `joint_fourier`; no standard tables
+  (`STANDARD_EVALUATION = False`, a new `sweep_common` setting next to the `EXTRA_EVALUATION` hook). **Read:** the
+  check should be at rounding (~1e-6) everywhere; then which readout ranks planted senders above its untrained
+  twin. That decides which attribution task 5's flow is built on.
+
+**Flow without annotation (task 5).** Today's flow (`attention_flow.patch_flow`) gives patch-to-patch fields and
+label heatmaps; the heatmaps need an annotation and the fields mix every programme. Proposed:
+- *Per-cell sender vectors.* For a receiver `i` and a target (one programme's predicted response under programme
+  masking, or the whole hidden prediction), the attribution `a_ij` of every cell `j` from the readout task 4
+  validates (integrated gradients as `response_influence` does, or whichever ranks planted senders best), minus
+  its expectation under the expression-permuted slide (the same geometry, no content), and with the distance
+  kernel taken out (each `a_ij` over the mean of cells as far away). The vector `v_i = Σ_j a⁺_ij (x_j − x_i) / Σ_j
+  a⁺_ij` points from the receiver to where its prediction draws from; its length is the reach.
+- *Fields, no labels.* `v_i` smoothed on a grid gives the field (arrows), per programme. The divergence of the
+  sender→receiver graph (a cell's outgoing minus incoming attribution) marks sources and sinks. Senders that feed
+  many receivers are called *source hubs*. All of it reads positions and attributions only.
+- *Summaries without annotation:* clusters of the cells by their vectors and source profiles (communication
+  niches), the sources' expression against the receivers' (which visible genes the sources share: a ligand
+  candidate list for T8), and with labels only optionally (T5).
+- *Checks:* on synth_spot the field must point from receivers to their planted sources (the angle between `v_i`
+  and the true direction to the sender, against the permuted slide and the untrained twin); on legnini the SHH
+  readouts' field should point to the floor plate (K9).
+- The design goes into attribution_plan.md with T4; built after task 4's read decides the attribution.
 
 ### T5 — how cell-type driven attention is (W2–W3)
 
@@ -691,16 +814,16 @@ SpatialDE, SPARK-X, AMICI, Steamboat, GraphCompass); the Visium and IMC data on 
 |---|---|---|---|
 | Mon | T0: seeds, per-arm evaluation | `response_masking` (3 seeds); legnini attention re-evaluation; `joint_rope`, `l2g_res` evaluation | – |
 | Tue | T0: `Precomputed` under programme masking; T1: oracle bar, distance prior; T4: gradient × input and integrated gradients for the sender ranks (moved up from W2); **T1b: design note and leakage tests** | `joint_fourier` added to response masking, 3 seeds of the main arms | you: the legnini gene set, the CosMx choices, T1b's patch sizes |
-| Wed | **T1b: grid pooling and un-pooling in `GlobalModel` and `CombinedModel`**; T2: D0 | `pre_pca_rope` added to response masking | – (response masking first read done 2026-10-19) |
-| Thu | **T1b: decoder arms for the global-only model (own-cell skip, nonlinear, LSE)**; T2: D2.2 | pooled smoke; legnini programme masking (cell-level and pooled) | legnini re-evaluation |
-| Fri | T0: the CosMx pipeline; masking_plan.md, attribution_plan.md; **T10: comparison harness and baseline environments** | **T1b sweep (grid sizes × global-only and joint, 3 seeds)**; decoder arms; T10: Visium and IMC data and baselines on the cluster (yours) | – |
+| Wed | **T1b: grid pooling and un-pooling in `GlobalModel` and `CombinedModel`**; T2: D0; **2026-10-21: re-masking (task 3) and the attention check (task 4) built** | `pre_pca_rope` added to response masking | – (response masking first read done 2026-10-19) |
+| Thu | **T1b: decoder arms for the global-only model (own-cell skip, nonlinear, LSE)**; T2: D2.2; **the Moran's I split (task 1)** | pooled smoke; legnini programme masking (cell-level and pooled); **`remask_test` (8 runs) and `attention_check` (evaluation only)** | legnini re-evaluation |
+| Fri | T0: the CosMx pipeline; masking_plan.md, attribution_plan.md; **T10: comparison harness and baseline environments**; **embedding dimensions vs genes (task 2)** | **T1b sweep (grid sizes × global-only and joint, 3 seeds)**; decoder arms; T10: Visium and IMC data and baselines on the cluster (yours) | **`remask_test`** |
 
 ### W2 (Mon 26 Oct – Sun 1 Nov): masks, whole slides, conditioning, attribution
 
 | days | build | run | read, decide |
 |---|---|---|---|
-| Mon | T3: the new masks; T2: D1.1 + D3.1, joint LSE (moved from W1); T1b: `niche` pooling on a frozen local stage | – | T1b sweep, legnini programme masking → **DP1** |
-| Tue | T4: integrated gradients, relevance target, null key and registers | T3 matrix (synth_spot); **T10 A: classification, CosMx cell type and Visium condition (base model, GCN, PCATransformer, baselines)** | – |
+| Mon | T3: the new masks; T2: D1.1 + D3.1, joint LSE (moved from W1); T1b: `niche` pooling on a frozen local stage; **flow without annotation: design (task 5)** | – | T1b sweep, legnini programme masking → **DP1**; **`attention_check` → the attribution for task 5** |
+| Tue | T4: integrated gradients, relevance target (built 2026-10-21), null key and registers; **flow without annotation (task 5)** | T3 matrix (synth_spot); **T10 A: classification, CosMx cell type and Visium condition (base model, GCN, PCATransformer, baselines)**; Moran's I split and dimension readouts on the DP1 model | – |
 | Wed | T6: SDPA, the whole-section blockers, query-sampled diagnostics, the distance-stratified expander, windows on synth_spot; **T10 C, D: domain and SVG scoring code** | T4 benchmark on W1's checkpoints; T3 subset (legnini) | – |
 | Thu | T7: generator, conditioning modes, swap evaluation; conditioning_plan.md | T6 run 1 (synth_spot); CosMx whole sections per backend (run 2, part 1); **T10 C, D on synth_spot with baselines** | T3 matrix → **DP2**; T10 A |
 | Fri | T8: priors, validation, ligand activity; T5 metric; T6 patch cross-attention (stretch) | T7 sweep (synth_spot); T2 sweep 2 | T4 table; T6 run 1 → **DP3** |

@@ -13,6 +13,7 @@ the same commit as the work.
 | stage | state | verified by | date |
 |---|---|---|---|
 | D0 — yardsticks: redundancy and attribution readouts | proposed | | |
+| D1.0 — re-masking before the transformer (hidden cells only) | **implemented, unverified** -- `remask: hidden` (roadmap.md, T2, task 3); sweep `remask_test` written, not run | 16 tests, 8 mutations, harness IDENTICAL | 2026-10-21 |
 | D1 — a context-only global embedding | proposed | | |
 | D2 — different targets per head | proposed | | |
 | D3 — one prediction from two parts | proposed | | |
@@ -75,7 +76,14 @@ the cell itself. Two ways, from the cheaper:
    under discs, made the rule for every cell.
 
 Either way the global head cannot copy the local one: its input carries no trace of the cell's own
-token. Tests: a change to a cell's own input never changes its global head's prediction (only its
+token.
+
+0. **Re-masking, for hidden cells only (built 2026-10-21, `model.global_component.parameters.remask: hidden`).**
+   The cheapest step towards 2: a cell hidden whole enters the transformer as one learned token instead of its
+   GCN token (GraphMAE's re-mask), while visible cells keep theirs. It removes the copying where the disc task
+   measured it -- a hidden rim cell's GCN token holds its visible neighbours -- but leaves visible cells, and
+   every cell under programme masking (none is hidden whole there), as they are. Design and checks in
+   roadmap.md, T2. Tests: a change to a cell's own input never changes its global head's prediction (only its
 local one); hidden values never reach a prediction; the default model unchanged.
 
 ## D2 — what each head is asked to predict

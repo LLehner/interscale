@@ -295,3 +295,23 @@ result was read; the entry above was the first one written live.*
   found the cell's own genes explain the three readouts (centred cosine 0.51, the surroundings adding 0.01), a
   second attempt with other settings disagreed on the surroundings (0.04 against 0.42), and the check was
   interrupted before a clean version ran.
+
+## 2026-10-21 — Is attention computed correctly? The vendored attention and the relevance against torch (code and toy models; no data)
+
+**What worked**
+- The default attention (the vendored copy of torch's, edited to keep the map in the autograd graph) equals torch's
+  stock `nn.MultiheadAttention` with the same weights to 1e-6: outputs, per-head maps and input gradients, under
+  boolean and float masks, key padding and both together, in training (dropout 0) and evaluation, and with separate
+  query/key and value tokens (`center_qk`). The custom encoder layer equals torch's stock layer. The gradient the
+  hook stores is autograd's gradient with respect to the map the layer used.
+- Chefer's rules 5 and 6 are implemented as in the paper (head mean of the positive gradient x attention, then
+  R += Ā R per layer).
+
+**What doesn't work**
+- The relevance averaged the heads over all graphs of a batch together (only harmless because `evaluate()` runs
+  one graph) and built its identity and masks on the CPU, so it failed for a model on a GPU. Fixed.
+- Its target, the summed output, is still degenerate (known since 2026-10-17); a target can now be given.
+- Left as they are, documented: `average_attn_weights` is ignored (maps are always per head); the map returned in
+  training is the one after dropout; `evaluate()`'s raw matrix is head 0 of graph 0, not a head mean (unused); the
+  input LayerNorm is applied twice (before and after the node encoding is added).
+- Nothing here says which readout finds senders: that is the `attention_check` sweep, not run.
