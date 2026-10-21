@@ -112,6 +112,7 @@ NOTES = {
     "same weights; largest absolute difference (max_abs: the expected tensor's scale; inf: blocked entries differ)",
     "readout_edges": "the planted sender's rank among cells as far from its receiver, per way of reading attention "
     "(attention_check.READOUTS) and range class (0.5: blind to the sender; read against the untrained twin)",
+    "readout_pairs": "the number of planted pairs behind each rank of readout_edges (a rank of few pairs is noise)",
     "readout_agreement": "mean Spearman correlation between two readouts' scores over a query's cells",
     "readout_span": "each readout's score-weighted distance to the query (span_um) and its share within each radius",
     "flow_summary": "where the cells of a patch draw their predictions from -- influence (gradient flow) and "
@@ -309,6 +310,7 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         out["attention_check"] = tables["attention_check"].set_index(["layer", "check", "quantity"])
     if "readout_edges" in tables:
         out["readout_edges"] = _pivot(tables["readout_edges"], "readout", "range_class", "matched_rank")
+        out["readout_pairs"] = _pivot(tables["readout_edges"], "readout", "range_class", "n_pairs")
     if "readout_agreement" in tables:
         out["readout_agreement"] = _pivot(tables["readout_agreement"], "readout_a", "readout_b", "spearman")
     if "readout_span" in tables:
@@ -338,6 +340,7 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         "response_check",
         "attention_check",
         "readout_edges",
+        "readout_pairs",
         "readout_agreement",
         "readout_span",
         "training",

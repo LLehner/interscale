@@ -414,6 +414,18 @@ def test_rollout_composes_the_head_mean_maps_with_the_residual_path_last_layer_l
     assert torch.allclose(_rollout(maps).sum(-1), torch.ones(4, dtype=torch.float64))  # rows stay distributions
 
 
+def test_the_report_keeps_the_number_of_pairs_behind_each_rank():
+    from interscale.evaluation.report import compact_tables
+
+    module = _build(_config(num_layers=1)).module
+    edges = pd.DataFrame({"sender": [0, 1], "receiver": [14, 20], "range_class": ["a", "b"]})
+    tables = _readouts(module, [_lattice()], edges)
+    compact = compact_tables({f"readout_{name}": table for name, table in tables.items()})
+    ranks, pairs = compact["readout_edges"], compact["readout_pairs"]
+    assert ranks.shape == pairs.shape and list(ranks.index) == list(pairs.index)
+    assert (pairs.loc[:, ["a", "b"]] >= 1).all().all() and pairs["any"].eq(pairs["a"] + pairs["b"]).all()
+
+
 def test_one_layer_readouts_agree_where_they_are_one_quantity():
     module = _build(_config(num_layers=1)).module
     edges = pd.DataFrame({"sender": [0], "receiver": [14], "range_class": ["planted"]})
