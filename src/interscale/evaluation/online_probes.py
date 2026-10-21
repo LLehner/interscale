@@ -58,7 +58,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.loader import DataLoader
 
-from interscale.tl.depth import hidden_depth  # noqa: F401  (re-exported: the evaluation modules import it from here)
+from interscale.tl.depth import hidden_depth  # the evaluation modules import it from here
 from interscale.tl.geome_utils import label_codes
 from interscale.tl.masking import MASK_VALUE
 

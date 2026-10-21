@@ -380,7 +380,7 @@ def attention_readouts(
                 batch = batch.to(device)
                 leaf: dict[str, torch.Tensor] = {}
 
-                def tokens_in(norm, args):
+                def tokens_in(norm, args, leaf=leaf):
                     # The first call normalises the flat [N, E] cell tokens (common_step_local_to_global); the
                     # second, inside forward, the padded sequence. The tokens become a leaf to take a gradient at.
                     if args[0].dim() != 2 or "x" in leaf:
