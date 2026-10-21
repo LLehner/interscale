@@ -12,6 +12,8 @@ from ._step_output import StepOutput, ViewOutput, gather_cls, gather_tokens
 
 #: How a hidden cell's precomputed embedding is replaced (``precomputed_mask_fill``).
 PRECOMPUTED_MASK_FILLS = ("learned", "minus_one")
+#: What the transformer gets for a cell hidden whole (``remask``): its local token, or one learned token.
+REMASK_KINDS = ("none", "hidden")
 
 
 class GlobalModule(BaseModule):
@@ -20,6 +22,7 @@ class GlobalModule(BaseModule):
         precomputed_mask_fill: str = "learned",
         programme_masking: bool = False,
         pooling=None,
+        remask: str = "none",
         **base_module_kwargs,
     ):
         """``precomputed_mask_fill``: what a hidden cell's ``Precomputed`` embedding is replaced by.
@@ -36,9 +39,30 @@ class GlobalModule(BaseModule):
 
         ``pooling``: a :class:`~interscale.module.global_modules.pooling.PatchPooling`, or None. With it the
         transformer runs on patches of cells (:meth:`step`); everything outside it still sees one row per cell.
+
+        ``remask``: ``"hidden"`` hands the transformer one learned token for every cell hidden whole instead
+        of the local component's token, which mixed in the cell's visible neighbours (:meth:`remask_tokens`).
+        Only behind a local component: a model without one already tokenises a hidden cell from its masked
+        input alone.
         """
         super().__init__(**base_module_kwargs)
         self.pooling = pooling
+        if remask not in REMASK_KINDS:
+            raise ValueError(f"remask must be one of {REMASK_KINDS}, got {remask!r}.")
+        self.remask = remask
+        if remask != "none":
+            if self.type_gex_embedding is not None:
+                raise ValueError(
+                    "remask replaces the local component's token of a hidden cell, but this global module "
+                    f"tokenises the expression itself (type_gex_embedding {self.type_gex_embedding!r}): a "
+                    "GlobalModel's hidden tokens hold nothing of the cell already. Use it in a CombinedModel."
+                )
+            if pooling is not None:
+                raise ValueError("remask: a pooled patch token already leaves out its hidden cells.")
+            # From a private generator, so building it draws nothing from the global one: every other weight
+            # is initialised as in the model without it.
+            gen = torch.Generator().manual_seed(0)
+            self.remask_token = torch.nn.Parameter(torch.randn(self.n_embed, generator=gen))
 
         self.registered_local_component = False
         self.registered_global_component = True
@@ -215,6 +239,21 @@ class GlobalModule(BaseModule):
             return none if gene_mask is None else gene_mask.bool().all(dim=1)
         return batch_masked.mask.bool()
 
+    def remask_tokens(self, batch_masked, emb: torch.Tensor) -> torch.Tensor:
+        """``emb`` ``[N, E]`` with the rows of the cells hidden whole replaced by the learned ``remask_token``.
+
+        Masking corrupts the input once, before the local component, which then hands a hidden cell a token
+        made of its visible neighbours: the transformer would read the cell's neighbourhood in the cell's own
+        residual stream, and its head could copy the local one. Re-masked, a hidden cell enters the
+        transformer as the same token everywhere (plus its position, added after), so its global embedding
+        is what attention gathers from other cells -- under the long-range mask, from beyond the local reach.
+        Visible cells keep their tokens. Unchanged when ``remask`` is ``"none"``.
+        """
+        if self.remask == "none":
+            return emb
+        hidden = self.wholly_hidden(batch_masked)
+        return torch.where(hidden[:, None], self.remask_token.to(emb.dtype).expand_as(emb), emb)
+
     def step(self, batched_data, emb: torch.Tensor):
         """The transformer on the cell tokens ``emb`` ``[N, E]`` of a masked batch: ``(global_embedding, src_padding_mask, index_nodes, attention_mask, attn)``.
 
@@ -222,8 +261,10 @@ class GlobalModule(BaseModule):
         tokens are first pooled into patch tokens, the transformer runs on the patches, and each cell gets
         its patch's output, laid out as the cell-level output is (``pooling.cell_layout``) -- so the
         decoders, the loss and every consumer read one row per cell either way. ``index_nodes`` then lists
-        every cell of each graph, and ``attn`` holds the patches' attention maps.
+        every cell of each graph, and ``attn`` holds the patches' attention maps. Under ``remask`` the tokens of
+        the cells hidden whole are replaced first (:meth:`remask_tokens`).
         """
+        emb = self.remask_tokens(batched_data, emb)
         if self.pooling is None:
             padded_emb, src_padding_mask, pad_index_nodes, attention_mask, rotary = self.common_step_local_to_global(
                 batched_data, emb
@@ -543,6 +584,7 @@ class GlobalModule(BaseModule):
                 precomputed_mask_fill=params.get("precomputed_mask_fill", "learned"),
                 programme_masking=bool(list(cfg.dataset.get("mask_genes", []) or [])),
                 pooling=build_pooling(cfg, n_embed) if n_embed is not None else None,
+                remask=params.get("remask", "none"),
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,
             )

@@ -160,6 +160,15 @@ def get_global_component_cfg(cfg, global_component_name):
         pool.n_patches = 0
         pool.offset = 0.0
         pool.features = []
+        # Re-masking before the transformer (GraphMAE's re-mask; `.claude/roadmap.md`, T2). Cells are masked
+        # once, in the input, and the local component mixes a hidden cell's visible neighbours into its
+        # token, so the transformer gets a hidden cell's neighbourhood in that cell's own token and the
+        # global head can copy the local one. `hidden`: every cell hidden whole (cell masking, discs) hands
+        # the transformer one learned token instead, so its global embedding comes from attention to other
+        # cells alone (with the long-range mask on, from beyond the local reach). `none`: the model from
+        # before. Models with a local component only; not with pooling (a hidden cell already weighs 0 in
+        # its patch) nor a hidden gene set (no cell is hidden whole).
+        cfg.model.global_component.parameters.remask = "none"
         # The attention mechanism, see `.claude/attention_plan.md`. `kind`: any registered backend
         # (`module/global_modules/attention.py`): `dense` is softmax attention over every pair, the
         # model from before backends existed. `head_dim` sets the width of one attention head apart

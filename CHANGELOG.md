@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Re-masking before the transformer (`model.global_component.parameters.remask`, default `none`): `hidden` hands
+  the transformer one learned token (`GlobalModule.remask_token`) for every cell hidden whole instead of the local
+  component's token, which mixed in the cell's visible neighbours (GraphMAE's re-mask), so a hidden cell's global
+  embedding comes from attention to other cells alone. Models with a local component, cell masking or discs;
+  checkpoint tag `rmk-hidden`.
 - Sender attribution: `receptive_field.response_influence(measure="attribution")` ranks a planted sender
   by its *contribution* to its receiver's predicted response -- integrated gradients (Gauss-Legendre,
   `steps` points) from a baseline cell (`baseline`: a `[G]` expression, e.g. the training mean; default the

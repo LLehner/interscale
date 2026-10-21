@@ -507,6 +507,37 @@ def _validate_pooling(cfg):
         raise ValueError(f"{where}: optim.loss {cfg.optim.loss!r} reads cell-by-cell attention maps, which patches do not give.")
 
 
+def _validate_remask(cfg):
+    """``remask`` (a learned token for wholly hidden cells before the transformer): a known kind, whole cells masked."""
+    from interscale.module.base._base_global_module import REMASK_KINDS
+
+    params = cfg.model.global_component.get("parameters", None)
+    remask = params.get("remask", "none") if params is not None else "none"
+    if remask not in REMASK_KINDS:
+        raise ValueError(f"model.global_component.parameters.remask must be one of {REMASK_KINDS}, got {remask!r}.")
+    if remask == "none":
+        return
+    where = f"model.global_component.parameters.remask {remask!r}"
+    if list(cfg.dataset.get("mask_genes", []) or []):
+        raise ValueError(
+            f"{where} replaces the tokens of cells hidden whole, but a hidden gene set (dataset.mask_genes) hides "
+            "no cell whole: it would change nothing."
+        )
+    blocks = cfg.dataset.get("mask_block_fraction", 0.0) > 0
+    if cfg.dataset.mask_strategy == "gene" and not blocks:
+        raise ValueError(
+            f"{where}: under mask_strategy gene only spatial blocks (mask_block_fraction) hide whole cells; "
+            "random entries almost never do."
+        )
+    if cfg.dataset.mask_percentage <= 0 and not blocks:
+        raise ValueError(f"{where}: nothing is masked (mask_percentage 0, no blocks), so no token would be replaced.")
+    pooling = params.get("pooling", None)
+    if pooling is not None and pooling.get("kind", "none") != "none":
+        raise ValueError(
+            f"{where}: a pooled patch token already leaves out its hidden cells; there is no cell token to replace."
+        )
+
+
 def _validate(cfg):
     """Run every load-time check.
 
@@ -522,6 +553,7 @@ def _validate(cfg):
     _validate_pe(cfg)
     _validate_attention(cfg)
     _validate_pooling(cfg)
+    _validate_remask(cfg)
     _validate_sce(cfg)
     _validate_center_targets(cfg)
     _validate_global_residual(cfg)

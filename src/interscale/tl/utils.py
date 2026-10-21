@@ -166,7 +166,8 @@ def _training_tag(cfg) -> str:
     2026-10-14: checkpoints trained with the mask on before then carry no tag. ``sch-<schedule>``,
     ``lw<local>-<global>`` and ``frz-<components>``: a staged schedule, loss weights other than
     the default 0.5 / 0.5, and frozen components (``train._schedule``). ``gs<cell rate>-<selectors>``:
-    a hidden gene set (``dataset.mask_genes``).
+    a hidden gene set (``dataset.mask_genes``). ``rmk-<kind>``: re-masking before the transformer
+    (``model.global_component.parameters.remask``).
     """
     # Here, not at module level: interscale.train imports this module.
     from interscale.train._schedule import resolve_loss_weights, schedule_tag
@@ -179,6 +180,8 @@ def _training_tag(cfg) -> str:
     params = cfg.model.global_component.get("parameters", None)
     if params is not None and params.get("long_range_attention", False):
         parts.append("lrm")
+    if params is not None and params.get("remask", "none") != "none":
+        parts.append(f"rmk-{params.remask}")
     schedule = schedule_tag(cfg)
     if schedule:
         parts.append(schedule)
