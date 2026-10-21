@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning][].
   component's token, which mixed in the cell's visible neighbours (GraphMAE's re-mask), so a hidden cell's global
   embedding comes from attention to other cells alone. Models with a local component, cell masking or discs;
   checkpoint tag `rmk-hidden`.
+- `evaluation.attention_check`: `check_attention` recomputes every layer's attention of a masked pass from the
+  inputs the layer received -- by the definition, by torch's stock `nn.MultiheadAttention` and by its stock encoder
+  layer -- and reports the largest differences; `attention_readouts` scores the cells for sampled queries by seven
+  readouts (head-mean attention of the last layer and of all layers, rollout with the residual path, Chefer's
+  rule 5 and full relevance from the query's own target, relevance from the summed output, gradient x input) and
+  compares them by the planted sender's matched rank, their rank agreement and span. New report sections
+  `attention_check`, `readout_edges`, `readout_agreement`, `readout_span`, with summary tables.
+- `SelfAttentionRelevance.generate_relevance(output, target=...)` traces a given scalar instead of the summed output;
+  `TransformerNodeEncoderHook.hooking_attention()` makes the passes inside hook their maps for relevance.
 - Sender attribution: `receptive_field.response_influence(measure="attribution")` ranks a planted sender
   by its *contribution* to its receiver's predicted response -- integrated gradients (Gauss-Legendre,
   `steps` points) from a baseline cell (`baseline`: a `[G]` expression, e.g. the training mean; default the
@@ -226,6 +235,10 @@ and this project adheres to [Semantic Versioning][].
   measures what a prediction depends on.
 
 ### Fixed
+
+- `SelfAttentionRelevance` averaged the heads over every graph of a batch together (now within each graph; one
+  graph, as `evaluate()` runs, gives the same numbers) and built its identity and masks on the CPU (now on the
+  output's device).
 
 - A dual decoder now logs each head's masked scaled cosine error (`<mode>_masked_scaled_cosine_error_local` /
   `_global`). The combined metric is the mean of both halves, so with one head frozen it said nothing about

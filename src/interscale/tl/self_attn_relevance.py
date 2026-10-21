@@ -18,7 +18,7 @@ class SelfAttentionRelevance:
         self.transformer_encoder = transformer_encoder
 
     @staticmethod
-    def avg_heads(attn_map, grad):
+    def avg_heads(attn_map, grad, n_heads: int | None = None):
         """
         Rule 5 from Chefer et al.: Averages the heads in the attention map after applying gradients.
 
@@ -28,17 +28,21 @@ class SelfAttentionRelevance:
                 Attention weight (Key and Query dependent), shape: BHxSxS
             grad: Tensor
                 Gradients to apply to the attention map, shape: BHxSxS
+            n_heads: int, optional
+                Heads per graph. Given, the heads are averaged within each graph, ``[B, S, S]``; None
+                averages over all ``B * H`` maps at once, which is the same for one graph and mixes
+                graphs for more.
 
         Returns
         -------
             Tensor
                 Averaged attention map after applying gradients.
         """
-        attn_map = attn_map.reshape(-1, attn_map.shape[-2], attn_map.shape[-1])
-        grad = grad.reshape(-1, grad.shape[-2], grad.shape[-1])
-        attn_map = grad * attn_map
-        attn_map = attn_map.clamp(min=0).mean(dim=0)
-        return attn_map
+        size = attn_map.shape[-2:]
+        cam = (grad.reshape(-1, *size) * attn_map.reshape(-1, *size)).clamp(min=0)
+        if n_heads is None:
+            return cam.mean(dim=0)
+        return cam.view(-1, n_heads, *size).mean(dim=1)
 
     @staticmethod
     def apply_self_attention_rules(R_ss, cam_ss):
@@ -59,36 +63,48 @@ class SelfAttentionRelevance:
         """
         return torch.matmul(cam_ss, R_ss)
 
-    def generate_relevance(self, transformer_output, category_index=None):
+    def generate_relevance(self, transformer_output, category_index=None, target=None):
         """
         Generates the relevance score for a given input and category index.
 
         Parameters
         ----------
             transformer_output
+                ``[S, B, E]``: the encoder's output from a pass that hooked every layer's attention map
+                (``forward(..., register_hook=True)``).
             category_index: List[int], optional
                 List of indices to consider in the category mask, default is None.
+            target: Tensor, optional
+                The scalar whose relevance is traced, computed from ``transformer_output`` (e.g. one
+                cell's predicted programme). None backpropagates the sum of the output over
+                ``category_index``: after the encoder's affine LayerNorm that sum is constant up to the
+                norm's weights' deviation from uniform, an arbitrary direction (``.claude/
+                linear_probing_docs.md``), so only a given target gives a readable relevance.
+
+        Returns
+        -------
+            Tensor
+                ``[S, S]`` for one graph, ``[B, S, S]`` for more: row ``i`` is what each token
+                contributed to token ``i``'s output.
         """
-        # output, _ = self.model(padded_h_node, src_padding_mask, register_hook=True)
-        category_mask = torch.ones(transformer_output.size())
-        if category_index is not None:
-            category_mask = torch.zeros(transformer_output.size())
-            category_mask[category_index, :, :] = 1
-        loss = (transformer_output * category_mask).sum()
+        if target is None:
+            category_mask = torch.ones_like(transformer_output)
+            if category_index is not None:
+                category_mask = torch.zeros_like(transformer_output)
+                category_mask[category_index, :, :] = 1
+            target = (transformer_output * category_mask).sum()
         self.transformer_encoder.zero_grad()
-        loss.backward(retain_graph=True)
+        target.backward(retain_graph=True)
 
-        num_tokens = self.transformer_encoder.layers[0].get_attn_output().shape[0]
+        num_tokens, n_graphs = self.transformer_encoder.layers[0].get_attn_output().shape[:2]
+        eye = torch.eye(num_tokens, num_tokens, device=transformer_output.device, dtype=transformer_output.dtype)
+        relevance = eye.expand(n_graphs, -1, -1).clone()
 
-        # I = torch.eye(num_tokens, num_tokens).cuda()
-        I = torch.eye(num_tokens, num_tokens)
-
-        for _, encoder in enumerate(self.transformer_encoder.layers):
+        for encoder in self.transformer_encoder.layers:
             attn_out_weights = encoder.get_attn_output_weights()
             attn_grad = encoder.get_attn_gradients()
 
-            attn_map = self.avg_heads(attn_out_weights, attn_grad)
-            # I += self.apply_self_attention_rules(I.cuda(), attn_map.cuda())
-            I += self.apply_self_attention_rules(I, attn_map)
+            attn_map = self.avg_heads(attn_out_weights, attn_grad, n_heads=encoder.self_attn.num_heads)
+            relevance = relevance + self.apply_self_attention_rules(relevance, attn_map)
 
-        return I
+        return relevance[0] if n_graphs == 1 else relevance

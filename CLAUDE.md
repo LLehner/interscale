@@ -214,7 +214,10 @@ queries against uniform attention, distance profiles, planted pairs against dist
 (`evaluation.report`: sections appended per arm, a cross-arm summary on top). The relevance rollout (`tl/self_attn_relevance.py`)
 backpropagates the summed output after an affine LayerNorm, a degenerate target, so `_attn_matrix`,
 `cls_horizontal`/`cls_vertical` and everything built on them (`downstream_regression`,
-`net_streams`, `flow_control`, `graph_classification`) are not interpretable.
+`net_streams`, `flow_control`, `graph_classification`) are not interpretable. `generate_relevance(output,
+target=...)` traces a given target instead; `evaluation.attention_check` checks the attention against torch's
+stock modules on real inputs (`check_attention`) and compares seven readouts of it against planted pairs
+(`attention_readouts`); a masked pass hooks its maps inside `TransformerNodeEncoderHook.hooking_attention()`.
 
 #### Online probes (`evaluation/online_probes.py`)
 

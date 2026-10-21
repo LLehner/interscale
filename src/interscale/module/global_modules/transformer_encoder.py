@@ -153,6 +153,8 @@ class TransformerNodeEncoderHook(GlobalModule):
         self.return_attention_maps = bool(return_attention_maps)
         # Set only inside `recording_attention`: the list each pass appends its maps and layout to.
         self._attention_record = None
+        # Set only inside `hooking_attention`: training-style passes hook their maps for relevance too.
+        self._hook_attention = False
 
     def common_step_local_to_global(self, batched_data, emb: torch.Tensor, eval_step: bool = False):
         """Convert local node embeddings ``[N, E]`` to padded local node embeddings ``[max_seq_len, E]``.
@@ -330,6 +332,21 @@ class TransformerNodeEncoderHook(GlobalModule):
             for layer in self.transformer_encoder.layers:
                 layer.record_tokens, layer.token_cosine = False, None
 
+    @contextmanager
+    def hooking_attention(self):
+        """Inside, every pass keeps each layer's attention map and hooks it for its gradient.
+
+        What :meth:`evaluate` does for its unmasked pass, for the passes that do not ask (``register_hook``
+        None, e.g. a masked pass through ``_common_step``), so a relevance can be traced from a target computed
+        on the masked pass (``SelfAttentionRelevance.generate_relevance(..., target=...)``). The flag is
+        restored on exit, even if a pass raises.
+        """
+        saved, self._hook_attention = self._hook_attention, True
+        try:
+            yield
+        finally:
+            self._hook_attention = saved
+
     def forward(self, padded_h_node, src_padding_mask, mask=None, register_hook: bool | None = None, rotary=None):
         """
         N_b_max: maximum number of nodes in the batch
@@ -350,8 +367,11 @@ class TransformerNodeEncoderHook(GlobalModule):
                 True: keep every layer's attention map, return them stacked, and hook them for their
                 gradient (what relevance needs; `evaluate` passes it). False: none of that. None
                 (training steps): return the stacked maps only when the loss reads them
-                (`return_attention_maps`), and hook nothing.
+                (`return_attention_maps`), and hook nothing -- unless inside `hooking_attention`, which
+                makes None mean True.
         """
+        if register_hook is None and self._hook_attention:
+            register_hook = True
         if (rotary is None) != (self.rotary_encoding is None):
             raise ValueError(
                 "the rotary encoding is enabled, so forward() needs the rotation common_step_local_to_global "

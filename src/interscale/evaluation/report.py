@@ -107,6 +107,13 @@ NOTES = {
     "uniform weights (1: uniform)",
     "response_check": "programme masking: share of the response's change from the baseline cell that the "
     "contributions fail to add up to (0: they add up; over 0.1: the integration is too coarse)",
+    "attention_check": "every layer's attention of a masked pass recomputed from its own inputs: reference = the "
+    "definition written out, torch = torch's stock MultiheadAttention, torch_layer = torch's stock encoder layer, "
+    "same weights; largest absolute difference (max_abs: the expected tensor's scale; inf: blocked entries differ)",
+    "readout_edges": "the planted sender's rank among cells as far from its receiver, per way of reading attention "
+    "(attention_check.READOUTS) and range class (0.5: blind to the sender; read against the untrained twin)",
+    "readout_agreement": "mean Spearman correlation between two readouts' scores over a query's cells",
+    "readout_span": "each readout's score-weighted distance to the query (span_um) and its share within each radius",
     "flow_summary": "where the cells of a patch draw their predictions from -- influence (gradient flow) and "
     "rollout (attention composed over layers with the residual path) -- against the slide with the visible "
     "cells' expression permuted: reach in µm, share kept in the source patch, KL from the permutations and "
@@ -202,7 +209,8 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     Known inputs: ``heads_cells``, ``heads_by_depth``, ``heads_by_group``, ``context_labels``,
     ``source_distances``, ``representations``, ``attention_by_query``, ``attention_profile``,
     ``attention_edges``, ``erf_by_query``, ``erf_profile``, ``erf_edges``, ``heads_by_group_cells``,
-    ``response_edges``, ``response_profile``, ``response_check`` and ``training``. The
+    ``response_edges``, ``response_profile``, ``response_check``, ``attention_check``, ``readout_edges``,
+    ``readout_agreement``, ``readout_span`` and ``training``. The
     per-gene head scores are left out (``heads_by_group`` summarises them); any other table passes
     through unchanged.
     """
@@ -297,6 +305,14 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
             .set_index(["head", "program"])[["value", "n_queries"]]
             .rename(columns={"value": "completeness_gap"})
         )
+    if "attention_check" in tables:
+        out["attention_check"] = tables["attention_check"].set_index(["layer", "check", "quantity"])
+    if "readout_edges" in tables:
+        out["readout_edges"] = _pivot(tables["readout_edges"], "readout", "range_class", "matched_rank")
+    if "readout_agreement" in tables:
+        out["readout_agreement"] = _pivot(tables["readout_agreement"], "readout_a", "readout_b", "spearman")
+    if "readout_span" in tables:
+        out["readout_span"] = _pivot(tables["readout_span"], "readout", "metric")
     if "training" in tables:
         out["training"] = tables["training"].set_index("metric")[["value"]]
     known = {
@@ -320,6 +336,10 @@ def compact_tables(tables: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         "response_edges",
         "response_profile",
         "response_check",
+        "attention_check",
+        "readout_edges",
+        "readout_agreement",
+        "readout_span",
         "training",
     }
     out.update({name: table for name, table in tables.items() if name not in known})
@@ -894,6 +914,33 @@ def summary_tables(
             "fail to add up to (0: complete; over 0.1: too few integration steps)",
             pd.DataFrame(rows),
         )
+    rows = []
+    for arm, table in _per_arm(sections, "attention_check", arms).items():
+        worst = table.groupby(level=["check", "quantity"], sort=False)["max_abs_diff"].max()
+        worst.index = [f"{check} {quantity}" for check, quantity in worst.index]
+        rows.append(worst.rename(arm))
+    if rows:
+        add(
+            "attention recomputed from each layer's inputs: largest absolute difference over the layers "
+            "(reference = the definition, torch = torch's stock modules; ~1e-6 is rounding)",
+            pd.DataFrame(rows),
+        )
+    parts = []
+    for arm, table in _per_arm(sections, "readout_edges", arms).items():
+        part = table.copy()
+        part.index = pd.MultiIndex.from_tuples([(arm, r) for r in part.index], names=["arm", "readout"])
+        parts.append(part)
+    if parts:
+        add(
+            "ways of reading attention, planted pairs: sender's rank among cells as far from the receiver (0.5: blind)",
+            pd.concat(parts),
+        )
+    rows = []
+    for arm, table in _per_arm(sections, "readout_span", arms).items():
+        if "span_um" in table.columns:
+            rows.append(table["span_um"].rename(arm))
+    if rows:
+        add("ways of reading attention: score-weighted distance to the query (µm)", pd.DataFrame(rows))
     parts = []
     for arm, table in _per_arm(sections, "flow_summary", arms).items():
         part = table.copy()
