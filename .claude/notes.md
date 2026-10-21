@@ -356,3 +356,22 @@ result was read; the entry above was the first one written live.*
   sit at 0.4-0.5. Trained attention avoids those senders relative to cells as far away. The number of pairs behind a class is
   not in these files (the report dropped `n_pairs`; kept since), so it is a lead, not a result.
 - Seeds scatter by 0.02-0.14 per class (the mid class up to 0.14), so single-class differences below that are noise.
+
+## 2026-10-21 — The oracle bar on synth_spot: what a ridge on the planted drivers reaches (model-free; fresh synth_spot, 24 training / test slides, programme masking)
+
+**What worked**
+- The task is solvable from the planted truth: a ridge on the spot's own visible genes plus the true drivers (distances to the sources as 24
+  Gaussian bumps each, receiver and cone gates, stripe and exposure flags, `R34_state`) reaches a mean centred cosine of **0.983** over
+  the 24 programmes, against 0.685 for `ref_own+context` (the sweeps' bar, 0.682 there) and 0.580 for `ref_own`. At least 0.94 on
+  every programme but one (the weakest after it: M4→MC4 at 0.949). So a programme the models miss is the model's limit, not the task's.
+- Where the model-free bar is far below the oracle: the stripe M9→MC12 (0.27 → 1.00), the cone M10→MC13 (0.16 → 0.83), the short-range
+  programmes (S1→R1 0.65, S2→R2 0.66, S3/S4→R3/R4 0.55 → 1.00 each once `R34_state` is a driver), the flat long-range M3→MC3 (0.46 → 0.98)
+  and M5→MC5 (0.58 → 0.98), the rings M7 and M8 (0.63, 0.76 → 1.00). These are the programmes a model can still gain on.
+
+**What doesn't work**
+- The cone M10→MC13 stays at 0.83: its response is a plateau and an exponential decay inside a 45° cone, which 24 quantile bumps resolve only
+  roughly. Without `R34_state` the S3/S4 programme read 0.88: R3 and R4 depend on both exposures, an interaction a linear ridge on the two flags
+  cannot form.
+- The oracle's ridge penalty sits at the lowest value of the grid (0.1), so noiseless drivers may want less regularisation than
+  `FITTED_ALPHAS` offers; the numbers are a floor for what the truth reaches.
+- The oracle is built on truth a model must infer (`is_receiver_*`, `R34_state`): it bounds the task, not what a model can learn.

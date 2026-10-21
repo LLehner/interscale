@@ -12,7 +12,7 @@ the same commit as the work.
 
 | stage | state | verified by | date |
 |---|---|---|---|
-| D0 — yardsticks: redundancy and attribution readouts | proposed | | |
+| D0 — yardsticks: redundancy and attribution readouts | **implemented, unverified on data** -- `representations.redundancy_table`, `masked_probing.attribution_shares`, `StepOutput.parts` (roadmap.md, T2); not run on checkpoints | 15 tests, 25 mutations (with the oracle), harness IDENTICAL | 2026-10-21 |
 | D1.0 — re-masking before the transformer (hidden cells only) | **implemented, unverified** -- `remask: hidden` (roadmap.md, T2, task 3); sweep `remask_test` written, not run | 16 tests, 8 mutations, harness IDENTICAL | 2026-10-21 |
 | D1 — a context-only global embedding | proposed | | |
 | D2.2 — regime-assigned losses | **implemented, unverified** -- `optim.regime_loss` (roadmap.md, T2); sweep `regime_loss` written, not run | 34 tests, mutation-checked, harness IDENTICAL | 2026-10-21 |
@@ -53,12 +53,16 @@ What decides between the options below, all on the masked pass:
   `ref_own+context` on long-range and sparse responses, and the planted senders' matched rank in
   their receivers' predicted responses (`response_influence`); the rewritten patch flow against its
   untrained twin.
-- **Redundancy:** linear CKA local~global by depth (exists, `representations`); new: how much of the
-  global embedding a ridge reads from the local one (R² of `h_global` from `h_local`, fit on train,
-  scored on test). Low is separated; with D1 it should drop well below today's ~0.9 at the rim.
+- **Redundancy:** linear CKA local~global by depth (exists, `representations`); new (**built 2026-10-21**,
+  `redundancy_table`): how much of the global embedding a ridge reads from the local one (R² of `h_global` from `h_local`,
+  fit on train, scored on test, each query group on its own cells). Low is separated; with D1 it should drop well below
+  today's ~0.9 at the rim. Next to it `global <- smoother` and `global <- pe`, the same read from a spatial average of the
+  visible expression and from the position alone.
 - **Attribution:** with D3, each component's share of the prediction (norm of its centred part over
   the norm of the whole) by depth and by programme. A separated model gives global the deep field and
-  the long-range programmes, local the rim and the short-range ones.
+  the long-range programmes, local the rim and the short-range ones. **Built 2026-10-21** for any head that is a sum of
+  named parts (`attribution_shares`; `norm_ratio` and `cov_share`): today the own-cell skip and the residual decoder, D3.1
+  when it exists. A plain dual decoder's heads each predict the whole target and have no parts.
 - **No regression:** whole-cell reconstruction of the combined prediction must not drop below
   today's joint model.
 

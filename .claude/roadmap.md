@@ -24,9 +24,9 @@ Last updated 2026-10-21.
 | track | question | state | verified by | date |
 |---|---|---|---|---|
 | T0 | infrastructure: seeds, per-arm evaluation, inputs, CosMx | **implemented, unverified** (2026-10-19; CosMx deferred by the user) — seed axis, run selection for job arrays, per-run section files, timing, cached references, `Precomputed` under programme masking, `pca_fit: train`; every mutation caught (two survivors led to a stronger test and a simplification), harness IDENTICAL; the sweep script checked on a stub synth_spot with untrained models. **Not run on data** | 2026-10-19 |
-| T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; legnini programme masking built 2026-10-20 (`legnini_programme`, decided gene set in legnini_plan.md; not run); sender ranks unreadable (gradient magnitude) → replaced 2026-10-20 by an integrated-gradients attribution, sparse programmes also scored within their receivers, per-programme wins/ties/losses in the report (**built, not yet run: the 19 checkpoints await `MODE = "evaluate"`**). Details in global_plan.md | `response_masking` run (11 arms, 19 runs, 3 twins) | 2026-10-20 |
+| T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; legnini programme masking built 2026-10-20 (`legnini_programme`, decided gene set in legnini_plan.md; not run); sender ranks unreadable (gradient magnitude) → replaced 2026-10-20 by an integrated-gradients attribution, sparse programmes also scored within their receivers, per-programme wins/ties/losses in the report (**built, not yet run: the 19 checkpoints await `MODE = "evaluate"`**). Details in global_plan.md. **Oracle bar built 2026-10-21** (`ref_oracle`, below): a ridge on the true drivers reaches 0.983 over the programmes on synth_spot, against 0.685 for `ref_own+context`, checked without any model | `response_masking` run (11 arms, 19 runs, 3 twins) | 2026-10-20 |
 | T1b | coarse-grained tokens: pool cells into patches or niches before the global model | **grid pooling implemented, unverified** (2026-10-19) — `pooling.kind: grid` (`size_um` or `n_patches`), `count`/`std` features, 39 tests, an end-to-end run for GlobalModel and CombinedModel, every mutation caught (one survivor led to a stronger test), harness IDENTICAL; 5 pooled arms in `response_masking`. The `niche` assignment waits for the user's details; patch-level attention readouts not built. **Not run on data**. **2026-10-21: the decoder arms for the global-only model built** (own-cell skip `model.decoder.own_cell_skip`, `nonlinear` and `linear-lse` as sweep arms, the skip also on pooled tokens), implemented, unverified; sweep `global_decoders` (10 runs), **not run** (T2 below) | 2026-10-19 |
-| T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed; **re-masking before the transformer implemented, unverified** (2026-10-21, task 3 below) -- `remask: hidden`: a wholly hidden cell enters the transformer as one learned token instead of its GCN token; 16 tests, 8 mutations caught, harness IDENTICAL; sweep `remask_test` written (8 runs), **not run**. **D2.2, each head's loss on the hidden cells of its regime, implemented, unverified** (2026-10-21) -- `optim.regime_loss`, near / deep by the distance to the nearest visible cell; 55 tests with the own-cell skip (34 regime loss, 21 skip and decoders), 32 mutations all caught (two only after two more tests), harness IDENTICAL; sweep `regime_loss` written (9 runs), **not run**. Moran's I split (task 1) and embedding dimensions vs genes (task 2) proposed | tests, harness | 2026-10-21 |
+| T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed; **re-masking before the transformer implemented, unverified** (2026-10-21, task 3 below) -- `remask: hidden`: a wholly hidden cell enters the transformer as one learned token instead of its GCN token; 16 tests, 8 mutations caught, harness IDENTICAL; sweep `remask_test` written (8 runs), **not run**. **D2.2, each head's loss on the hidden cells of its regime, implemented, unverified** (2026-10-21) -- `optim.regime_loss`, near / deep by the distance to the nearest visible cell; 55 tests with the own-cell skip (34 regime loss, 21 skip and decoders), 32 mutations all caught (two only after two more tests), harness IDENTICAL; sweep `regime_loss` written (9 runs), **not run**. **D0, the yardsticks, implemented, unverified on data** (2026-10-21): ridge redundancy of the two embeddings per depth group, attribution shares of a head's parts (`StepOutput.parts`), 15 tests. Moran's I split (task 1) and embedding dimensions vs genes (task 2) proposed | tests, harness | 2026-10-21 |
 | T3 | masking strategies | proposed | | |
 | T4 | interpretation beyond raw attention; attention sinks | **sender attribution built, unverified on data** (2026-10-20) — `response_influence(measure="attribution")`: integrated gradients from the training-mean cell on a programme's summed response genes, completeness check, hidden entries fixed, one random state along the path; 16 + 6 tests, 31 mutations caught. Not built: the other methods of the table below, the null key and registers, the permuted-slide baseline. **Not run on data**. **2026-10-21 (task 4 below): attention checked against torch and the readouts compared; run and read 2026-10-21 on the 13 + 3 `response_masking` checkpoints (notes.md): the attention is computed correctly (zero difference to the definition and to torch), no readout finds the planted senders (ranks 0.47-0.55, twins 0.48-0.52), gradient x input is the only one above its twin (+0.04-0.05), RoPE attention ranks the mid-range sender far below chance (0.09-0.35; pair counts missing, now kept)**: the vendored attention equals torch's stock `nn.MultiheadAttention` and encoder layer (tests, every mask form); relevance fixed (heads averaged per graph, tensors on the output's device, a target can be given); `evaluation.attention_check` (`check_attention` on the real inputs, `attention_readouts`: 7 readouts against planted pairs); 40 tests; of 15 mutations 14 caught (2 after two more tests), the survivor a redundant gradient clear; sweep `attention_check` (evaluation only, on the `response_masking` checkpoints), **not run**. Label-free flow (task 5) proposed | 2026-10-21 |
 | T5 | how cell-type driven attention is | proposed | | |
@@ -167,6 +167,26 @@ inputs cannot. Every later track builds on the model chosen here (DP1).
 - **Build: an oracle bar.** A ridge on the true drivers, for synthetic data only: distances to the
   sources, and the receptor. The script names the obs keys. It separates "not learnable from these
   inputs" from "the model fails".
+  **Built 2026-10-21 (implemented; checked without a model, not yet read for any trained arm).**
+  - *What it is.* `ref_oracle`, one more fitted reference (`masked_probing.FittedReferences(drivers=...)`): the same
+    ridge, penalty search and training slides as `ref_own+context`, on the spot's own visible genes plus the features of
+    `masked_probing.oracle_features`: each numeric obs key (a distance to a source) as 24 Gaussian bumps at quantiles of its
+    values, with an indicator where it is missing (M4, M5, the M9 stripe exist on some slides only); a flag as it is;
+    another categorical one-hot; and a key's features also multiplied by a boolean gate (the sparse responses exist only at
+    receivers, the M10 response only in its cone). The sweep script names the keys (`ORACLE_KEYS`, `ORACLE_GATES`,
+    `ORACLE_BASIS` in `sweep_common.py`); `response_masking.py` and `global_decoders.py` name synth_spot's 28.
+  - *Where it appears.* In the head-score tables as `ref_oracle`, beside the other references but never as "the best
+    reference" (the bar the wins / ties / losses count against); the summary adds a second wins table against it.
+  - *What it gives* (fresh synth_spot, the sweep's pipeline, 24 training slides, test slides, no model; fit 2 min): mean
+    centred cosine over the 24 programmes **0.983**, against 0.685 for `ref_own+context` (the sweeps' bar, 0.682) and 0.580 for
+    `ref_own`. At least 0.94 on every programme but the cone M10→MC13 (**0.83**; its response is a plateau and a decay inside a
+    cone, which 24 bumps resolve only roughly). Where the bar is far below it: M9 (0.27 → 1.00), M10 (0.16 → 0.83), the
+    short-range S1/S2/S3S4→R (0.65, 0.66, 0.55 → 1.00, 1.00, 1.00), M3 (0.46 → 0.98), M5 (0.58 → 0.98), M7/M8 rings (0.63, 0.76
+    → 1.00). So the task is solvable from the planted drivers, and a programme a model misses is the model's limit, not the
+    task's.
+  - *Caveats.* It is a bar built on the truth, not a model: it uses `is_receiver_*` and `R34_state` as they are, where a model
+    must infer them. Its penalty sits at the grid's lowest value (0.1), so the noiseless drivers may want less
+    regularisation than `FITTED_ALPHAS` allows. Changing the keys refits the references (the cache key includes them).
 - **Build: a distance prior with a length scale per head.** Start the linear distance bias (it
   exists, in ALiBi form, and starts at 0) at fixed per-head length scales from ~20 µm to ~2 mm,
   optionally frozen.
@@ -365,9 +385,26 @@ scales, but the decoder decides what the model can express and how it is read:
 
 Order:
 
-1. **D0, the yardsticks:**
+1. **D0, the yardsticks:** **built 2026-10-21 (implemented, unverified on data).**
    - redundancy: the ridge R² of `h_global` from `h_local`;
    - attribution shares by depth and by programme.
+   - *Redundancy* (`representations.redundancy_table`, in the disc evaluation next to the CKA): per query group (visible,
+     hidden, each depth bin) a ridge fitted on the group's training cells maps the source to the target (z-scored; a source
+     wider than 64 columns is cut to its leading components of the training cells; the penalty by leave-one-out), scored by
+     R² on the group's test cells. Pairs: `global <- local`, `local <- global`, and as controls `global <- smoother` and
+     `global <- pe` (what the visible expression's average, or the position alone, already gives). `global <- local` near 1 on a
+     group says its global tokens hold nothing the local ones do not. Each group is fitted on its own cells, so the question
+     is whether a *hidden* cell's global token is a function of its local token, not whether a map learnt on visible cells
+     carries over.
+   - *Attribution shares* (`masked_probing.attribution_shares`, in both evaluations): a head whose prediction is a sum of named
+     parts is taken apart. Parts come from the modules (`StepOutput.parts`): a global-only model's transformer read-out
+     (`context`) and its own-cell skip (`own_cell`); a residual dual decoder's `local` (detached) and `global` part; later
+     D3.1's two parts. Over a group of genes and a set of cells (all, then each depth bin), the parts are centred per gene
+     over the hidden entries; `cov_share` is each part's share of the whole's variance (sums to 1, negative for a part
+     against the others), `norm_ratio` its norm over the whole's. A head with one part has none (a plain dual decoder's heads).
+     Needs `global_residual` or the skip to show anything today; it is the readout D3.1 and the regime sweeps will use.
+   - *Tested:* 15 tests (constructed embeddings where the answer is known; the parts through the real modules and
+     `collect_head_predictions`; the report); 25 mutations over the oracle and D0, all caught (four only after stronger tests).
 2. **D2.2:** each loss on its regime. Cheap. **Built 2026-10-21 (implemented, unverified):**
    - *Regimes.* A cell hidden whole is *near* when the nearest visible cell of its slide lies within
      `optim.regime_loss.depth_um` (default 290 µm, the 2-hop GCN's reach on the 100 µm lattice; you do not want it
@@ -857,7 +894,7 @@ SpatialDE, SPARK-X, AMICI, Steamboat, GraphCompass); the Visium and IMC data on 
 | day | build | run | read, decide |
 |---|---|---|---|
 | Mon | T0: seeds, per-arm evaluation | `response_masking` (3 seeds); legnini attention re-evaluation; `joint_rope`, `l2g_res` evaluation | – |
-| Tue | T0: `Precomputed` under programme masking; T1: oracle bar, distance prior; T4: gradient × input and integrated gradients for the sender ranks (moved up from W2); **T1b: design note and leakage tests** | `joint_fourier` added to response masking, 3 seeds of the main arms | you: the legnini gene set, the CosMx choices, T1b's patch sizes |
+| Tue | T0: `Precomputed` under programme masking; T1: oracle bar (**built 2026-10-21**), distance prior; T4: gradient × input and integrated gradients for the sender ranks (moved up from W2); **T1b: design note and leakage tests** | `joint_fourier` added to response masking, 3 seeds of the main arms | you: the legnini gene set, the CosMx choices, T1b's patch sizes |
 | Wed | **T1b: grid pooling and un-pooling in `GlobalModel` and `CombinedModel`**; T2: D0; **2026-10-21: re-masking (task 3) and the attention check (task 4) built** | `pre_pca_rope` added to response masking | – (response masking first read done 2026-10-19) |
 | Thu | **T1b: decoder arms for the global-only model (own-cell skip, nonlinear, LSE)**; T2: D2.2; **the Moran's I split (task 1)** | pooled smoke; legnini programme masking (cell-level and pooled); **`remask_test` (8 runs), `attention_check` (evaluation only), `regime_loss` (9 runs) and `global_decoders` (10 runs)**; **built 2026-10-21: D2.2 and the decoder arms** | legnini re-evaluation |
 | Fri | T0: the CosMx pipeline; masking_plan.md, attribution_plan.md; **T10: comparison harness and baseline environments**; **embedding dimensions vs genes (task 2)** | **T1b sweep (grid sizes × global-only and joint, 3 seeds)**; decoder arms; T10: Visium and IMC data and baselines on the cluster (yours) | **`remask_test`** |
