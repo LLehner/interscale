@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
 from anndata import AnnData
-from torch.nn import functional as F
 from yacs.config import CfgNode as CN
 
 from interscale.model.base._base_model import BaseModel
@@ -101,8 +100,6 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
             )
             # no masking during evaluation
             y_pred = self.module.predict(global_embedding, src_padding_mask, self.prediction_level)
-
-            cosine_sim = F.cosine_similarity(batch.x, y_pred, dim=1)
 
             # I = self_attention_relevance.generate_relevance(transformer_in, src_padding_mask)
             batch_obs_names_str = batch.obs_names.numpy().astype(int).astype(str)[pad_index_nodes[0]]

@@ -236,6 +236,8 @@ and this project adheres to [Semantic Versioning][].
 
 ### Fixed
 
+- `GlobalModel.get_model_output` raised on a slide with more cells than `max_seq_len`: an unused cosine of the whole
+  input against the kept cells' predictions had mismatched lengths. Removed.
 - `SelfAttentionRelevance` averaged the heads over every graph of a batch together (now within each graph; one
   graph, as `evaluate()` runs, gives the same numbers) and built its identity and masks on the CPU (now on the
   output's device).
