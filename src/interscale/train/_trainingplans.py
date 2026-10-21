@@ -12,7 +12,7 @@ from interscale.module.base._base_module import BaseModule
 from interscale.nn import CosineWarmupScheduler
 from interscale.tl.masking import masked_loss
 
-from ._schedule import frozen_modules, resolve_loss_weights
+from ._schedule import DEFAULT_LOSS_WEIGHTS, frozen_modules, resolve_loss_weights
 from .aux_losses import CompositeAuxLoss
 from .losses import BalancedPearsonCorrelationLoss, SCE_EntropyATT_Loss, SCELoss, scaled_cosine_error
 
@@ -592,17 +592,27 @@ class TrainingPlan(pl.LightningModule):
                 y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask, extra_loss=aux_total
             )
 
+        # `optim.regime_loss`: each head's loss on the hidden cells of its regime (`tl.depth`). The metrics keep
+        # every hidden entry (`entry_mask`); only the loss is cut.
+        regimes = out.loss_mask is not None
+        loss_mask = out.loss_mask if regimes else entry_mask
         separate_losses = self.module.compute_separate_losses(
-            self.loss, self.loss_type, *self.centred(y_pred, y_true), entry_mask
+            self.loss, self.loss_type, *self.centred(y_pred, y_true), loss_mask
         )
+        # The default stacked loss is one mean over the rows of both heads, which under regimes would weigh a
+        # head by how many cells its regime has: weigh the heads instead, by `loss_weights` (0.5 / 0.5).
+        weights = self.loss_weights if self.loss_weights is not None or not regimes else DEFAULT_LOSS_WEIGHTS
         weighted = None
-        if self.loss_weights is not None:
+        if weights is not None:
             if separate_losses.get("local_loss") is None or separate_losses.get("global_loss") is None:
                 raise RuntimeError("loss_weights need both heads' losses; this step produced one (graph level?).")
             weighted = (
-                self.loss_weights["local"] * separate_losses["local_loss"]
-                + self.loss_weights["global"] * separate_losses["global_loss"]
+                weights["local"] * separate_losses["local_loss"] + weights["global"] * separate_losses["global_loss"]
             )
+        if regimes:
+            half = len(loss_mask) // 2
+            for name, rows in (("local", loss_mask[:half]), ("global", loss_mask[half:])):
+                self._log_scalar(f"{mode}_regime_cells_{name}", rows.any(dim=1).sum().float(), sync_dist)
 
         for key in ("local_loss", "global_loss", "combined_loss"):
             # `val` never logged combined_loss; preserved to keep this refactor number-identical.

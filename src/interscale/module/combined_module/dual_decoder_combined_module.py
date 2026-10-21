@@ -4,6 +4,7 @@ import torch
 from yacs.config import CfgNode as CN
 
 from interscale.module.base import BaseModule, GlobalModule, LocalModule, StepOutput, ViewOutput
+from interscale.tl.depth import RegimeLoss
 from interscale.tl.masking import masked_loss
 
 
@@ -32,6 +33,8 @@ class DualDecoderCombinedModule(BaseModule):
         # `model.decoder.global_residual`: the global head's prediction is the local one (detached)
         # plus the global decoder's output -- see `combine_global`.
         self.global_residual = bool(cfg.model.decoder.get("global_residual", False))
+        # `optim.regime_loss`: each head's loss on the hidden cells of its regime (`tl.depth`), or None.
+        self.regime = RegimeLoss.from_config(cfg)
 
         # Local module with decoder
         self.local_module = LocalModule.from_config(
@@ -164,6 +167,7 @@ class DualDecoderCombinedModule(BaseModule):
         local_embedding, global_embedding, src_padding_mask, pad_index_nodes, attention_mask, attn = self.forward(
             batch_masked
         )
+        loss_mask = None
 
         # Predict from global embedding (one row per cell the padding kept)
         y_pred_global = self.predict_global(global_embedding, src_padding_mask, prediction_level)
@@ -209,6 +213,15 @@ class DualDecoderCombinedModule(BaseModule):
             # The entry mask is per-cell, and both halves are now the same cells in the same
             # order, so it is simply stacked twice.
             entry_mask_combined = None if entry_mask is None else torch.cat([entry_mask, entry_mask], dim=0)
+            if self.regime is not None:
+                # Each head's loss on the cells of its regime; the metrics keep every hidden entry.
+                loss_mask = self.regime.loss_mask(
+                    entry_mask,
+                    self.global_module.wholly_hidden(batch_masked),
+                    self._positions(batch),
+                    batch.batch,
+                    padded_node_idx,
+                )
         else:
             raise ValueError(f"Invalid prediction level: {prediction_level}")
 
@@ -220,6 +233,7 @@ class DualDecoderCombinedModule(BaseModule):
             y_pred=y_pred_combined,
             y_true=y_true_combined,
             entry_mask=entry_mask_combined,
+            loss_mask=loss_mask,
             views=[
                 ViewOutput(
                     local_embedding=local_embedding,
@@ -230,6 +244,28 @@ class DualDecoderCombinedModule(BaseModule):
                 )
             ],
         )
+
+    @staticmethod
+    def _positions(batch) -> torch.Tensor:
+        """The batch's cell coordinates, which ``optim.regime_loss`` measures depth in."""
+        pos = getattr(batch, "pos", None)
+        if pos is None:
+            raise ValueError(
+                "optim.regime_loss measures how far a hidden cell lies from a visible one, but the graphs carry "
+                "no coordinates (`pos`): set dataset.spatial_key."
+            )
+        return pos
+
+    def _head_loss(self, loss_fn, loss_type, y_pred, y_true, entry_mask):
+        """One head's masked loss; a zero that still reaches the head when its regime has no cell in the batch.
+
+        Without ``optim.regime_loss`` every hidden cell counts for both heads and nothing is special-cased.
+        Under it a head can have none (a batch without a deep cell, a slide hidden nowhere), where a mean over
+        no cells is NaN.
+        """
+        if self.regime is not None and entry_mask is not None and not bool(entry_mask.any()):
+            return y_pred.sum() * 0.0
+        return masked_loss(loss_fn, loss_type, y_pred, y_true, entry_mask)
 
     def get_separate_predictions(self, y_pred_combined, y_true_combined):
         """Get separate predictions and ground truth for local and global decoders.
@@ -294,7 +330,8 @@ class DualDecoderCombinedModule(BaseModule):
             Optional ``[2*N_masked, F]`` boolean from ``_common_step``. When given, each half's
             loss is computed over that half's masked entries only -- which is the whole point of
             gene masking, since the unmasked entries were handed to the model as input and
-            reconstructing them is the identity.
+            reconstructing them is the identity. Under ``optim.regime_loss`` the training plan passes the
+            step's ``loss_mask`` here instead: the same entries, each half cut to its regime's cells.
 
         Returns
         -------
@@ -322,8 +359,8 @@ class DualDecoderCombinedModule(BaseModule):
             else:
                 mask_local = entry_mask_combined[: self._n_masked_nodes]
                 mask_global = entry_mask_combined[self._n_masked_nodes :]
-            local_loss = masked_loss(loss_fn, loss_type, y_pred_local, y_true_local, mask_local)
-            global_loss = masked_loss(loss_fn, loss_type, y_pred_global, y_true_global, mask_global)
+            local_loss = self._head_loss(loss_fn, loss_type, y_pred_local, y_true_local, mask_local)
+            global_loss = self._head_loss(loss_fn, loss_type, y_pred_global, y_true_global, mask_global)
             losses["local_loss"] = local_loss
             losses["global_loss"] = global_loss
 

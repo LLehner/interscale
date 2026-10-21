@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import torch
 from anndata import AnnData
 from yacs.config import CfgNode as CN
 
@@ -99,7 +100,13 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
                 batch, embedding
             )
             # no masking during evaluation
-            y_pred = self.module.predict(global_embedding, src_padding_mask, self.prediction_level)
+            y_pred = self.module.predict(
+                global_embedding,
+                src_padding_mask,
+                self.prediction_level,
+                own_embedding=embedding,
+                node_idx=torch.as_tensor(pad_index_nodes[0], dtype=torch.long, device=embedding.device),
+            )
 
             # I = self_attention_relevance.generate_relevance(transformer_in, src_padding_mask)
             batch_obs_names_str = batch.obs_names.numpy().astype(int).astype(str)[pad_index_nodes[0]]

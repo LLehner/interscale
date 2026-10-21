@@ -132,6 +132,21 @@ def _pooling_tag(cfg) -> str:
     return f"pool-{pooling.kind}{'-' if size.startswith('n') else ''}{size}{offset}{features}_"
 
 
+def _decoder_tag(cfg) -> str:
+    """``dec-<type>[-skip]_`` for a decoder other than the plain linear one or with the own-cell skip, else ``""``.
+
+    The decoder type was never part of a checkpoint name, so an arm that varies it would overwrite the arm
+    that does not; the default (``linear``, no skip) adds nothing and every earlier name is unchanged.
+    """
+    decoder = cfg.model.get("decoder", None)
+    if decoder is None:
+        return ""
+    kind, skip = decoder.get("type", "linear"), bool(decoder.get("own_cell_skip", False))
+    if kind in (None, "linear") and not skip:
+        return ""
+    return f"dec-{kind or 'linear'}{'-skip' if skip else ''}_"
+
+
 def _embedding_tag(cfg) -> str:
     """The token input of a GlobalModel, for its checkpoint name.
 
@@ -167,7 +182,8 @@ def _training_tag(cfg) -> str:
     ``lw<local>-<global>`` and ``frz-<components>``: a staged schedule, loss weights other than
     the default 0.5 / 0.5, and frozen components (``train._schedule``). ``gs<cell rate>-<selectors>``:
     a hidden gene set (``dataset.mask_genes``). ``rmk-<kind>``: re-masking before the transformer
-    (``model.global_component.parameters.remask``).
+    (``model.global_component.parameters.remask``). ``rgm<depth um>-<local>-<global>``: each head's loss on
+    the hidden cells of its regime (``optim.regime_loss``).
     """
     # Here, not at module level: interscale.train imports this module.
     from interscale.train._schedule import resolve_loss_weights, schedule_tag
@@ -182,6 +198,9 @@ def _training_tag(cfg) -> str:
         parts.append("lrm")
     if params is not None and params.get("remask", "none") != "none":
         parts.append(f"rmk-{params.remask}")
+    regime = cfg.optim.get("regime_loss", None)
+    if regime is not None and regime.get("kind", "none") != "none":
+        parts.append(f"rgm{float(regime.depth_um):g}-{regime.local_cells}-{regime.global_cells}")
     schedule = schedule_tag(cfg)
     if schedule:
         parts.append(schedule)
@@ -222,7 +241,7 @@ def get_model_filename_prefix(cfg, local_component: bool, global_component: bool
         # LocalModel: only local component
         if cfg.model.local_component.name:
             file_name_prefix = file_name_prefix + f"{cfg.model.local_component.name}_"
-        file_name_prefix = file_name_prefix + _training_tag(cfg)
+        file_name_prefix = file_name_prefix + _decoder_tag(cfg) + _training_tag(cfg)
     elif global_component and not local_component:
         # GlobalModel: only global component
         if cfg.model.global_component.name:
@@ -233,6 +252,7 @@ def get_model_filename_prefix(cfg, local_component: bool, global_component: bool
             + _positional_encoding_tag(cfg)
             + _attention_tag(cfg)
             + _pooling_tag(cfg)
+            + _decoder_tag(cfg)
             + _training_tag(cfg)
         )
     elif local_component and global_component:
@@ -246,6 +266,7 @@ def get_model_filename_prefix(cfg, local_component: bool, global_component: bool
             + _positional_encoding_tag(cfg)
             + _attention_tag(cfg)
             + _pooling_tag(cfg)
+            + _decoder_tag(cfg)
             + _training_tag(cfg)
         )
         if cfg.model.decoder.dual_decoder:

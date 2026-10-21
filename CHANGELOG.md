@@ -12,6 +12,19 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Regime-assigned losses (`optim.regime_loss`, default `kind: none`): each head of the dual decoder is trained on the
+  hidden cells of its regime -- `near` (a visible cell within `depth_um` of the cell hidden whole) for the local head,
+  `deep` beyond for the global one (`local_cells`, `global_cells`: `near`, `deep` or `all`). The metrics keep every
+  hidden entry (`StepOutput.loss_mask` cuts the loss only); each head's loss is a mean over its own cells and the heads
+  are weighed by `optim.loss_weights`; the cells each loss covered are logged as `<mode>_regime_cells_{local,global}`.
+  Checkpoint tag `rgm<depth>-<local>-<global>`. New `tl.depth` (`hidden_depth`, now chunked and moved from the
+  evaluation module, which still exports it; `regime_rows`, `RegimeLoss`).
+- The own-cell skip of a global-only model (`model.decoder.own_cell_skip`): `y = decoder(h_global) + W_o e_own`, the cell's
+  own token before the transformer reaching the prediction around it; `W_o` starts at zero. `GlobalModule.predict` takes
+  `own_embedding` and `node_idx`.
+- The decoder type and the skip are part of the checkpoint name when they are not the plain linear decoder
+  (`dec-nonlinear_`, `dec-linear-lse_`, `dec-linear-skip_`): arms that vary the decoder no longer share a name.
+
 - Re-masking before the transformer (`model.global_component.parameters.remask`, default `none`): `hidden` hands
   the transformer one learned token (`GlobalModule.remask_token`) for every cell hidden whole instead of the local
   component's token, which mixed in the cell's visible neighbours (GraphMAE's re-mask), so a hidden cell's global

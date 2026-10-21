@@ -57,6 +57,21 @@ def get_optim_cfg(cfg):
     # A weight of 0 still lets the head train through the other head's gradient into shared parts.
     # Keys local / global (set by item: `global` is a Python keyword, so no attribute access).
     cfg.optim.loss_weights = CN({"local": 0.5, "global": 0.5})
+    # Regime-assigned losses (`.claude/decoder_plan.md`, D2.2; `interscale.tl.depth`). Both heads of a dual
+    # decoder predict the full target of every hidden cell, so the global head can do no better than copy
+    # the local one where the local component can see: a hidden cell with a visible cell nearby. `depth`
+    # gives each head the hidden cells of its regime: a cell hidden whole is `near` when the nearest visible
+    # cell of its slide lies within `depth_um` (set it to the local component's reach: the 2-hop GCN on
+    # synth_spot's 100 um lattice reaches ~290 um), `deep` beyond it. `local_cells` / `global_cells` name
+    # the regime of each head's loss: near, deep or all (all, all is the loss as before). Each head's loss
+    # is the mean over its own cells, and the two are weighted by `loss_weights` (0.5 / 0.5), however
+    # many cells each regime has. Needs cells hidden whole (cell masking or spatial blocks wider than
+    # `depth_um`, not a hidden gene set) and a dual-decoder CombinedModel. `none` leaves every run as it was.
+    cfg.optim.regime_loss = CN()
+    cfg.optim.regime_loss.kind = "none"  # none | depth
+    cfg.optim.regime_loss.depth_um = 290.0
+    cfg.optim.regime_loss.local_cells = "near"
+    cfg.optim.regime_loss.global_cells = "deep"
     # Components not trained at all: any of local, global. Their parameters get no gradient and
     # they stay in eval mode (dropout off). With schedule joint only. Not `freeze`: a CfgNode
     # already has a freeze() method, which `cfg.optim.freeze` would return instead of the key.

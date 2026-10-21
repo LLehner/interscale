@@ -75,6 +75,10 @@ class StepOutput:
     entry_mask
         ``[N, F]`` boolean marking the entries the *loss* is restricted to, or ``None`` for
         classification. Metrics are computed over everything; only the loss is restricted.
+    loss_mask
+        ``[N, F]`` boolean, laid out as ``entry_mask``: the entries each head's loss is restricted to,
+        when that is fewer than the masked ones (``optim.regime_loss`` gives each head the hidden cells of
+        its regime). ``None``: the loss uses ``entry_mask``. The metrics always use ``entry_mask``.
     views
         One :class:`ViewOutput` per forward pass. Length 1 until the two-view stage.
     """
@@ -82,6 +86,7 @@ class StepOutput:
     y_pred: torch.Tensor
     y_true: torch.Tensor
     entry_mask: torch.Tensor | None = None
+    loss_mask: torch.Tensor | None = None
     views: list[ViewOutput] = field(default_factory=list)
 
     @property

@@ -538,6 +538,61 @@ def _validate_remask(cfg):
         )
 
 
+def _validate_regime_loss(cfg):
+    """``optim.regime_loss`` (each head's loss on its regime's hidden cells): known values, cells hidden whole."""
+    from interscale.tl.depth import REGIME_CELLS, REGIME_KINDS
+    from interscale.train._trainingplans import NO_LOSS
+
+    regime = cfg.optim.get("regime_loss", None)
+    if regime is None or regime.get("kind", "none") == "none":
+        return
+    where = "optim.regime_loss"
+    if regime.kind not in REGIME_KINDS:
+        raise ValueError(f"{where}.kind must be one of {REGIME_KINDS}, got {regime.kind!r}.")
+    if not regime.depth_um > 0:
+        raise ValueError(f"{where}.depth_um must be > 0 (the local component's reach, in um), got {regime.depth_um}.")
+    for key in ("local_cells", "global_cells"):
+        if regime[key] not in REGIME_CELLS:
+            raise ValueError(f"{where}.{key} must be one of {REGIME_CELLS}, got {regime[key]!r}.")
+    if not cfg.model.decoder.get("dual_decoder", False):
+        raise ValueError(f"{where} gives the two heads their own cells; it needs model.decoder.dual_decoder: true.")
+    if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":
+        raise ValueError(f"{where} splits the hidden cells of a reconstruction: regression at prediction_level node.")
+    if cfg.optim.loss in NO_LOSS or cfg.optim.loss == "SCE_EntropyATT_Loss":
+        raise ValueError(f"{where} needs each head's own loss, which optim.loss {cfg.optim.loss!r} does not give.")
+    if list(cfg.dataset.get("mask_genes", []) or []):
+        raise ValueError(
+            f"{where} sorts cells hidden whole by their depth, but a hidden gene set (dataset.mask_genes) hides "
+            "no cell whole: every cell would be near."
+        )
+    blocks = cfg.dataset.get("mask_block_fraction", 0.0) > 0
+    if cfg.dataset.mask_strategy == "gene" and not blocks:
+        raise ValueError(f"{where}: under mask_strategy gene only spatial blocks hide whole cells; use node or blocks.")
+    if cfg.dataset.get("spatial_key", None) is None:
+        raise ValueError(f"{where} measures depth from the cells' coordinates, so it needs dataset.spatial_key.")
+    if not cfg.dataset.spatial_unit_um > 0:
+        raise ValueError(f"dataset.spatial_unit_um must be > 0, got {cfg.dataset.spatial_unit_um}.")
+    if "deep" in (regime.local_cells, regime.global_cells) and not (
+        blocks and cfg.dataset.mask_block_radius_um > regime.depth_um
+    ):
+        drawn = f"blocks of radius {cfg.dataset.mask_block_radius_um:g} um" if blocks else "no spatial blocks"
+        raise ValueError(
+            f"{where} gives a head the deep cells (more than {regime.depth_um:g} um from a visible one), but "
+            f"{drawn} leave none: that head would have nothing to learn from. Use blocks wider than depth_um "
+            "(dataset.mask_block_radius_um), or lower depth_um."
+        )
+
+
+def _validate_own_cell_skip(cfg):
+    """``model.decoder.own_cell_skip`` is a per-cell term: it needs a node-level prediction."""
+    if not cfg.model.decoder.get("own_cell_skip", False):
+        return
+    if cfg.dataset.prediction_level != "node":
+        raise ValueError(
+            "model.decoder.own_cell_skip adds each cell's own token to its prediction; it needs prediction_level node."
+        )
+
+
 def _validate(cfg):
     """Run every load-time check.
 
@@ -554,6 +609,8 @@ def _validate(cfg):
     _validate_attention(cfg)
     _validate_pooling(cfg)
     _validate_remask(cfg)
+    _validate_regime_loss(cfg)
+    _validate_own_cell_skip(cfg)
     _validate_sce(cfg)
     _validate_center_targets(cfg)
     _validate_global_residual(cfg)

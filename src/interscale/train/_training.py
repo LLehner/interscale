@@ -9,6 +9,7 @@ from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, Mode
 from lightning.pytorch.trainer import seed_everything
 
 from interscale.evaluation.online_probes import build_probe_callback
+from interscale.tl.depth import regime_loss_on
 from interscale.tl.utils import get_model_filename_prefix
 from interscale.train._schedule import component_modules, freezing, phase_epochs, phase_warmup, schedule_phases
 from interscale.train._trainingplans import TrainingPlan
@@ -52,6 +53,24 @@ class NodeMaskingTrainingPlan:
         return monitor, ("min" if monitor.endswith(("loss", "error", "mse")) else "max")
 
     # @devices_dsp.dedent -TODO: Why is this here in scvi-tools?
+    def _refuse_unsupported_options(self) -> None:
+        """Raise for a config option that this model would silently ignore.
+
+        The config validator does not know the model type: ``optim.regime_loss`` splits the two heads of a
+        dual-decoder CombinedModel, and ``model.decoder.own_cell_skip`` adds a cell's own token to a
+        GlobalModel's prediction. Any other model has no such part, and would train the plain objective.
+        """
+        if regime_loss_on(self._cfg) and getattr(self.module, "regime", None) is None:
+            raise ValueError(
+                "optim.regime_loss gives the local and the global head their own hidden cells, but this model has "
+                "no such pair of heads: use a CombinedModel with model.decoder.dual_decoder: true."
+            )
+        if self._cfg.model.decoder.get("own_cell_skip", False) and not getattr(self.module, "own_cell_skip", False):
+            raise ValueError(
+                "model.decoder.own_cell_skip adds a cell's own token to the prediction of a GlobalModel; this "
+                "model has none to add."
+            )
+
     def train(
         self,
         max_epochs: int,
@@ -107,6 +126,7 @@ class NodeMaskingTrainingPlan:
             Additional keyword arguments passed into the
             :class:`~lightning.pytorch.trainer.trainer.Trainer` (of every phase).
         """
+        self._refuse_unsupported_options()
         phases = schedule_phases(self._cfg)
         run = {
             "early_stopping": early_stopping,

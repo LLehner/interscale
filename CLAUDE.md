@@ -190,6 +190,30 @@ one phase, unchanged), `local_then_global`, `local_then_global_ft`, `alternating
   `schedule/phase<k>_<metric>`): `drift_<component>`, the relative change of that component's
   weights (0 when frozen), and the phase's last validation losses.
 
+### Regime losses and the own-cell skip (`tl/depth.py`, `.claude/decoder_plan.md`)
+
+`optim.regime_loss` (default `kind: none`, every run as before) gives each head of the dual decoder the hidden cells of
+its regime: `near` when the nearest visible cell of the slide lies within `depth_um` (290: the 2-hop GCN's reach on
+synth_spot), `deep` beyond; `local_cells` / `global_cells` name each head's regime (`near`, `deep`, `all`).
+Invariants:
+
+- **Only the loss is cut.** `DualDecoderCombinedModule` returns `StepOutput.loss_mask` (the entry mask, each half cut to
+  its cells); `TrainingPlan._step` hands that to `compute_separate_losses` and keeps `entry_mask` for every metric, so
+  `*_masked_*` metrics and `_log_head_sce` mean what they always did.
+- **The heads are weighed, not the rows.** Under regimes the plan always uses the weighted path (`loss_weights`,
+  default 0.5 / 0.5), because one mean over the stacked rows would weigh a head by its regime's cell count. A head
+  with no cell in a batch gets a zero (`_head_loss`), never a NaN.
+- **Depth is `tl.depth.hidden_depth`** over every cell of the slide (also those `pad_batch` left out), in the units of
+  `pos`; the threshold is divided by `dataset.spatial_unit_um`. It needs cells hidden whole (cell masking or discs, not
+  `mask_genes`), and `deep` needs discs wider than `depth_um`; the validator says so. A model without two heads refuses
+  the option in `train()` (`_refuse_unsupported_options`).
+
+`model.decoder.own_cell_skip` (GlobalModel only; default off) adds the cell's own token to its prediction around the
+transformer: `y = decoder(h_global) + W_o e_own` (`GlobalModule.predict(..., own_embedding=, node_idx=)`, which refuses to
+run without them). `e_own` is `gex_embedding` of the *masked* batch, so no hidden entry reaches it; `W_o` starts at zero
+and draws no random number. Any new caller of `predict` on such a module must pass both. The decoder type and the skip
+are in the checkpoint name (`dec-<type>[-skip]_`; the plain linear decoder adds nothing).
+
 ### Preprocessing / robustness utilities (`interscale.pp`)
 
 `pp.segmentation_noise.apply_segmentation_noise` simulates cell-segmentation errors (used when `cfg.dataset.segmentation_robustness` is set in `main.py`/`main_sweep.py`) for robustness sweeps.

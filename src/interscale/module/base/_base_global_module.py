@@ -3,6 +3,7 @@ from typing import Literal
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.decomposition import NMF, PCA
 
 from interscale.tl.masking import MASK_VALUE
@@ -23,6 +24,7 @@ class GlobalModule(BaseModule):
         programme_masking: bool = False,
         pooling=None,
         remask: str = "none",
+        own_cell_skip: bool = False,
         **base_module_kwargs,
     ):
         """``precomputed_mask_fill``: what a hidden cell's ``Precomputed`` embedding is replaced by.
@@ -44,6 +46,11 @@ class GlobalModule(BaseModule):
         of the local component's token, which mixed in the cell's visible neighbours (:meth:`remask_tokens`).
         Only behind a local component: a model without one already tokenises a hidden cell from its masked
         input alone.
+
+        ``own_cell_skip``: the cell's own token (``e_own``, what :meth:`gex_embedding` gives, before the
+        transformer) reaches the prediction around it, ``y = decoder(h_global) + W_o e_own``, with ``W_o``
+        starting at zero (:meth:`predict`). Only for a module that tokenises the expression itself, i.e. a
+        ``GlobalModel``.
         """
         super().__init__(**base_module_kwargs)
         self.pooling = pooling
@@ -63,6 +70,16 @@ class GlobalModule(BaseModule):
             # is initialised as in the model without it.
             gen = torch.Generator().manual_seed(0)
             self.remask_token = torch.nn.Parameter(torch.randn(self.n_embed, generator=gen))
+        self.own_cell_skip = bool(own_cell_skip)
+        if self.own_cell_skip:
+            if self.type_gex_embedding is None:
+                raise ValueError(
+                    "own_cell_skip adds the cell's own token to the prediction, but this global module has none: "
+                    "a CombinedModel's tokens are the local component's output. Use it in a GlobalModel."
+                )
+            # Zeros, not an initialiser: no draw from the global RNG, so every other weight is initialised as
+            # without the skip, and the model starts as the one without it.
+            self.own_skip_weight = torch.nn.Parameter(torch.zeros(self.n_output, self.n_embed))
 
         self.registered_local_component = False
         self.registered_global_component = True
@@ -460,7 +477,7 @@ class GlobalModule(BaseModule):
 
     #     return y_true, adjusted_mask_idx
 
-    def predict(self, global_embedding, src_padding_mask, prediction_level):
+    def predict(self, global_embedding, src_padding_mask, prediction_level, own_embedding=None, node_idx=None):
         """Predict with the decoder.
 
         Parameters
@@ -469,13 +486,30 @@ class GlobalModule(BaseModule):
             Size: [N, E]
         prediction_level: Literal["node", "graph"]
             Level of prediction
+        own_embedding: torch.Tensor | None
+            ``[N, E]`` in batch node order: each cell's own token, from :meth:`gex_embedding`. Required under
+            ``own_cell_skip`` (a module that has one refuses to predict without it, rather than predict as if
+            it had none), ignored otherwise.
+        node_idx: torch.Tensor | None
+            ``[N_kept]`` batch-global node index of each kept token (``_process_batch_for_metrics``'s
+            ``padded_node_idx``), bringing ``own_embedding`` into token order. Required with it.
         """
         ## Graph-level prediction: get cls_token from last position
         if "graph" in prediction_level:
+            if self.own_cell_skip:
+                raise ValueError("own_cell_skip is a per-cell term; a graph-level prediction has none.")
             return self.decoder(gather_cls(global_embedding))
         ## Node-level prediction: remove cls_token from last position
         elif "node" in prediction_level:
-            return self.decoder(gather_tokens(global_embedding, src_padding_mask))
+            y_pred = self.decoder(gather_tokens(global_embedding, src_padding_mask))
+            if self.own_cell_skip:
+                if own_embedding is None or node_idx is None:
+                    raise ValueError(
+                        "own_cell_skip needs the cells' own tokens and their node index to predict: pass "
+                        "own_embedding and node_idx."
+                    )
+                y_pred = y_pred + F.linear(own_embedding[node_idx].to(y_pred.dtype), self.own_skip_weight)
+            return y_pred
         else:
             raise Exception("Choose a valid prediction tasks (graph or node).")
 
@@ -507,8 +541,6 @@ class GlobalModule(BaseModule):
 
         global_embedding, src_padding_mask, pad_index_nodes, _, attn_matrix = self.step(batch_masked, embedding)
 
-        y_pred = self.predict(global_embedding, src_padding_mask, prediction_level)
-
         if prediction_task == "classification" and prediction_level == "graph":
             y_true = batch.y[batch.ptr[:-1]]
             entry_mask = None
@@ -517,12 +549,17 @@ class GlobalModule(BaseModule):
             y_true, padded_node_idx, entry_mask = self._process_batch_for_metrics(
                 batch, prediction_task, prediction_level, pad_index_nodes
             )
-            if entry_mask is None:
-                # Node-level classification: the masked cells ARE the supervision targets, so
-                # both loss and metrics stay restricted to them. Only reconstruction moved to
-                # scoring every cell.
-                keep = batch.mask[padded_node_idx].bool()
-                y_pred, y_true = y_pred[keep], y_true[keep]
+
+        # The cells' own tokens reach the prediction around the transformer under `own_cell_skip`.
+        y_pred = self.predict(
+            global_embedding, src_padding_mask, prediction_level, own_embedding=embedding, node_idx=padded_node_idx
+        )
+        if padded_node_idx is not None and entry_mask is None:
+            # Node-level classification: the masked cells ARE the supervision targets, so
+            # both loss and metrics stay restricted to them. Only reconstruction moved to
+            # scoring every cell.
+            keep = batch.mask[padded_node_idx].bool()
+            y_pred, y_true = y_pred[keep], y_true[keep]
 
         assert len(y_pred) == len(y_true), "y_pred and y_true are not consistent"
         assert not torch.any(torch.isnan(y_pred)), "y_pred contains NaN values"
@@ -585,6 +622,7 @@ class GlobalModule(BaseModule):
                 programme_masking=bool(list(cfg.dataset.get("mask_genes", []) or [])),
                 pooling=build_pooling(cfg, n_embed) if n_embed is not None else None,
                 remask=params.get("remask", "none"),
+                own_cell_skip=bool(cfg.model.decoder.get("own_cell_skip", False)),
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,
             )

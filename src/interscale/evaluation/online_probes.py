@@ -58,6 +58,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.loader import DataLoader
 
+from interscale.tl.depth import hidden_depth  # noqa: F401  (re-exported: the evaluation modules import it from here)
 from interscale.tl.geome_utils import label_codes
 from interscale.tl.masking import MASK_VALUE
 
@@ -201,25 +202,6 @@ def node_positional_encoding(module, batch) -> torch.Tensor | None:
         return None
     dtype = next(encoding.parameters()).dtype
     return encoding(batch, dtype=dtype, device=batch.x.device)
-
-
-def hidden_depth(pos: torch.Tensor, hidden_cell: torch.Tensor, graph: torch.Tensor) -> torch.Tensor:
-    """``[N]`` distance from each hidden cell to the nearest non-hidden cell of the same graph.
-
-    In the units of ``pos``; 0 for a cell that is not hidden, ``inf`` in a graph hidden completely.
-    """
-    depth = torch.zeros(len(pos), dtype=torch.float64, device=pos.device)
-    for g in torch.unique(graph):
-        rows = torch.where(graph == g)[0]
-        hid = hidden_cell[rows]
-        if not hid.any():
-            continue
-        p = pos[rows].double()
-        if hid.all():
-            depth[rows] = float("inf")
-            continue
-        depth[rows[hid]] = torch.cdist(p[hid], p[~hid]).min(dim=1).values
-    return depth
 
 
 def _concat(chunks: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
