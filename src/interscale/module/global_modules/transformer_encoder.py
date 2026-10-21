@@ -20,6 +20,7 @@ from interscale.tl import (
     blocked_pairs,
     create_transformer_attention_mask_from_edges,
     pad_batch,
+    pad_like,
 )
 
 
@@ -130,6 +131,8 @@ class TransformerNodeEncoderHook(GlobalModule):
         # shifts neither another weight's initialisation nor the batch order.
         self.attention_spec = ATTENTION_REGISTRY[self.attention_kind]
         self.attention_cfg = attention
+        # `attention.visible_keys_only`: no cell attends to a cell hidden whole (`_without_hidden_keys`).
+        self.visible_keys_only = bool(attention.get("visible_keys_only", False)) if attention is not None else False
         self.attention_seed = int(attention_seed)
         # Draws a sparse backend's pattern when it is resampled in training (Exphormer's `resample`).
         self.attention_generator = torch.Generator().manual_seed(self.attention_seed)
@@ -261,6 +264,15 @@ class TransformerNodeEncoderHook(GlobalModule):
             # 0 * -inf that an "inverse adjacency" built by arithmetic would produce.
             attention_mask = attention_mask.to(dtype=torch.bool)
 
+        if self.visible_keys_only and not eval_step:
+            if isinstance(attention_mask, StructuredMask):
+                raise ValueError(
+                    "attention.visible_keys_only needs a dense attention mask; this backend takes a pattern."
+                )
+            attention_mask = self._without_hidden_keys(
+                attention_mask, batched_data, index_nodes, src_padding_mask.shape[1]
+            )
+
         if self.attention_bias is not None and not isinstance(attention_mask, StructuredMask):
             # Merged by indexing, never by arithmetic: blocked pairs become -inf, every other pair
             # keeps its finite bias. The bias is laid out from this call's index_nodes, and its CLS
@@ -292,6 +304,19 @@ class TransformerNodeEncoderHook(GlobalModule):
                 entry["open"] = ~blocked.view(n_graphs, -1, *blocked.shape[1:])[:, 0].detach()
             self._attention_record.append(entry)
         return GlobalInput(padded_emb, src_padding_mask, index_nodes, attention_mask, rotary)
+
+    def _without_hidden_keys(self, mask: torch.Tensor, batched_data, index_nodes, seq_len: int) -> torch.Tensor:
+        """``mask`` ``[B * heads, S + 1, S + 1]`` (True: blocked) with every key that is a cell hidden whole blocked too.
+
+        A hidden cell stays a query: its row loses only the hidden keys, and CLS (the last slot, never hidden) stays open,
+        so no row is ever empty. The cells are laid out like the tokens (``pad_like`` with this call's ``index_nodes``).
+        """
+        hidden = self.wholly_hidden(batched_data)
+        keys = pad_like(hidden[:, None].float(), batched_data.batch, index_nodes, seq_len)[..., 0] > 0  # [B, S]
+        keys = torch.nn.functional.pad(keys, (0, 1))  # CLS open
+        n_graphs = keys.shape[0]
+        blocked = mask.reshape(n_graphs, self.n_heads, seq_len + 1, seq_len + 1) | keys[:, None, None, :]
+        return blocked.reshape(mask.shape)
 
     @contextmanager
     def recording_attention(self, reference: bool = False):

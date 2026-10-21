@@ -308,6 +308,71 @@ class LinearDistanceBias(nn.Module):
         return knots, self.slope.detach().cpu()[:, None] * (knots / 1000.0)
 
 
+class ScaledDistanceBias(nn.Module):
+    """A distance prior with its own length scale in every head: Steamboat's multi-scale heads, without labels.
+
+    ``b_h(d) = -s_h * phi(d / l_h)``, with ``phi(u) = u^2 / 2`` (``gaussian``: the attention weight of a pair is
+    multiplied by a Gaussian window of standard deviation ``l_h``) or ``phi(u) = u`` (``exponential``: a Laplace
+    window, a heavier tail). The scales ``l_h`` are spaced geometrically over ``[scale_min_um, scale_max_um]`` and dealt
+    out across the heads, so from the first step some heads attend locally and some globally, and what each head looks at
+    is readable from its scale. ``s_h`` is the prior's strength, 1 at the start.
+
+    Unlike the other biases this one is not zero at step 0: it is a prior, and the model starts with it. The scales and the
+    strengths are learned (``log l_h`` and ``s_h``, so a head can widen, narrow or drop its prior) unless ``frozen``, where
+    they are buffers and the content logits have to work around a fixed window.
+
+    With the long-range mask on, no key lies within the local reach of a query: a head whose scale is far below the reach
+    puts a huge penalty on every key it can see and attends to the nearest, so ``scale_min_um`` should be about that reach.
+    """
+
+    def __init__(
+        self, n_heads: int, scale_min_um: float, scale_max_um: float, shape: str, strength: float, frozen: bool
+    ):
+        super().__init__()
+        if shape not in DISTANCE_SHAPES:
+            raise ValueError(f"shape must be one of {DISTANCE_SHAPES}, got {shape!r}.")
+        self.shape, self.frozen = shape, bool(frozen)
+        n = int(n_heads)
+        if n == 1:
+            scales = torch.full((1,), math.sqrt(float(scale_min_um) * float(scale_max_um)))
+        else:
+            scales = torch.logspace(math.log10(scale_min_um), math.log10(scale_max_um), n)
+        log_scale, amplitude = scales.log(), torch.full((n,), float(strength))
+        if frozen:
+            self.register_buffer("log_scale", log_scale)
+            self.register_buffer("strength", amplitude)
+        else:
+            self.log_scale = nn.Parameter(log_scale)
+            self.strength = nn.Parameter(amplitude)
+
+    def extra_repr(self) -> str:
+        values = ", ".join(f"{s:.0f}" for s in self.scales().tolist())
+        return f"shape={self.shape}, scales_um=[{values}], frozen={self.frozen}"
+
+    def scales(self) -> torch.Tensor:
+        """``[heads]`` the length scales, µm."""
+        return self.log_scale.detach().exp()
+
+    def _lookup(self, dist: torch.Tensor) -> torch.Tensor:
+        """Distances of any shape (µm) to their biases, ``[*shape, heads]``."""
+        u = dist.unsqueeze(-1) / self.log_scale.exp().to(dist.dtype)
+        window = 0.5 * u * u if self.shape == "gaussian" else u
+        return -self.strength.to(dist.dtype) * window
+
+    def forward(self, dist: torch.Tensor) -> torch.Tensor:
+        """``[B, S, S]`` distances in µm to ``[B, heads, S, S]`` biases."""
+        return self._lookup(dist).permute(0, 3, 1, 2)
+
+    def pairs(self, pos_um: torch.Tensor, graph, query, key) -> torch.Tensor:
+        """``[B, S, 2]`` positions (µm) and ``P`` token pairs to their biases, ``[P, heads]``."""
+        return self._lookup(_pair_distance(pos_um, graph, query, key))
+
+    def profile(self, max_dist: float = 2000.0, num: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(knots [num] in µm, values [heads, num])`` -- each head's bias along ``[0, max_dist]``."""
+        knots = torch.linspace(0.0, float(max_dist), int(num))
+        return knots, self._lookup(knots).detach().cpu().t().clone()
+
+
 class ExpressionBias(nn.Module):
     """A learned function of how alike two cells' expression is, one per head, added to their logit.
 
@@ -716,13 +781,26 @@ def _validate_rw(pe):
     _positive(pe.rw.steps, "rw.steps")
 
 
-DISTANCE_KINDS = ("profile", "linear")
+DISTANCE_KINDS = ("profile", "linear", "scales")
+#: The window ``pe.distance.shape`` gives a head of the ``scales`` bias.
+DISTANCE_SHAPES = ("gaussian", "exponential")
 
 
 def _validate_distance(pe):
     if pe.distance.kind not in DISTANCE_KINDS:
         raise ValueError(f"pe.distance.kind must be one of {DISTANCE_KINDS}, got {pe.distance.kind!r}.")
     if pe.distance.kind == "linear":
+        return  # num_kernels and max_dist only describe the profile
+    if pe.distance.kind == "scales":
+        d = pe.distance
+        if not 0 < d.scale_min_um <= d.scale_max_um:
+            raise ValueError(
+                f"pe.distance scales need 0 < scale_min_um <= scale_max_um, got {d.scale_min_um} and {d.scale_max_um}."
+            )
+        if d.shape not in DISTANCE_SHAPES:
+            raise ValueError(f"pe.distance.shape must be one of {DISTANCE_SHAPES}, got {d.shape!r}.")
+        if not d.strength > 0:
+            raise ValueError(f"pe.distance.strength must be > 0, got {d.strength}.")
         return  # num_kernels and max_dist only describe the profile
     if pe.distance.num_kernels < 2:
         raise ValueError(f"pe.distance.num_kernels must be >= 2 (the two ends), got {pe.distance.num_kernels}.")
@@ -824,6 +902,11 @@ def _build_rw(pe, n_embed):
 def _build_distance(pe, n_heads):
     if pe.distance.kind == "linear":
         return LinearDistanceBias(n_heads)
+    if pe.distance.kind == "scales":
+        d = pe.distance
+        return ScaledDistanceBias(
+            n_heads, float(d.scale_min_um), float(d.scale_max_um), d.shape, float(d.strength), bool(d.frozen)
+        )
     if not pe.distance.max_dist > 0:
         raise ValueError(
             "pe.distance.max_dist is 0, which means 'derive it from the data', but nothing derived it. "

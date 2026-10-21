@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- `pe.distance.kind: scales` (`ScaledDistanceBias`): a distance prior with a length scale per head -- the window
+  `-strength * phi(d / l_h)`, gaussian or exponential, the scales spaced geometrically over `[scale_min_um, scale_max_um]`, so some
+  heads attend locally and some globally from step 0. A prior, so not zero at step 0. Scales and strength are learned unless `frozen`.
+  Checkpoint tag `distance-scales-<g|e><min>-<max>[-s<strength>][-fz]`.
+- `attention.visible_keys_only`: a cell hidden whole is still a query but no cell attends to it (dense-mask backends; CLS stays
+  open; not on a clean pass). Checkpoint tag `-vk`.
+
 - The oracle reference `ref_oracle` for synthetic data: `masked_probing.oracle_features` turns the true drivers in `obs` (distances
   to sources as Gaussian bumps with an indicator for missing values, flags, one-hot categoricals, and a key's features also
   gated by a boolean column) into the `drivers` of `FittedReferences`, which fits one more ridge on them and the cell's own

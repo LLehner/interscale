@@ -80,7 +80,12 @@ def _positional_encoding_tag(cfg) -> str:
     params = cfg.model.global_component.get("parameters", None)
     pe = params.get("pe", None) if params is not None else None
     names = list(pe.node) + list(pe.get("bias", [])) + list(pe.get("rotary", [])) if pe is not None else []
-    if "distance" in names and pe.distance.get("kind", "profile") != "profile":
+    if "distance" in names and pe.distance.get("kind", "profile") == "scales":
+        d = pe.distance
+        window = f"{d.shape[0]}{float(d.scale_min_um):g}-{float(d.scale_max_um):g}"
+        strength = f"-s{float(d.strength):g}" if float(d.strength) != 1.0 else ""
+        names[names.index("distance")] = f"distance-scales-{window}{strength}{'-fz' if d.frozen else ''}"
+    elif "distance" in names and pe.distance.get("kind", "profile") != "profile":
         names[names.index("distance")] = f"distance-{pe.distance.kind}"
     if "rope" in names and pe.rope.get("kind", "axial") != "axial":
         names[names.index("rope")] = f"rope-{pe.rope.kind}"
@@ -104,7 +109,8 @@ def _attention_tag(cfg) -> str:
         return ""
     kind, head_dim = str(attention.get("kind", "dense")), int(attention.get("head_dim", 0))
     center = bool(attention.get("center_qk", False))
-    if kind == "dense" and head_dim == 0 and not center:
+    visible = bool(attention.get("visible_keys_only", False))
+    if kind == "dense" and head_dim == 0 and not center and not visible:
         return ""
     settings = ""
     if kind == "entmax":
@@ -113,7 +119,13 @@ def _attention_tag(cfg) -> str:
         settings = f"-a{float(entmax.get('alpha', 1.5)):g}" + ("l" if learn else "")
     elif kind == "topk":
         settings = f"-k{int(attention.get('topk', {}).get('k', 32))}"
-    return f"attn-{kind}{settings}" + (f"-hd{head_dim}" if head_dim > 0 else "") + ("-cqk" if center else "") + "_"
+    return (
+        f"attn-{kind}{settings}"
+        + (f"-hd{head_dim}" if head_dim > 0 else "")
+        + ("-cqk" if center else "")
+        + ("-vk" if visible else "")
+        + "_"
+    )
 
 
 def _pooling_tag(cfg) -> str:

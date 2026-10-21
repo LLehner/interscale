@@ -85,10 +85,22 @@ def get_global_component_cfg(cfg, global_component_name):
         #   The checkpoint stores the range the model was trained with.
         # * `linear` -- one slope per head on the distance in mm (ALiBi): attention only falls or
         #   rises with distance. `num_kernels` and `max_dist` are ignored.
+        # * `scales` -- a distance prior with a length scale per head (`.claude/roadmap.md`, T1): head h
+        #   gets the window -strength * phi(d / l_h), `phi` u^2 / 2 for `shape` gaussian or u for
+        #   exponential, the scales l_h spaced geometrically over [scale_min_um, scale_max_um] and dealt out
+        #   across the heads, so some heads attend locally and some globally from step 0 and each head's
+        #   scale is known. Not zero at step 0 (a prior). Scales and strength are learned unless `frozen`.
+        #   With the long-range mask on, put `scale_min_um` about at the local reach (a head far below it
+        #   attends to the nearest visible key). `num_kernels` and `max_dist` are ignored.
         pe.distance = CN()
         pe.distance.kind = "profile"
         pe.distance.num_kernels = 16
         pe.distance.max_dist = 0.0
+        pe.distance.scale_min_um = 20.0
+        pe.distance.scale_max_um = 2000.0
+        pe.distance.shape = "gaussian"
+        pe.distance.strength = 1.0
+        pe.distance.frozen = False
         # A learned bias per head as a function of how alike two cells' expression is: each key's
         # rank among the query's keys by Euclidean distance of their expression (the kNN view of
         # scanpy.pp.neighbors on the expression), piecewise linear in log2(1 + rank) between
@@ -183,6 +195,12 @@ def get_global_component_cfg(cfg, global_component_name):
         # identical, their dot products barely tell keys apart, and attention stays uniform with no
         # gradient to leave it. Centring compares spots by what differs between them. Any backend.
         att.center_qk = False
+        # Only visible cells are keys (`.claude/roadmap.md`, T1 / K5): a cell hidden whole (cell masking, discs) is
+        # still a query, but no cell attends to it. Its token is the mask token (or, behind a GCN, its neighbours'
+        # mean) and the same for every hidden cell, so under discs the hidden cells form a block that the
+        # others can attend to for nothing, a sink. CLS stays open. Dense-mask backends only (dense, entmax,
+        # topk); needs cells hidden whole, so not with a hidden gene set or pooling. No effect on a clean pass.
+        att.visible_keys_only = False
         # `linear`: elu+1 linear attention, O(S) like the performer but with a fixed, deterministic
         # feature map instead of random features -- not an estimate of softmax. Each head's map has
         # rank <= head_dim, so it wants wide heads (head_dim >= 32; it warns below). It carries

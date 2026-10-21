@@ -403,6 +403,28 @@ def _validate_pe(cfg):
             )
 
 
+def _validate_visible_keys_only(cfg, params, kind, spec):
+    """``attention.visible_keys_only`` blocks the keys that are cells hidden whole: a dense mask, and cells hidden whole."""
+    from interscale.module.global_modules.attention import ATTENTION_REGISTRY
+
+    where = "attention.visible_keys_only"
+    if spec.mask != "dense":
+        carriers = sorted(k for k, s in ATTENTION_REGISTRY.items() if s.mask == "dense")
+        raise ValueError(
+            f"{where} edits the dense attention mask; attention.kind {kind!r} has none. Use one of {carriers}."
+        )
+    pooling = params.get("pooling", None)
+    if pooling is not None and pooling.get("kind", "none") != "none":
+        raise ValueError(f"{where}: a pooled patch already leaves its hidden cells out, and its keys are patches.")
+    if list(cfg.dataset.get("mask_genes", []) or []):
+        raise ValueError(f"{where} blocks cells hidden whole, but a hidden gene set (dataset.mask_genes) hides none.")
+    blocks = cfg.dataset.get("mask_block_fraction", 0.0) > 0
+    if cfg.dataset.mask_strategy == "gene" and not blocks:
+        raise ValueError(f"{where}: under mask_strategy gene only spatial blocks hide whole cells; use node or blocks.")
+    if cfg.dataset.mask_percentage <= 0 and not blocks:
+        raise ValueError(f"{where}: nothing is masked (mask_percentage 0, no blocks), so there is no hidden key.")
+
+
 def _validate_attention(cfg):
     """Reject an attention backend that cannot carry what the rest of the config asks of it.
 
@@ -453,6 +475,8 @@ def _validate_attention(cfg):
             f"attention.kind {kind!r} cannot apply pe.rotary {rotary}. Backends that can: {carriers}."
             + (f" {spec.note}" if spec.note else "")
         )
+    if attention.get("visible_keys_only", False):
+        _validate_visible_keys_only(cfg, params, kind, spec)
     loss = cfg.optim.get("loss", None)
     if loss in LOSSES_READING_ATTENTION and not spec.training_maps:
         carriers = sorted(k for k, s in ATTENTION_REGISTRY.items() if s.training_maps)

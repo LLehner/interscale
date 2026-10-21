@@ -190,6 +190,20 @@ one phase, unchanged), `local_then_global`, `local_then_global_ft`, `alternating
   `schedule/phase<k>_<metric>`): `drift_<component>`, the relative change of that component's
   weights (0 when frozen), and the phase's last validation losses.
 
+### Distance prior per head and visible keys only (`.claude/roadmap.md`, T1)
+
+`pe.bias: [distance]` with `pe.distance.kind: scales` (`ScaledDistanceBias`) gives head `h` the window
+`-strength * phi(d / l_h)` (`shape` gaussian: `phi = u²/2`, or exponential: `phi = u`) with the scales `l_h` spaced geometrically
+over `[scale_min_um, scale_max_um]`. It is a prior: **not zero at step 0**, unlike every other bias (the "a bias starts at zero"
+convention of the other kinds does not hold). Scales and strength are learned unless `frozen`. Dense and pair forms only (not the
+Performer). With the long-range mask on, `scale_min_um` should be about the local reach.
+
+`attention.visible_keys_only` (default off) blocks, in the dense mask of `common_step_local_to_global`, every key that is a cell hidden
+whole (`GlobalModule.wholly_hidden`); a hidden cell still queries, CLS stays open, a clean pass (`eval_step`) is untouched. The key
+vector is laid out with `pad_like` from this call's `index_nodes` -- never a second `pad_batch` -- so it follows left padding and
+subsampling. It must run *before* the bias is merged into the mask. Needs a dense-mask backend (the validator names which) and
+cells hidden whole (not with `mask_genes`, pooling, or gene masking without discs). Checkpoint tag `-vk` in the attention part.
+
 ### Regime losses and the own-cell skip (`tl/depth.py`, `.claude/decoder_plan.md`)
 
 `optim.regime_loss` (default `kind: none`, every run as before) gives each head of the dual decoder the hidden cells of
