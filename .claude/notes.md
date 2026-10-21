@@ -329,3 +329,30 @@ result was read; the entry above was the first one written live.*
 - 300 µm discs (and anything with a radius near the threshold) leave almost no deep spot: the global head would have
   nothing to learn from, which the config now refuses.
 - My first estimate for 500 µm discs, "a fifth deep", was wrong by a third: discs overlap and merge into larger holes.
+
+## 2026-10-21 — Attention check on the response_masking checkpoints: is it computed correctly, and which readout finds the planted senders (13 trained runs, 3 untrained twins, programme masking on synth_spot)
+
+**What worked**
+- The attention is computed as the definition says: for every layer of every run the stored map and the layer output
+  equal the written-out definition to below the table's 4 decimals (reported as 0; scale of the values 0.3-2), and
+  where torch's stock `nn.MultiheadAttention` can take the same inputs (no RoPE: `lin_none`, the Fourier arms) it agrees
+  as well. So the vendored attention and its per-head, graph-kept maps are correct, also after training.
+- Gradient x input at the tokens is the one readout above its untrained twin in every arm and seed that has a Fourier bias
+  or RoPE: planted sender's matched rank 0.551 (`lin_fourier`, 3 seeds: 0.541 / 0.550 / 0.562) and 0.549 (`joint_fourier`:
+  0.562 / 0.552 / 0.533) against twins at 0.511 and 0.498. Small (+0.04-0.05), but it reads no attention map.
+- After training the readouts disagree, before it they do not: attention, attention mean and rollout correlate 0.98-1.0 in
+  the untrained twins (uniform attention) and 0.70-0.93 trained; gradient readouts correlate 0.15-0.5 with the attention ones.
+  Which readout is used therefore changes the picture; it is not one signal read many ways.
+
+**What doesn't work**
+- No readout finds the planted senders: the rank over all planted pairs is 0.47-0.55 for all seven readouts in all arms, the
+  untrained twins 0.48-0.52. Chefer's relevance from a query's own target (0.535 for `lin_fourier`) is no better than the
+  degenerate summed-output relevance (0.546), so this instrument cannot yet tell a valid target from an arbitrary one.
+- Attention is still nearly uniform: the score-weighted distance to the query is 2.4-2.6 mm in every arm (twins 2.53 mm),
+  the share within 300 um is 1.1% for the twins (= uniform). `lin_fourier` is below that (0.5%: it looks away from near
+  cells), `lin_rope` far above (6.1% last layer, 5 x uniform: local heads, but still no sender selection).
+- The RoPE arms rank the mid-range planted sender far *below* chance: `lin_rope` 0.18 (attn_last) and 0.09 (rollout),
+  `joint_rope` 0.33 and 0.21 over 3 seeds (rollout per seed 0.235 / 0.195 / 0.185), `joint_fourier` 0.38 / 0.36; the twins
+  sit at 0.4-0.5. Trained attention avoids those senders relative to cells as far away. The number of pairs behind a class is
+  not in these files (the report dropped `n_pairs`; kept since), so it is a lead, not a result.
+- Seeds scatter by 0.02-0.14 per class (the mid class up to 0.14), so single-class differences below that are noise.
