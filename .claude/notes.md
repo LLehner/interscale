@@ -315,3 +315,17 @@ result was read; the entry above was the first one written live.*
   training is the one after dropout; `evaluate()`'s raw matrix is head 0 of graph 0, not a head mean (unused); the
   input LayerNorm is applied twice (before and after the node encoding is added).
 - Nothing here says which readout finds senders: that is the `attention_check` sweep, not run.
+
+## 2026-10-21 — Disc geometry on a synth_spot-sized lattice: how deep the hidden spots are (model-free, 20 draws; for the regime loss, D2.2)
+
+**What worked**
+- The disc masks give the regime loss both regimes to work with. With discs over 30% of a 50 x 50 lattice (100 µm
+  spacing) and the threshold at the 2-hop GCN's reach (290 µm), the share of hidden spots that are deep is 7% for
+  300 µm discs, **34% for 500 µm** (+-3%), 50% for 750 µm and **64% for 1000 µm** (+-4%).
+- At 500 µm the hidden spots fall in the depth bins 0-150 / 150-290 / 290-500 / 500+ µm as 38 / 28 / 32 / 2%; the
+  evaluation's bins therefore cover them, and nearly none lies deeper than 500 µm. At 1000 µm: 19 / 17 / 29 / 35%.
+
+**What doesn't work**
+- 300 µm discs (and anything with a radius near the threshold) leave almost no deep spot: the global head would have
+  nothing to learn from, which the config now refuses.
+- My first estimate for 500 µm discs, "a fifth deep", was wrong by a third: discs overlap and merge into larger holes.

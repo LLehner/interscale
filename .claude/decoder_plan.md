@@ -15,8 +15,10 @@ the same commit as the work.
 | D0 — yardsticks: redundancy and attribution readouts | proposed | | |
 | D1.0 — re-masking before the transformer (hidden cells only) | **implemented, unverified** -- `remask: hidden` (roadmap.md, T2, task 3); sweep `remask_test` written, not run | 16 tests, 8 mutations, harness IDENTICAL | 2026-10-21 |
 | D1 — a context-only global embedding | proposed | | |
-| D2 — different targets per head | proposed | | |
-| D3 — one prediction from two parts | proposed | | |
+| D2.2 — regime-assigned losses | **implemented, unverified** -- `optim.regime_loss` (roadmap.md, T2); sweep `regime_loss` written, not run | 34 tests, mutation-checked, harness IDENTICAL | 2026-10-21 |
+| D2 — different targets per head | D2.1 and D2.3 proposed | | |
+| D3.0 — own-cell skip in a global-only model | **implemented, unverified** -- `model.decoder.own_cell_skip` (roadmap.md, T2); sweep `global_decoders` written, not run | 21 tests, mutation-checked, harness IDENTICAL | 2026-10-21 |
+| D3 — one prediction from two parts | D3.1 (in the dual model) to D3.3 proposed | | |
 | D4 — penalties on the embeddings; run the existing contrastive losses | proposed | | |
 
 ## Why the two components do not separate today
@@ -106,6 +108,12 @@ Give the heads different targets, so they are not competing for one signal:
    step, one loss each.
 
 ## D3 — combining the heads into one prediction
+
+0. **Own-cell skip in a global-only model (built 2026-10-21, `model.decoder.own_cell_skip`).** `ŷ = decoder(h_global) +
+   W_o e_own`: D3.1 without a GCN, the cell's own token (before the transformer, from its visible genes) reaching the
+   prediction around it. `W_o` starts at zero. It gives the own-versus-context split by construction and tests
+   whether the global-only model's misses on the mirror programmes are a read-out problem. For the dual model D3.1
+   below is the same idea with the GCN's token as the cell's own part.
 
 1. **Additive linear decoder.** `ŷ = W_l h_l + W_g h_g + b`, the loss on `ŷ` (optionally small
    per-head terms). Neither part predicts the full target alone, so duplicating a signal earns

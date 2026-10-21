@@ -25,8 +25,8 @@ Last updated 2026-10-21.
 |---|---|---|---|---|
 | T0 | infrastructure: seeds, per-arm evaluation, inputs, CosMx | **implemented, unverified** (2026-10-19; CosMx deferred by the user) — seed axis, run selection for job arrays, per-run section files, timing, cached references, `Precomputed` under programme masking, `pca_fit: train`; every mutation caught (two survivors led to a stronger test and a simplification), harness IDENTICAL; the sweep script checked on a stub synth_spot with untrained models. **Not run on data** | 2026-10-19 |
 | T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; legnini programme masking built 2026-10-20 (`legnini_programme`, decided gene set in legnini_plan.md; not run); sender ranks unreadable (gradient magnitude) → replaced 2026-10-20 by an integrated-gradients attribution, sparse programmes also scored within their receivers, per-programme wins/ties/losses in the report (**built, not yet run: the 19 checkpoints await `MODE = "evaluate"`**). Details in global_plan.md | `response_masking` run (11 arms, 19 runs, 3 twins) | 2026-10-20 |
-| T1b | coarse-grained tokens: pool cells into patches or niches before the global model | **grid pooling implemented, unverified** (2026-10-19) — `pooling.kind: grid` (`size_um` or `n_patches`), `count`/`std` features, 39 tests, an end-to-end run for GlobalModel and CombinedModel, every mutation caught (one survivor led to a stronger test), harness IDENTICAL; 5 pooled arms in `response_masking`. The `niche` assignment waits for the user's details; patch-level attention readouts not built. **Not run on data** | 2026-10-19 |
-| T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed; **re-masking before the transformer implemented, unverified** (2026-10-21, task 3 below) -- `remask: hidden`: a wholly hidden cell enters the transformer as one learned token instead of its GCN token; 16 tests, 8 mutations caught, harness IDENTICAL; sweep `remask_test` written (8 runs), **not run**. Moran's I split (task 1) and embedding dimensions vs genes (task 2) proposed | tests, harness | 2026-10-21 |
+| T1b | coarse-grained tokens: pool cells into patches or niches before the global model | **grid pooling implemented, unverified** (2026-10-19) — `pooling.kind: grid` (`size_um` or `n_patches`), `count`/`std` features, 39 tests, an end-to-end run for GlobalModel and CombinedModel, every mutation caught (one survivor led to a stronger test), harness IDENTICAL; 5 pooled arms in `response_masking`. The `niche` assignment waits for the user's details; patch-level attention readouts not built. **Not run on data**. **2026-10-21: the decoder arms for the global-only model built** (own-cell skip `model.decoder.own_cell_skip`, `nonlinear` and `linear-lse` as sweep arms, the skip also on pooled tokens), implemented, unverified; sweep `global_decoders` (10 runs), **not run** (T2 below) | 2026-10-19 |
+| T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed; **re-masking before the transformer implemented, unverified** (2026-10-21, task 3 below) -- `remask: hidden`: a wholly hidden cell enters the transformer as one learned token instead of its GCN token; 16 tests, 8 mutations caught, harness IDENTICAL; sweep `remask_test` written (8 runs), **not run**. **D2.2, each head's loss on the hidden cells of its regime, implemented, unverified** (2026-10-21) -- `optim.regime_loss`, near / deep by the distance to the nearest visible cell; 55 tests with the own-cell skip (34 regime loss, 21 skip and decoders), 32 mutations all caught (two only after two more tests), harness IDENTICAL; sweep `regime_loss` written (9 runs), **not run**. Moran's I split (task 1) and embedding dimensions vs genes (task 2) proposed | tests, harness | 2026-10-21 |
 | T3 | masking strategies | proposed | | |
 | T4 | interpretation beyond raw attention; attention sinks | **sender attribution built, unverified on data** (2026-10-20) — `response_influence(measure="attribution")`: integrated gradients from the training-mean cell on a programme's summed response genes, completeness check, hidden entries fixed, one random state along the path; 16 + 6 tests, 31 mutations caught. Not built: the other methods of the table below, the null key and registers, the permuted-slide baseline. **Not run on data**. **2026-10-21 (task 4 below): attention checked against torch, readouts compared, implemented, unverified on data**: the vendored attention equals torch's stock `nn.MultiheadAttention` and encoder layer (tests, every mask form); relevance fixed (heads averaged per graph, tensors on the output's device, a target can be given); `evaluation.attention_check` (`check_attention` on the real inputs, `attention_readouts`: 7 readouts against planted pairs); 40 tests; of 15 mutations 14 caught (2 after two more tests), the survivor a redundant gradient clear; sweep `attention_check` (evaluation only, on the `response_masking` checkpoints), **not run**. Label-free flow (task 5) proposed | 2026-10-21 |
 | T5 | how cell-type driven attention is | proposed | | |
@@ -343,12 +343,56 @@ scales, but the decoder decides what the model can express and how it is read:
 - With pooled tokens (T1b) the same decoders read the patch token, with the own-cell skip at cell
   level.
 
+**Built 2026-10-21 (implemented, unverified).**
+- *Own-cell skip:* `model.decoder.own_cell_skip: true` (a `GlobalModel` only; a combined or local model refuses it).
+  `ŷ = decoder(h_global) + W_o e_own`, `e_own` the cell's token before the transformer from the masked input
+  (the learned input layer's output, or the precomputed / PCA embedding), gathered into token order like the
+  decoder's rows; `W_o` starts at zero and draws no random number, so the model starts as without it and every
+  other weight is initialised as before. `GlobalModule.predict` takes `own_embedding` and `node_idx` and refuses
+  to run without them rather than predict as if there were no skip; `get_model_output` decodes with it too.
+  Tested: it adds exactly `W_o e_own` (also pooled, where it is the only per-cell part), a hidden entry never
+  reaches a prediction through it while a visible one does, and a model without tokens of its own refuses it.
+- *Decoder types:* a checkpoint name now carries a decoder other than the plain linear one or the skip
+  (`dec-nonlinear_`, `dec-linear-lse_`, `dec-linear-skip_`): the decoder type was never in the name, so arms that
+  vary it would have overwritten each other. Every earlier name is unchanged. Each type trains finite through a
+  global-only model (tested, with and without the skip).
+- *Sweep `global_decoders`* (slurm folder; `lin_fourier` of `response_masking` read out six ways): `lin_fourier`,
+  `lin_fourier_skip` (3 seeds each), `lin_fourier_nonlinear`, `lin_fourier_lse`, `lin_fourier_pool500`,
+  `lin_fourier_pool500_skip` (one seed each); an untrained twin of `lin_fourier` only (the skip starts at zero, so
+  its twin would be the same model). **Read:** per programme against `ref_own` and the bar `ref_own+context`, first the
+  mirror programmes (MC1, MC2, MC4, MC6: 0.36 against `ref_own` 0.68 for MC4) and the sparse ones; the ring and
+  long-range programmes (M7, M8: 0.95) must not drop; the planted senders' rank against the twin.
+
 Order:
 
 1. **D0, the yardsticks:**
    - redundancy: the ridge R² of `h_global` from `h_local`;
    - attribution shares by depth and by programme.
-2. **D2.2:** each loss on its regime. Cheap.
+2. **D2.2:** each loss on its regime. Cheap. **Built 2026-10-21 (implemented, unverified):**
+   - *Regimes.* A cell hidden whole is *near* when the nearest visible cell of its slide lies within
+     `optim.regime_loss.depth_um` (default 290 µm, the 2-hop GCN's reach on the 100 µm lattice; you do not want it
+     lower), *deep* beyond (`tl/depth.py`; `hidden_depth` moved there from the evaluation module, now chunked, and is
+     still importable from `online_probes`). `local_cells` and `global_cells` name the regime of each head's loss:
+     `near`, `deep` or `all`; the default is near / deep, `all` / `all` is the loss as before.
+   - *Mechanism.* The module builds a per-head loss mask (`StepOutput.loss_mask`, the entry mask cut to each head's
+     cells) and the training plan hands that to `compute_separate_losses`; the metrics keep every hidden entry, so
+     the logged `*_masked_*` numbers mean what they always did. Each head's loss is the mean over its own cells and
+     the heads are weighed by `optim.loss_weights` (0.5 / 0.5), not by how many cells each regime has (one mean over
+     the stacked rows would weigh them 40 : 9 on a typical disc). A head with no cell in its regime in a batch gets a
+     zero. `train_regime_cells_{local,global}` log the cells each loss covered.
+   - *Refused:* a hidden gene set (no cell is hidden whole), gene masking without discs, a head given the deep cells
+     when the discs are not wider than `depth_um`, no dual decoder or no coordinates; a model without two heads
+     refuses it in `train()`. Checkpoint tag `rgm<depth>-<local>-<global>`.
+   - *Geometry, measured* (50 x 50 lattice, 20 draws of discs over 30% of the slide): the share of hidden spots
+     deeper than 290 µm is 7% for 300 µm discs, **34% for 500 µm**, 50% for 750 µm and **64% for 1000 µm**; at 500 µm the
+     depth bins 0-150 / 150-290 / 290-500 / 500+ hold 38 / 28 / 32 / 2% of the hidden spots.
+   - *Sweep `regime_loss`* (slurm folder; `joint` is `staged_training`'s): `joint`, `regime` (3 seeds each),
+     `regime_remask` (the regime loss and re-masking), and `joint_d1000`, `regime_d1000` (discs of 1000 µm: the wider
+     discs you thought of; the threshold stays 290 µm and the evaluation's discs stay 500 µm). **Read:** CKA
+     local~global by depth bin (should fall at the rim), each head's score by depth (the local head should hold on the
+     near bins and may fall on the deep ones, the global head the reverse; a head that holds on both did not
+     specialise), the better head per bin against the baseline (no regression).
+   - *Not built:* a gate that combines the two heads by depth (D3), fractional weights per regime.
 3. **D1.1 and D3.1:** a context read-out and an additive linear decoder. Then D1.2, the context
    query, if two layers still leak the cell's own token.
 4. **LSE, the description's DRVI-style decoder:**
@@ -815,7 +859,7 @@ SpatialDE, SPARK-X, AMICI, Steamboat, GraphCompass); the Visium and IMC data on 
 | Mon | T0: seeds, per-arm evaluation | `response_masking` (3 seeds); legnini attention re-evaluation; `joint_rope`, `l2g_res` evaluation | – |
 | Tue | T0: `Precomputed` under programme masking; T1: oracle bar, distance prior; T4: gradient × input and integrated gradients for the sender ranks (moved up from W2); **T1b: design note and leakage tests** | `joint_fourier` added to response masking, 3 seeds of the main arms | you: the legnini gene set, the CosMx choices, T1b's patch sizes |
 | Wed | **T1b: grid pooling and un-pooling in `GlobalModel` and `CombinedModel`**; T2: D0; **2026-10-21: re-masking (task 3) and the attention check (task 4) built** | `pre_pca_rope` added to response masking | – (response masking first read done 2026-10-19) |
-| Thu | **T1b: decoder arms for the global-only model (own-cell skip, nonlinear, LSE)**; T2: D2.2; **the Moran's I split (task 1)** | pooled smoke; legnini programme masking (cell-level and pooled); **`remask_test` (8 runs) and `attention_check` (evaluation only)** | legnini re-evaluation |
+| Thu | **T1b: decoder arms for the global-only model (own-cell skip, nonlinear, LSE)**; T2: D2.2; **the Moran's I split (task 1)** | pooled smoke; legnini programme masking (cell-level and pooled); **`remask_test` (8 runs), `attention_check` (evaluation only), `regime_loss` (9 runs) and `global_decoders` (10 runs)**; **built 2026-10-21: D2.2 and the decoder arms** | legnini re-evaluation |
 | Fri | T0: the CosMx pipeline; masking_plan.md, attribution_plan.md; **T10: comparison harness and baseline environments**; **embedding dimensions vs genes (task 2)** | **T1b sweep (grid sizes × global-only and joint, 3 seeds)**; decoder arms; T10: Visium and IMC data and baselines on the cluster (yours) | **`remask_test`** |
 
 ### W2 (Mon 26 Oct – Sun 1 Nov): masks, whole slides, conditioning, attribution
