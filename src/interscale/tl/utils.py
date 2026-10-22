@@ -196,7 +196,8 @@ def _training_tag(cfg) -> str:
     ``lw<local>-<global>`` and ``frz-<components>``: a staged schedule, loss weights other than
     the default 0.5 / 0.5, and frozen components (``train._schedule``). ``gs<cell rate>-<selectors>``:
     a hidden gene set (``dataset.mask_genes``). ``rmk-<kind>``: re-masking before the transformer
-    (``model.global_component.parameters.remask``). ``rgm<depth um>-<local>-<global>``: each head's loss on
+    (``model.global_component.parameters.remask``). ``ctx-<kind>``: a context-only global embedding
+    (``model.global_component.parameters.context_only``). ``rgm<depth um>-<local>-<global>``: each head's loss on
     the hidden cells of its regime (``optim.regime_loss``).
     """
     # Here, not at module level: interscale.train imports this module.
@@ -214,6 +215,8 @@ def _training_tag(cfg) -> str:
         parts.append("lrm")
     if params is not None and params.get("remask", "none") != "none":
         parts.append(f"rmk-{params.remask}")
+    if params is not None and params.get("context_only", "none") != "none":
+        parts.append(f"ctx-{params.context_only}")
     regime = cfg.optim.get("regime_loss", None)
     if regime is not None and regime.get("kind", "none") != "none":
         parts.append(f"rgm{float(regime.depth_um):g}-{regime.local_cells}-{regime.global_cells}")

@@ -17,6 +17,9 @@ PRECOMPUTED_MASK_FILLS = ("learned", "minus_one")
 REMASK_KINDS = ("none", "hidden")
 #: What the own-cell skip reads (``own_cell_skip_input``): the cell's token, or its visible genes themselves.
 OWN_CELL_SKIP_INPUTS = ("embedding", "raw")
+#: What a cell's global embedding may depend on (``context_only``): its own token as well (the transformer as it
+#: was), or the other cells' tokens and its position only (a query stream that never holds its own token).
+CONTEXT_ONLY_KINDS = ("none", "query")
 
 
 class GlobalModule(BaseModule):
@@ -28,6 +31,7 @@ class GlobalModule(BaseModule):
         remask: str = "none",
         own_cell_skip: bool = False,
         own_cell_skip_input: str = "embedding",
+        context_only: str = "none",
         **base_module_kwargs,
     ):
         """``precomputed_mask_fill``: what a hidden cell's ``Precomputed`` embedding is replaced by.
@@ -59,6 +63,11 @@ class GlobalModule(BaseModule):
         ``n_embed``. ``"raw"``: the cell's visible genes themselves (:meth:`own_cell_input`), ``W_o`` is
         ``[n_output, n_input]`` -- a full-rank linear read, which tells a limit of the skip's width from a limit of its
         training.
+
+        ``context_only``: ``"query"`` makes the global embedding of a cell a function of the *other* cells' tokens and
+        its position alone (``TransformerNodeEncoderHook.forward``): the transformer's queries come from one learned
+        token plus the cell's node encoding, never from the cell's own token, and they read the cells' input tokens
+        through the layers' weights. ``context_token`` is that learned token. ``"none"``: the transformer as it was.
         """
         super().__init__(**base_module_kwargs)
         self.pooling = pooling
@@ -78,6 +87,14 @@ class GlobalModule(BaseModule):
             # is initialised as in the model without it.
             gen = torch.Generator().manual_seed(0)
             self.remask_token = torch.nn.Parameter(torch.randn(self.n_embed, generator=gen))
+        if context_only not in CONTEXT_ONLY_KINDS:
+            raise ValueError(f"context_only must be one of {CONTEXT_ONLY_KINDS}, got {context_only!r}.")
+        self.context_only = context_only
+        if context_only != "none":
+            # From a private generator, so building it draws nothing from the global one: every other weight is
+            # initialised as in the model without it.
+            gen = torch.Generator().manual_seed(0)
+            self.context_token = torch.nn.Parameter(torch.randn(self.n_embed, generator=gen))
         self.own_cell_skip = bool(own_cell_skip)
         if own_cell_skip_input not in OWN_CELL_SKIP_INPUTS:
             raise ValueError(f"own_cell_skip_input must be one of {OWN_CELL_SKIP_INPUTS}, got {own_cell_skip_input!r}.")
@@ -310,12 +327,11 @@ class GlobalModule(BaseModule):
         """
         emb = self.remask_tokens(batched_data, emb)
         if self.pooling is None:
-            padded_emb, src_padding_mask, pad_index_nodes, attention_mask, rotary = self.common_step_local_to_global(
-                batched_data, emb
-            )
+            given = self.common_step_local_to_global(batched_data, emb)
+            padded_emb, src_padding_mask, pad_index_nodes, attention_mask, rotary = given
             assert not torch.any(torch.isnan(padded_emb)), "padded_emb contains NaN values"
             global_embedding, src_padding_mask, attn = self.forward(
-                padded_emb, src_padding_mask, attention_mask, rotary=rotary
+                padded_emb, src_padding_mask, attention_mask, rotary=rotary, **self._query_kwargs(given)
             )
             assert not torch.any(torch.isnan(global_embedding)), "global_embedding contains NaN values"
             return global_embedding, src_padding_mask, pad_index_nodes, attention_mask, attn
@@ -324,17 +340,24 @@ class GlobalModule(BaseModule):
 
         plan = self.pooling.plan(batched_data, max_patches=self.max_seq_len)
         tokens, visible = self.pooling.pool(emb, self.wholly_hidden(batched_data), plan)
-        padded_emb, patch_padding, patch_index_nodes, attention_mask, rotary = self.common_step_local_to_global(
-            self.pooling.batch(plan, visible), tokens
-        )
+        given = self.common_step_local_to_global(self.pooling.batch(plan, visible), tokens)
+        padded_emb, patch_padding, patch_index_nodes, attention_mask, rotary = given
         assert not torch.any(torch.isnan(padded_emb)), "padded_emb contains NaN values"
-        out, patch_padding, attn = self.forward(padded_emb, patch_padding, attention_mask, rotary=rotary)
+        out, patch_padding, attn = self.forward(
+            padded_emb, patch_padding, attention_mask, rotary=rotary, **self._query_kwargs(given)
+        )
         assert not torch.any(torch.isnan(out)), "global_embedding contains NaN values"
         rows = gather_tokens(out, patch_padding)  # [P, E], patch 0 first: every patch was kept (max_seq_len checked)
         global_embedding, cell_padding, index_nodes = cell_layout(
             rows[plan.patch], out[-1], batched_data.batch.long(), int(batched_data.batch.max()) + 1
         )
         return global_embedding, cell_padding, index_nodes, attention_mask, attn
+
+    @staticmethod
+    def _query_kwargs(given) -> dict:
+        """``forward``'s ``queries=`` for the input ``common_step_local_to_global`` returned: only where it has any."""
+        queries = getattr(given, "queries", None)
+        return {} if queries is None else {"queries": queries}
 
     def _pca_transform(self, embeddings):
         """Project onto the stored PCA basis: ``(X - mean_) @ components_.T``.
@@ -673,6 +696,7 @@ class GlobalModule(BaseModule):
                 remask=params.get("remask", "none"),
                 own_cell_skip=bool(cfg.model.decoder.get("own_cell_skip", False)),
                 own_cell_skip_input=str(cfg.model.decoder.get("own_cell_skip_input", "embedding")),
+                context_only=params.get("context_only", "none"),
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,
             )

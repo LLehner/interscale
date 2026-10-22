@@ -562,6 +562,37 @@ def _validate_remask(cfg):
         )
 
 
+def _validate_context_only(cfg):
+    """``context_only`` (the global embedding from the other cells' tokens and the position only): a known kind, a node-level prediction, torch's dense attention."""
+    from interscale.module.base._base_global_module import CONTEXT_ONLY_KINDS
+    from interscale.module.global_modules.attention import attention_head_dim, attention_kind
+
+    params = cfg.model.global_component.get("parameters", None)
+    context_only = params.get("context_only", "none") if params is not None else "none"
+    if context_only not in CONTEXT_ONLY_KINDS:
+        raise ValueError(
+            f"model.global_component.parameters.context_only must be one of {CONTEXT_ONLY_KINDS}, got {context_only!r}."
+        )
+    if context_only == "none":
+        return
+    where = f"model.global_component.parameters.context_only {context_only!r}"
+    if cfg.dataset.prediction_level != "node":
+        raise ValueError(f"{where} is a per-cell notion (a cell's embedding without the cell); it needs prediction_level node.")
+    attention = params.get("attention", None)
+    kind = attention_kind(attention)
+    default_width = (
+        cfg.model.n_embed % params.n_heads == 0
+        and attention_head_dim(attention, cfg.model.n_embed, params.n_heads) * params.n_heads == cfg.model.n_embed
+    )
+    if kind != "dense" or not default_width:
+        raise ValueError(
+            f"{where} reads the cells' tokens with queries of their own, which only torch's dense attention at the "
+            f"default head width takes; attention.kind is {kind!r} at a head width of "
+            f"{attention_head_dim(attention, cfg.model.n_embed, params.n_heads)} (n_embed / n_heads would be "
+            f"{cfg.model.n_embed // params.n_heads}). The other backends are self-attention only."
+        )
+
+
 def _validate_regime_loss(cfg):
     """``optim.regime_loss`` (each head's loss on its regime's hidden cells): known values, cells hidden whole."""
     from interscale.tl.depth import REGIME_CELLS, REGIME_KINDS
@@ -646,6 +677,7 @@ def _validate(cfg):
     _validate_attention(cfg)
     _validate_pooling(cfg)
     _validate_remask(cfg)
+    _validate_context_only(cfg)
     _validate_regime_loss(cfg)
     _validate_own_cell_skip(cfg)
     _validate_sce(cfg)

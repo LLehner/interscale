@@ -212,6 +212,17 @@ def _refuse_pooled(transformer, what: str) -> None:
         )
 
 
+def _refuse_context_only(transformer, what: str) -> None:
+    """A context-only model's layers read the input tokens with a query stream; these readouts compose attention as token mixing."""
+    if getattr(transformer, "context_only", "none") != "none":
+        raise ValueError(
+            f"{what} composes the layers' attention as token mixing (a rollout) or traces the layers' own forward "
+            f"pass, but with context_only {transformer.context_only!r} every layer reads the same input tokens with "
+            "a query stream: nothing is passed from layer to layer through the cells. Its readouts are the head "
+            "scores, the probes, the receptive field and the single-layer attention maps (attention_diagnostics)."
+        )
+
+
 def attention_diagnostics(
     module,
     data_list,

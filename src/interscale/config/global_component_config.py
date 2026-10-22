@@ -181,6 +181,19 @@ def get_global_component_cfg(cfg, global_component_name):
         # before. Models with a local component only; not with pooling (a hidden cell already weighs 0 in
         # its patch) nor a hidden gene set (no cell is hidden whole).
         cfg.model.global_component.parameters.remask = "none"
+        # A context-only global embedding (`.claude/decoder_plan.md`, D1). Plain transformer: each cell is a token
+        # that attends to the others, its own token riding along in its residual stream, so the global
+        # embedding of a cell carries the cell (near visible cells the global head copies the local one,
+        # CKA 0.93 at the rim). `query`: the transformer's queries come from one learned token plus the
+        # cell's node encoding -- never from its own token -- and read the cells' input tokens through the
+        # layers' weights (cross-attention from "this place" to the tissue, XLNet's query stream). A cell's
+        # global embedding is then a function of the other cells' tokens and its position alone: with the
+        # long-range mask on, of cells beyond the local component's reach only. Pair it with something that
+        # supplies the cell itself: the dual model's local part (`model.decoder.additive`) or the global-only
+        # model's own-cell skip (`model.decoder.own_cell_skip`). Torch's dense attention only (not the other
+        # backends), node-level prediction. Attention rollout and relevance (which compose attention over
+        # layers as token mixing) are not defined for it.
+        cfg.model.global_component.parameters.context_only = "none"
         # The attention mechanism, see `.claude/attention_plan.md`. `kind`: any registered backend
         # (`module/global_modules/attention.py`): `dense` is softmax attention over every pair, the
         # model from before backends existed. `head_dim` sets the width of one attention head apart

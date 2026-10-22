@@ -58,13 +58,22 @@ class NodeMaskingTrainingPlan:
 
         The config validator does not know the model type: ``optim.regime_loss`` splits the two heads of a
         dual-decoder CombinedModel, ``model.decoder.additive`` adds that pair's decoders into one prediction, and
-        ``model.decoder.own_cell_skip`` adds a cell's own token to a GlobalModel's prediction. Any other model has no
-        such part, and would train the plain objective.
+        ``model.decoder.own_cell_skip`` adds a cell's own token to a GlobalModel's prediction, and
+        ``model.global_component.parameters.context_only`` changes the transformer. Any other model has no such
+        part, and would train the plain objective.
         """
         if regime_loss_on(self._cfg) and getattr(self.module, "regime", None) is None:
             raise ValueError(
                 "optim.regime_loss gives the local and the global head their own hidden cells, but this model has "
                 "no such pair of heads: use a CombinedModel with model.decoder.dual_decoder: true."
+            )
+        params = self._cfg.model.global_component.get("parameters", None)
+        wants_context = params is not None and params.get("context_only", "none") != "none"
+        transformer = getattr(self.module, "global_module", self.module)
+        if wants_context and getattr(transformer, "context_only", "none") == "none":
+            raise ValueError(
+                "model.global_component.parameters.context_only reads the cells' tokens with a query stream of the "
+                "transformer; this model has no transformer (use a GlobalModel or a CombinedModel)."
             )
         if self._cfg.model.decoder.get("additive", False) and not getattr(self.module, "additive", False):
             raise ValueError(

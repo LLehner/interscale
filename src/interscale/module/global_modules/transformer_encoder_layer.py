@@ -148,22 +148,37 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
                 attention weigths between L (target sequence) and S (source sequence)
                 unbatched: (L,S) or batched: (N,L,S) where
         """
+        return self._attend(x, x, attn_mask, key_padding_mask, is_causal)
+
+    def _attend(self, x, memory, attn_mask, key_padding_mask, is_causal):
+        """Attention of the tokens ``x`` ``[L, N, E]`` over ``memory`` ``[L, N, E]`` (its keys and values), with the hooks.
+
+        Self-attention is ``memory is x``: queries, keys and values from one sequence, as ever. Anything else is a
+        read-out (:meth:`read_context`): the queries come from ``x``, the keys and values from ``memory``, row ``l`` of
+        each being the same cell (the mask, the rotation and the padding are laid out once for both).
+        """
         # Torch's vendored attention always takes its explicit path (need_weights=True), which is
         # what keeps its numbers unchanged. Other backends compute the map only when it is kept, and
         # may otherwise take a cheaper path to the same output.
         backend = getattr(self.self_attn, "is_backend", False)
         extra = {"context": self.attention_context} if backend else {}
+        self_attention = memory is x
         query = key = x
+        if not self_attention:
+            key = memory
         if self.center_qk or self.record_tokens:
-            cells = cell_positions(x, key_padding_mask)
+            cells = cell_positions(memory, key_padding_mask)
             if self.record_tokens:
-                self.token_cosine = mean_pairwise_cosine(x.detach(), cells)
+                self.token_cosine = mean_pairwise_cosine(memory.detach(), cells)
             if self.center_qk:
-                query = key = center_tokens(x, cells)
+                if self_attention:
+                    query = key = center_tokens(x, cells)
+                else:
+                    query, key = center_tokens(x, cells), center_tokens(memory, cells)
         attn_output, attn_output_weights = self.self_attn(
             query,
             key,
-            x,
+            memory,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
             need_weights=self.keep_maps or not backend,
@@ -181,3 +196,17 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
         # if self.register_hook:
         #     attn_output_weights.register_hook(self.save_attn_gradients) # Note: Source code modification in MultiHeadAttention Module (F.multi_head_attention_forward function) to calculate gradient on weights
         return self.dropout1(attn_output)
+
+    def read_context(self, queries, memory, attn_mask=None, key_padding_mask=None):
+        """This layer as a step of a read-out stream: ``queries`` ``[L, N, E]`` read ``memory`` ``[L, N, E]``, then the feed-forward block.
+
+        The pre-norm layer with the query stream in place of the tokens: ``q + attention(norm1(q), norm1(memory))``,
+        then ``q + feed_forward(norm2(q))``. The weights are the layer's own (a self-attention layer's projections
+        serve as cross-attention). The memory is read, never written: nothing of ``queries`` enters it, and the
+        keys and values are the memory's alone -- which is what makes the stream's state a function of the other
+        cells' tokens and the position (``TransformerNodeEncoderHook.forward``, ``context_only``).
+        """
+        if not self.norm_first:
+            raise ValueError("read_context is the pre-norm layer; this one is post-norm.")
+        queries = queries + self._attend(self.norm1(queries), self.norm1(memory), attn_mask, key_padding_mask, False)
+        return queries + self._ff_block(self.norm2(queries))

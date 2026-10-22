@@ -60,7 +60,7 @@ from torch.nn import functional as F
 from torch_geometric.loader import DataLoader
 
 from interscale.evaluation._spatial_weights import graph_edges, hidden_cells, matched_ranks
-from interscale.evaluation.attention_diagnostics import _refuse_pooled
+from interscale.evaluation.attention_diagnostics import _refuse_context_only, _refuse_pooled
 from interscale.evaluation.online_probes import _rng_untouched
 
 #: The readouts :func:`attention_readouts` compares, in the order the tables list them.
@@ -186,6 +186,7 @@ def check_attention(
         )
         return pd.DataFrame()
     _refuse_pooled(transformer, "check_attention")
+    _refuse_context_only(transformer, "check_attention")
     layers = list(transformer.transformer_encoder.layers)
     found: dict[tuple, list] = defaultdict(lambda: [0.0, 0.0, 0])
 
@@ -352,6 +353,7 @@ def attention_readouts(
         )
         return {}
     _refuse_pooled(transformer, "attention_readouts")
+    _refuse_context_only(transformer, "attention_readouts")
     layers = list(transformer.transformer_encoder.layers)
     if not all(_checkable(layer.self_attn) for layer in layers):
         warnings.warn(

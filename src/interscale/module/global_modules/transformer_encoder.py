@@ -24,15 +24,7 @@ from interscale.tl import (
 )
 
 
-class GlobalInput(NamedTuple):
-    """What :meth:`TransformerNodeEncoderHook.common_step_local_to_global` hands to ``forward``.
-
-    Everything in padded order: ``S`` tokens per graph, left-padded, plus CLS appended last by
-    ``forward``. ``rotary`` is the ``(cos, sin)`` of the rotary encoding, each
-    ``[B * heads, S + 1, head_dim]``, or None when it is off; pass it on as ``forward(...,
-    rotary=...)``.
-    """
-
+class _GlobalInputFields(NamedTuple):
     padded_emb: torch.Tensor  # [S, B, E]
     src_padding_mask: torch.Tensor  # [B, S], True at padding
     index_nodes: list  # per graph, the node indices pad_batch kept
@@ -40,6 +32,23 @@ class GlobalInput(NamedTuple):
     # never forms the S x S matrix, an `attention.StructuredMask` (blocked pairs, bias factors).
     attention_mask: torch.Tensor | StructuredMask
     rotary: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+class GlobalInput(_GlobalInputFields):
+    """What :meth:`TransformerNodeEncoderHook.common_step_local_to_global` hands to ``forward``.
+
+    Everything in padded order: ``S`` tokens per graph, left-padded, plus CLS appended last by
+    ``forward``. ``rotary`` is the ``(cos, sin)`` of the rotary encoding, each
+    ``[B * heads, S + 1, head_dim]``, or None when it is off; pass it on as ``forward(...,
+    rotary=...)``.
+
+    ``queries`` is one more thing ``forward`` needs under ``context_only: query`` and is not a field of the tuple
+    (the five fields are unpacked by position all over): ``[S, B, E]``, each token's node encoding laid out like
+    ``padded_emb`` and zero where the model has none, the position half of the position-only queries. None
+    otherwise; pass it on as ``forward(..., queries=...)``.
+    """
+
+    queries: torch.Tensor | None = None
 
 
 class TransformerNodeEncoderHook(GlobalModule):
@@ -141,6 +150,14 @@ class TransformerNodeEncoderHook(GlobalModule):
             if hasattr(layer.self_attn, "draw_features"):
                 layer.self_attn.draw_features(generator)
 
+        if self.context_only != "none" and any(
+            getattr(layer.self_attn, "is_backend", False) for layer in self.transformer_encoder.layers
+        ):
+            raise ValueError(
+                f"context_only {self.context_only!r} reads the cells' tokens with separate queries, which only torch's "
+                f"vendored dense attention takes; attention.kind {self.attention_kind!r} at head width {self.head_dim} "
+                "is another backend (it is self-attention only). Use attention.kind dense at the default head width."
+            )
         # Node positional encodings (`positional_encodings.py`), or None when the config enables
         # none -- in which case nothing is registered and the module is the one from before PEs.
         self.positional_encoding = positional_encoding
@@ -190,11 +207,13 @@ class TransformerNodeEncoderHook(GlobalModule):
         # Each positional input prepared this pass, by Data key -- the rotary encoding reads the
         # coordinates the node encodings used, so both see the same rotation of each graph.
         pe_inputs = {}
+        node_encoding = None
         if self.positional_encoding is not None:
             # Added to the flat [N, E] tokens BEFORE pad_batch: pad_batch subsamples with its own
             # randomness when a graph exceeds max_seq_len, so anything per-cell must ride along
             # here or be gathered by the index_nodes it returns -- never padded a second time.
-            emb = emb + self.positional_encoding(batched_data, dtype=emb.dtype, device=emb.device, inputs=pe_inputs)
+            node_encoding = self.positional_encoding(batched_data, dtype=emb.dtype, device=emb.device, inputs=pe_inputs)
+            emb = emb + node_encoding
 
         if self.masked_nodes and not eval_step:
             keep_indices = batched_data.mask
@@ -303,7 +322,22 @@ class TransformerNodeEncoderHook(GlobalModule):
                 n_graphs = src_padding_mask.shape[0]
                 entry["open"] = ~blocked.view(n_graphs, -1, *blocked.shape[1:])[:, 0].detach()
             self._attention_record.append(entry)
-        return GlobalInput(padded_emb, src_padding_mask, index_nodes, attention_mask, rotary)
+        given = GlobalInput(padded_emb, src_padding_mask, index_nodes, attention_mask, rotary)
+        if self.context_only != "none":
+            given.queries = self._query_encoding(node_encoding, batched_data, index_nodes, padded_emb)
+        return given
+
+    def _query_encoding(self, node_encoding, batched_data, index_nodes, padded_emb) -> torch.Tensor:
+        """``[S, B, E]``: the node encodings the tokens were given, alone, laid out as the tokens (zeros without any).
+
+        The position half of ``context_only``'s queries. It is the very tensor that went into the tokens of this
+        pass (the encodings draw their random signs and rotations once), taken through the selection ``pad_batch``
+        made -- ``pad_like`` with this call's ``index_nodes``, never a second padding.
+        """
+        seq_len, n_graphs, _ = padded_emb.shape
+        if node_encoding is None:
+            return padded_emb.new_zeros(padded_emb.shape)
+        return pad_like(node_encoding, batched_data.batch, index_nodes, seq_len).transpose(0, 1).to(padded_emb.dtype)
 
     def _without_hidden_keys(self, mask: torch.Tensor, batched_data, index_nodes, seq_len: int) -> torch.Tensor:
         """``mask`` ``[B * heads, S + 1, S + 1]`` (True: blocked) with every key that is a cell hidden whole blocked too.
@@ -372,7 +406,9 @@ class TransformerNodeEncoderHook(GlobalModule):
         finally:
             self._hook_attention = saved
 
-    def forward(self, padded_h_node, src_padding_mask, mask=None, register_hook: bool | None = None, rotary=None):
+    def forward(
+        self, padded_h_node, src_padding_mask, mask=None, register_hook: bool | None = None, rotary=None, queries=None
+    ):
         """
         N_b_max: maximum number of nodes in the batch
         B: batch size
@@ -388,6 +424,10 @@ class TransformerNodeEncoderHook(GlobalModule):
             rotary: (cos, sin), each [B * heads, N_b_max + 1, H_d / heads]
                 The rotary encoding's rotation from `common_step_local_to_global` (GlobalInput.rotary).
                 Required when the rotary encoding is enabled, and only then.
+            queries: [N_b_max x B X H_d] or None
+                `GlobalInput.queries`: the node encodings, laid out as the tokens. Required under
+                ``context_only`` (the queries are one learned token plus these, never a cell's own token),
+                and only then.
             register_hook: bool or None
                 True: keep every layer's attention map, return them stacked, and hook them for their
                 gradient (what relevance needs; `evaluate` passes it). False: none of that. None
@@ -411,6 +451,19 @@ class TransformerNodeEncoderHook(GlobalModule):
                     f"the rotation has shape {tuple(rotary[0].shape)}, but these tokens need {expected} "
                     "(graphs x heads, tokens + CLS, head width): it was computed for another batch."
                 )
+
+        if (queries is None) != (self.context_only == "none"):
+            raise ValueError(
+                "context_only is on, so forward() needs the queries common_step_local_to_global returned "
+                "(GlobalInput.queries); without them there is no position to read from."
+                if queries is None
+                else "forward() got queries, but context_only is off."
+            )
+        if queries is not None and tuple(queries.shape) != tuple(padded_h_node.shape):
+            raise ValueError(
+                f"the queries have shape {tuple(queries.shape)}, but these tokens have {tuple(padded_h_node.shape)}: "
+                "they were computed for another batch."
+            )
 
         relevance = bool(register_hook)
         keep_maps = relevance or (register_hook is None and self.return_attention_maps)
@@ -455,9 +508,12 @@ class TransformerNodeEncoderHook(GlobalModule):
             encoder.rotary = rotary
             encoder.attention_context = mask if structured else None
         try:
-            transformer_out = self.transformer_encoder(
-                padded_h_node, src_key_padding_mask=key_padding_mask, mask=None if structured else mask
-            )  # (S, B, h_d)
+            if self.context_only == "none":
+                transformer_out = self.transformer_encoder(
+                    padded_h_node, src_key_padding_mask=key_padding_mask, mask=None if structured else mask
+                )  # (S, B, h_d)
+            else:
+                transformer_out = self._read_context(queries, padded_h_node, key_padding_mask, mask)  # (S, B, h_d)
         finally:
             for encoder in self.transformer_encoder.layers:
                 encoder.rotary = None
@@ -488,6 +544,24 @@ class TransformerNodeEncoderHook(GlobalModule):
 
         return transformer_out, src_padding_mask, final_attn
 
+    def _read_context(self, queries, memory, key_padding_mask, mask) -> torch.Tensor:
+        """The query stream (``context_only: query``): ``[S + 1, B, E]``, position-only queries read the cells' input tokens.
+
+        Every cell starts as ``context_token + its node encoding`` (CLS as the CLS token), normalised like the tokens,
+        and in each layer reads ``memory`` -- the input tokens, CLS included, the same at every layer -- through that
+        layer's weights (:meth:`CustomTransformerEncoderLayer.read_context`). The attention mask is the one the
+        tokens would have had: a cell never reads its own token, and under the long-range mask not the cells its
+        local component already mixed in. The stream holds nothing of its cell's token, and the memory is not
+        updated by it, so a cell's state is a function of the other cells' input tokens and its own position:
+        what it says about the cell is what its context says. (``attention.center_qk`` subtracts the mean over
+        all cells' tokens, the cell's own included at weight 1 / S, from queries and keys.)
+        """
+        cls = self.cls_embedding.expand(1, memory.size(1), -1)
+        state = self.norm_input(torch.cat([self.context_token.view(1, 1, -1) + queries, cls], dim=0))
+        for layer in self.transformer_encoder.layers:
+            state = layer.read_context(state, memory, attn_mask=mask, key_padding_mask=key_padding_mask)
+        return self.transformer_encoder.norm(state)
+
     def evaluate(self, batched_data, embedding):
         """Evaluates transformer encoder on a batch of data without masking and registering hook.
 
@@ -507,12 +581,16 @@ class TransformerNodeEncoderHook(GlobalModule):
             )
         # evaluation on single graph
         batched_data.batch = torch.Tensor(len(batched_data.obs_names) * [0])
-        transformer_in, src_padding_mask, pad_index_nodes, attn_mask, rotary = self.common_step_local_to_global(
-            batched_data, embedding, eval_step=True
-        )
+        given = self.common_step_local_to_global(batched_data, embedding, eval_step=True)
+        transformer_in, src_padding_mask, pad_index_nodes, attn_mask, rotary = given
 
         transformer_out, src_padding_mask, _ = self.forward(
-            transformer_in, src_padding_mask, attn_mask, register_hook=True, rotary=rotary
+            transformer_in,
+            src_padding_mask,
+            attn_mask,
+            register_hook=True,
+            rotary=rotary,
+            **self._query_kwargs(given),
         )
 
         last_layer = self.transformer_encoder.layers[-1]
@@ -555,5 +633,6 @@ class TransformerNodeEncoderHook(GlobalModule):
             f"attention_bias: {sorted(self.attention_bias.encoders) if self.attention_bias else []}, \n"
             f"rotary_encoding: {sorted(self.rotary_encoding.encoders) if self.rotary_encoding else []}, \n"
             f"attention: {self.attention_kind}, head_dim: {self.head_dim}, \n"
+            f"context_only: {self.context_only}, \n"
         )
         return summary
