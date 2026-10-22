@@ -153,9 +153,9 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
             )
             # no masking during evaluation
             y_pred_global = self.module.predict_global(global_embedding, src_padding_mask, self.prediction_level)
-            if getattr(self.module, "global_residual", False):
-                # The global head predicts the local head's error: its prediction is the sum, with the
-                # local predictions brought into token order (one graph per batch here).
+            if getattr(self.module, "global_is_sum", False):
+                # The global head's prediction is the sum of the two decoders (a residual or an additive decoder), with
+                # the local predictions brought into token order (one graph per batch here).
                 kept = torch.as_tensor(pad_index_nodes[0], dtype=torch.long, device=y_pred_local.device)
                 y_pred_global = self.module.combine_global(y_pred_local[kept], y_pred_global)
             ## Save model output

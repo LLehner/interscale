@@ -33,6 +33,14 @@ class DualDecoderCombinedModule(BaseModule):
         # `model.decoder.global_residual`: the global head's prediction is the local one (detached)
         # plus the global decoder's output -- see `combine_global`.
         self.global_residual = bool(cfg.model.decoder.get("global_residual", False))
+        # `model.decoder.additive`: the global head's prediction is the sum of the two decoders' outputs, the local half
+        # of the stacked output is the local decoder's alone -- see `combine_global`.
+        self.additive = bool(cfg.model.decoder.get("additive", False))
+        if self.additive and self.global_residual:
+            raise ValueError(
+                "model.decoder.additive and model.decoder.global_residual both make the global head a sum of the two "
+                "decoders: choose one."
+            )
         # `optim.regime_loss`: each head's loss on the hidden cells of its regime (`tl.depth`), or None.
         self.regime = RegimeLoss.from_config(cfg)
 
@@ -120,6 +128,11 @@ class DualDecoderCombinedModule(BaseModule):
         y_pred = self.global_module.predict(global_embedding, src_padding_mask, prediction_level)
         return y_pred
 
+    @property
+    def global_is_sum(self) -> bool:
+        """The global head is the local and the global decoder's outputs added (``additive`` or ``global_residual``)."""
+        return self.additive or self.global_residual
+
     def combine_global(self, y_pred_local: torch.Tensor, y_pred_global: torch.Tensor) -> torch.Tensor:
         """The global head's prediction from the two decoders' outputs for the same cells, in the same order.
 
@@ -127,8 +140,12 @@ class DualDecoderCombinedModule(BaseModule):
         global decoder models what the local prediction misses. The global loss does not reach the
         local prediction, so the local decoder answers to the local loss alone and cannot drift
         toward whatever makes the sum easy; the GCN still gets the global loss through the tokens,
-        as under plain dual decoding. Otherwise the global decoder's output as it is.
+        as under plain dual decoding. Under ``model.decoder.additive`` it is ``y_pred_local + y_pred_global``
+        with the gradient reaching both decoders: the two outputs are parts of one prediction, and the loss on the sum
+        is what each is trained for (decoder_plan.md, D3.1). Otherwise the global decoder's output as it is.
         """
+        if self.additive:
+            return y_pred_local + y_pred_global
         if not self.global_residual:
             return y_pred_global
         return y_pred_local.detach() + y_pred_global
@@ -191,9 +208,13 @@ class DualDecoderCombinedModule(BaseModule):
             y_pred_local = self.predict_local(local_embedding, padded_node_idx)
             y_pred_global_decoded = y_pred_global
             y_pred_global = self.combine_global(y_pred_local, y_pred_global)
-            if self.global_residual:
-                # The global head is the local prediction plus what its decoder adds: two parts to attribute.
-                parts = {"global": {"local": y_pred_local.detach(), "global": y_pred_global_decoded}}
+            if self.global_is_sum:
+                # The global head is the local prediction plus what its decoder adds: two parts to attribute. Under
+                # `additive` they are the sum's own tensors, gradient and all: the head `global_part` the evaluation adds
+                # is read by the influence readouts, which differentiate it. A residual head's local part is the detached one
+                # the sum used.
+                local_part = y_pred_local if self.additive else y_pred_local.detach()
+                parts = {"global": {"local": local_part, "global": y_pred_global_decoded}}
 
             if entry_mask is None:
                 # Node-level classification: the masked cells are the supervision targets, so

@@ -638,6 +638,7 @@ def _validate(cfg):
     _validate_sce(cfg)
     _validate_center_targets(cfg)
     _validate_global_residual(cfg)
+    _validate_additive(cfg)
     _validate_gex_embedding(cfg)
     _validate_precomputed_embedding(cfg)
     _validate_schedule(cfg)
@@ -714,6 +715,37 @@ def _validate_global_residual(cfg):
     if cfg.dataset.prediction_level != "node":
         raise ValueError(
             "model.decoder.global_residual pairs the two heads cell by cell; it needs prediction_level node."
+        )
+
+
+def _validate_additive(cfg):
+    """``model.decoder.additive``: one prediction from the two heads' decoders, which needs both, cell by cell.
+
+    The loss weights must be chosen: the default mean also trains the local part to predict the whole target alone, which
+    is what an additive decoder is for not doing.
+    """
+    from interscale.train._schedule import resolve_loss_weights
+
+    if not cfg.model.decoder.get("additive", False):
+        return
+    if not cfg.model.decoder.dual_decoder:
+        raise ValueError(
+            "model.decoder.additive adds the two heads' decoders into one prediction; it needs "
+            "model.decoder.dual_decoder: true, where both heads exist."
+        )
+    if cfg.model.decoder.get("global_residual", False):
+        raise ValueError(
+            "model.decoder.additive and model.decoder.global_residual both make the global head a sum of the two "
+            "decoders (with and without a gradient into the local one): choose one."
+        )
+    if cfg.dataset.prediction_level != "node":
+        raise ValueError("model.decoder.additive pairs the two heads cell by cell; it needs prediction_level node.")
+    default_weights = resolve_loss_weights(cfg.optim.get("loss_weights", None)) is None
+    if cfg.optim.get("schedule", "joint") == "joint" and default_weights:
+        raise ValueError(
+            "model.decoder.additive with the default optim.loss_weights (0.5 / 0.5) also trains the local part to "
+            "predict the whole target alone. Set optim.loss_weights: {local: 0.0, global: 1.0} for the loss on the sum "
+            "only, or a small local weight (e.g. 0.1 / 0.9)."
         )
 
 

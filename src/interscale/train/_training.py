@@ -57,13 +57,19 @@ class NodeMaskingTrainingPlan:
         """Raise for a config option that this model would silently ignore.
 
         The config validator does not know the model type: ``optim.regime_loss`` splits the two heads of a
-        dual-decoder CombinedModel, and ``model.decoder.own_cell_skip`` adds a cell's own token to a
-        GlobalModel's prediction. Any other model has no such part, and would train the plain objective.
+        dual-decoder CombinedModel, ``model.decoder.additive`` adds that pair's decoders into one prediction, and
+        ``model.decoder.own_cell_skip`` adds a cell's own token to a GlobalModel's prediction. Any other model has no
+        such part, and would train the plain objective.
         """
         if regime_loss_on(self._cfg) and getattr(self.module, "regime", None) is None:
             raise ValueError(
                 "optim.regime_loss gives the local and the global head their own hidden cells, but this model has "
                 "no such pair of heads: use a CombinedModel with model.decoder.dual_decoder: true."
+            )
+        if self._cfg.model.decoder.get("additive", False) and not getattr(self.module, "additive", False):
+            raise ValueError(
+                "model.decoder.additive adds the two decoders of a dual-decoder CombinedModel into one prediction; this "
+                "model has no such pair: use a CombinedModel with model.decoder.dual_decoder: true."
             )
         if self._cfg.model.decoder.get("own_cell_skip", False) and not getattr(self.module, "own_cell_skip", False):
             raise ValueError(

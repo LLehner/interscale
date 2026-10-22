@@ -32,6 +32,12 @@ def get_model_cfg(cfg):
     # under plain dual decoding copying the local head is already optimal for it. The reported
     # global prediction (metrics, get_model_output, gene ranks) is that sum.
     cfg.model.decoder.global_residual = False
+    # With the dual decoder: one prediction from two parts (`.claude/decoder_plan.md`, D3.1), y = W_l h_local + W_g
+    # h_global + b. The local half of the stacked output is the local part alone, the global half is the sum -- the
+    # prediction the model reports, as under `global_residual`; neither part is asked to predict the target alone, so
+    # set `optim.loss_weights` to {local: 0, global: 1} (or a small local weight). No gradient is cut (unlike
+    # `global_residual`), and a part needs a decoder of its own: `dual_decoder: true`. Not with `global_residual`.
+    cfg.model.decoder.additive = False
     # GlobalModel only: the cell's own visible genes reach the prediction around the transformer.
     # y = W_c h_global + W_o e_own + b, where e_own is the cell's token before the transformer (the
     # learned input layer's output, or the precomputed / PCA embedding) from the masked input. W_o starts

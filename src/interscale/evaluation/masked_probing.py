@@ -606,8 +606,9 @@ class HeadPredictions:
     heads
         ``{name: [N, G]}``. The model's own heads are ``local`` and/or ``global``: both for a dual
         decoder (the global one as the model reports it, i.e. local plus residual under
-        ``model.decoder.global_residual``), ``global`` for a ``GlobalModel`` or a single-decoder
-        ``CombinedModel``, ``local`` for a ``LocalModel``. Reference predictors
+        ``model.decoder.global_residual``, or the sum of both decoders under ``model.decoder.additive``, which adds
+        ``global_part``, the global decoder's output alone, while ``local`` is the local decoder's alone), ``global``
+        for a ``GlobalModel`` or a single-decoder ``CombinedModel``, ``local`` for a ``LocalModel``. Reference predictors
         (:func:`reference_predictions`) are added under names starting with
         :data:`REFERENCE_PREFIX`.
     true
@@ -952,7 +953,11 @@ def _model_heads(module, out) -> tuple[dict[str, torch.Tensor], torch.Tensor, to
 
     if isinstance(module, DualDecoderCombinedModule):
         n = len(out.y_pred) // 2
-        return {"local": out.y_pred[:n], "global": out.y_pred[n:]}, out.y_true[:n], out.entry_mask[:n]
+        heads = {"local": out.y_pred[:n], "global": out.y_pred[n:]}
+        if module.additive:
+            # The global half is the sum; the global decoder's output alone is the other part to score.
+            heads["global_part"] = out.parts["global"]["global"]
+        return heads, out.y_true[:n], out.entry_mask[:n]
     name = "global" if getattr(module, "registered_global_component", False) else "local"
     return {name: out.y_pred}, out.y_true, out.entry_mask
 

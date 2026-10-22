@@ -188,8 +188,8 @@ def _training_tag(cfg) -> str:
 
     For the same reason as the encoding and attention tags: a sweep over one of these would
     otherwise write every arm to one checkpoint. ``ctr``: ``optim.center_targets``; ``res``:
-    ``model.decoder.global_residual``; ``blk<radius µm>f<fraction>``: spatial blocks; ``lrm``: the
-    long-range attention mask (``long_range_attention``, off by default). ``lrm`` was added on
+    ``model.decoder.global_residual``; ``add``: ``model.decoder.additive``; ``blk<radius µm>f<fraction>``: spatial
+    blocks; ``lrm``: the long-range attention mask (``long_range_attention``, off by default). ``lrm`` was added on
     2026-10-14: checkpoints trained with the mask on before then carry no tag. ``sch-<schedule>``,
     ``lw<local>-<global>`` and ``frz-<components>``: a staged schedule, loss weights other than
     the default 0.5 / 0.5, and frozen components (``train._schedule``). ``gs<cell rate>-<selectors>``:
@@ -205,6 +205,8 @@ def _training_tag(cfg) -> str:
         parts.append("ctr")
     if cfg.model.decoder.get("global_residual", False):
         parts.append("res")
+    if cfg.model.decoder.get("additive", False):
+        parts.append("add")
     params = cfg.model.global_component.get("parameters", None)
     if params is not None and params.get("long_range_attention", False):
         parts.append("lrm")
