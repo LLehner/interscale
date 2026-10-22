@@ -112,15 +112,18 @@ POSITION = "position"
 MODEL_EMBEDDINGS = ("local", "global", "local+global")
 
 
-def feature_sets(features: ProbeBatchFeatures) -> dict[str, np.ndarray]:
+def feature_sets(features: ProbeBatchFeatures, *, joint_embeddings: bool = True) -> dict[str, np.ndarray]:
     """The collected representations, plus the combinations the probes compare.
 
     ``local+global``; ``smoother+<embedding>`` with the smoother; with the position as well, the
     model-free bar ``smoother+position`` and ``smoother+position+<embedding>``; with the position
     alone, ``position+<embedding>``. An embedding knows more than the bar where bar+embedding beats it.
+    ``joint_embeddings=False`` leaves out ``local+global`` and every set built on it (three of the twelve
+    sets of a dual model with a smoother and a position, two of them the widest): the summaries of a sweep
+    read ``local`` and ``global`` each against the bars, never the two together.
     """
     sets = dict(features.embeddings)
-    if "local" in sets and "global" in sets:
+    if joint_embeddings and "local" in sets and "global" in sets:
         sets["local+global"] = np.concatenate([sets["local"], sets["global"]], axis=1)
     models = [name for name in MODEL_EMBEDDINGS if name in sets]
     if SMOOTHER in sets:
@@ -325,6 +328,23 @@ def oracle_features(
     return drivers
 
 
+def _fit_rows(rows: np.ndarray, max_rows: int | None, seed: int) -> np.ndarray:
+    """``rows`` (boolean over the training cells), cut to a seeded random subset of at most ``max_rows`` of them.
+
+    A probe's cost grows with the cells it is fitted on, and a probe is a read-out, not an estimate that wants all of
+    them. One draw per call, so every feature set and every target is fitted on the same cells and the sets stay
+    paired; the test cells are never cut. ``None``: every row, as before.
+    """
+    if max_rows is None or int(rows.sum()) <= max_rows:
+        return rows
+    if max_rows < 2:
+        raise ValueError(f"max_train_rows must be at least 2 (or None for every row), got {max_rows}.")
+    chosen = np.random.default_rng(seed).choice(np.flatnonzero(rows), size=int(max_rows), replace=False)
+    keep = np.zeros_like(rows)
+    keep[chosen] = True
+    return keep
+
+
 def _depth_rows(depth_um: np.ndarray | None, rows: np.ndarray, depth_bins_um) -> list[tuple[str, np.ndarray]]:
     """``("all", every row)``, then one ``(bin, rows)`` per non-empty depth bin of the wholly hidden rows.
 
@@ -482,12 +502,20 @@ def probe_labels(
     max_iter: int = 2000,
     seed: int = 0,
     depth_bins_um: list[float] | None = None,
+    max_train_rows: int | None = None,
+    joint_embeddings: bool = True,
 ) -> pd.DataFrame:
     """Read each categorical target out of each representation with a balanced logistic regression.
 
     With ``hidden_only`` (collected from a ``"cells"`` pass) only hidden cells are used, so the label
     has to come from the context: a label the cell's own expression encodes -- a response gene that
     marks it -- is otherwise read straight off its input.
+
+    The cost is the logistic regressions: one per target and feature set, each on every training row and up to
+    ``max_iter`` iterations, the sets holding the smoother the widest. ``max_train_rows`` fits each on one seeded
+    random subset of that many training rows (the same rows for every set and target; the test rows are all scored),
+    and ``joint_embeddings=False`` drops the sets that hold the local and the global embedding together
+    (:func:`feature_sets`). The defaults fit everything, as before.
 
     Returns
     -------
@@ -501,8 +529,10 @@ def probe_labels(
     """
     tr = train.cell_masked.astype(bool) if hidden_only else np.ones(train.n_cells(), bool)
     te = test.cell_masked.astype(bool) if hidden_only else np.ones(test.n_cells(), bool)
+    tr = _fit_rows(tr, max_train_rows, seed)
     groups = _depth_rows(test.depth_um, te, depth_bins_um)
-    sets, test_sets = feature_sets(train), feature_sets(test)
+    sets = feature_sets(train, joint_embeddings=joint_embeddings)
+    test_sets = feature_sets(test, joint_embeddings=joint_embeddings)
     rows = []
     for target in targets:
         y_tr, y_te = train.categorical[target][tr], test.categorical[target][te]
@@ -547,8 +577,13 @@ def probe_covariates(
     hidden_only: bool = True,
     alpha: float = 1.0,
     depth_bins_um: list[float] | None = None,
+    max_train_rows: int | None = None,
+    joint_embeddings: bool = True,
+    seed: int = 0,
 ) -> pd.DataFrame:
     """Predict a vector of numeric covariates (e.g. distances to every source); score by cosine.
+
+    ``max_train_rows`` and ``joint_embeddings`` cut the cost as in :func:`probe_labels` (``seed`` draws the rows).
 
     Each covariate is z-scored with the training statistics first, so every one weighs the same in
     the cosine and the training mean sits at 0: ``cosine_centred`` is then the cosine of the
@@ -563,13 +598,15 @@ def probe_covariates(
     """
     tr = train.cell_masked.astype(bool) if hidden_only else np.ones(train.n_cells(), bool)
     te = test.cell_masked.astype(bool) if hidden_only else np.ones(test.n_cells(), bool)
+    tr = _fit_rows(tr, max_train_rows, seed)
     groups = _depth_rows(test.depth_um, te, depth_bins_um)
     y_tr = np.stack([train.continuous[c] for c in names], axis=1)[tr].astype(np.float64)
     y_te = np.stack([test.continuous[c] for c in names], axis=1)[te].astype(np.float64)
     mu, sd = y_tr.mean(0), y_tr.std(0)
     sd = np.where(sd > 0, sd, 1.0)
     z_tr, z_te = (y_tr - mu) / sd, (y_te - mu) / sd
-    sets, test_sets = feature_sets(train), feature_sets(test)
+    sets = feature_sets(train, joint_embeddings=joint_embeddings)
+    test_sets = feature_sets(test, joint_embeddings=joint_embeddings)
     keep_all = np.ones_like(z_te, dtype=bool)
     rows = []
     for name, x in sets.items():
