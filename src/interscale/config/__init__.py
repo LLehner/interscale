@@ -608,8 +608,21 @@ def _validate_regime_loss(cfg):
 
 
 def _validate_own_cell_skip(cfg):
-    """``model.decoder.own_cell_skip`` is a per-cell term: it needs a node-level prediction."""
+    """``model.decoder.own_cell_skip`` is a per-cell term: it needs a node-level prediction.
+
+    ``own_cell_skip_input`` names what it reads and means nothing without the skip.
+    """
+    from interscale.module.base._base_global_module import OWN_CELL_SKIP_INPUTS
+
+    read = cfg.model.decoder.get("own_cell_skip_input", "embedding")
+    if read not in OWN_CELL_SKIP_INPUTS:
+        raise ValueError(f"model.decoder.own_cell_skip_input must be one of {OWN_CELL_SKIP_INPUTS}, got {read!r}.")
     if not cfg.model.decoder.get("own_cell_skip", False):
+        if read != "embedding":
+            raise ValueError(
+                f"model.decoder.own_cell_skip_input {read!r} sets what the own-cell skip reads, but "
+                "model.decoder.own_cell_skip is off."
+            )
         return
     if cfg.dataset.prediction_level != "node":
         raise ValueError(

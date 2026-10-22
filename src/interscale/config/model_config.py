@@ -44,5 +44,8 @@ def get_model_cfg(cfg):
     # at zero, so the model starts as without it. Gives each cell's own-versus-context split by
     # construction (`.claude/decoder_plan.md`, D3.1 without a GCN). Pooled tokens: the skip stays per cell.
     cfg.model.decoder.own_cell_skip = False
+    # What the skip reads: "embedding" (the cell's token, so W_o is limited to rank n_embed) or "raw" (its visible
+    # genes themselves, a full-rank linear read: W_o is [n_output, n_input]; a hidden entry is -1 as in the model's input).
+    cfg.model.decoder.own_cell_skip_input = "embedding"
 
     return cfg

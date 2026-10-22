@@ -15,6 +15,8 @@ from ._step_output import StepOutput, ViewOutput, gather_cls, gather_tokens
 PRECOMPUTED_MASK_FILLS = ("learned", "minus_one")
 #: What the transformer gets for a cell hidden whole (``remask``): its local token, or one learned token.
 REMASK_KINDS = ("none", "hidden")
+#: What the own-cell skip reads (``own_cell_skip_input``): the cell's token, or its visible genes themselves.
+OWN_CELL_SKIP_INPUTS = ("embedding", "raw")
 
 
 class GlobalModule(BaseModule):
@@ -25,6 +27,7 @@ class GlobalModule(BaseModule):
         pooling=None,
         remask: str = "none",
         own_cell_skip: bool = False,
+        own_cell_skip_input: str = "embedding",
         **base_module_kwargs,
     ):
         """``precomputed_mask_fill``: what a hidden cell's ``Precomputed`` embedding is replaced by.
@@ -51,6 +54,11 @@ class GlobalModule(BaseModule):
         transformer) reaches the prediction around it, ``y = decoder(h_global) + W_o e_own``, with ``W_o``
         starting at zero (:meth:`predict`). Only for a module that tokenises the expression itself, i.e. a
         ``GlobalModel``.
+
+        ``own_cell_skip_input``: what the skip reads. ``"embedding"``: the token ``e_own``, so ``W_o`` has rank at most
+        ``n_embed``. ``"raw"``: the cell's visible genes themselves (:meth:`own_cell_input`), ``W_o`` is
+        ``[n_output, n_input]`` -- a full-rank linear read, which tells a limit of the skip's width from a limit of its
+        training.
         """
         super().__init__(**base_module_kwargs)
         self.pooling = pooling
@@ -71,6 +79,13 @@ class GlobalModule(BaseModule):
             gen = torch.Generator().manual_seed(0)
             self.remask_token = torch.nn.Parameter(torch.randn(self.n_embed, generator=gen))
         self.own_cell_skip = bool(own_cell_skip)
+        if own_cell_skip_input not in OWN_CELL_SKIP_INPUTS:
+            raise ValueError(f"own_cell_skip_input must be one of {OWN_CELL_SKIP_INPUTS}, got {own_cell_skip_input!r}.")
+        self.own_cell_skip_input = own_cell_skip_input
+        if self.own_cell_skip_input != "embedding" and not self.own_cell_skip:
+            raise ValueError(
+                f"own_cell_skip_input {own_cell_skip_input!r} sets what the own-cell skip reads, but it is off."
+            )
         if self.own_cell_skip:
             if self.type_gex_embedding is None:
                 raise ValueError(
@@ -79,7 +94,8 @@ class GlobalModule(BaseModule):
                 )
             # Zeros, not an initialiser: no draw from the global RNG, so every other weight is initialised as
             # without the skip, and the model starts as the one without it.
-            self.own_skip_weight = torch.nn.Parameter(torch.zeros(self.n_output, self.n_embed))
+            width = self.n_input if self.own_cell_skip_input == "raw" else self.n_embed
+            self.own_skip_weight = torch.nn.Parameter(torch.zeros(self.n_output, width))
 
         self.registered_local_component = False
         self.registered_global_component = True
@@ -160,6 +176,17 @@ class GlobalModule(BaseModule):
         embedding = torch.tensor(embedding, dtype=torch.float32, device=batch.x.device)
         if self.type_gex_embedding == "Precomputed" and hidden is not None:
             embedding = self.hide_embeddings(embedding, hidden)
+        return embedding
+
+    def own_cell_input(self, batch, embedding: torch.Tensor) -> torch.Tensor:
+        """``[N, ·]`` in batch node order: what the own-cell skip reads, from ``batch`` as the model got it.
+
+        ``embedding`` (:meth:`gex_embedding` of the same batch) under ``own_cell_skip_input: embedding``; under ``raw`` the
+        batch's expression itself, the masked one in training (a hidden entry is :data:`MASK_VALUE`, as in every other
+        input) and the clean one at inference. Pass the same batch that was tokenised.
+        """
+        if self.own_cell_skip_input == "raw":
+            return batch.x.float()
         return embedding
 
     def hide_embeddings(self, embedding: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
@@ -511,7 +538,8 @@ class GlobalModule(BaseModule):
         prediction_level: Literal["node", "graph"]
             Level of prediction
         own_embedding: torch.Tensor | None
-            ``[N, E]`` in batch node order: each cell's own token, from :meth:`gex_embedding`. Required under
+            ``[N, E]`` in batch node order: what the skip reads, from :meth:`own_cell_input` -- each cell's own token
+            (:meth:`gex_embedding`), or under ``own_cell_skip_input: raw`` its genes ``[N, n_input]``. Required under
             ``own_cell_skip`` (a module that has one refuses to predict without it, rather than predict as if
             it had none), ignored otherwise.
         node_idx: torch.Tensor | None
@@ -564,7 +592,11 @@ class GlobalModule(BaseModule):
 
         # The cells' own tokens reach the prediction around the transformer under `own_cell_skip`.
         parts = self.predict_parts(
-            global_embedding, src_padding_mask, prediction_level, own_embedding=embedding, node_idx=padded_node_idx
+            global_embedding,
+            src_padding_mask,
+            prediction_level,
+            own_embedding=self.own_cell_input(batch_masked, embedding),
+            node_idx=padded_node_idx,
         )
         y_pred, *rest = parts.values()
         for part in rest:
@@ -640,6 +672,7 @@ class GlobalModule(BaseModule):
                 pooling=build_pooling(cfg, n_embed) if n_embed is not None else None,
                 remask=params.get("remask", "none"),
                 own_cell_skip=bool(cfg.model.decoder.get("own_cell_skip", False)),
+                own_cell_skip_input=str(cfg.model.decoder.get("own_cell_skip_input", "embedding")),
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,
             )

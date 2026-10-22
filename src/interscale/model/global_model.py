@@ -104,7 +104,7 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
                 global_embedding,
                 src_padding_mask,
                 self.prediction_level,
-                own_embedding=embedding,
+                own_embedding=self.module.own_cell_input(batch, embedding),
                 node_idx=torch.as_tensor(pad_index_nodes[0], dtype=torch.long, device=embedding.device),
             )
 

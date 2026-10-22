@@ -11,7 +11,10 @@ transformer, from the masked input. Pinned here:
 * **inference** -- ``get_model_output`` decodes with it too;
 * **refusals** -- a module without tokens of its own, graph-level prediction, a model that has no such part;
 * **the decoder types** -- ``nonlinear`` and ``linear-lse`` train finite through a global-only model, and each
-  decoder and the skip have a checkpoint name of their own.
+  decoder and the skip have a checkpoint name of their own;
+* **the raw read** (``own_cell_skip_input: raw``) -- the skip reads the cell's visible genes instead of its token: the
+  weight is ``[n_output, n_input]`` and the contribution has full rank where the token's has at most ``n_embed``;
+  the same switch, leakage, inference, refusals and name checks as the token read.
 """
 
 import types
@@ -31,7 +34,7 @@ G, E = 6, 16
 SPACING = 100.0
 
 
-def _cfg(skip=False, decoder="linear", embedding="Linear", pool=None):
+def _cfg(skip=False, decoder="linear", embedding="Linear", pool=None, read="embedding"):
     from interscale.config import get_cfg_defaults
     from interscale.config.global_component_config import get_global_component_cfg
 
@@ -42,6 +45,7 @@ def _cfg(skip=False, decoder="linear", embedding="Linear", pool=None):
     params.max_seq_len, params.type_gex_embedding = 64, embedding
     params.pe.node = ["sinusoidal"]
     cfg.model.decoder.type, cfg.model.decoder.own_cell_skip = decoder, skip
+    cfg.model.decoder.own_cell_skip_input = read
     cfg.dataset.name = "d"
     if pool is not None:
         params.pooling.kind, params.pooling.size_um = "grid", pool
@@ -49,16 +53,16 @@ def _cfg(skip=False, decoder="linear", embedding="Linear", pool=None):
     return cfg
 
 
-def _module(skip=False, decoder="linear", strategy="node", rate=0.3, pool=None, seed=0):
+def _module(skip=False, decoder="linear", strategy="node", rate=0.3, pool=None, seed=0, read="embedding", embed=E):
     from interscale.module.base import GlobalModule
 
     torch.manual_seed(seed)
     return GlobalModule.from_config(
-        _cfg(skip, decoder, pool=pool),
+        _cfg(skip, decoder, pool=pool, read=read),
         local_mask_hops=0,
         n_input=G,
         n_output=G,
-        n_embed=E,
+        n_embed=embed,
         decoder_type=decoder,
         dropout_decoder=0.0,
         decoder_hidden_dims=[16],
@@ -185,7 +189,8 @@ def test_no_hidden_entry_reaches_a_prediction_through_the_skip_and_a_visible_one
 # --------------------------------------------------------------------------- inference
 
 
-def test_inference_decodes_with_the_skip_too(monkeypatch):
+@pytest.mark.parametrize("read", ["embedding", "raw"])
+def test_inference_decodes_with_the_skip_too(monkeypatch, read):
     import pandas as pd
     from anndata import AnnData
 
@@ -201,7 +206,7 @@ def test_inference_decodes_with_the_skip_too(monkeypatch):
     GlobalModel._setup_anndata(
         adata=adata, layer_key=None, sample_key_list=["sample"], prediction_task="regression", view_registry=False
     )
-    cfg = _cfg(skip=True)
+    cfg = _cfg(skip=True, read=read)
     cfg.model.n_embed = E
     cfg.dataset.spatial_key = "spatial"
     cfg.model.global_component.parameters.max_seq_len = 8  # fewer tokens than cells: a subsample
@@ -209,7 +214,8 @@ def test_inference_decodes_with_the_skip_too(monkeypatch):
     model = GlobalModel(adata, cfg=cfg)
     model.module.eval()
     model.is_trained_ = True
-    model.module.own_skip_weight.data = torch.randn(G, E, generator=torch.Generator().manual_seed(2))
+    width = G if read == "raw" else E
+    model.module.own_skip_weight.data = torch.randn(G, width, generator=torch.Generator().manual_seed(2))
 
     graph = Data(
         x=torch.tensor(adata.X),
@@ -232,7 +238,8 @@ def test_inference_decodes_with_the_skip_too(monkeypatch):
     random.seed(0)  # the same subsample
     _, emb, padding, kept, _ = module.evaluate(graph.clone(), tokens)
     base = module.decoder(gather_tokens(emb, padding))
-    expected = (base + F.linear(tokens[torch.as_tensor(kept[0])], module.own_skip_weight)).detach().numpy()
+    own = graph.x.float() if read == "raw" else tokens  # what the skip reads: the genes, or the cell's token
+    expected = (base + F.linear(own[torch.as_tensor(kept[0])], module.own_skip_weight)).detach().numpy()
     rows = ~np.isnan(found).any(axis=1)
     assert rows.sum() == 8
     assert np.allclose(found[rows], expected, atol=1e-5)
@@ -344,3 +351,146 @@ def test_each_decoder_and_the_skip_have_a_checkpoint_name_of_their_own():
     for local, glob in ((True, True), (True, False)):
         nonlinear = get_model_filename_prefix(_cfg(False, "nonlinear"), local, glob)
         assert nonlinear != get_model_filename_prefix(_cfg(), local, glob)
+
+
+# --------------------------------------------------------------------------- the raw read
+
+
+def _raw_inputs(module, batch):
+    """The genes the raw skip reads, as ``_common_step`` hands them to ``predict``: the masked batch's expression."""
+    batch_masked, _, _ = module._common_step_masking(batch)
+    return module.own_cell_input(batch_masked, module.gex_embedding(batch_masked)), batch_masked
+
+
+def test_the_raw_read_is_off_by_default_and_gives_the_weight_the_width_of_the_genes():
+    assert _cfg().model.decoder.own_cell_skip_input == "embedding"
+    assert _module(skip=True).own_skip_weight.shape == (G, E)  # the token's width
+    raw = _module(skip=True, read="raw")
+    assert raw.own_skip_weight.shape == (G, G) and raw.own_cell_skip_input == "raw"
+    assert _module().own_cell_skip_input == "embedding"
+
+
+def test_the_raw_read_differs_by_one_zero_parameter_and_starts_as_without_it():
+    off, on = _module(), _module(skip=True, read="raw")
+    assert set(on.state_dict()) - set(off.state_dict()) == {"own_skip_weight"}
+    assert all(torch.equal(off.state_dict()[k], on.state_dict()[k]) for k in off.state_dict())  # same initial weights
+    assert not on.own_skip_weight.any()
+    batch = _batch()
+    with torch.no_grad():
+        assert torch.equal(
+            off._common_step(batch, "regression", "node").y_pred, on._common_step(batch, "regression", "node").y_pred
+        )
+
+
+@pytest.mark.parametrize("strategy", ["node", "gene"])
+def test_the_raw_read_adds_exactly_the_weight_times_the_masked_genes(strategy):
+    rate = 0.3 if strategy == "node" else 1.0
+    off = _module(strategy=strategy, rate=rate)
+    on = _with_random_skip(strategy=strategy, rate=rate, read="raw")
+    batch = _batch(strategy=strategy)
+    with torch.no_grad():
+        out_off = off._common_step(batch, "regression", "node")
+        out_on = on._common_step(batch, "regression", "node")
+        genes, masked = _raw_inputs(on, batch)
+    index = out_on.view.padded_node_idx
+    assert torch.equal(genes, masked.x.float())  # what the model is given, hidden entries filled
+    assert torch.allclose(out_on.y_pred - out_off.y_pred, F.linear(genes[index], on.own_skip_weight), atol=1e-5)
+    assert (out_on.y_pred - out_off.y_pred).abs().max() > 1e-3
+    assert torch.equal(out_on.parts["global"]["context"], out_off.y_pred)  # the transformer's part is untouched
+    assert torch.allclose(out_on.parts["global"]["own_cell"], F.linear(genes[index], on.own_skip_weight), atol=1e-5)
+
+
+def test_the_raw_read_has_full_rank_where_the_tokens_read_has_at_most_the_embedding_width():
+    """Why the option exists: the token's width bounds the rank of what the skip can read off the genes."""
+    narrow = 4  # fewer than the 6 genes; the transformer needs a width its 4 heads divide
+    batch = _batch(n=24)
+    ranks = {}
+    for read in ("embedding", "raw"):
+        on = _with_random_skip(read=read, embed=narrow)
+        with torch.no_grad():
+            out = on._common_step(batch, "regression", "node")
+        part = out.parts["global"]["own_cell"]
+        ranks[read] = int(torch.linalg.matrix_rank(part - part.mean(0), atol=1e-4))
+    assert ranks["embedding"] <= narrow
+    assert ranks["raw"] == G > narrow
+
+
+def test_the_raw_weight_gets_a_gradient_and_the_tokens_still_train():
+    on = _module(skip=True, read="raw").train()
+    out = on._common_step(_batch(), "regression", "node")
+    (out.y_pred - out.y_true).pow(2).mean().backward()
+    assert on.own_skip_weight.grad is not None and on.own_skip_weight.grad.abs().sum() > 0
+    assert on.input_embedding.weight.grad.abs().sum() > 0
+
+
+def test_pooled_tokens_keep_the_raw_skip_per_cell():
+    off = _module(pool=3 * SPACING)
+    on = _with_random_skip(pool=3 * SPACING, read="raw")
+    batch = _batch(n=16)
+    with torch.no_grad():
+        out_off = off._common_step(batch, "regression", "node")
+        out_on = on._common_step(batch, "regression", "node")
+        genes, _ = _raw_inputs(on, batch)
+    delta = out_on.y_pred - out_off.y_pred
+    assert torch.allclose(delta, F.linear(genes[out_on.view.padded_node_idx], on.own_skip_weight), atol=1e-5)
+    patch = out_off.y_pred
+    pairs = [(i, j) for i in range(16) for j in range(i)]
+    assert any(torch.equal(patch[i], patch[j]) and not torch.equal(delta[i], delta[j]) for i, j in pairs)
+
+
+def test_no_hidden_entry_reaches_a_prediction_through_the_raw_skip_and_a_visible_one_does():
+    on = _with_random_skip(strategy="gene", rate=1.0, read="raw")
+    batch = _batch(strategy="gene")
+    with torch.no_grad():
+        before = on._common_step(batch, "regression", "node").y_pred
+        hidden = batch.clone()
+        hidden.x = batch.x.clone()
+        hidden.x[:, [0, 1]] = torch.rand(batch.num_nodes, 2) * 50.0
+        assert torch.equal(on._common_step(hidden, "regression", "node").y_pred, before)
+        visible = batch.clone()
+        visible.x = batch.x.clone()
+        visible.x[5, 4] += 50.0
+        assert not torch.allclose(on._common_step(visible, "regression", "node").y_pred[5], before[5])
+
+
+def test_a_cell_hidden_whole_gives_the_raw_skip_nothing_of_its_own_row():
+    """Under cell masking the hidden cell's row is the fill: changing its true expression moves no prediction."""
+    on = _with_random_skip(read="raw")
+    batch = _batch()
+    assert batch.mask[:4].all() and not batch.mask[4:].any()  # cells 0-3 are hidden by `_batch`
+    with torch.no_grad():
+        before = on._common_step(batch, "regression", "node")
+        changed = batch.clone()
+        changed.x = batch.x.clone()
+        changed.x[:4] += 50.0
+        after = on._common_step(changed, "regression", "node")
+    index = before.view.padded_node_idx
+    assert torch.equal(index, after.view.padded_node_idx)
+    assert torch.equal(after.parts["global"]["own_cell"], before.parts["global"]["own_cell"])
+    assert torch.equal(after.y_pred, before.y_pred)
+
+
+def test_the_raw_read_needs_the_skip_and_a_known_name():
+    from interscale.config import _validate_own_cell_skip
+    from interscale.module.base import GlobalModule
+
+    _validate_own_cell_skip(_cfg(skip=True, read="raw"))
+    _validate_own_cell_skip(_cfg(skip=True))
+    _validate_own_cell_skip(_cfg())
+    with pytest.raises(ValueError, match="own_cell_skip_input"):
+        _validate_own_cell_skip(_cfg(skip=True, read="genes"))
+    with pytest.raises(ValueError, match="is off"):
+        _validate_own_cell_skip(_cfg(skip=False, read="raw"))
+    with pytest.raises(ValueError, match="is off"):
+        GlobalModule.from_config(
+            _cfg(skip=False, read="raw"), local_mask_hops=0, n_input=G, n_output=G, n_embed=E, decoder_type="linear"
+        )
+
+
+def test_the_raw_read_has_a_checkpoint_name_of_its_own():
+    token, raw = _cfg(True), _cfg(True, read="raw")
+    names = {get_model_filename_prefix(c, False, True) for c in (_cfg(), token, raw)}
+    assert len(names) == 3
+    assert "dec-linear-skipraw_" in get_model_filename_prefix(raw, False, True)
+    assert "dec-linear-skip_" in get_model_filename_prefix(token, False, True)  # unchanged
+    assert get_model_filename_prefix(_cfg(read="raw"), False, True) == get_model_filename_prefix(_cfg(), False, True)

@@ -145,10 +145,11 @@ def _pooling_tag(cfg) -> str:
 
 
 def _decoder_tag(cfg) -> str:
-    """``dec-<type>[-skip]_`` for a decoder other than the plain linear one or with the own-cell skip, else ``""``.
+    """``dec-<type>[-skip|-skipraw]_`` for a decoder other than the plain linear one or with the own-cell skip, else ``""``.
 
     The decoder type was never part of a checkpoint name, so an arm that varies it would overwrite the arm
-    that does not; the default (``linear``, no skip) adds nothing and every earlier name is unchanged.
+    that does not; the default (``linear``, no skip) adds nothing and every earlier name is unchanged. ``-skipraw``:
+    the skip reads the cell's genes (``model.decoder.own_cell_skip_input: raw``), ``-skip`` its token.
     """
     decoder = cfg.model.get("decoder", None)
     if decoder is None:
@@ -156,7 +157,8 @@ def _decoder_tag(cfg) -> str:
     kind, skip = decoder.get("type", "linear"), bool(decoder.get("own_cell_skip", False))
     if kind in (None, "linear") and not skip:
         return ""
-    return f"dec-{kind or 'linear'}{'-skip' if skip else ''}_"
+    raw = skip and decoder.get("own_cell_skip_input", "embedding") == "raw"
+    return f"dec-{kind or 'linear'}{('-skipraw' if raw else '-skip') if skip else ''}_"
 
 
 def _embedding_tag(cfg) -> str:
