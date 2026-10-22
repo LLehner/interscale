@@ -375,3 +375,109 @@ result was read; the entry above was the first one written live.*
 - The oracle's ridge penalty sits at the lowest value of the grid (0.1), so noiseless drivers may want less regularisation than
   `FITTED_ALPHAS` offers; the numbers are a floor for what the truth reaches.
 - The oracle is built on truth a model must infer (`is_receiver_*`, `R34_state`): it bounds the task, not what a model can learn.
+
+## 2026-10-22 — Decoder arms of the global-only model under programme masking (`global_decoders`: `lin_fourier` and `lin_fourier_skip` at 3 seeds, nonlinear, LSE, pooled 500 µm with and without the skip at 1 seed; synth_spot)
+
+**What worked**
+- The own-cell skip does what it was built for, on the programmes it was built for. Over 3 seeds (seed spread 0.01-0.05) the
+  mirror programmes rise: M1→MC1 0.54 → 0.63, M2→MC2 0.41 → 0.56, M4→MC4 0.27 → 0.49, M6→MC6 0.47 → 0.60, also M17→MC21
+  0.44 → 0.53. Nothing else drops: the rings stay at 0.95 / 0.96, the sparse programmes at 0.91-0.98. Mean over the 24
+  programmes 0.542 → 0.577, wins / ties / losses against the bar 4/10/10 → 5/10/9. On the joint model's global head the same
+  mirror programmes read 0.21-0.28 (MC4) and 0.46-0.51 (MC6), so the skip does better on them than the GCN does.
+- Pooled 500 µm tokens with the skip match the per-cell model at about 1/25 of the tokens: programme mean 0.582 (one seed)
+  against 0.577, peak GPU memory 0.14 against 0.77 GiB. They do better on M3→MC3 (0.72 against 0.61) and pick up some
+  short-range signal (S1, S2: 0.14, 0.21 against ~0), and lose some on the rings (0.80 / 0.87 against 0.95 / 0.96).
+- The linear decoder is the right one for a global-only model; the other two are worse (below).
+
+**What doesn't work**
+- Every per-cell global-only arm is blind to the short-range programmes: S1→R1, S2→R2, S3/S4→R3/R4 at 0.00-0.03 against
+  the bar's 0.55-0.66. Within their receivers they are strongly *negative* (−0.56 to −0.86). M11→MC14/15, which a 150 µm kernel
+  solves (bar 0.92), reads 0.14-0.19. `lin_rope` in `response_masking` gives the same zeros, local heads or not. The joint model
+  reads these programmes (0.59-0.68) only through its GCN. Short range is the largest single loss of the global-only model, and
+  no decoder fixes it: the attention never selects the near neighbours (attention check: `lin_fourier` puts 0.5% of its weight
+  within 300 µm, below uniform).
+- The skip closes only about half the gap to `ref_own` on the mirror programmes (MC4 0.49 against 0.68, MC1 0.63 against 0.84),
+  although `W_o e_own` is linear in the same visible genes that `ref_own`'s ridge reads. The cause is not known yet: optimisation
+  (W_o starts at 0, 100 epochs, the transformer path already fits most of the loss), or the input layer's width as a rank limit.
+  The all-hidden cosine does not move (0.764 against 0.761): it is dominated by the long-range genes.
+- Without the skip, pooling destroys the sparse programmes (M12-M18 at 0.00-0.03 against 0.91-0.98): a patch token cannot say
+  which of its cells is a receiver. A pooled model needs the skip.
+- `linear-lse` loses the sparse programmes (M12→MC16 0.28, M16→MC20 0.08, M17→MC21 0.06; programme mean 0.324) and `nonlinear`
+  loses M16 / M17 (0.06 / 0.03) and its magnitudes (raw SCE 0.071 against 0.039; mean 0.472). Drop both for global-only models.
+- Sender ranks do not move with the decoder: 0.51-0.59 per class for `lin_fourier` (mid class seed spread 0.08), 0.52-0.56 with
+  the skip, twin 0.49-0.54. The pooled arms rank short-range senders 0.70-0.75, but there the sender usually shares the
+  receiver's patch, so this is not yet a sign of selection.
+- These runs used a library and sweep script older than the oracle and D0 (committed 16:06 on 2026-10-21, report rebuilt 16:00):
+  no `ref_oracle`, no attribution shares, so the skip's `own_cell` share is not measured. Re-evaluate the checkpoints
+  (`MODE = "evaluate"`) to get them.
+
+## 2026-10-22 — Each head's loss on its own regime (D2.2, `regime_loss`: `joint` and `regime` at 3 seeds, `regime_remask`, `joint_d1000`, `regime_d1000` at 1 seed; synth_spot, 500 µm discs in the evaluation)
+
+**What worked**
+- The heads specialise as assigned, and the effect is far larger than the seed spread (0.002-0.012). The local head trained on
+  near cells only gains near the rim: 0.443 → 0.483 (0-150 µm) and 0.423 → 0.466 (150-290 µm). On 0-150 µm this ties
+  `kernel_400um` (0.481) and is the best per-cell number at the rim so far. The global head trained on deep cells only loses near
+  the rim (0.428 → 0.385) and stays the same deep (0.400 → 0.406, 0.382 → 0.390). CKA local~global over hidden spots
+  falls 0.485 → 0.414, at the rim 0.888 → 0.848.
+- Regime loss and re-masking go together without a cost (one seed): global 0.400 at every depth (regime alone 0.394), local
+  0.490 / 0.472 near the rim, CKA over hidden spots 0.369, the lowest of the sweep.
+- At depth the global head reads the label `region` better than the smoother does (balanced accuracy 0.900 against 0.863 at
+  500+ µm), but only 0.03 better than smoother+position, on 135 spots.
+
+**What doesn't work**
+- No head beats the smoother in its own regime. The deep global head (0.406 / 0.390) is below `kernel_400um` (0.448 / 0.413)
+  and `nearest_50` (0.444 / 0.413). Taking the local head near the rim and the global head deep gives
+  0.483 / 0.466 / 0.406 / 0.390, against 0.481 / 0.467 / 0.448 / 0.413 for the kernel: a tie near the rim, a loss deep.
+  So the regime loss separates the heads because of what each one is trained on, not because the global head learns
+  something the local one cannot.
+- Wider training discs (1000 µm, so 64% of the hidden spots are deep instead of 34%) make the global head worse at every depth,
+  including the deep bins it now trains on much more: `joint_d1000` 0.345 / 0.340 / 0.315 / 0.301, `regime_d1000` about 0.34
+  everywhere, against 0.40 for 500 µm discs (one seed each, the gap ~10× the seed spread). More deep training cells do not
+  teach a long-range rule. Less visible context to smooth just makes the head worse.
+- Specialising costs the global head the rim (−0.04) and nothing comes back elsewhere. The blend scores show the same thing:
+  `blend_global` 0.460 → 0.448.
+- Cost: the label and source-distance probes take 1,440-1,775 s per arm, about 25 min of a ~30 min evaluation. Cut or
+  subsample them in the next disc sweeps.
+- The redundancy table (D0) is missing: these runs predate it. Re-evaluate the checkpoints to get it.
+
+## 2026-10-22 — Re-masking hidden cells before the transformer (task 3, `remask_test`: `joint` and `joint_remask` at 3 seeds with the long-range mask, `joint_nolrm` and `joint_nolrm_remask` at 1 seed without it; synth_spot, 500 µm discs)
+
+**What worked**
+- The mechanism works. With the long-range mask on, a rim cell's global head now draws 94% of its influence from beyond
+  300 µm (was 7%), CKA local~global falls at the rim (0.888 → 0.776) and over all hidden spots (0.485 → 0.297), and hidden
+  queries stop attending to hidden keys (visible share over key share 0.77-0.87 → 1.14 in layer 0, where above 1 means the
+  visible keys get more than their share). With the long-range mask, a hidden cell's global embedding is now provably made
+  from context beyond the GCN's reach, which is the property an interpretation of the global head needs.
+- Without the long-range mask, re-masking costs nothing (global 0.417 against 0.418 at every depth) and still lowers the CKA
+  over hidden spots (0.473 → 0.254).
+
+**What doesn't work**
+- With the long-range mask on, the global head loses 0.02-0.05 at every depth: 0.428 → 0.378 at the rim (expected: the near
+  visible cells are now out of its reach), but also 0.400 → 0.376 at 290-500 µm and 0.382 → 0.361 beyond 500 µm, where nothing
+  was copied (the local head reads 0.05 there). The likely reason: under plain masking the deep cells drew on the hidden
+  rim cells' GCN tokens, which carry the rim's visible neighbours, so the hidden-token "sink" of K5 was partly a relay. After
+  re-masking those tokens are all the same and attention avoids them. Long-range response genes: 0.813 → 0.720.
+- Without the long-range mask the copying moves into attention rather than going away: the rim cells' global head attends
+  nearer (span 0.66 of uniform's, was 0.83) and still draws 79% of its influence from within 300 µm. The global head then
+  reads the same near cells as the local head, only through attention instead of its own token.
+- Nothing beats the smoother: best head 0.418 against `kernel_400um` 0.465; planted senders at 0.47-0.54 in every arm.
+- The local head loses a little when the GCN no longer feeds the hidden cells' global tokens (0.443 → 0.434 at the rim; in
+  `nolrm` 0.421 → 0.403 at 150-290 µm).
+
+## 2026-10-22 — Cost of the label probes on synthetic arrays shaped like a disc sweep's (no model: 18,000 hidden training spots, 6,000 test, 64-d embeddings, a 960-d smoother, 4 classes; 6 of the 12 feature sets)
+
+**What worked**
+- Fitting each probe on a seeded subset of the training rows cuts the cost in proportion: 6,000 rows took 8.9 s instead of 34.5 s
+  (3.9 x), 3,000 rows 5.7 s (6 x). One draw serves every feature set and label, so the sets stay paired.
+- The accuracies at 6,000 rows stay close: smoother 0.250 -> 0.260, smoother+global 0.275 -> 0.269, smoother+position+global 0.271 ->
+  0.268; at 3,000 rows they move further (global 0.346 -> 0.288).
+
+**What doesn't work**
+- The synthetic fits do not reproduce the real cost. Here the logistic regressions converge in 16-140 iterations and a smoother
+  fit takes 10 s, so 12 sets x 4 labels would be 8 minutes; the disc sweeps spent 1,440-1,775 s on this step. The real fits must run
+  many more iterations (or on wider sets) than these, so the speed-up of `max_iter` 300 against 2000 cannot be measured here (on these arrays it
+  changes nothing: no fit reached 300), and the row cap's 3 x is a ratio of rows, not a measured one on the cluster's features.
+- A cap moves single-set accuracies by more than the gains the tables read: global alone fell 0.346 -> 0.315 at 6,000 rows on this one draw,
+  while the real region gains over the smoother are 0.01-0.02. The smoother and smoother+embedding are cut to the same rows, so the
+  gain rows are paired, but their noise from the subsample was not measured. Probe numbers from capped runs are not comparable to the
+  uncapped ones of the first disc sweeps.

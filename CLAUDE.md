@@ -226,7 +226,36 @@ Invariants:
 transformer: `y = decoder(h_global) + W_o e_own` (`GlobalModule.predict(..., own_embedding=, node_idx=)`, which refuses to
 run without them). `e_own` is `gex_embedding` of the *masked* batch, so no hidden entry reaches it; `W_o` starts at zero
 and draws no random number. Any new caller of `predict` on such a module must pass both. The decoder type and the skip
-are in the checkpoint name (`dec-<type>[-skip]_`; the plain linear decoder adds nothing).
+are in the checkpoint name (`dec-<type>[-skip|-skipraw]_`; the plain linear decoder adds nothing).
+
+### The additive decoder and the raw skip (`.claude/decoder_plan.md`, D3.1)
+
+`model.decoder.additive` (dual decoder only; default off) makes the dual model's prediction the sum of its two decoders,
+`y = W_l h_local + W_g h_global + b`. Invariants:
+
+- **The halves.** The stacked `[2N]` output keeps its layout: the local half is the local decoder's output **alone**, the global
+  half is the **sum** -- the prediction the model reports, as under `global_residual`. `DualDecoderCombinedModule.combine_global` is
+  the one place that sums (training, `get_model_output`), `global_is_sum` is true for `additive` and `global_residual` (the two
+  are exclusive: one cuts the gradient into the local decoder, the other does not). No gradient is cut.
+- **The loss weights are a choice.** The default 0.5 / 0.5 also trains the local part to predict the whole target alone, which is what
+  the option is for not doing; the validator refuses it under the `joint` schedule. `{local: 0, global: 1}` is the loss on the sum only,
+  a small local weight a per-head term; a staged schedule sets its own per phase.
+- **Parts and heads.** `StepOutput.parts["global"]` is `{"local", "global"}`, the sum's own tensors (not detached: the influence readouts differentiate
+  the head `global_part`), what `attribution_shares` takes apart. `masked_probing._model_heads` adds the head `global_part` (the global decoder's output alone) for
+  an additive module, so it appears in every head table and every consumer that loops over heads (`response_influence` runs a backward
+  per head).
+- **It separates nothing by itself.** The global component's tokens are built from the local ones, so the sum is a reparametrisation the
+  optimiser may use unevenly; the attribution shares say how much each part carries. A context-only global embedding (D1) is what stops
+  the global part repeating the local one.
+
+`model.decoder.own_cell_skip_input` (`embedding` by default, or `raw`): what the own-cell skip reads. `raw` is the cell's visible genes
+(`GlobalModule.own_cell_input`: the masked batch's `x` in training, hidden entries at `MASK_VALUE`; the clean batch at inference), `W_o`
+is `[n_output, n_input]`, so the read has full rank; `embedding` is the token, rank at most `n_embed`. Both start at zero. Any caller of
+`predict` must pass `own_embedding=module.own_cell_input(batch, embedding)` and the same batch that was tokenised.
+
+The label and distance probes of a disc evaluation are the slowest step (one logistic regression per label and feature set):
+`probe_labels` / `probe_covariates` take `max_train_rows` and `joint_embeddings`, the sweeps set them through `PROBE_*` in
+`sweep_common.py` (not under version control). The defaults fit everything.
 
 ### Preprocessing / robustness utilities (`interscale.pp`)
 

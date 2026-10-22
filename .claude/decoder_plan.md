@@ -17,8 +17,9 @@ the same commit as the work.
 | D1 — a context-only global embedding | proposed | | |
 | D2.2 — regime-assigned losses | **implemented, unverified** -- `optim.regime_loss` (roadmap.md, T2); sweep `regime_loss` written, not run | 34 tests, mutation-checked, harness IDENTICAL | 2026-10-21 |
 | D2 — different targets per head | D2.1 and D2.3 proposed | | |
-| D3.0 — own-cell skip in a global-only model | **implemented, unverified** -- `model.decoder.own_cell_skip` (roadmap.md, T2); sweep `global_decoders` written, not run | 21 tests, mutation-checked, harness IDENTICAL | 2026-10-21 |
-| D3 — one prediction from two parts | D3.1 (in the dual model) to D3.3 proposed | | |
+| D3.0 — own-cell skip in a global-only model | **run and read 2026-10-22** (`global_decoders`, 3 seeds; notes.md): the mirror programmes rise (MC4 0.27 → 0.49, MC2 0.41 → 0.56, MC6 0.47 → 0.60), about half the gap to `ref_own`; nothing else drops. The full-rank read `own_cell_skip_input: raw` (2026-10-22) tests whether the other half is the skip's width: arms `lin_fourier_skipraw` (3 seeds), `lin_fourier_pool500_skipraw`, **not run** | 21 + 12 tests, mutation-checked, harness IDENTICAL | 2026-10-22 |
+| D3.1 — additive linear decoder in the dual model | **implemented, unverified** -- `model.decoder.additive` (2026-10-22): `y = W_l h_local + W_g h_global + b`, the loss on the sum; sweep `additive_decoder` (10 runs) written, **not run** | 22 tests, 41 mutations caught (with the raw skip and the probe cost), harness IDENTICAL | 2026-10-22 |
+| D3 — the rest | D3.2 (gated mixture) and D3.3 (FiLM) proposed | | |
 | D4 — penalties on the embeddings; run the existing contrastive losses | proposed | | |
 
 ## Why the two components do not separate today
@@ -117,12 +118,42 @@ Give the heads different targets, so they are not competing for one signal:
    W_o e_own`: D3.1 without a GCN, the cell's own token (before the transformer, from its visible genes) reaching the
    prediction around it. `W_o` starts at zero. It gives the own-versus-context split by construction and tests
    whether the global-only model's misses on the mirror programmes are a read-out problem. For the dual model D3.1
-   below is the same idea with the GCN's token as the cell's own part.
+   below is the same idea with the GCN's token as the cell's own part. **Read 2026-10-22** (notes.md): it closes about half
+   the gap to `ref_own` on the mirror programmes, although `W_o e_own` is linear in the same genes `ref_own` reads. The token
+   is the output of the learned input layer, so `W_o` has rank at most `n_embed`; **`own_cell_skip_input: raw` (built
+   2026-10-22)** reads the visible genes themselves (`W_o` `[n_output, n_input]`, full rank, hidden entries at the fill as in
+   every other input). If it reaches `ref_own`, the limit was the skip's width; if it lands where the token read did, it was
+   the training (`W_o` starts at zero, 100 epochs, the transformer path already carrying the own cell's token).
 
 1. **Additive linear decoder.** `ŷ = W_l h_l + W_g h_g + b`, the loss on `ŷ` (optionally small
    per-head terms). Neither part predicts the full target alone, so duplicating a signal earns
    nothing; each part keeps its own gene loadings. Unlike today's residual decoder, the global part
    is not asked to undo a constant in the blind area -- and with D1 it cannot copy.
+
+   **Built 2026-10-22 (implemented, unverified on data): `model.decoder.additive`.**
+   - *The halves.* The stacked output keeps its layout (the training plan, the metrics and every head consumer read it as before):
+     the **local half is the local decoder's output alone**, the **global half is the sum**, the prediction the model reports -- as
+     under `global_residual`, whose gradient cut it does not have. `combine_global` is the one place that sums, in training and in
+     `get_model_output`. Not with `global_residual`; needs the dual decoder at node level.
+   - *The loss.* `optim.loss_weights` weigh the halves: `{local: 0, global: 1}` is the loss on the sum only (neither part is asked to
+     predict the target alone), `{0.1, 0.9}` a small term for the local part alone (the "optional per-head term"). The default 0.5 / 0.5
+     would also train the local part to predict the whole target alone, so the validator refuses it under the `joint` schedule. A
+     staged schedule sets its own weights per phase: `local_then_global` trains the local part alone first and then the global part on
+     the sum with the local component frozen -- a stagewise additive model.
+   - *The readouts.* `StepOutput.parts["global"] = {"local", "global"}` (the sum's own tensors, not detached: the influence readouts differentiate the
+     head `global_part`), so `attribution_shares` takes the sum apart per
+     programme and depth; the evaluation adds the head `global_part` (the global decoder alone) next to `local` and `global`, so
+     the head tables score what each part reads alone. Each decoder keeps its bias (their sum is the one bias).
+   - *What it does not do.* The global component's tokens are built from the local ones, so the sum is a reparametrisation the
+     optimiser may use unevenly -- a part that repeats the other earns nothing but is not punished. The shares measure it; D1 (a
+     context-only global embedding) is what removes the possibility.
+   - *Sweep `additive_decoder`* (slurm folder; programme masking on synth_spot; `joint_fourier`'s model): `joint_fourier` (the plain dual
+     decoder) and `add_fourier` (loss on the sum) at 3 seeds, `add_fourier_l01` (weights 0.1 / 0.9), `add_fourier_l2g` (staged), and the
+     pooled pair `add_fourier_pool500` / `joint_fourier_pool500` (a cell's prediction is its patch's global output plus its own local
+     output: the un-pooling of roadmap.md T1b) at one seed. **Read:** the attribution shares per programme (short-range on the local
+     part, long-range on the global part?), the sum's programme scores against `ref_own+context`, the oracle and the plain model's
+     global head (first the short-range programmes and M11, then that the rings do not drop), `local` and `global_part` alone, and the
+     senders' ranks.
 2. **Gated mixture with a competitive loss** (Jacobs et al. 1991). Each head predicts `ŷ_k`; a gate
    `g_k(cell)` from depth and the embeddings weighs them; the loss is
    `-log Σ_k g_k exp(-L_k / τ)`. Unlike a cooperative mixture (loss on `Σ g_k ŷ_k`, which rewards

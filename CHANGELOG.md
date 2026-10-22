@@ -12,6 +12,19 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- `model.decoder.additive` (dual decoder, default off): one prediction from the two heads' decoders, `y = W_l h_local + W_g h_global
+  + b`, the loss on the sum (decoder_plan.md, D3.1). The stacked output keeps its halves -- the local half is the local decoder alone,
+  the global half the sum -- and no gradient is cut (unlike `global_residual`, which it excludes). It needs chosen
+  `optim.loss_weights` (`{local: 0, global: 1}` for the loss on the sum only): the default mean also trains the local part to predict
+  the whole target alone. `StepOutput.parts` hands the two outputs over for `attribution_shares`; `collect_head_predictions` adds the
+  head `global_part` (the global decoder alone); `DualDecoderCombinedModule.global_is_sum`. Checkpoint tag `add`.
+- `model.decoder.own_cell_skip_input: raw` (default `embedding`): the own-cell skip reads the cell's visible genes instead of its token,
+  `W_o` is `[n_output, n_input]` -- a full-rank linear read where the token's has rank at most `n_embed`. `GlobalModule.own_cell_input`.
+  Checkpoint tag `dec-<type>-skipraw`.
+- `masked_probing.probe_labels` and `probe_covariates` take `max_train_rows` (fit each probe on one seeded random subset of the
+  training rows, the same for every feature set and target; the test rows are all scored) and `joint_embeddings=False` (leave out
+  `local+global` and the sets built on it); `feature_sets(..., joint_embeddings=)`. Defaults fit everything, as before.
+
 - `pe.distance.kind: scales` (`ScaledDistanceBias`): a distance prior with a length scale per head -- the window
   `-strength * phi(d / l_h)`, gaussian or exponential, the scales spaced geometrically over `[scale_min_um, scale_max_um]`, so some
   heads attend locally and some globally from step 0. A prior, so not zero at step 0. Scales and strength are learned unless `frozen`.
