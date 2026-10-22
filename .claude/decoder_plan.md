@@ -14,7 +14,7 @@ the same commit as the work.
 |---|---|---|---|
 | D0 — yardsticks: redundancy and attribution readouts | **implemented, unverified on data** -- `representations.redundancy_table`, `masked_probing.attribution_shares`, `StepOutput.parts` (roadmap.md, T2); not run on checkpoints | 15 tests, 25 mutations (with the oracle), harness IDENTICAL | 2026-10-21 |
 | D1.0 — re-masking before the transformer (hidden cells only) | **implemented, unverified** -- `remask: hidden` (roadmap.md, T2, task 3); sweep `remask_test` written, not run | 16 tests, 8 mutations, harness IDENTICAL | 2026-10-21 |
-| D1 — a context-only global embedding | proposed | | |
+| D1 — a context-only global embedding | **D1.2 implemented, unverified** -- `model.global_component.parameters.context_only: query` (2026-10-22): the transformer's queries from one learned token plus the node encoding, reading the cells' input tokens; sweep `context_query` (13 runs + 2 twins) written, **not run**. D1.1 not built (below) | 36 tests, 38 mutations, harness IDENTICAL | 2026-10-22 |
 | D2.2 — regime-assigned losses | **implemented, unverified** -- `optim.regime_loss` (roadmap.md, T2); sweep `regime_loss` written, not run | 34 tests, mutation-checked, harness IDENTICAL | 2026-10-21 |
 | D2 — different targets per head | D2.1 and D2.3 proposed | | |
 | D3.0 — own-cell skip in a global-only model | **run and read 2026-10-22** (`global_decoders`, 3 seeds; notes.md): the mirror programmes rise (MC4 0.27 → 0.49, MC2 0.41 → 0.56, MC6 0.47 → 0.60), about half the gap to `ref_own`; nothing else drops. The full-rank read `own_cell_skip_input: raw` (2026-10-22) tests whether the other half is the skip's width: arms `lin_fourier_skipraw` (3 seeds), `lin_fourier_pool500_skipraw`, **not run** | 21 + 12 tests, mutation-checked, harness IDENTICAL | 2026-10-22 |
@@ -84,6 +84,40 @@ the cell itself. Two ways, from the cheaper:
 
 Either way the global head cannot copy the local one: its input carries no trace of the cell's own
 token.
+
+**Built 2026-10-22 (implemented, unverified on data): D1.2, `model.global_component.parameters.context_only: query`.**
+   D1.1 (decode from the transformer's output minus the cell's input token) was not built: it does not remove the cell. The layer's
+   feed-forward block can re-encode the token it is given (256 ReLU units hold a 64-dimensional `x` as `relu(x) - relu(-x)`), and the
+   attention query is the cell's own token, so subtracting the residual path leaves two ways for the cell to reach its embedding.
+   The query stream has none.
+   - *The stream.* Each cell, and CLS, starts as `norm_input(context_token + node encoding)`: one learned token and the position half of
+     the token the cell would have had, laid out like the tokens. (`GlobalInput.queries`, an attribute of the input and not a field of the
+     tuple, which is unpacked by position in the module and some thirty tests; zeros without a node encoding, in which case the position enters through
+     the attention biases and RoPE alone.) In every layer it reads the cells' **input** tokens (after `norm_input`, CLS included) through that
+     layer's own weights, `read_context`: `q + attention(norm1(q), norm1(memory))`, then `q + feed_forward(norm2(q))`; the output is the
+     encoder's final norm of the stream. The memory is the same at every layer and nothing of the stream is written into it, so there is no
+     second-order path from a cell back to itself through another cell's updated token either (XLNet's query stream would have one). The
+     cost is the encoder's: one cross-attention per layer in place of one self-attention. No second pass (the open question below).
+   - *The mask* is the tokens' own: the diagonal, the long-range mask (behind a GCN none of the cells its neighbourhood mixed the cell
+     into are keys), `visible_keys_only`, padding, the attention biases and RoPE, unchanged.
+   - *What is exact* (tests): a cell's global embedding does not move, bit for bit, with its own expression, at one to three layers,
+     with a node encoding, an attention bias or RoPE, for a pooled patch, and behind a GCN with the long-range mask (without the mask it
+     does: the neighbours' GCN tokens hold the cell). The plain transformer's moves by 0.2. One exception: `attention.center_qk` centres
+     queries and keys on the mean over all cells' tokens, the cell's own included at weight 1 / S; the dependence falls with S (tested), and
+     the arm `add_ctx_fourier_nocenter` has none.
+   - *What it asks of the rest.* The global embedding alone says nothing about the cell, so something else has to: the own-cell skip of a
+     global-only model, the local part of the additive dual model. Two linear parts add; they do not gate, so a response that is the
+     *product* of the cell's own receptor and the distance to a source (the sparse programmes) is out of reach of the pair, and is what D3.2
+     (a gate) or D3.3 (FiLM) are for.
+   - *Not defined:* attention rollout and relevance (they compose attention over layers as token mixing, and here every layer reads the same
+     tokens; the readouts refuse the model, the single-layer attention maps and the gradient readouts work), other attention backends
+     (self-attention only), graph-level prediction. The attention maps a context-only model returns are the read-out's: a cell queries, the
+     other cells are keys.
+   - *Sweep `context_query`* (slurm folder; programme masking on synth_spot): global-only `ctx_fourier`, `ctx_fourier_skip` (3 seeds),
+     `ctx_fourier_skipraw`; dual `add_fourier` (3 seeds, the arm to beat), `add_ctx_fourier` (3 seeds, the main bet: D1.2 + D3.1),
+     `add_ctx_fourier_nocenter`, `ctx_joint_fourier` (D1 alone). **Read:** `ctx_fourier` against `lin_fourier` (the long-range and ring
+     programmes should hold, the mirror, short-range and sparse ones fall); the skip arms against `lin_fourier_skip` (what the skip brings
+     back, what gating loses); the attribution shares of `add_ctx_fourier` against `add_fourier` per programme; the planted senders' rank.
 
 0. **Re-masking, for hidden cells only (built 2026-10-21, `model.global_component.parameters.remask: hidden`).**
    The cheapest step towards 2: a cell hidden whole enters the transformer as one learned token instead of its
@@ -192,7 +226,8 @@ then legnini.
 
 ## Open questions
 
-- D1.2 needs a second query stream through the transformer (cost ~1 extra pass with the keys and
-  values cached): acceptable, or start with the one-layer-exact D1.1?
+- ~~D1.2 needs a second query stream through the transformer (cost ~1 extra pass with the keys and
+  values cached): acceptable, or start with the one-layer-exact D1.1?~~ Answered 2026-10-22: the stream
+  replaces the encoder and reads the input tokens, so there is no second pass; and D1.1 is not exact at one layer.
 - D2.1's `σ_g`: fixed per dataset, or several heads at several scales (a multi-scale decomposition)?
 - Should the combined prediction or each component be what the downstream attribution analyses read?

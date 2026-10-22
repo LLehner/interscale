@@ -257,6 +257,31 @@ The label and distance probes of a disc evaluation are the slowest step (one log
 `probe_labels` / `probe_covariates` take `max_train_rows` and `joint_embeddings`, the sweeps set them through `PROBE_*` in
 `sweep_common.py` (not under version control). The defaults fit everything.
 
+### The context query (`.claude/decoder_plan.md`, D1)
+
+`model.global_component.parameters.context_only: query` (default `none`) makes a cell's global embedding a function of the *other* cells'
+tokens and its position. The transformer is then not run as an encoder: every cell (and CLS) is a **query stream** starting as
+`norm_input(context_token + node encoding)`, which in each layer reads the cells' *input* tokens (`norm_input` of the tokens, CLS appended;
+the same memory at every layer, never updated) through that layer's own weights (`CustomTransformerEncoderLayer.read_context`, built on
+`_attend(x, memory, ...)`, which is the self-attention block with `memory is x`), and the output is the encoder's final norm
+(`TransformerNodeEncoderHook._read_context`). Invariants:
+
+- **A cell is blind to itself.** Its embedding does not move, bit for bit, with its own expression (tested at 1-3 layers, with node encodings,
+  biases, RoPE, pooled patches, and behind a GCN under the long-range mask, which blocks the neighbours' tokens that hold the cell). Keep
+  the memory the layer-0 tokens and keep the stream out of it: reading the stream's own state, or the updated tokens of other cells, would open
+  a path back to the cell. `attention.center_qk` is the one exception (the mean it centres on holds the cell at weight 1 / S).
+- **The queries ride on the input.** `GlobalInput.queries` is an *attribute* of the returned tuple (a subclass), not a sixth field: `common_step_local_to_global`'s
+  five fields are unpacked by position in many places. It is the very node encoding added to the tokens of this pass (the encodings draw their
+  random signs and rotations once), taken through the selection `pad_batch` made (`pad_like`), zeros without an encoding. `forward` needs it
+  exactly when the option is on (`GlobalModule._query_kwargs` passes it); a caller that unpacks the five fields and calls `forward` itself must
+  pass `queries=`.
+- **Zero-initialised encodings.** Every node-encoding projection and attention-bias table starts at zero, so a test of anything positional must
+  set them to nonzero values first (the context-query tests do), or it checks nothing.
+- **Torch's dense attention only** (the vendored one takes separate queries, keys and values; the backends are self-attention only). The
+  readouts that compose attention as token mixing (`attention_check`, the rollout flow, relevance) refuse a context-only model; the
+  single-layer attention maps (`attention_diagnostics`) and the gradient readouts work. The returned attention maps are the read-out's.
+- The learned token is built from a private generator: the option draws nothing from the global one.
+
 ### Preprocessing / robustness utilities (`interscale.pp`)
 
 `pp.segmentation_noise.apply_segmentation_noise` simulates cell-segmentation errors (used when `cfg.dataset.segmentation_robustness` is set in `main.py`/`main_sweep.py`) for robustness sweeps.

@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- `model.global_component.parameters.context_only: query` (default `none`): a cell's global embedding from the *other* cells' tokens and its
+  position alone. The transformer's queries are one learned token plus the cell's node encoding, never the cell's own token, and read the cells'
+  input tokens in every layer through that layer's weights (`CustomTransformerEncoderLayer.read_context`; `GlobalInput.queries`;
+  `TransformerNodeEncoderHook._read_context`). Bit for bit the embedding does not move with the cell's own expression (with `attention.center_qk`
+  it enters at weight 1 / S). Torch's dense attention and node-level prediction only; the rollout, relevance and layer-hook readouts refuse it.
+  Checkpoint tag `ctx-query`.
 - `model.decoder.additive` (dual decoder, default off): one prediction from the two heads' decoders, `y = W_l h_local + W_g h_global
   + b`, the loss on the sum (decoder_plan.md, D3.1). The stacked output keeps its halves -- the local half is the local decoder alone,
   the global half the sum -- and no gradient is cut (unlike `global_residual`, which it excludes). It needs chosen

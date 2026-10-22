@@ -481,3 +481,30 @@ result was read; the entry above was the first one written live.*
   while the real region gains over the smoother are 0.01-0.02. The smoother and smoother+embedding are cut to the same rows, so the
   gain rows are paired, but their noise from the subsample was not measured. Probe numbers from capped runs are not comparable to the
   uncapped ones of the first disc sweeps.
+
+## 2026-10-22 — The context query (D1) on toy data: is a cell blind to itself, and can the read-out still learn from the context (no model run on synth_spot; stirred parameters, 16-100 cells, 2 layers, 4 heads, width 16)
+
+**What worked**
+- A cell's global embedding does not move, bit for bit, with its own expression: at one to three layers, with a node encoding, an attention bias or RoPE,
+  for a pooled patch, and behind a 2-hop GCN with the long-range mask (without the mask it moves: the neighbours' GCN tokens hold the cell). The plain
+  transformer's moves by 0.19-0.26 on the same perturbation. Through the instrument of the sender ranks (integrated gradients from a baseline cell) the
+  receiver contributes exactly 0 to its own predicted response under the query stream and a nonzero amount under the plain transformer.
+- The read-out equals its definition written out with plain tensor operations (to 1e-5, also centred); the attention of a cell has weight 0 on every blocked
+  pair and on padding, rows sum to 1, the CLS key stays open; the queries follow the kept cells of a subsampled slide.
+- A toy where the other cells determine the target (the mean of gene 0 over the others) is learned by the query stream, held-out correlation 0.53 and 0.74
+  at two seeds after 300 steps (the plain transformer: 0.73 and 0.55); a target that copies the cell's own gene 0 is learned by the plain transformer
+  (0.995, 0.993) and not by the query stream (-0.07, 0.03). So the stream has no way to the cell and keeps the way to the context.
+- With `attention.center_qk` a cell enters its embedding through the mean it is centred on, and the dependence falls faster than 1 / S: 1.1e-3, 6.5e-4, 2.8e-4,
+  9e-5 at 16, 36, 64 and 100 cells, against 0.19-0.26 for the plain transformer and 6e-3 to 2e-2 for the effect of the same perturbation on the other cells.
+
+**What doesn't work**
+- At the default initialisation every node-encoding projection and attention-bias table is zero and the layer norms are identities, so the first versions of the
+  tests ran with the encoding and the bias off: six mutations survived (the encoding dropped from the queries, the memory left un-normalised, norm2 for norm1,
+  the encodings not following the kept cells) until every parameter was moved by seeded noise (`tests-stir-the-init` in memory). Two tests that built their
+  own module were still unstirred and showed it in a second run.
+- A stirred start (noise 0.1 on every parameter) learned the "mean of the others" toy at -0.09 in 300 steps, from the default start 0.53: random bias tables
+  concentrate the attention at the start, and the stream has to undo them. A trainability check must start from the default; it is also a small warning about
+  the read-out's first steps.
+- Exact blindness holds with `center_qk` off only, and the sweeps' default has it on (`add_ctx_fourier_nocenter` is the arm without).
+- Nothing here says what the global part learns on synth_spot. The expectation that two linear parts (context plus the cell) cannot gate, so the sparse
+  programmes that multiply the cell's receptor and a distance fall, is an expectation: the sweep `context_query` is its test.
