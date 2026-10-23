@@ -19,14 +19,14 @@ The terms used below:
 
 ## Status
 
-Last updated 2026-10-22.
+Last updated 2026-10-23.
 
 | track | question | state | verified by | date |
 |---|---|---|---|---|
 | T0 | infrastructure: seeds, per-arm evaluation, inputs, CosMx | **implemented, unverified** (2026-10-19; CosMx deferred by the user) — seed axis, run selection for job arrays, per-run section files, timing, cached references, `Precomputed` under programme masking, `pca_fit: train`; every mutation caught (two survivors led to a stronger test and a simplification), harness IDENTICAL; the sweep script checked on a stub synth_spot with untrained models. **Not run on data** | 2026-10-19 |
 | T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; legnini programme masking built 2026-10-20 (`legnini_programme`, decided gene set in legnini_plan.md; not run); sender ranks unreadable (gradient magnitude) → replaced 2026-10-20 by an integrated-gradients attribution, sparse programmes also scored within their receivers, per-programme wins/ties/losses in the report (**built, not yet run: the 19 checkpoints await `MODE = "evaluate"`**). Details in global_plan.md. **Oracle bar built 2026-10-21** (`ref_oracle`, below): a ridge on the true drivers reaches 0.983 over the programmes on synth_spot, against 0.685 for `ref_own+context`, checked without any model. **Model-side options built 2026-10-21** (implemented, unverified on data): a distance prior with a length scale per head (`pe.distance.kind: scales`) and visible keys only (`attention.visible_keys_only`); 31 tests, 20 mutations caught, harness IDENTICAL. No arms yet: they are devised once the pending runs are read | `response_masking` run (11 arms, 19 runs, 3 twins) | 2026-10-20 |
 | T1b | coarse-grained tokens: pool cells into patches or niches before the global model | **grid pooling implemented, unverified** (2026-10-19) — `pooling.kind: grid` (`size_um` or `n_patches`), `count`/`std` features, 39 tests, an end-to-end run for GlobalModel and CombinedModel, every mutation caught (one survivor led to a stronger test), harness IDENTICAL; 5 pooled arms in `response_masking`. The `niche` assignment waits for the user's details; patch-level attention readouts not built. **Not run on data**. **2026-10-21: the decoder arms for the global-only model built** (own-cell skip `model.decoder.own_cell_skip`, `nonlinear` and `linear-lse` as sweep arms, the skip also on pooled tokens), implemented, unverified; sweep `global_decoders` (10 runs) **run and read 2026-10-22** (notes.md): pooled tokens with the skip match the per-cell model's programme mean (0.582 against 0.577, one seed) at about 1/25 of the tokens and 0.14 against 0.77 GiB; without the skip pooling loses the sparse programmes (0.00-0.03); the nonlinear and LSE decoders are worse. **2026-10-22: the full-rank skip `own_cell_skip_input: raw` built**, arms `lin_fourier_pool500_skipraw` and `lin_fourier_skipraw` added to the sweep, **not run** | 2026-10-22 |
-| T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed; **re-masking before the transformer implemented, unverified** (2026-10-21, task 3 below) -- `remask: hidden`: a wholly hidden cell enters the transformer as one learned token instead of its GCN token; 16 tests, 8 mutations caught, harness IDENTICAL; sweep `remask_test` (8 runs) **run and read 2026-10-22** (notes.md): the mechanism works (with the long-range mask a rim cell's global head draws 94% of its influence from beyond 300 µm, was 7%; CKA local~global at the rim 0.89 → 0.78), at a cost of 0.02-0.05 at every depth with the mask on and none without it (where the copying moves into attention); no head beats the smoother. **D2.2, each head's loss on the hidden cells of its regime, implemented, unverified** (2026-10-21) -- `optim.regime_loss`, near / deep by the distance to the nearest visible cell; 55 tests with the own-cell skip (34 regime loss, 21 skip and decoders), 32 mutations all caught (two only after two more tests), harness IDENTICAL; sweep `regime_loss` (9 runs) **run and read 2026-10-22**: the heads specialise as assigned (the local head near the rim 0.443 → 0.483, the global head loses the rim 0.428 → 0.385 and holds deep) but no head beats the smoother in its own regime, and discs of 1000 µm make the global head worse everywhere (0.40 → 0.34). **D0, the yardsticks, implemented, unverified on data** (2026-10-21): ridge redundancy of the two embeddings per depth group, attribution shares of a head's parts (`StepOutput.parts`), 15 tests. **D3.1, the additive decoder of the dual model, implemented, unverified** (2026-10-22): `model.decoder.additive`, `y = W_l h_local + W_g h_global + b` with the loss on the sum, the parts for `attribution_shares`; 22 tests, 41 mutations caught (with the raw skip and the probe cost), harness IDENTICAL; sweep `additive_decoder` (10 runs) written, **not run**. **Cheaper disc evaluation** (2026-10-22): `max_train_rows` and `joint_embeddings` for the label and distance probes, `PROBE_*` in `sweep_common.py`; the new numbers are not comparable to the first disc sweeps'. **D1.2, the context-only global embedding, implemented, unverified** (2026-10-22): `model.global_component.parameters.context_only: query` -- the transformer's queries from one learned token plus the node encoding, reading the cells' input tokens, so a cell's global embedding does not hold the cell (bit for bit; 1 / S with `center_qk`); 36 tests, 38 mutations, harness IDENTICAL; sweep `context_query` (13 runs + 2 twins) written, **not run**. Moran's I split (task 1) and embedding dimensions vs genes (task 2) proposed | tests, harness | 2026-10-22 |
+| T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed; **re-masking before the transformer implemented, unverified** (2026-10-21, task 3 below) -- `remask: hidden`: a wholly hidden cell enters the transformer as one learned token instead of its GCN token; 16 tests, 8 mutations caught, harness IDENTICAL; sweep `remask_test` (8 runs) **run and read 2026-10-22** (notes.md): the mechanism works (with the long-range mask a rim cell's global head draws 94% of its influence from beyond 300 µm, was 7%; CKA local~global at the rim 0.89 → 0.78), at a cost of 0.02-0.05 at every depth with the mask on and none without it (where the copying moves into attention); no head beats the smoother. **D2.2, each head's loss on the hidden cells of its regime, implemented, unverified** (2026-10-21) -- `optim.regime_loss`, near / deep by the distance to the nearest visible cell; 55 tests with the own-cell skip (34 regime loss, 21 skip and decoders), 32 mutations all caught (two only after two more tests), harness IDENTICAL; sweep `regime_loss` (9 runs) **run and read 2026-10-22**: the heads specialise as assigned (the local head near the rim 0.443 → 0.483, the global head loses the rim 0.428 → 0.385 and holds deep) but no head beats the smoother in its own regime, and discs of 1000 µm make the global head worse everywhere (0.40 → 0.34). **D0, the yardsticks, implemented, unverified on data** (2026-10-21): ridge redundancy of the two embeddings per depth group, attribution shares of a head's parts (`StepOutput.parts`), 15 tests. **D3.1, the additive decoder of the dual model, implemented, unverified** (2026-10-22): `model.decoder.additive`, `y = W_l h_local + W_g h_global + b` with the loss on the sum, the parts for `attribution_shares`; 22 tests, 41 mutations caught (with the raw skip and the probe cost), harness IDENTICAL; sweep `additive_decoder` (10 runs) written, **not run**. **Cheaper disc evaluation** (2026-10-22): `max_train_rows` and `joint_embeddings` for the label and distance probes, `PROBE_*` in `sweep_common.py`; the new numbers are not comparable to the first disc sweeps'. **D1.2, the context-only global embedding, implemented, unverified** (2026-10-22): `model.global_component.parameters.context_only: query` -- the transformer's queries from one learned token plus the node encoding, reading the cells' input tokens, so a cell's global embedding does not hold the cell (bit for bit; 1 / S with `center_qk`); 36 tests, 38 mutations, harness IDENTICAL; sweep `context_query` (13 runs + 2 twins) written, **not run**. **Moran's I split (task 1) implemented, unverified on a trained model** (2026-10-23): `evaluation.gene_scales` -- per gene Moran's I against the k nearest cells (shells, sampled centres, a permutation null), its length scale, and each part's share of a decomposable prediction read on cell folds; without a model on synth_spot's test slides the measured scale ranks with the planted one at 0.59 over 53 variable genes and the short-range receivers show at the second shell (notes.md); 28 tests, 35 mutations caught (two only after stronger tests), harness IDENTICAL; sweep `gene_scales` (5 runs + 1 twin, cell masking) written, **not run**. Embedding dimensions vs genes (task 2) proposed | tests, harness, synth_spot data | 2026-10-23 |
 | T3 | masking strategies | **channel masking implemented, unverified** (2026-10-22): `dataset.mask_channel_fraction` (30% first, 50% the same code), 31 tests, 36 mutations, harness IDENTICAL; sweep `channel_masking` (8 runs, evaluated on the programme set via `EVAL_MASK_GENES`) written, **not run**. The other new masks (structured, by cell type, same-type blocks) proposed | tests, harness | 2026-10-22 |
 | T4 | interpretation beyond raw attention; attention sinks | **sender attribution built, unverified on data** (2026-10-20) — `response_influence(measure="attribution")`: integrated gradients from the training-mean cell on a programme's summed response genes, completeness check, hidden entries fixed, one random state along the path; 16 + 6 tests, 31 mutations caught. Not built: the other methods of the table below, the null key and registers, the permuted-slide baseline. **Not run on data**. **2026-10-21 (task 4 below): attention checked against torch and the readouts compared; run and read 2026-10-21 on the 13 + 3 `response_masking` checkpoints (notes.md): the attention is computed correctly (zero difference to the definition and to torch), no readout finds the planted senders (ranks 0.47-0.55, twins 0.48-0.52), gradient x input is the only one above its twin (+0.04-0.05), RoPE attention ranks the mid-range sender far below chance (0.09-0.35; pair counts missing, now kept)**: the vendored attention equals torch's stock `nn.MultiheadAttention` and encoder layer (tests, every mask form); relevance fixed (heads averaged per graph, tensors on the output's device, a target can be given); `evaluation.attention_check` (`check_attention` on the real inputs, `attention_readouts`: 7 readouts against planted pairs); 40 tests; of 15 mutations 14 caught (2 after two more tests), the survivor a redundant gradient clear; sweep `attention_check` (evaluation only, on the `response_masking` checkpoints), **not run**. Label-free flow (task 5) proposed | 2026-10-21 |
 | T5 | how cell-type driven attention is | proposed | | |
@@ -76,7 +76,7 @@ Asked for on 2026-10-21, sorted into the tracks below (details there):
 
 | # | task | track | state | when |
 |---|---|---|---|---|
-| 1 | **Moran's I split:** how a gene's Moran's I changes as the neighbourhood grows; a fast decay marks local variability (a likely local interaction), a slow one global variability; group the genes so, and check whether the local or the global component picks each group up | T2 (a label-free yardstick for the scale assignment, real data included), feeds T10 D | proposed | build W1 Thu, run with the remask and decoder sweeps |
+| 1 | **Moran's I split:** how a gene's Moran's I changes as the neighbourhood grows; a fast decay marks local variability (a likely local interaction), a slow one global variability; group the genes so, and check whether the local or the global component picks each group up | T2 (a label-free yardstick for the scale assignment, real data included), feeds T10 D | **built 2026-10-23** (T2 section; `evaluation.gene_scales`): k-shells from sampled centres, pooled over slides, decomposable models only, plots A/B, Spearman of ℓ_g vs global share; the data side checked on synth_spot without a model | sweep `gene_scales` (cell masking, every gene a target) written, not run |
 | 2 | **Embedding dimensions and genes:** the most important dimensions of each learned embedding, the genes correlating with each, and whether a gene's expression and the dimension's value agree across cells and in space, especially for genes of interest | T2 (read-out of the separated components), T9 (the manuscript's gene programmes) | proposed | build W1 Fri |
 | 3 | **Re-masking before the transformer:** the dual model masks cells once, before the GCN; a hidden cell then hands the transformer its GCN token, built from its visible neighbours. Re-mask it before the transformer too | T2 (K2) | **built 2026-10-21**, sweep `remask_test` not run | run W1 Thu, read W1 Fri |
 | 4 | **Is attention computed correctly:** the module that takes the gradient into account (relevance), torch's attention against the custom one, averaging against gradient-based readouts | T4 (K10) | **built 2026-10-21**, sweep `attention_check` not run | run W1 Thu, read W2 Mon |
@@ -548,24 +548,73 @@ from beyond the GCN's reach only. Visible cells keep their tokens; the local hea
 - *Caveat:* all hidden cells now share one key and value too, the sink of K5 (programme masking avoids it;
   T1's visible-keys-only option would remove it).
 
-**Moran's I split (task 1).** Per gene, Moran's I over growing neighbourhoods (k-nearest neighbours at k = 4 ...
-256, or radii in µm -- a config list, per slide, averaged over the training slides), on the expression itself
-(no model). Its decay is the gene's length scale: ℓ_g, the neighbourhood size at which I falls to half its
-smallest-neighbourhood value, and the AUC over log size (the manuscript's Figs. 3C, 4I). Fast decay = local
-variability (a likely local interaction), slow or none = global (tissue-scale) variability. Genes are grouped by
-ℓ_g (thresholds or quantiles from the config, so dataset-agnostic), then each group is scored by component on the
-masked pass: per gene the local and the global head's centred cosine on its hidden entries (`score_heads`'
-per-gene table), and the share of its decoder variance on each embedding. Expected: local-scale genes go to the
-local head, global-scale genes to the global head.
-- *Sanity check first, on synth_spot:* the short-range receivers must come out local, the long-range responses
-  and region genes global, the noise genes with I ≈ 0 at every size.
-- *Two cautions.* For a smooth field I falls with the neighbourhood anyway; the class is the decay *scale*, not
-  its sign. A rising I means short-range anti-correlation (neighbours that exclude each other, e.g. alternating
-  senders and receivers), not more global variation, and is reported apart. A cell-type marker is spatially
-  variable through composition, so with labels the profile is also computed within each type (as T10 D).
-- *Where:* a function in `evaluation` (squidpy's `spatial_autocorr` per graph, or a sparse weights matrix per
-  neighbourhood), a `gene_scales` table and a per-group head table in the report; synth_spot first, then legnini
-  (pixel coordinates, `PIXEL_TO_UM`).
+**Moran's I split (task 1).** An evaluation (not a training signal): does a model with a decomposable prediction put
+the genes that vary on a local scale on its local part and the ones that vary on a tissue scale on its global part?
+Moran's I is spatial autocorrelation, not interaction; it is the axis of interest we can measure without labels.
+*Design agreed 2026-10-23:*
+- *The curve.* Per gene, Moran's I against the number of neighbours k (a config list, e.g. 4-256), the median neighbour
+  distance in µm on a second axis (legnini through `PIXEL_TO_UM`). **Sampled centres** (revised 2026-10-23; every cell as a
+  centre is infeasible at large k on CosMx): ~2,000 random cells per slide (config), the same for every gene and k; I is the
+  mean of their local I's, an estimate of the global I at fixed cost (centres x k x genes). Two forms: **shells** (neighbours
+  ranked k/2+1 ... k; the main read: a local gene drops to ~0 beyond its scale, a global one stays up) and **cumulative**
+  (neighbours 1 ... k, the manuscript's Figs. 3C, 4I). Neighbours within a slide only (slides share no coordinates); each
+  gene z-scored within its slide; the sums **pooled over the slides into one curve per gene** (no per-slide output). Floor:
+  a permutation band (positions shuffled). ℓ_g is the k at which the shell I falls to half its first value.
+- *What is decomposed.* Only a prediction that is a sum of parts: the additive decoder (`local` = W_l h_l, `global` =
+  W_g h_g; with the context query the cleanest), the residual decoder as a baseline. The global-only own-cell skip is
+  cell-vs-context, not local-vs-global: left out. A pooled global part is constant within a patch, so its curve is high
+  below the patch size by construction: marked on the plot.
+- *Every gene is ranked* -- but only from a model whose training trained every gene's decoder rows. The loss counts hidden
+  entries only, so under programme masking the rows `W_l[g]`, `W_g[g]` of a gene outside the programme get no gradient and
+  keep their initial values: its split is noise. `additive_decoder` and `context_query` (programme masking) can rank the
+  programme genes only. For the panel: an additive arm trained with **cell masking** (every gene hidden, from the
+  neighbourhood alone: the local part is the neighbourhood, the global part beyond it -- the axis; channel masking would let
+  the local part use the cell's own correlated genes), e.g. `add_ctx_fourier` under `node` masking.
+- *The parts* are computed after training on the input corrupted as in training (`collect_head_predictions`,
+  `HeadPredictions.parts`): the outputs were trained only at hidden cells, and on a fully visible input every output sits
+  where it never got a loss (and the local part can copy the visible gene, K11).
+- *Plot A.* One thin curve per gene of the **true** expression (shells; x log k, y I), coloured by the model's
+  assignment: the gene's global share of the prediction's variance (`attribution_shares` per gene) above 0.5 = global
+  colour; a bold median per colour. Separated model: global-coloured curves stay up, local-coloured ones drop.
+- *Plot B.* For chosen genes: the curves of the true expression, the local part and the global part, with each part's
+  variance share beside it (z-scoring hides a part's size); synthetic data with predicted and true maps next to them.
+- *Summary number.* Spearman of ℓ_g against the global share over the genes; on synth_spot also the confusion against the
+  design (short-range receivers local; long-range responses and region genes global; noise genes flat).
+- *Cautions.* With labels, the curve also on the expression minus its label mean (a marker is variable through
+  composition). A curve that rises again is short-range anti-correlation (alternating senders and receivers), reported
+  apart, not called global. synth_spot's slide-level programmes (cg_1-3) are ~0 within a slide.
+- *Not now:* for the plain dual model (both heads predict every gene) the colour would be "which head scores better on the
+  masked pass" (`score_heads` per gene); kept as a note, the dual model is not the one to read. Moran's I as a loss or
+  as a target split (D2.1) would make the evaluation circular; ℓ_g's distribution may set knobs (GCN reach, T1b's patch
+  size).
+- *Where:* `evaluation` (a `gene_scales` function, the two plots, a report section); synth_spot first, then legnini.
+
+**Built 2026-10-23 (implemented; the data side checked on synth_spot without a model; unverified on a trained model).**
+`evaluation.gene_scales` (CLAUDE.md, "Gene scales"). What changed from the design while building it:
+- *The estimator.* With sampled centres Moran's I is the ratio `sum z_c * mean z_nb / sum z_c^2` over the centres, not over the slide's variance:
+  on a smooth field read from 300 of 900 cells it was at most 0.035 off (20 draws) against up to 0.15 (it read I = 1.11). With every cell a
+  centre both are the textbook statistic (tested to 1e-12). Products in float32 (2e-7 from float64, half the time).
+- *The scale and the pattern read the peak, not the first shell.* On the lattice synth_spot's receivers sit diagonally to their senders: about 0
+  in the 4 nearest spots, 0.42-0.47 in the next 4. `ell_k` is where the shell curve halves after its peak; `variable` = the highest shell above the
+  null (Bonferroni over the shells), `anti` = the first shell below it. Each gene's null SD is floored at the median over genes (10 shuffles made
+  4 of 170 noise genes look structured; 2 remain).
+- *Defaults.* k = 4 ... 512 (1.44 mm on the 100 µm lattice; 1,024 doubled the cost and only moved genes from "beyond" to a number), 2,000 centres
+  per slide, 10 shuffles: 22 s for the data side of synth_spot's 8 test slides, about 2 s per further map.
+- *The model side.* `collect_fold_parts` hides the cells of each test slide fold by fold (`n_folds = round(1 / mask_percentage)`) and keeps every
+  cell's prediction from the fold that hid it, taken apart (`StepOutput.parts`); `part_shares` per gene; `gene_cosine` per gene beside the kernel
+  references, so a share is read only for a gene the model predicts.
+- *Outputs.* `scale_tables`: `gene_scales` (per gene, the largest global share first), `gene_scales_summary` (`rho_ell_share`, `global_majority`;
+  with planted scales `rho_ell_planted`, `rho_share_planted`), `gene_scales_by_design`; in the report's summary across arms. Figures: Plot A
+  (`plot_scale_curves`), Plot B (`plot_part_curves`), the maps (`plot_part_maps`).
+- *What the data says* (notes.md, 2026-10-23): the measured scale ranks with the planted one at 0.59 over 53 variable genes; rings read at their
+  width and compact sources at twice their radius, so the axis is the scale of variation, not the range of an interaction; the senders have no
+  scale, the sparse responses hardly any autocorrelation.
+- *Sweep `gene_scales`* (slurm folder; `genescales.sbatch`): cell masking (`ALLOW_CELL_MASKING`, a new `sweep_common` setting, off by default),
+  additive decoder, long-range mask; `add_ctx_fourier` (30% hidden, 3 seeds), `add_ctx_fourier_m50` (50%), `add_fourier` (no context query), a twin
+  of `add_ctx_fourier`; only the gene-scale evaluation (`STANDARD_EVALUATION = False`). **Read:** `rho_ell_share` against the twin and
+  `add_fourier`; by design class; Plot A and B. Expect the local part to carry most genes (the visible neighbours predict any smooth gene) and the
+  global share to rise with the scale rather than pass 0.5.
+- *Not built:* the curve within cell types (labels; for CosMx and legnini clusters), the radius form (`k` only), the dual-model fallback (kept as a note).
 
 **Embedding dimensions and genes (task 2).** For each learned embedding (local, global; also the pooled patch
 token), the most important dimensions -- `calculate_dim_importance` (standardised decoder loadings, on the

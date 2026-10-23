@@ -318,6 +318,27 @@ target=...)` traces a given target instead; `evaluation.attention_check` checks 
 stock modules on real inputs (`check_attention`) and compares seven readouts of it against planted pairs
 (`attention_readouts`); a masked pass hooks its maps inside `TransformerNodeEncoderHook.hooking_attention()`.
 
+#### Gene scales (`evaluation/gene_scales.py`)
+
+Which genes vary on a local and which on a tissue scale, and which part of a decomposable prediction carries each
+(`.claude/roadmap.md`, task 1). Per gene, Moran's I against the `k` nearest other cells of the same slide (shells `k_prev+1..k`
+and cumulative), its length scale (`ell_k`, `ell_um`: where the shell curve halves after its peak) against a permutation null;
+the model side is each part's share of a gene's prediction (`part_shares`). Invariants:
+
+- **The statistic.** Each gene is z-scored within its slide, neighbours never cross a slide, the sums are pooled over slides.
+  With sampled centres it is a ratio estimator (`sum z_c * mean z_nb / sum z_c^2` over the centres), which with every cell a
+  centre is the textbook statistic (tested to 1e-12); dividing by the slide variance instead is noisier (up to 0.15 off on a smooth
+  field). Every draw (centres, shuffles, folds) uses a private numpy generator.
+- **Only a decomposable prediction is split** (`StepOutput.parts`: the additive decoder, the residual decoder); `collect_fold_parts`
+  refuses a head without parts. The plain dual decoder's two heads both predict every gene and are not read here.
+- **The parts are read where the model was trained to predict.** `collect_fold_parts` hides the cells of each slide fold by fold
+  (`cell_folds`, `n_folds = round(1 / mask_percentage)`) and keeps each cell's row from the fold that hid it, then puts every graph's
+  own `mask` / `gene_mask` back. On a fully visible pass every output sits where it never got a loss.
+- **Every gene must have been a training target** for its share to mean anything: under programme masking the decoder rows of a gene
+  outside the programme get no gradient. The sweep `gene_scales` trains with cell masking (`ALLOW_CELL_MASKING` in `sweep_common.py`).
+- `pattern` is `anti` when the first shell is below the null, `variable` when the highest shell is above it (Bonferroni over the
+  shells); each gene's null SD is floored at the median over genes (10 shuffles underestimate some).
+
 #### Online probes (`evaluation/online_probes.py`)
 
 `linear_probing.py` probes a finished run's `.h5ad`. `online_probes.py` probes *during* training,

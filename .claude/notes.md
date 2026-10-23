@@ -508,3 +508,38 @@ result was read; the entry above was the first one written live.*
 - Exact blindness holds with `center_qk` off only, and the sweeps' default has it on (`add_ctx_fourier_nocenter` is the arm without).
 - Nothing here says what the global part learns on synth_spot. The expectation that two linear parts (context plus the cell) cannot gate, so the sparse
   programmes that multiply the cell's receptor and a distance fall, is an expectation: the sweep `context_query` is its test.
+
+## 2026-10-23 — Moran's I against the neighbourhood size: does the instrument read synth_spot's planted scales (model-free, the 8 test slides; toy models for the fold passes)
+
+`evaluation.gene_scales` (roadmap.md, task 1), on `layers['log1p_norm']` of `/home/lehnerl/Arbeit/data/synth_spot.h5ad`'s test split (19,877 spots,
+253 genes): shells of k = 4 ... 512 neighbours (100 µm ... 1.44 mm), 2,000 centres per slide, a 10-shuffle null. Figures and the per-gene table in
+`/home/lehnerl/Arbeit/data/synth_spot_gene_scales/` (`design_scales.png`: every gene's curve coloured by its design class).
+
+**What worked**
+- With every cell a centre the estimate is the textbook Moran's I (row-standardised k-NN weights) to 1e-12, per shell and cumulative; float32 sums agree
+  with float64 to 2e-7. Sampled centres: the ratio sum z_c * mean z_neighbours / sum z_c^2 over the centres was at most 0.035 off on a smooth field read
+  from 300 of 900 lattice cells (20 draws); dividing by the slide's variance instead was up to 0.15 off (median 0.05) and read I = 1.11.
+- The measured scale (where the shell curve halves after its peak) follows the planted one where the planted one is a scale of variation: SP9 265 µm
+  (planted 200), SP10 310 (180), SP8 363 (250), SP7 452 (300), SP6 761 (350), SP5 765 (500), SP3 813 (600), SP2 996 (700), SP4 1,033 (1,000), SP1 beyond
+  1.44 mm (900). Region markers stay up beyond 1.44 mm. Spearman with the planted scale 0.59 over the 53 variable genes that have one.
+- The short-range receivers R1-R4 are found from the second shell: about 0.01 in the 4 nearest spots, 0.42-0.47 in the next 4 (their senders sit
+  diagonally), halving at k = 12.5, 190 µm: local scale. The first version read the first shell only and called three of them "none".
+- 168 of the 170 noise genes sit inside the null; batch and condition genes (slide-level) are flat within a slide.
+- Cost on the 8 test slides: 0.9 s for the neighbours, 2 s per map, 19 s for the 10-shuffle null, 22 s for the data side (145 s at first: k up to 1,024,
+  float64, 20 shuffles).
+- A constructed check (rough fields on a "local part", smooth fields on a "global part"): Spearman of the scale with the global share 0.76, each part's
+  curve and map as constructed. Through a real stirred additive dual model on toy slides, the fold passes give every cell one row, the parts add up to
+  the prediction, a cell's own values never reach its row while a visible neighbour's do.
+
+**What doesn't work**
+- The planted scale is a generative parameter, not the scale of variation. Rings read at their width: MC7 726 µm, MC8 539, MC9 524 for radii of 1-3 mm;
+  compact sources at about twice their radius (M12-M21 465-475 µm for 200). So the axis is how far a gene's variation reaches, not how far an interaction
+  reaches: a long-range signal can make a locally varying gene.
+- The senders S1-S4 (random spots) have no autocorrelation and no scale: Moran's I sees a one-spot interaction on the receiver side only.
+- The sparse responses exist at receivers only: Moran's I 0.003-0.11, 6 of 10 "variable" at small effect sizes with short measured scales against
+  planted 1-3 mm. They pull the planted Spearman down (0.72 over 48 genes before the receivers and these were read at their peak).
+- Per-gene null SDs from 10 shuffles made 4 noise genes look structured (3 "anti", 1 "variable"); flooring each gene's SD at the median over genes and
+  correcting the peak test for the 8 shells leaves 2 (NB40 anti at z = -3.6, POI5 variable at I = 0.017).
+- Nothing here says what a trained model does. Under cell masking at 30% a hidden spot's neighbours are mostly visible, so the local part can read any
+  smooth gene whatever its scale; a gene that varies only within the GCN's reach can only be the local part's. Expect the global share to rise with the
+  scale (the Spearman) rather than pass 0.5. The sweep `gene_scales` is the test.
