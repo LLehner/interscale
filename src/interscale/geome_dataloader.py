@@ -18,6 +18,7 @@ from interscale.tl.masking import (
     MASK_STRATEGIES,
     resolve_mask_genes,
     sample_block_mask,
+    sample_channel_mask,
     sample_gene_mask,
     sample_gene_set_mask,
     sample_node_mask,
@@ -39,14 +40,20 @@ def block_mask_kwargs(cfg) -> dict:
 
 
 def gene_set_mask_kwargs(cfg, adata) -> dict:
-    """The gene-set argument of :class:`GraphAnnDataModule` from ``cfg.dataset.mask_genes``, resolved on ``adata.var``.
+    """The gene-set arguments of :class:`GraphAnnDataModule`: ``mask_genes`` resolved on ``adata.var``, or the channel fraction.
 
-    ``adata.var`` is read only when a gene set is configured.
+    A fixed gene set (programme masking, ``mask_gene_columns``) and a random one (channel masking,
+    ``mask_channel_fraction = dataset.mask_channel_fraction``) are two ways to name the hidden genes and the config
+    allows one. ``adata.var`` is read only when a fixed gene set is configured.
     """
+    kwargs = {}
     selectors = list(cfg.dataset.get("mask_genes", []) or [])
-    if not selectors:
-        return {}
-    return {"mask_gene_columns": resolve_mask_genes(selectors, adata.var)}
+    if selectors:
+        kwargs["mask_gene_columns"] = resolve_mask_genes(selectors, adata.var)
+    channels = float(cfg.dataset.get("mask_channel_fraction", 0.0))
+    if channels:
+        kwargs["mask_channel_fraction"] = channels
+    return kwargs
 
 
 class GraphAnnDataModule(pl.LightningDataModule):
@@ -63,6 +70,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
         mask_block_radius: float = 0.0,
         mask_block_fraction: float = 0.0,
         mask_gene_columns: Sequence[int] | None = None,
+        mask_channel_fraction: float = 0.0,
     ):
         """Manages loading and sampling schemes before loading to GPU.
 
@@ -93,6 +101,11 @@ class GraphAnnDataModule(pl.LightningDataModule):
             gene columns in the selected cells (`dataset.mask_genes`, resolved by
             `gene_set_mask_kwargs`) instead of random entries: a cell is selected with probability
             `mask_percentage` -- per cell, not per entry -- or by a disc. Defaults to None.
+        mask_channel_fraction (float, optional): Under `mask_strategy="gene"`, hide a random share of the genes
+            (`tl.masking.sample_channel_mask`: `round(fraction * G)` of them, the same set in every selected cell)
+            and draw it again with every redraw of a graph's mask -- every epoch for the training graphs, once
+            at setup for validation and test (`dataset.mask_channel_fraction`). Cells are selected as for
+            `mask_gene_columns`, which it excludes. 0 draws nothing. Defaults to 0.0.
 
         Raises
         ------
@@ -128,6 +141,16 @@ class GraphAnnDataModule(pl.LightningDataModule):
         self.mask_gene_columns = (
             list(mask_gene_columns) if mask_gene_columns is not None and len(mask_gene_columns) else None
         )
+        if mask_channel_fraction:
+            if not 0 < mask_channel_fraction < 1:
+                raise ValueError(
+                    f"mask_channel_fraction is a share of the genes in (0, 1), got {mask_channel_fraction}."
+                )
+            if mask_strategy != "gene":
+                raise ValueError("mask_channel_fraction hides a random gene set, which needs mask_strategy 'gene'.")
+            if self.mask_gene_columns is not None:
+                raise ValueError("mask_channel_fraction and mask_gene_columns both name the hidden gene set; give one.")
+        self.mask_channel_fraction = float(mask_channel_fraction)
         self.first_time = True
 
     def _nodewise_setup(self, stage: str | None) -> None:
@@ -213,8 +236,21 @@ class GraphAnnDataModule(pl.LightningDataModule):
 
         With spatial blocks the cells in the discs are added to either: masked cells under "node",
         whole masked rows under "gene".
+
+        With `mask_channel_fraction` (under "gene") the hidden genes are a random set, the same in every selected
+        cell and drawn anew by every call: the gene-set branch below with fresh columns.
         """
-        if self.mask_strategy == "gene" and self.mask_gene_columns is not None:
+        if self.mask_strategy == "gene" and self.mask_channel_fraction:
+            gene_mask = sample_channel_mask(
+                data.num_nodes,
+                data.x.shape[1],
+                self.mask_channel_fraction,
+                self.mask_percentage,
+                self._sample_blocks(data),
+            )
+            data.gene_mask = gene_mask
+            data.mask = gene_mask.any(dim=1)
+        elif self.mask_strategy == "gene" and self.mask_gene_columns is not None:
             # A gene set: those genes in the selected cells, and nothing else -- discs select cells
             # for it rather than hiding whole rows.
             gene_mask = sample_gene_set_mask(

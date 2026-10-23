@@ -26,6 +26,19 @@ Two granularities are available, selected by ``mask_strategy``:
     senders, sources, receptors, position -- which is what a model of cell-cell communication
     should be able to do and a smoother of the programme itself cannot.
 
+``"gene"`` with ``dataset.mask_channel_fraction`` -- channel masking
+    The label-free form of programme masking. A fraction of the *genes* (the "channels": one gene across all
+    cells, as a marker in multiplexed imaging) is drawn at random -- ``round(fraction * G)`` of them, the same
+    set for every selected cell of a graph -- and hidden, and drawn again each time the graph's mask is
+    redrawn (every epoch, for the training graphs). It needs no knowledge of which genes respond to what: a
+    hidden gene is shown by no neighbour either, so it can be predicted from the cell's other genes and
+    from what drives it elsewhere in the tissue, never read off the surroundings as under ``"gene"``
+    entries. Because the set changes at each draw, the shortcut the per-entry draw below is built to avoid
+    ("these G_masked genes are always missing") cannot form. A random set rarely hides a whole programme
+    together, so a hidden response can often be predicted from its visible co-responders in the same cell,
+    which needs no communication: read it against ``ref_own``, and try a large fraction. Cells are selected
+    as for a gene set (``mask_percentage``, 1.0: every cell; discs select cells too).
+
 Spatial blocks (``dataset.mask_block_fraction`` > 0) -- on top of either strategy
     Whole cells in discs of ``dataset.mask_block_radius_um`` (:func:`sample_block_mask`) are
     hidden as well: under ``"node"`` they join the masked cells, under ``"gene"`` every entry of
@@ -80,6 +93,17 @@ def block_masking_on(cfg) -> bool:
     autoencoder.
     """
     return float(cfg.dataset.get("mask_block_fraction", 0.0)) > 0
+
+
+def hides_gene_set(cfg) -> bool:
+    """Whether ``cfg`` hides a gene set rather than random entries or whole cells.
+
+    A programme (``dataset.mask_genes``: a fixed set) or channels (``dataset.mask_channel_fraction`` > 0: a random
+    set, redrawn). Either hides the set in the cells it selects and nothing else, so no cell is hidden whole, which
+    is what re-masking, the regime loss and visible-keys-only attention are about.
+    """
+    named = bool(list(cfg.dataset.get("mask_genes", []) or []))
+    return named or float(cfg.dataset.get("mask_channel_fraction", 0.0)) > 0
 
 
 def sample_node_mask(num_nodes: int, pct: float, generator: torch.Generator | None = None) -> torch.Tensor:
@@ -204,6 +228,48 @@ def sample_gene_set_mask(
     genes = torch.zeros(num_genes, dtype=torch.bool)
     genes[torch.as_tensor(list(columns), dtype=torch.long)] = True
     return cells[:, None] & genes[None, :]
+
+
+def sample_channel_columns(num_genes: int, fraction: float, generator: torch.Generator | None = None) -> list[int]:
+    """A random set of channels (gene columns) to hide: ``round(fraction * num_genes)`` of them, sorted.
+
+    The count is exact, not a per-gene Bernoulli draw, so a draw is never empty and never everything: at least one
+    gene is hidden and at least one stays visible, whatever the fraction. Every gene is equally likely to be in
+    the set, so over many draws each is hidden a ``fraction`` of the time.
+
+    Parameters
+    ----------
+    num_genes
+        Number of genes (columns of ``data.x``); at least 2.
+    fraction
+        Share of the genes to hide, in (0, 1).
+    generator
+        Optional RNG, for reproducible draws.
+    """
+    if num_genes < 2:
+        raise ValueError(f"channel masking hides some genes and keeps some visible; {num_genes} genes cannot be split.")
+    if not 0 < fraction < 1:
+        raise ValueError(f"the share of genes to hide must be in (0, 1), got {fraction}.")
+    count = min(max(1, round(fraction * num_genes)), num_genes - 1)
+    return sorted(torch.randperm(num_genes, generator=generator)[:count].tolist())
+
+
+def sample_channel_mask(
+    num_nodes: int,
+    num_genes: int,
+    fraction: float,
+    cell_rate: float,
+    blocks: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Hide a random gene set in a selection of cells: ``[num_nodes, num_genes]`` boolean.
+
+    One set of :func:`sample_channel_columns` per call, the same for every selected cell (so no neighbour shows a
+    hidden gene), then selected cells as in :func:`sample_gene_set_mask`: with probability ``cell_rate`` (1.0: every
+    cell) or when ``blocks`` marks them.
+    """
+    columns = sample_channel_columns(num_genes, fraction, generator)
+    return sample_gene_set_mask(num_nodes, num_genes, columns, cell_rate, blocks, generator)
 
 
 def sample_block_mask(

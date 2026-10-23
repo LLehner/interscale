@@ -57,6 +57,14 @@ def get_dataset_cfg(cfg):
     # cells and nothing else. mask_percentage is then the share of cells (1.0: every cell), and
     # discs, if on, select cells for it too. Empty: random entries, as before.
     cfg.dataset.mask_genes = []
+    # Channel masking (mask_strategy "gene" only): the label-free form of programme masking. A random share of
+    # the genes -- round(fraction * G), the same set in every selected cell -- is hidden, and drawn again each time
+    # the graphs' masks are redrawn (every epoch for the training graphs; validation and test graphs keep the set
+    # drawn at setup). 0.3 hides 30% of the genes, 0.5 half. mask_percentage is then the share of cells (1.0: every
+    # cell, and the sensible value: a lower one lets the other cells show the hidden genes, which the config warns
+    # about), as for mask_genes, and discs select cells too. Not together with mask_genes; a Precomputed embedding
+    # (made from all the genes) cannot be used. 0 (the default): off, and no random number is drawn.
+    cfg.dataset.mask_channel_fraction = 0.0
 
     # Optional per-cell annotations attached to every PyG Data object when set. All default to
     # None, which attaches nothing and leaves the graphs byte-identical to before.

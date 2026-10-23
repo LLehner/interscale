@@ -125,7 +125,7 @@ def _validate_masking(cfg):
         If ``mask_strategy`` is unknown, or ``mask_percentage`` is not a rate in (0, 1] for a
         regression task.
     """
-    from interscale.tl.masking import MASK_STRATEGIES
+    from interscale.tl.masking import MASK_STRATEGIES, hides_gene_set
 
     if cfg.dataset.mask_strategy not in MASK_STRATEGIES:
         raise ValueError(f"dataset.mask_strategy must be one of {MASK_STRATEGIES}, got {cfg.dataset.mask_strategy!r}.")
@@ -136,13 +136,41 @@ def _validate_masking(cfg):
             f"dataset.mask_genes {gene_set} hides a gene set, which needs mask_strategy 'gene' "
             f"(got {cfg.dataset.mask_strategy!r})."
         )
+    channels = float(cfg.dataset.get("mask_channel_fraction", 0.0))
+    if channels:
+        where = f"dataset.mask_channel_fraction {channels:g}"
+        if not 0 < channels < 1:
+            raise ValueError(
+                f"dataset.mask_channel_fraction is the share of genes to hide, in (0, 1), or 0 for off; got {channels:g}."
+            )
+        if cfg.dataset.mask_strategy != "gene":
+            raise ValueError(
+                f"{where} hides a random gene set, which needs mask_strategy 'gene' (got {cfg.dataset.mask_strategy!r})."
+            )
+        if gene_set:
+            raise ValueError(
+                f"{where} and dataset.mask_genes {gene_set} both name the hidden gene set (a random one, a fixed one): "
+                "give one."
+            )
+        if cfg.dataset.mask_percentage < 1:
+            import warnings
+
+            warnings.warn(
+                f"{where} with dataset.mask_percentage {cfg.dataset.mask_percentage:g}: only that share of the cells "
+                "hides the channels; the others show every gene, so a neighbour can give away a hidden one. "
+                "mask_percentage 1.0 hides them in every cell.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     if "regression" not in cfg.dataset.prediction_task:
         return
 
     # Spatial blocks under "node", or selecting the cells of a gene set, are targets of their own,
     # so the Bernoulli cells may be off.
-    blocks_alone = cfg.dataset.get("mask_block_fraction", 0.0) > 0 and (cfg.dataset.mask_strategy == "node" or gene_set)
+    blocks_alone = cfg.dataset.get("mask_block_fraction", 0.0) > 0 and (
+        cfg.dataset.mask_strategy == "node" or hides_gene_set(cfg)
+    )
     if blocks_alone and cfg.dataset.mask_percentage == 0:
         return
     if not 0 < cfg.dataset.mask_percentage <= 1:
@@ -178,8 +206,9 @@ def _validate_block_mask(cfg):
         )
     if not cfg.dataset.spatial_unit_um > 0:
         raise ValueError(f"dataset.spatial_unit_um must be > 0, got {cfg.dataset.spatial_unit_um}.")
-    gene_set = list(cfg.dataset.get("mask_genes", []) or [])
-    if cfg.dataset.mask_strategy == "gene" and cfg.dataset.mask_percentage == 0 and not gene_set:
+    from interscale.tl.masking import hides_gene_set
+
+    if cfg.dataset.mask_strategy == "gene" and cfg.dataset.mask_percentage == 0 and not hides_gene_set(cfg):
         raise ValueError(
             "Under mask_strategy gene every cell keeps at least one masked entry, so mask_percentage 0 would "
             "still mask one entry per cell. For the discs alone use mask_strategy node."
@@ -416,8 +445,12 @@ def _validate_visible_keys_only(cfg, params, kind, spec):
     pooling = params.get("pooling", None)
     if pooling is not None and pooling.get("kind", "none") != "none":
         raise ValueError(f"{where}: a pooled patch already leaves its hidden cells out, and its keys are patches.")
-    if list(cfg.dataset.get("mask_genes", []) or []):
-        raise ValueError(f"{where} blocks cells hidden whole, but a hidden gene set (dataset.mask_genes) hides none.")
+    from interscale.tl.masking import hides_gene_set
+
+    if hides_gene_set(cfg):
+        raise ValueError(
+            f"{where} blocks cells hidden whole, but a hidden gene set (dataset.mask_genes, or channel masking) hides none."
+        )
     blocks = cfg.dataset.get("mask_block_fraction", 0.0) > 0
     if cfg.dataset.mask_strategy == "gene" and not blocks:
         raise ValueError(f"{where}: under mask_strategy gene only spatial blocks hide whole cells; use node or blocks.")
@@ -542,10 +575,12 @@ def _validate_remask(cfg):
     if remask == "none":
         return
     where = f"model.global_component.parameters.remask {remask!r}"
-    if list(cfg.dataset.get("mask_genes", []) or []):
+    from interscale.tl.masking import hides_gene_set
+
+    if hides_gene_set(cfg):
         raise ValueError(
-            f"{where} replaces the tokens of cells hidden whole, but a hidden gene set (dataset.mask_genes) hides "
-            "no cell whole: it would change nothing."
+            f"{where} replaces the tokens of cells hidden whole, but a hidden gene set (dataset.mask_genes, or "
+            "channel masking) hides no cell whole: it would change nothing."
         )
     blocks = cfg.dataset.get("mask_block_fraction", 0.0) > 0
     if cfg.dataset.mask_strategy == "gene" and not blocks:
@@ -615,10 +650,12 @@ def _validate_regime_loss(cfg):
         raise ValueError(f"{where} splits the hidden cells of a reconstruction: regression at prediction_level node.")
     if cfg.optim.loss in NO_LOSS or cfg.optim.loss == "SCE_EntropyATT_Loss":
         raise ValueError(f"{where} needs each head's own loss, which optim.loss {cfg.optim.loss!r} does not give.")
-    if list(cfg.dataset.get("mask_genes", []) or []):
+    from interscale.tl.masking import hides_gene_set
+
+    if hides_gene_set(cfg):
         raise ValueError(
-            f"{where} sorts cells hidden whole by their depth, but a hidden gene set (dataset.mask_genes) hides "
-            "no cell whole: every cell would be near."
+            f"{where} sorts cells hidden whole by their depth, but a hidden gene set (dataset.mask_genes, or "
+            "channel masking) hides no cell whole: every cell would be near."
         )
     blocks = cfg.dataset.get("mask_block_fraction", 0.0) > 0
     if cfg.dataset.mask_strategy == "gene" and not blocks:
@@ -721,7 +758,8 @@ def _validate_precomputed_embedding(cfg):
             "type_gex_embedding Precomputed cannot be combined with mask_strategy gene: a cell's embedding "
             "encodes all of its expression, so single hidden genes would still reach the model through it. "
             "Use mask_strategy node (or spatial blocks), or hide a gene set (dataset.mask_genes) with an "
-            "embedding computed from the other genes (interscale.tl.record_embedding_genes)."
+            "embedding computed from the other genes (interscale.tl.record_embedding_genes). Channel masking "
+            "(dataset.mask_channel_fraction) hides every gene at some step, so no embedding is free of them."
         )
 
 

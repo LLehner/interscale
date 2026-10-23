@@ -195,7 +195,8 @@ def _training_tag(cfg) -> str:
     2026-10-14: checkpoints trained with the mask on before then carry no tag. ``sch-<schedule>``,
     ``lw<local>-<global>`` and ``frz-<components>``: a staged schedule, loss weights other than
     the default 0.5 / 0.5, and frozen components (``train._schedule``). ``gs<cell rate>-<selectors>``:
-    a hidden gene set (``dataset.mask_genes``). ``rmk-<kind>``: re-masking before the transformer
+    a hidden gene set (``dataset.mask_genes``). ``ch<fraction>c<cell rate>``: channel masking, a random share of the
+    genes (``dataset.mask_channel_fraction``) in that share of the cells. ``rmk-<kind>``: re-masking before the transformer
     (``model.global_component.parameters.remask``). ``ctx-<kind>``: a context-only global embedding
     (``model.global_component.parameters.context_only``). ``rgm<depth um>-<local>-<global>``: each head's loss on
     the hidden cells of its regime (``optim.regime_loss``).
@@ -235,6 +236,9 @@ def _training_tag(cfg) -> str:
         # Letters, digits and dashes only: "role=response" -> "role-response".
         names = "-".join(re.sub(r"[^A-Za-z0-9]+", "-", str(s)).strip("-") for s in gene_set)
         parts.append(f"gs{float(cfg.dataset.mask_percentage):g}-{names}")
+    channels = float(cfg.dataset.get("mask_channel_fraction", 0.0))
+    if channels:
+        parts.append(f"ch{channels:g}c{float(cfg.dataset.mask_percentage):g}")
     return f"var-{'+'.join(parts)}_" if parts else ""
 
 
