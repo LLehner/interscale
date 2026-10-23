@@ -40,6 +40,16 @@ from interscale.train.context_nce import (
     to_token_edges,
     valid_contexts,
 )
+from interscale.train.orthogonality import (
+    canonical_overlap,
+    centre_by_group,
+    cross_cosine,
+    decorrelation,
+    gene_correlation,
+    kernel_cka,
+    linear_cka,
+    loading_orthogonality,
+)
 from interscale.train.ring_nce import extra_negatives, pooled_ring_and_core, ring_membership, similarity_gap
 from interscale.train.vicreg import covariance_term, invariance_term, variance_term
 
@@ -883,3 +893,364 @@ class RingNCE(AuxLoss):
             "_ring_nce_gap": torch.cat(gaps).mean().detach() if gaps else projected.sum().detach() * 0.0,
             "_ring_nce_kept": torch.cat(kept).mean().detach(),
         }
+
+
+# ------------------------------------------------------------------------------- orthogonality (decoder_plan.md, D4)
+
+
+def _is_dual(module) -> bool:
+    from interscale.module.combined_module import DualDecoderCombinedModule
+
+    return isinstance(module, DualDecoderCombinedModule)
+
+
+def _is_global(module) -> bool:
+    from interscale.module.base import GlobalModule
+
+    return isinstance(module, GlobalModule)
+
+
+def _linear_loading(decoder, name: str) -> torch.Tensor:
+    """The ``[genes, dims]`` weight of a linear decoder; a nonlinear one has no loadings to compare."""
+    from interscale.nn import LinearDecoder
+
+    if isinstance(decoder, LinearDecoder):
+        return decoder.decoder.weight
+    raise ValueError(f"{name} reads gene loadings, which only a linear decoder has (model.decoder.type: linear).")
+
+
+def part_loadings(module, name: str = "the term") -> dict[str, torch.Tensor]:
+    """The ``[genes, dims]`` loadings through which each part of a decomposable head reaches the prediction.
+
+    The additive or residual dual decoder: ``local`` and ``global``; a global-only model with the own-cell skip:
+    ``context`` and ``own_cell``.
+    """
+    if _is_dual(module):
+        if not module.global_is_sum:
+            raise ValueError(
+                f"{name} reads the two parts of one prediction; the dual decoder's heads each predict the whole "
+                "target. Set model.decoder.additive (or global_residual)."
+            )
+        return {
+            "local": _linear_loading(module.local_module.decoder, name),
+            "global": _linear_loading(module.global_module.decoder, name),
+        }
+    if _is_global(module) and module.own_cell_skip:
+        return {"context": _linear_loading(module.decoder, name), "own_cell": module.own_skip_weight}
+    raise ValueError(
+        f"{name} reads the two parts of a decomposable prediction: the additive or residual dual decoder, or a "
+        "global-only model with model.decoder.own_cell_skip."
+    )
+
+
+def global_loading(module, name: str = "the term") -> torch.Tensor:
+    """The ``[genes, dims]`` loadings of the decoder that reads the global part."""
+    if _is_dual(module):
+        return _linear_loading(module.global_module.decoder, name)
+    if _is_global(module):
+        return _linear_loading(module.decoder, name)
+    raise ValueError(f"{name} reads the global part's decoder; this model has none of its own.")
+
+
+class OrthogonalityTerm(AuxLoss):
+    """Base of the ``orth_*`` terms: orthogonality between the parts of a prediction, or within the global part.
+
+    decoder_plan.md, D4; the functions are in :mod:`interscale.train.orthogonality`. Each term reports one value in
+    [0, 1] under its name. The rows are the cells whose predictions the loss reads (any entry in ``entry_mask``), each
+    graph centred on its own; the pairwise terms read at most ``optim.orthogonality.subsample`` of them, drawn from a
+    private generator seeded with ``optim.seed``, so the global generators are never touched.
+
+    A term that reads decoder weights reads them off the module that holds it. The module is kept in a tuple, which
+    ``nn.Module`` does not register: it is neither a child of its own term (the terms live on the module, and a
+    registered back-reference would make the state dict recurse) nor in the state dict, and a deep copy of the module
+    points the copy's term at the copy. A term whose model lacks what it reads refuses at construction.
+    """
+
+    requires_views = 1
+    #: The name it is registered, weighted and reported under.
+    name = ""
+    #: Whether the term reads embeddings or predictions of cells (all but the loading terms, which read weights).
+    reads_cells = True
+
+    def __init__(self, cfg, module=None):
+        super().__init__()
+        settings = cfg.optim.orthogonality
+        self.subsample = int(settings.subsample)
+        self.ridge = float(settings.ridge)
+        self._seed = int(cfg.optim.seed)
+        self._draws = 0
+        if self.reads_cells and self.dropout(cfg) > 0:
+            # Measured on a toy dual model (decoder_plan.md, D4): with dropout 0.1 the training value of orth_cka fell
+            # to 0.02 while the validation value stayed at 0.999 -- dropout noise is independent between the two parts,
+            # so the model meets the term with noise that evaluation removes. Without dropout it fell to 0.10 in
+            # validation.
+            raise ValueError(
+                f"{self.name} reads cells, and with dropout ({self.dropout(cfg):g}) on their path training meets it "
+                "with noise that evaluation removes. Set model.local_component.parameters.dropout_local and "
+                "model.global_component.parameters.dropout_global to 0 (and the same in the arms it is compared with)."
+            )
+        self._owner = (module,) if module is not None else ()
+        if module is not None:
+            self.check(module)
+
+    @staticmethod
+    def dropout(cfg) -> float:
+        """The largest dropout rate on the path from the input to what the term reads: the encoder's."""
+        return _encoder_dropout(cfg)
+
+    def check(self, module) -> None:
+        """Raise when ``module`` lacks what the term reads."""
+
+    @property
+    def owner(self):
+        if not self._owner:
+            raise ValueError(f"{self.name} reads the model's decoders: build it with build_aux_losses(cfg, module).")
+        return self._owner[0]
+
+    def value(self, out: StepOutput, batch) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward(self, out: StepOutput, batch) -> dict[str, torch.Tensor]:
+        return {self.name: self.value(out, batch)}
+
+    # ------------------------------------------------------------------ rows
+
+    def _layout(self, out: StepOutput, batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """``(padded_node_idx, [N] rows the loss reads, [N] graph of each row or None)``, in token order."""
+        idx = out.view.padded_node_idx
+        if idx is None:
+            raise ValueError(f"{self.name} is per cell, and a graph-level prediction gathers no cells.")
+        if out.entry_mask is None:
+            rows = torch.ones(len(idx), dtype=torch.bool, device=idx.device)
+        else:
+            rows = out.entry_mask[: len(idx)].bool().any(dim=1)
+        graph = getattr(batch, "batch", None) if batch is not None else None
+        return idx, rows, (graph[idx] if graph is not None else None)
+
+    def _embeddings(self, out: StepOutput, batch):
+        """The dual model's local and global embedding of the rows the loss reads, and each row's graph."""
+        idx, rows, groups = self._layout(out, batch)
+        view = out.view
+        if view.local_embedding is None or view.global_embedding is None:
+            raise ValueError(f"{self.name} reads a local and a global embedding of the same cells: a dual model.")
+        local, glob = view.local_embedding[idx][rows], view.tokens()[rows]
+        return local, glob, (groups[rows] if groups is not None else None)
+
+    def _subsample(self, *tensors):
+        """At most ``subsample`` rows, the same for each tensor, drawn from the term's own generator."""
+        n = len(tensors[0])
+        if n <= self.subsample:
+            return tensors
+        generator = torch.Generator().manual_seed(self._seed * 1_000_003 + self._draws)
+        self._draws += 1
+        pick = torch.randperm(n, generator=generator)[: self.subsample].to(tensors[0].device)
+        return tuple(None if t is None else t[pick] for t in tensors)
+
+
+def _zero(*tensors: torch.Tensor) -> torch.Tensor:
+    """A zero that keeps the graph: a step without enough rows contributes nothing, and no NaN."""
+    return sum(t.sum() for t in tensors) * 0.0
+
+
+def _require_dual(module, name: str) -> None:
+    if not _is_dual(module):
+        raise ValueError(
+            f"{name} compares the local and the global embedding of the same cells: a CombinedModel with "
+            "model.decoder.dual_decoder."
+        )
+
+
+def _require_parts(module, name: str) -> None:
+    """Raise unless ``module`` makes its global head a sum of two parts (the decoders need not be linear)."""
+    if _is_dual(module) and module.global_is_sum:
+        return
+    if _is_global(module) and module.own_cell_skip:
+        return
+    raise ValueError(
+        f"{name} reads the two parts of a decomposable prediction: the additive or residual dual decoder, or a "
+        "global-only model with model.decoder.own_cell_skip."
+    )
+
+
+@register_aux_loss("orth_cka")
+class OrthCKA(OrthogonalityTerm):
+    """Linear CKA of the dual model's local and global embeddings over cells: DSN's subspace orthogonality, normalised.
+
+    Invariant to the scale and rotation of either embedding. It weighs directions by their variance, so a large
+    direction the decoder ignores lowers it while a small one carries a copy (``orth_cca`` closes that).
+    """
+
+    name = "orth_cka"
+
+    def check(self, module) -> None:
+        _require_dual(module, self.name)
+
+    def value(self, out, batch):
+        local, glob, groups = self._embeddings(out, batch)
+        if len(local) < 3:
+            return _zero(local, glob)
+        return linear_cka(centre_by_group(local, groups), centre_by_group(glob, groups))
+
+
+@register_aux_loss("orth_cca")
+class OrthCCA(OrthogonalityTerm):
+    """Mean squared canonical correlation of the dual model's local and global embeddings over cells.
+
+    Invariant to any invertible linear map of either embedding -- what a linear decoder can undo -- so a copy cannot
+    hide in a small direction, down to ``optim.orthogonality.ridge``.
+    """
+
+    name = "orth_cca"
+
+    def check(self, module) -> None:
+        _require_dual(module, self.name)
+
+    def value(self, out, batch):
+        local, glob, groups = self._embeddings(out, batch)
+        if len(local) < 3:
+            return _zero(local, glob)
+        return canonical_overlap(centre_by_group(local, groups), centre_by_group(glob, groups), self.ridge)
+
+
+@register_aux_loss("orth_kernel_cka")
+class OrthKernelCKA(OrthogonalityTerm):
+    """RBF kernel CKA (normalised HSIC) of the dual model's local and global embeddings, on a subsample of the cells.
+
+    Sees nonlinear dependence, which the linear terms do not: a global embedding that is a nonlinear function of the
+    local one has a linear CKA near 0 and a kernel CKA near 1.
+    """
+
+    name = "orth_kernel_cka"
+
+    def check(self, module) -> None:
+        _require_dual(module, self.name)
+
+    def value(self, out, batch):
+        local, glob, groups = self._subsample(*self._embeddings(out, batch))
+        if len(local) < 3:
+            return _zero(local, glob)
+        return kernel_cka(centre_by_group(local, groups), centre_by_group(glob, groups))
+
+
+@register_aux_loss("orth_opl")
+class OrthOPL(OrthogonalityTerm):
+    """OPL's term with the two parts as the classes: the mean ``|cos|`` of every pair of a local and a global vector.
+
+    Raw vectors on a subsample of the cells, as the paper reads them. A control rather than a separator: with two
+    decoders, rotating one part into the orthogonal complement of the other meets it without removing any information.
+    """
+
+    name = "orth_opl"
+
+    def check(self, module) -> None:
+        _require_dual(module, self.name)
+
+    def value(self, out, batch):
+        local, glob, _ = self._subsample(*self._embeddings(out, batch))
+        if len(local) < 1:
+            return _zero(local, glob)
+        return cross_cosine(local, glob)
+
+
+@register_aux_loss("orth_gene_corr")
+class OrthGeneCorr(OrthogonalityTerm):
+    """Per gene, the squared correlation over cells of the two parts of a decomposable prediction, averaged over genes.
+
+    The additive or residual dual decoder (``local``, ``global``) or a global-only model's own-cell skip (``context``,
+    ``own_cell``), on each gene's entries in the loss. At 0 every gene's prediction is an orthogonal sum, so the
+    attribution shares have no cross term. Under the residual decoder the local part is detached: only the global part
+    moves. Under cell masking a hidden cell's own token is the fill, so the own-cell part is constant on the loss's
+    cells and the term is 0: it needs gene masking there.
+    """
+
+    name = "orth_gene_corr"
+
+    @staticmethod
+    def dropout(cfg) -> float:
+        """The encoder's dropout, and a nonlinear decoder's: the parts are the decoders' outputs."""
+        decoder = cfg.model.get("decoder", None)
+        rate = float(decoder.get("dropout_decoder", 0.0) or 0.0) if decoder is not None else 0.0
+        nonlinear = decoder is not None and decoder.get("type", "linear") == "nonlinear"
+        return max(_encoder_dropout(cfg), rate if nonlinear else 0.0)
+
+    def check(self, module) -> None:
+        _require_parts(module, self.name)
+
+    def value(self, out, batch):
+        idx, _, groups = self._layout(out, batch)
+        parts = (out.parts or {}).get("global")
+        if not parts or len(parts) != 2:
+            raise ValueError(
+                f"{self.name} reads the two parts of the global head; this step reported {sorted(parts or {})}."
+            )
+        a, b = parts.values()
+        mask = out.entry_mask[: len(idx)] if out.entry_mask is not None else None
+        return gene_correlation(a, b, mask, groups)
+
+
+@register_aux_loss("orth_loadings")
+class OrthLoadings(OrthogonalityTerm):
+    """The overlap of the two parts' gene-space loadings: the mean squared cosine of their principal angles.
+
+    0 when the two parts' outputs lie in orthogonal gene subspaces -- orthogonal gene programmes. Invariant to any
+    invertible linear map of either part's latent space. Two subspaces of the genes can only be orthogonal when their
+    dimensions add up to at most the number of genes, so a full-rank part (the raw own-cell skip) is refused.
+    """
+
+    name = "orth_loadings"
+    reads_cells = False
+
+    def check(self, module) -> None:
+        loadings = part_loadings(module, self.name)
+        (_, a), (_, b) = loadings.items()
+        n_genes = a.shape[0]
+        if a.shape[1] + b.shape[1] > n_genes:
+            raise ValueError(
+                f"{self.name}: the two parts read {a.shape[1]} and {b.shape[1]} dimensions into {n_genes} genes, so "
+                "their gene subspaces cannot be orthogonal (a full-rank part, such as own_cell_skip_input: raw, spans "
+                "every programme)."
+            )
+
+    def value(self, out, batch):
+        a, b = part_loadings(self.owner, self.name).values()
+        return canonical_overlap(a, b, self.ridge)
+
+
+@register_aux_loss("orth_decorrelation")
+class OrthDecorrelation(OrthogonalityTerm):
+    """Mean squared correlation between distinct dimensions of the global embedding over cells (each standardised).
+
+    Within one embedding, so a global-only model has it too: readable dimensions (roadmap.md, task 2), not separation.
+    The normalised form of VICReg's covariance term.
+    """
+
+    name = "orth_decorrelation"
+
+    def check(self, module) -> None:
+        if not (_is_dual(module) or _is_global(module)):
+            raise ValueError(f"{self.name} reads the global embedding: a GlobalModel or a dual CombinedModel.")
+
+    def value(self, out, batch):
+        _, rows, groups = self._layout(out, batch)
+        tokens = out.view.tokens()[rows]
+        if len(tokens) < 3:
+            return _zero(tokens)
+        return decorrelation(tokens, groups[rows] if groups is not None else None)
+
+
+@register_aux_loss("orth_loading_ortho")
+class OrthLoadingOrtho(OrthogonalityTerm):
+    """Mean squared cosine between distinct loading vectors of the global part's decoder.
+
+    Each latent dimension then loads its own gene programme: the soft orthogonality of the decoder, columns normalised.
+    Within one decoder, so a global-only model has it too.
+    """
+
+    name = "orth_loading_ortho"
+    reads_cells = False
+
+    def check(self, module) -> None:
+        global_loading(module, self.name)
+
+    def value(self, out, batch):
+        return loading_orthogonality(global_loading(self.owner, self.name))

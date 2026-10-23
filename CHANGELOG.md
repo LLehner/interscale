@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Orthogonality terms (`train.orthogonality`; decoder_plan.md, D4): eight scale-free auxiliary losses in [0, 1], each its own
+  weight `optim.aux_loss_weights.orth_<name>` (default 0: never built). Between the dual model's local and global embedding
+  over cells: linear CKA (`orth_cka`), mean squared canonical correlation (`orth_cca`), RBF kernel CKA (`orth_kernel_cka`),
+  OPL's cross-class term as a control (`orth_opl`). Between the two parts of a decomposable prediction (additive or residual
+  dual decoder, global-only own-cell skip): per-gene correlation of their predictions (`orth_gene_corr`), principal angles
+  between their gene-space loadings (`orth_loadings`). Within the global part: dimension decorrelation
+  (`orth_decorrelation`), loading orthogonality (`orth_loading_ortho`). Settings `optim.orthogonality.subsample` and `ridge`.
+  A term that reads cells refuses dropout on their path. Checkpoint names now carry every non-zero auxiliary weight
+  (`aux-<name><weight>`).
 - `evaluation.gene_scales` (roadmap.md, task 1): which genes vary on a local and which on a tissue scale, and which part of a
   decomposable prediction carries each. Per gene, Moran's I against the `k` nearest cells of the same slide (sampled centres, a ratio
   estimator that is the textbook statistic with every cell a centre; shells and cumulative; slides z-scored apart and pooled) beside a

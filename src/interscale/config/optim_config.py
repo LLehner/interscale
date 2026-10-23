@@ -103,6 +103,28 @@ def get_optim_cfg(cfg):
     # neighbourhood (what the GNN aggregates). The M = 1 - A mask restated as an objective.
     # One forward pass. See `optim.contrastive.ring_*`.
     cfg.optim.aux_loss_weights.ring_nce = 0.0
+    # Orthogonality terms (`.claude/decoder_plan.md`, D4; `interscale.train.orthogonality`), each its own weight, 0.0
+    # leaving it unbuilt; every value lies in [0, 1]. Between the dual model's local and global embedding over cells:
+    # linear CKA, mean squared canonical correlation, RBF kernel CKA, and OPL's |cos| term (a control: a rotation meets
+    # it). Between the two parts of a decomposable prediction (additive or residual dual decoder, or a global-only
+    # model's own-cell skip): the per-gene correlation of their predictions, and the principal angles between their
+    # gene-space loadings. Within the global part: the correlation of its dimensions, the cosine of its decoder's
+    # loading vectors.
+    cfg.optim.aux_loss_weights.orth_cka = 0.0
+    cfg.optim.aux_loss_weights.orth_cca = 0.0
+    cfg.optim.aux_loss_weights.orth_kernel_cka = 0.0
+    cfg.optim.aux_loss_weights.orth_opl = 0.0
+    cfg.optim.aux_loss_weights.orth_gene_corr = 0.0
+    cfg.optim.aux_loss_weights.orth_loadings = 0.0
+    cfg.optim.aux_loss_weights.orth_decorrelation = 0.0
+    cfg.optim.aux_loss_weights.orth_loading_ortho = 0.0
+
+    # Settings of the orthogonality terms. Inert until one of them carries a weight.
+    cfg.optim.orthogonality = CN()
+    # Cells the pairwise terms (orth_kernel_cka, orth_opl) read at most per step, drawn from the loss's cells.
+    cfg.optim.orthogonality.subsample = 1024
+    # Ridge of the canonical overlap (orth_cca, orth_loadings), as a share of the mean variance.
+    cfg.optim.orthogonality.ridge = 1e-3
 
     # Shared settings for the contrastive terms. Inert until one of them carries a weight.
     cfg.optim.contrastive = CN()

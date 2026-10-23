@@ -242,6 +242,21 @@ def _validate_objective(cfg):
     )
 
 
+def _validate_orthogonality(cfg):
+    """The settings of the orthogonality terms (``optim.orthogonality``; decoder_plan.md, D4), when one has a weight."""
+    weights = dict(cfg.optim.get("aux_loss_weights", {}))
+    if not any(float(w) != 0.0 for name, w in weights.items() if name.startswith("orth_")):
+        return
+    settings = cfg.optim.orthogonality
+    if int(settings.subsample) < 3:
+        raise ValueError(f"optim.orthogonality.subsample must be at least 3 cells, got {settings.subsample}.")
+    if not float(settings.ridge) > 0:
+        raise ValueError(
+            f"optim.orthogonality.ridge must be > 0, got {settings.ridge}: without it the canonical overlap divides by "
+            "directions of no variance."
+        )
+
+
 def _validate_optim(cfg):
     """Reject configs whose training-length settings stop a run inside the LR warm-up.
 
@@ -709,6 +724,7 @@ def _validate(cfg):
     _validate_block_mask(cfg)
     _validate_masking(cfg)
     _validate_objective(cfg)
+    _validate_orthogonality(cfg)
     _validate_probe(cfg)
     _validate_pe(cfg)
     _validate_attention(cfg)

@@ -199,7 +199,10 @@ def _training_tag(cfg) -> str:
     genes (``dataset.mask_channel_fraction``) in that share of the cells. ``rmk-<kind>``: re-masking before the transformer
     (``model.global_component.parameters.remask``). ``ctx-<kind>``: a context-only global embedding
     (``model.global_component.parameters.context_only``). ``rgm<depth um>-<local>-<global>``: each head's loss on
-    the hidden cells of its regime (``optim.regime_loss``).
+    the hidden cells of its regime (``optim.regime_loss``). ``aux-<name><weight>-...``: every auxiliary loss with a
+    non-zero weight (``optim.aux_loss_weights``: the orthogonality and the contrastive terms), added 2026-10-23 --
+    checkpoints trained with one before then carry no tag. A term's inner settings (``optim.orthogonality``,
+    ``optim.contrastive``) are not in it.
     """
     # Here, not at module level: interscale.train imports this module.
     from interscale.train._schedule import resolve_loss_weights, schedule_tag
@@ -239,6 +242,9 @@ def _training_tag(cfg) -> str:
     channels = float(cfg.dataset.get("mask_channel_fraction", 0.0))
     if channels:
         parts.append(f"ch{channels:g}c{float(cfg.dataset.mask_percentage):g}")
+    weights = {name: float(w) for name, w in dict(cfg.optim.get("aux_loss_weights", {})).items() if float(w) != 0.0}
+    if weights:
+        parts.append("aux-" + "-".join(f"{name}{w:g}" for name, w in sorted(weights.items())))
     return f"var-{'+'.join(parts)}_" if parts else ""
 
 
