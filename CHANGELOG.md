@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- `evaluation.gene_scales` (roadmap.md, task 1): which genes vary on a local and which on a tissue scale, and which part of a
+  decomposable prediction carries each. Per gene, Moran's I against the `k` nearest cells of the same slide (sampled centres, a ratio
+  estimator that is the textbook statistic with every cell a centre; shells and cumulative; slides z-scored apart and pooled) beside a
+  permutation null; its length scale (`ell_k`, `ell_um`: where the shell curve halves after its peak) and pattern (variable / anti / none).
+  `collect_fold_parts` hides the cells of each slide fold by fold and keeps every cell's prediction taken apart (the additive or the
+  residual decoder's parts); `part_shares` gives each gene's share per part. `scale_tables` (per gene; Spearman of the scale with the
+  global share; per design class), `plot_scale_curves`, `plot_part_curves`, `plot_part_maps`; the report's notes and summary carry the
+  tables.
 - Channel masking (`dataset.mask_channel_fraction`, default 0 = off; `mask_strategy: gene`): the label-free form of programme masking. A random
   share of the genes -- `round(fraction * G)`, the same set in every selected cell of a graph -- is hidden and drawn again at every redraw of the
   graph's mask (every epoch for the training graphs). 0.3 and 0.5 are the same code. `tl.masking.sample_channel_columns` / `sample_channel_mask`,

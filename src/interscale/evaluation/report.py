@@ -133,6 +133,17 @@ NOTES = {
     "flow more than 2 null SDs above the permutations",
     "flow_labels": "the same by label (query label drawing from key label): observed share, permuted share, "
     "log2 observed / permuted and z against the permutations",
+    "gene_scales": "per gene, Moran's I of its expression against the neighbours k (evaluation.gene_scales): "
+    "pattern (variable / none / anti / constant against the permutation null), i_first (the nearest shell), "
+    "i_peak at k_peak, ell_k and ell_um (where the shell curve halves after its peak; inf = beyond the largest k), "
+    "auc; and each part's share of the prediction's variance over the hidden cells (share_*: sums to 1; norm_*: "
+    "its size), the largest global share first",
+    "gene_scales_summary": "over the spatially variable genes: rho_ell_share = Spearman of the measured length "
+    "scale with the global part's share (positive: the longer a gene's scale, the more the global part carries it), "
+    "global_majority = share of genes the global part carries most of; rho_ell_planted / rho_share_planted = the "
+    "scale and the share against a planted scale",
+    "gene_scales_by_design": "per class of a given design (e.g. local / global / none): genes, spatially variable "
+    "genes, median measured scale (µm), median global share, share of genes the global part carries most of",
     "training": "the last epoch's throughput and peak memory, the final validation metrics",
     "timing": "seconds each step of the evaluation took",
     "phases": "staged training, each phase's end: drift_<component> = relative weight change (0: frozen), "
@@ -899,6 +910,26 @@ def summary_tables(
             "attribution: share of the variance of a head's prediction over all genes that each of its parts supplies, "
             "by depth (sums to 1 over the parts)",
             table[ordered(table.columns)],
+        )
+    summaries = _per_arm(sections, "gene_scales_summary", arms)
+    rows = [table.iloc[0].rename(arm) for arm, table in summaries.items() if len(table)]
+    if rows:
+        add(
+            "gene scales (Moran's I against the neighbourhood size): Spearman of each variable gene's length scale "
+            "with the global part's share of its prediction (rho_ell_share), and the share of genes the global part "
+            "carries most of",
+            pd.DataFrame(rows),
+        )
+    parts = []
+    for arm, table in _per_arm(sections, "gene_scales_by_design", arms).items():
+        part = table.copy()
+        part.index = pd.MultiIndex.from_tuples([(arm, label) for label in part.index], names=["arm", "design"])
+        parts.append(part)
+    if parts:
+        add(
+            "gene scales by design class: median measured scale, median global share, share of genes carried most by "
+            "the global part",
+            pd.concat(parts),
         )
     attention = _per_arm(sections, "attention_by_query", arms)
     means = _select(attention, "head", "mean", ["layer", "metric"])
