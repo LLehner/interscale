@@ -543,3 +543,30 @@ result was read; the entry above was the first one written live.*
 - Nothing here says what a trained model does. Under cell masking at 30% a hidden spot's neighbours are mostly visible, so the local part can read any
   smooth gene whatever its scale; a gene that varies only within the GCN's reach can only be the local part's. Expect the global share to rise with the
   scale (the Spearman) rather than pass 0.5. The sweep `gene_scales` is the test.
+
+## 2026-10-23 — Orthogonality terms on constructed data and a toy dual model: what each measure reads, and dropout (D4; no synth_spot run)
+
+The eight `orth_*` terms of decoder_plan.md, D4 (`train.orthogonality`), on constructed matrices, and through `train()` on ten toy
+slides (dual additive model, n_embed 8, one transformer layer, 30% of the cells hidden, 15 epochs, weight 1).
+
+**What worked**
+- Each measure matches its definition: linear and kernel CKA the textbook formulas, the canonical overlap the canonical correlations
+  from a QR (and, on loadings, the mean squared cosine of scipy's principal angles, exactly), OPL's term a double loop.
+- The loopholes the plan names are real and the scale-free forms close the first: a copy hidden under an inflated unused direction
+  reads linear CKA 0.0015 and canonical overlap 0.997; a nonlinear copy (y = x²) linear CKA 0.009, kernel CKA 0.43 (independent
+  0.002); a copy moved into the orthogonal complement of a shared space OPL's term 0.0 with the overlap at 1.0.
+- Optimised alone on a stirred toy dual model, every term falls fast: CKA 0.39 → 0.005, canonical overlap 0.24 → 0.02, gene
+  correlation 0.06 → 0.003, kernel CKA 0.46 → 0.01 (300 Adam steps; most of the fall in the first 60).
+- Trained without dropout, the term lowers its measure at evaluation: CKA 0.998 → 0.10 and canonical overlap 0.47 → 0.19 (80
+  cells per slide), 0.51 → 0.29 (30 per slide), the run without the term against the run with it; the reconstruction converged
+  in both.
+
+**What doesn't work**
+- With dropout (0.1 in the GCN and the transformer, the sweeps' default) the term is met by noise: the training value of `orth_cka`
+  fell 0.97 → 0.02 within three epochs while the validation value stayed at 0.999, and the canonical overlap ended higher with the
+  term than without (0.62 against 0.55). Dropout adds noise independent between the two parts in training only. Every term that
+  reads cells now refuses dropout on its path; an orthogonality sweep has to train every arm, its baseline too, without dropout.
+- A global-only model's own-cell part is constant on the loss's cells under cell masking (a hidden cell's own token is the fill),
+  so `orth_gene_corr` is 0 there and does nothing; under gene masking it works.
+- The toy runs say the terms can lower redundancy; not whether that separates the scales or costs the global part its long-range
+  programmes. That is the sweep's question.

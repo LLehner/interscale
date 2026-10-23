@@ -283,6 +283,26 @@ the same memory at every layer, never updated) through that layer's own weights 
   single-layer attention maps (`attention_diagnostics`) and the gradient readouts work. The returned attention maps are the read-out's.
 - The learned token is built from a private generator: the option draws nothing from the global one.
 
+### Orthogonality terms (`train/orthogonality.py`, `.claude/decoder_plan.md`, D4)
+
+Eight auxiliary losses, each its own weight `optim.aux_loss_weights.orth_<name>` (default 0: never built): between the dual
+model's local and global embedding over cells (`orth_cka`, `orth_cca`, `orth_kernel_cka`, and `orth_opl` as a control),
+between the two parts of a decomposable prediction (`orth_gene_corr` on their predictions per gene, `orth_loadings` on
+their gene-space loadings), and within the global part (`orth_decorrelation`, `orth_loading_ortho`). Invariants:
+
+- **Scale-free, in [0, 1].** The additive decoder rescales each part freely, so a raw Frobenius penalty can be met by
+  shrinking a part. Which other changes a term ignores decides how it can be gamed: CKA is variance-weighted (an inflated
+  unused direction lowers it), the canonical overlap reads through any invertible linear map down to `optim.orthogonality.ridge`,
+  OPL's term is met by a rotation into the orthogonal complement. A run is read by quantities it did not train.
+- **No dropout on the path.** With dropout, training meets a term that reads cells with noise evaluation removes (toy: train
+  CKA 0.02, validation 0.999). Every such term refuses encoder dropout at construction (`orth_gene_corr` also a nonlinear
+  decoder's); compare it only with arms trained without dropout too.
+- **Rows and centring.** A term reads the cells whose predictions the loss reads (`entry_mask` rows; the local embedding
+  gathered by `padded_node_idx`), each graph centred on its own; the pairwise terms subsample with a generator of their own.
+- **The owner.** A loading term reads the decoders of the module that holds it, kept in a tuple that `nn.Module` does not
+  register: not a child, not in the state dict, and a deep copy points at the copy. Add no registered back-reference.
+- Checkpoint names carry every non-zero auxiliary weight (`aux-<name><weight>`, since 2026-10-23, the contrastive terms too).
+
 ### Preprocessing / robustness utilities (`interscale.pp`)
 
 `pp.segmentation_noise.apply_segmentation_noise` simulates cell-segmentation errors (used when `cfg.dataset.segmentation_robustness` is set in `main.py`/`main_sweep.py`) for robustness sweeps.

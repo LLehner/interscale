@@ -20,7 +20,7 @@ the same commit as the work.
 | D3.0 — own-cell skip in a global-only model | **run and read 2026-10-22** (`global_decoders`, 3 seeds; notes.md): the mirror programmes rise (MC4 0.27 → 0.49, MC2 0.41 → 0.56, MC6 0.47 → 0.60), about half the gap to `ref_own`; nothing else drops. The full-rank read `own_cell_skip_input: raw` (2026-10-22) tests whether the other half is the skip's width: arms `lin_fourier_skipraw` (3 seeds), `lin_fourier_pool500_skipraw`, **not run** | 21 + 12 tests, mutation-checked, harness IDENTICAL | 2026-10-22 |
 | D3.1 — additive linear decoder in the dual model | **implemented, unverified** -- `model.decoder.additive` (2026-10-22): `y = W_l h_local + W_g h_global + b`, the loss on the sum; sweep `additive_decoder` (10 runs) written, **not run** | 22 tests, 41 mutations caught (with the raw skip and the probe cost), harness IDENTICAL | 2026-10-22 |
 | D3 — the rest | D3.2 (gated mixture) and D3.3 (FiLM) proposed | | |
-| D4 — penalties on the embeddings; run the existing contrastive losses | proposed | | |
+| D4 — orthogonality terms (rewritten 2026-10-23: eight scale-free forms as auxiliary losses) | **implemented, unverified on synth_spot** (2026-10-23): `train.orthogonality`, the `orth_*` terms; a term lowers its measure on a toy dual model only without dropout, so terms that read cells refuse dropout; the sweep to design | 55 tests, 43 mutations, harness IDENTICAL | 2026-10-23 |
 
 ## Why the two components do not separate today
 
@@ -196,20 +196,95 @@ Give the heads different targets, so they are not competing for one signal:
 3. **FiLM** (global modulates the local decoder per gene programme: "context sets competence").
    Biologically apt, but the separation is weaker; last.
 
-## D4 — penalties on the embeddings, on top of D1–D3
+## D4 — orthogonality terms (rewritten 2026-10-23)
 
-1. **Cross-covariance penalty** `||Cov(z_l, z_g)||_F^2` over a batch (the Barlow Twins cross term):
-   no linear redundancy, cheap. Two stronger forms for the description's "orthogonality between
-   embedding subspaces": on uncentred embeddings, `||Z_l^T Z_g||_F^2` (orthogonal column spaces, not
-   just uncorrelated), and on the decoder weights, `||W_l^T W_g||_F^2` (a gene's loadings on the two
-   scales point apart). HSIC for the non-linear case; an adversarial predictor (gradient reversal) or
-   a CLUB mutual-information bound if needed -- more fragile.
-2. **The existing contrastive losses** (`contrastive_plan.md`, stages 1, 2, 2b: VICReg, context NCE,
-   ring NCE) are implemented and **were never evaluated** on a task that can show communication.
-   Ring NCE is scale separation as a loss (positive: the outer ring; negative: the GCN's own
-   neighbourhood). Run them under D0's yardsticks before building anything new in this stage.
-3. **Information bottleneck** on the global embedding (KL to a prior, weight β), only together with
-   D3: it then encodes what the local part does not already supply.
+The user (2026-10-23) asked for real orthogonality losses (pointing to the Orthogonal Projection Loss, Ranasinghe et al.
+2021) and wants one sweep over a variety of them; the contrastive losses get their own rework for global-only models
+(`contrastive_plan.md`). The first version of this section proposed raw Frobenius penalties. They were the right *kind*
+but gameable, and they did not say which of several orthogonalities they meant.
+
+**Which orthogonality constrains what.**
+- *Between two representations of the same cells, over cells* -- Domain Separation Networks' soft subspace
+  orthogonality (Bousmalis et al. 2016, `||H_c^T H_p||_F^2`): no linear function of one part predicts the other across
+  cells. This is the disentangling kind and what the description's "orthogonality between embedding subspaces" means.
+  Written raw it is gameable: the additive decoder rescales a part freely, so shrinking it zeroes the penalty. Every term
+  below is scale-free.
+- *Per cell, between two vectors in a shared feature space* (`z_l(i) ⟂ z_g(i)`, or OPL's cross-class term with the
+  component as the class): with two decoders a rotation of one part meets it without removing any information. It is
+  kept as a control, to show that.
+- *In gene space, between the parts' decoder loadings*: the two parts' outputs live in orthogonal gene subspaces --
+  orthogonal gene programmes.
+- *Within one embedding or decoder*: decorrelated dimensions, orthogonal loading vectors -- readable dimensions (task 2).
+  The only kind a global-only model without parts has.
+- *Between classes within one space* (OPL itself): needs labels and separates classes, not components. Not part of this
+  stage; an arm for a classification track (roadmap T10 A) if one starts.
+
+**The terms.** Each is an auxiliary loss (`train.aux_losses`) with its own weight `optim.aux_loss_weights.orth_<name>`
+(default 0: never built, every run unchanged), so a sweep can switch any mix on. Each value lies in [0, 1].
+
+| term | what it penalises | pair | invariant to | caveat |
+|---|---|---|---|---|
+| `orth_cka` | linear CKA (Kornblith et al. 2019) of `h_local` and `h_global` over cells: DSN's loss, normalised | dual | scale, rotation | dominated by high-variance directions: an unused inflated direction lowers it |
+| `orth_cca` | mean squared canonical correlation of `h_local` and `h_global` | dual | any invertible linear map (what a linear decoder can undo) | ridge `optim.orthogonality.ridge`: directions below it escape |
+| `orth_kernel_cka` | RBF kernel CKA (normalised HSIC) of the same, on a subsample | dual | scale, rotation; nonlinear dependence | bandwidth from the median distance |
+| `orth_opl` | OPL's term with the component as the class: mean `|cos|` between every local and every global vector | dual | -- | the control: met by moving one part into the other's orthogonal complement |
+| `orth_gene_corr` | per gene, the squared correlation over cells of the two parts' predictions | any decomposable head | per gene | makes each gene's prediction an orthogonal sum, so the attribution shares have no cross term |
+| `orth_loadings` | mean squared cosine of the principal angles between the two parts' gene-space loadings | any decomposable head, linear decoders | any invertible linear map | a full-rank part (raw skip) spans every programme: refused |
+| `orth_decorrelation` | mean squared correlation between distinct dimensions of the global embedding | any model with a global part | per-dimension scale | a basis choice: readable dimensions, not separation |
+| `orth_loading_ortho` | mean squared cosine between distinct loading vectors of the global decoder | linear global decoder | per-column scale | each dimension a distinct gene programme |
+
+"Dual" is the dual decoder (`local` = the GCN embedding, `global` = the transformer token); "decomposable head" is the
+additive or residual dual decoder (parts `local`, `global`) or a global-only model with the own-cell skip (parts
+`context`, `own_cell`).
+
+**Rules.**
+- Every term reads the cells whose predictions the loss reads (rows with a hidden entry), each graph centred on its own
+  (OPL reads raw vectors, as the paper does). The pairwise terms (kernel CKA, OPL) read at most
+  `optim.orthogonality.subsample` of them, drawn from a private generator.
+- **No dropout on the path of a term that reads cells** (found while building, below): with it, training meets the term
+  with noise that evaluation removes. Such a term refuses a model with encoder dropout (or, for `orth_gene_corr`, a
+  nonlinear decoder's dropout); the arms it is compared with must drop dropout too. The loading terms read weights and
+  do not care.
+- A term whose model lacks what it needs refuses at construction, with the reason.
+- Checkpoint names carry every non-zero auxiliary weight (`aux-<name><weight>`); until now even the contrastive terms
+  left no trace, so arms differing only in one would have overwritten each other.
+
+**Cautions.**
+- Independence is a strong target. Local and far-field context are genuinely correlated (autocorrelation beyond two
+  hops), so a penalty makes the global part the *residual* of the local one; shared variation goes to whichever part is
+  cheaper, likely the local one.
+- Every linear measure has a loophole (above), so a run is never read by the quantity it trained: the redundancy table,
+  the attribution shares, the gene-scale split (`evaluation.gene_scales`: Spearman of each gene's scale with its global
+  share), the programme scores against the bar, and the reconstruction, which must not drop much.
+- With the context query (D1.2) the global part already cannot see the cell or, under the long-range mask, its
+  neighbourhood. A penalty then only removes far-field information the near field also carries.
+
+**Not in this stage.** An information bottleneck on the global embedding (KL to a prior, weight β), only together with
+D3: it then encodes what the local part does not already supply. The contrastive losses (VICReg, context NCE, ring NCE)
+moved to `contrastive_plan.md`'s rework for global-only models.
+
+**Built 2026-10-23 (implemented; checked on toy models, unverified on synth_spot).** `train.orthogonality` (the measures),
+the eight `orth_*` terms in `train.aux_losses`, `optim.orthogonality` (`subsample` 1024, `ridge` 1e-3), the checkpoint tag.
+- *The measures, checked against their definitions* (notes.md, 2026-10-23): linear CKA and kernel CKA against the textbook
+  formulas, the canonical overlap against the canonical correlations from a QR and against scipy's principal angles
+  (exact), OPL's term against a double loop. The loopholes hold as stated: a copy under an inflated unused direction reads
+  CKA 0.0015 and canonical overlap 0.997; a copy moved into the orthogonal complement of a shared space reads OPL 0.0 and
+  overlap 1.0; a nonlinear copy (y = x²) reads linear CKA 0.009 and kernel CKA 0.43.
+- *Dropout meets the terms with noise* (found while building). On a toy dual additive model trained with `orth_cka` at
+  weight 1 and dropout 0.1, the training value fell 0.97 → 0.02 within three epochs while the validation value stayed at
+  0.999. Without dropout the term works at evaluation: CKA 0.998 → 0.10, canonical overlap 0.47 → 0.19 (the same run
+  without the term against with it, toy slides). Hence the rule above.
+- *The canonical overlap scales each column to unit size before whitening* (an invertible map: no canonical correlation
+  changes), so one inflated column cannot raise the ridge over the others; directions that are combinations of columns
+  with little variance still escape below the ridge.
+- *The own-cell skip under cell masking:* a hidden cell's own token is the fill, so the own-cell part is constant on the
+  loss's cells and `orth_gene_corr` is 0 there; it needs gene masking.
+- *Tested:* 55 tests (the measures and their invariances, the plumbing on hand-built step outputs, every term through a real
+  dual and global-only step reaching exactly the parameters it should, the refusals, the state dict and a deep copy, the
+  name, the settings, a real `train()` run in which the term lowers its measure); 43 mutations, all caught; harness
+  IDENTICAL.
+- *Not built:* a nonlinear redundancy read for the evaluation (the redundancy table is a ridge); the sweep (to be designed
+  with the user).
 
 ## Recommended order
 
@@ -218,8 +293,8 @@ Give the heads different targets, so they are not competing for one signal:
 2. **D1.2 (context query) + D3.1 (additive linear decoder)** -- removes copying by construction and
    keeps a linear, attributable read-out per component; the main bet.
 3. **D2.1 (scale split)** as the target alternative, compared with 2.
-4. **D4.2** -- the existing ring NCE and context NCE under the new yardsticks; **D4.1** cross-covariance
-   as an add-on to whichever of 2–3 wins.
+4. **D4** -- the orthogonality terms (rewritten 2026-10-23), one sweep over a variety of them on top of whichever of 2–3
+   wins; the contrastive losses separately, reworked for global-only models.
 
 Each arm on synth_spot under programme masking and discs, 3 seeds for the arms a decision rests on;
 then legnini.
