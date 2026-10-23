@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Channel masking (`dataset.mask_channel_fraction`, default 0 = off; `mask_strategy: gene`): the label-free form of programme masking. A random
+  share of the genes -- `round(fraction * G)`, the same set in every selected cell of a graph -- is hidden and drawn again at every redraw of the
+  graph's mask (every epoch for the training graphs). 0.3 and 0.5 are the same code. `tl.masking.sample_channel_columns` / `sample_channel_mask`,
+  `hides_gene_set`; cells are selected as for `mask_genes` (`mask_percentage`, discs), which it excludes; a partial cell rate warns. Re-masking,
+  the regime loss, visible-keys-only attention and a `Precomputed` embedding refuse it. Checkpoint tag `ch<fraction>c<cell rate>`.
 - `model.global_component.parameters.context_only: query` (default `none`): a cell's global embedding from the *other* cells' tokens and its
   position alone. The transformer's queries are one learned token plus the cell's node encoding, never the cell's own token, and read the cells'
   input tokens in every layer through that layer's weights (`CustomTransformerEncoderLayer.read_context`; `GlobalInput.queries`;
