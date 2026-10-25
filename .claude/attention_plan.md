@@ -33,6 +33,7 @@ a real state.
 | 7 — inducing points (optional) | not started | | |
 | 8 — beyond the window (whole slides; FlexAttention) | not planned in detail | | |
 | 9 — sparse normalisers (entmax, top-k), expression bias, attention flow; legnini sweep | **implemented, unverified** — entmax is alpha-entmax of the dense logits with one alpha per head (learned as 1 + sigmoid(a) from 1.5, or fixed), exact zeros, never weight on a blocked key; top-k keeps exactly k keys per query (ties at the cut no longer stretch the budget) and is dense softmax when k covers every key; the expression bias ranks keys by RMS expression distance over the genes both cells show, gives every pair with a wholly hidden cell one learned value per head, ignores padding, starts at zero; through a real GlobalModule no hidden value reaches a prediction under either backend with distance + expression biases. Attention records carry the mask's open keys, so diagnostics and the flow no longer read a sparse backend's zeros as blocked keys. `evaluation.attention_flow`: uniform attention is explained by both expectations (KL 0, exact uniform sums), attention by distance alone by the distance expectation only, label flows sum to 1, masks survive the disc draws. 10 mutations, each caught (3 had first survived and led to stronger tests); 848 tests pass; harness IDENTICAL; the legnini script smoke-trained (all 5 arms) and evaluated (with twins, maps) on a legnini-shaped stub on the CPU. **Not run on data** | 2026-10-18 |
+| 10 — per-head roles: a bias for a set of heads (10a), the long-range mask for a set of heads (10b) | **proposed 2026-10-24** -- 10a recommended: the dense, pair and factor forms of every bias are laid out per head already, so the change is where the kinds are summed; 10b feasible on the dense path only, and not recommended: under the context query it breaks a cell's blindness to itself, without it it reopens the copying the mask stops, and a global-only model has no mask | | 2026-10-24 |
 
 ## In short
 
@@ -101,7 +102,7 @@ a real state.
 | global tokens | ETC/Longformer global tokens, Exphormer virtual nodes, registers | **yes** (4) | CLS is already one; more can absorb attention sinks; Exphormer needs them |
 | exact, memory-efficient | SDPA, FlashAttention, FlexAttention | **yes** (6, 8) | same function, no approximation |
 | latent bottleneck | Set Transformer ISAB, Luna, Perceiver IO | optional (7) | tissue-wide latents as a summary |
-| local patterns | local window, blockwise, Image Transformer, Swin | no | the GNN already does local; the long-range mask forbids it |
+| local patterns | local window, blockwise, Image Transformer, Swin | no; **reopened 2026-10-24** (10) | the GNN already does local; the long-range mask forbids it. But a soft distance window (`pe.distance.kind: scales`) let a global-only model read synth_spot's short range far better than the GCN (one seed): see stage 10 |
 | strided / axial | Sparse Transformer, Longformer dilation, Axial, CCNet | no | need a 1D order or a grid, and token order here is arbitrary node order |
 | low-rank length projection | Linformer, Synthesizer | no | weights indexed by token position: not permutation-equivariant, and N varies per graph |
 | learnable patterns | Reformer, Routing, Sinkhorn | not now | fallback if kernels and Exphormer both fail sharp long-range attention |
@@ -754,6 +755,69 @@ with 0.
   the local kernel; programme masking on the SHH readouts (PTCH1, GLI1, HHIP are in the panel, but
   the gene set is the user's call).
 
+### 10 — per-head roles: a bias for a set of heads, the long-range mask for a set of heads (proposed 2026-10-24)
+
+**Why.** In the `local_global_split` sweep (notes.md, 2026-10-24) a GlobalModel with the distance prior (`pe.distance.kind: scales`,
+windows of 100, 311, 965 and 3000 µm, one per head) and the full-rank own-cell skip read synth_spot's short-range receivers at
+0.94-0.98 (within their receivers 0.94-0.98; one seed), where the dual models' GCN reaches 0.57-0.68 and every earlier
+global-only model ~0, and ranked the planted short-range senders at 0.94-1.00. In the dual model the same prior changed no
+score: the long-range mask removes every key within the GCN's two hops, exactly where the narrowest window would look. That
+undoes the triage's "no" to local windows. The user asked (2026-10-24) whether heads could have roles -- short, mid and long
+range, one with a special bias -- and different normalisers. The sweep `synth_spot_window` (three seeds, a range aimed at M11,
+PCA and scVI tokens; written 2026-10-24) tests the global-only window first.
+
+**What exists, and what does not.**
+- Each bias kind already learns per head: the distance profile is a `[heads, K]` table, the scales prior a scale `l_h` and a
+  strength `s_h` per head (a head can widen, narrow or drop its window unless `frozen`), the expression bias a table per head, the
+  Fourier bias coefficients per head. So short, mid and long range heads is what the scales prior already is.
+- entmax already learns one alpha per head, in (1, 2): a head can end anywhere between softmax and sparsemax.
+- Not there: every enabled bias reaches every head (`AttentionBias.forward` sums the kinds over all heads), the long-range mask is
+  one boolean mask repeated per head (`create_transformer_attention_mask_from_edges`), top-k has one `k`, and one `attention.kind`
+  serves the whole model.
+
+**10a -- a bias for a set of heads (recommended).**
+- *Config.* `pe.bias_heads: {<kind>: [head indices]}`; a kind it does not name reaches every head. Default empty: today's model
+  (harness IDENTICAL).
+- *Build.* Each encoder is built with as many heads as it serves -- so the scales prior deals its geometric scales over its own
+  heads -- and `AttentionBias` places its output into the full head axis, zero for the other heads: the dense bias
+  `[B, heads, S, S]`, the pair form `[P, heads]` (Exphormer), the low-rank factors `[B * heads, S + 1, r]` (Performer; zero rows
+  for the other heads). All three are per head already, so every backend that takes a bias keeps taking it.
+- *Validation.* Indices in range and distinct; every listed kind serves at least one head; a head may carry several kinds (they
+  add) or none -- a free head, content only (plus RoPE where it is on).
+- *What it is for.* (1) A free head beside windowed ones: today every head is windowed from step 0, the widest at the top of the
+  range, and a head can only drop its window by learning its strength to 0. The window sweep's 100-1000 µm range buys M11's
+  scale at the price of any window beyond 1 mm; three windowed heads and one free head would keep both. (2) One head on expression
+  similarity alone (roadmap T5, how cell-type driven attention is): its maps read as that by construction. (3) Heads whose role is
+  set by construction, so the per-head readouts (`attention_by_query`, the maps) can be read by role (T4).
+- *Cost.* Nothing measurable: the dense bias is already formed per head; no parameters beyond the kinds' own.
+- *Tests.* A head a kind does not serve gets exactly 0 from it in every layer; the served heads get what a model built with that
+  kind on those heads alone gets; the scales are dealt over the served heads; the default is unchanged; the checkpoint tag names
+  the assignment (e.g. `pe-distance@0-2`). Stirred parameters (memory: tests-stir-the-init), or the zero-initialised tables make
+  every positional test pass vacuously.
+- *First arms.* On `lin_dist_skipraw`: four windowed heads (as now) against three windowed heads over 100-1000 µm plus one free
+  head with the Fourier bias; the rings, M11 and the short range together decide.
+
+**10b -- the long-range mask for a set of heads (feasible, not recommended now).**
+- *Config and build.* `long_range_heads: [indices]` (default every head). The dense mask is already `[B * heads, S + 1, S + 1]`;
+  the exempt heads' slices would take the diagonal-only mask (`attn_mask_diagonal`) instead of the repeated long-range one, and
+  `visible_keys_only` and the padding merge as now. The pair and pattern backends (Performer, Exphormer) share one list of blocked
+  pairs across heads and would refuse it.
+- *Why not.* It breaks an invariant or does nothing in every model the sweeps use:
+  - under the context query (decoder_plan.md, D1.2) an exempt head reads the neighbours' GCN tokens, which hold the cell, so a
+    cell's global embedding would move with its own expression again -- the property D1.2 is built and tested on. It would
+    have to be refused with `context_only: query`;
+  - without the context query, the exempt heads read the neighbourhood the GCN has already mixed: the copying the mask was built
+    to stop (CKA 0.93 at the rim), and the additive decoder's shares would stop meaning local against global;
+  - a global-only model has no mask to be exempt from.
+- *Instead,* if the dual model should get the window's short range: make attention over a distance window the local component
+  (a local module whose reach is a distance, the long-range mask then defined by that distance instead of by GCN hops), or keep
+  the global-only windowed model, whose parts are the cell and its context. Neither is planned; the window sweep decides first
+  whether the global-only route holds over seeds.
+
+**Normalisers per head.** entmax's per-head alpha already spans softmax to sparsemax, so a separate softmax / sparse backend per
+head inside a layer would add little and is not planned. A per-head `k` for top-k is small if it is wanted (take the top `max k_h`
+once, keep the first `k_h` of each head's), but no result asks for it yet.
+
 ## Test matrix
 
 The axes, all independent:
@@ -1145,6 +1209,59 @@ Every code change goes in as an opt-in config flag with tests, so defaults stay 
       mask on before 2026-10-14 (round 1, the PE sweeps) carry no tag; rename them to reload them
       under the current code.
     15 mutations, each caught; 717 tests pass; harness IDENTICAL.
+  - **Round 3b rerun, read 2026-10-14** (`attention_dense_3b_new_synth`,
+    `attention_performer_3b_new_synth`; `all_arms.csv`, 4629/4707 rows), after the mask fix and the
+    synth signal-scale commit `d8abe9d` (structured genes × 6, so they are no longer swamped by
+    background noise). Analysed in the wrong chat (opened for something else); this is the carry-
+    over note, continued in a new one. Dense and performer agree on every number below, usually to
+    0.001–0.003 — none of this is a backend effect.
+    - **`rope_gene` is not comparable to the other six on any pooled number.** It trains under
+      `mask_strategy: gene` (round 3a's rate 0.3), not the node+disc masking the rest use, and
+      `CLAUDE.md`'s masking docs say `node` and `gene` runs are not comparable. Its sane-looking
+      `val_r2` (−0.43 vs. −70 to −147 for the rest) is an easier, different task, not an architecture
+      win; its `heads_cells` SCE (1.8) and catastrophic `heads_by_group` numbers (housekeeping
+      −187.6, highly_variable −110.4) are the already-documented "scored on discs it never trained
+      for" effect. Judge it only against its own round-3a number: raw SCE 0.0677–0.0678 here vs.
+      0.0702 in 3a — a small gain, plausibly from `d8abe9d`.
+    - **The six real arms replicate "what to read first" cleanly.** `global - local` SCE at depth
+      `(290, 500]`/beyond: `none` +0.010 to +0.012 (global *worse* — no position, one prediction),
+      `naive` ~0, `fourier` −0.006 to −0.007, `rope` −0.010 to −0.011, `rope_no_lrm` −0.011 to
+      −0.013 (barely different from `rope` — the long-range mask still buys nothing), `rope_no_res`
+      −0.018 to −0.020, the largest gap of the six. `source_distances` agrees: `local+global` beats
+      `local` alone only for the encoded arms (+0.05 to +0.08) and *hurts* for `none` (−0.02 to
+      −0.04); `rope_no_res`/`rope_no_lrm` post the highest raw `global` cosine (0.38+). Two probes
+      now agree that scoring global on local's residual (what `rope` does and `rope_no_res`
+      doesn't) looks like it suppresses a global signal that is otherwise there — a `rope` vs.
+      `rope_no_res` ablation on the residual decoder specifically looks worth running next.
+    - **Attention is still uniform by every direct measure.** `attention_variance`: distance/region/
+      counts explain 0.3–2.5% of weight variance, every arm including `rope_gene`. `attention_distance`:
+      mean weight flat across all 9 distance bins (±0.003–0.005). `planted_edges`: `rank_open`
+      0.47–0.52 (chance), `lift_open` 0.85–1.03 (dense) — reproduces 3a's band almost exactly, no
+      arm prefers the true long-range sender edges. `cls_mass` ≈ 0 everywhere, ruling out a CLS-sink
+      explanation for the gains above.
+    - **Leading mechanism: token collapse, not attention.** `token_cosine` (pre-attention token
+      similarity) is 0.78–0.91 for every arm but `naive` (0.596 dense / 0.749 performer, matching
+      3a's "naive 0.61" closely) — *above* 3a's 0.69–0.74 band, not below it. 500 µm/30%-coverage
+      discs plausibly homogenize representations more than 3a's masking did, which would explain
+      uniform attention, the null on planted edges, and why global's edge above looks like broad
+      averaging over a still-fairly-uniform token pool rather than selective attending:
+      `effective_keys` runs *backward* from what "informative attention" would predict — the three
+      best arms on the depth metric (`rope_no_res` 1999.9, `rope_no_lrm` 1745.3, `rope` 1795.2,
+      dense, of ~2500 open keys) have the *least* concentrated attention of the six, not the most.
+    - **Open: `training_summary`'s `val_r2` (−70 to −147, all six real arms, both backends) does not
+      match anything else in these tables.** `heads_by_group` exhaustively covers all 253 genes (its
+      `n_genes` sum to 253, matching `gene_ranks.csv`), and every one of its 12 group means is sane
+      (−0.05 to 0.7) for the six real arms — the arithmetic rules out a hidden low-variance-gene
+      outlier *within these groups* as the sole cause (unlike `rope_gene`, where the mechanism is
+      directly visible: `masked_regression_metrics` in `_trainingplans.py` gates its per-gene R² only
+      on `var_t > eps` at 1e-8, unbounded below for a near-zero-variance gene). Likely explanation,
+      not yet confirmed: training redraws discs every epoch (`train._utils.redraws_masks`) while
+      every post-hoc table here is scored on one fixed, seeded draw (`masked_probing.draw_masks`) —
+      `val_r2` and `heads_by_group` may simply be scored on different populations of hidden cells.
+      **Next, in the new chat:** recompute `masked_regression_metrics.r2` on the same fixed discs
+      `score_heads` uses, for one arm, and check whether it reproduces; also pull `heads_per_gene`
+      (in `all_arms.csv`, 253 genes × 7 arms = 1771 rows, not yet inspected) directly for the
+      per-gene R² tail instead of inferring it from group means.
 - **Controls:**
   - evaluate an untrained checkpoint through the same script, to see what a random GCN already
     preserves;
@@ -1154,7 +1271,14 @@ Status: diagnosed 2026-10-12 (the user called it urgent). On 2026-10-13 levers 2
 implemented and round 3a was set up. Round 3a ran and was read on 2026-10-14: levers 1, 2 and 5
 verified on data (above). Round 3b set up on 2026-10-14 (head scores on hidden discs, long-range
 tag, scripts and sweeps) and run once, but that run was invalid (disc arms trained unmasked, see
-above); fixed the same day, awaiting a rerun. Levers 3 and 4 are still unverified on data.
+above); fixed the same day. Rerun with the rescaled synth data (`d8abe9d`) read 2026-10-14 (above):
+the depth-binned local-vs-global gap and the source-distance probe both replicate, backend-
+independent, and `rope_no_res` now looks like the lead on the residual-decoder question; attention
+itself is still uniform by every direct measure (distance, planted edges, `cls_mass`), and
+`token_cosine` — above 3a's band for every arm but `naive` — is the leading explanation for why.
+Unresolved: `training_summary`'s `val_r2` does not match `heads_by_group`'s per-group numbers on the
+same run, most likely because training-time mask redraws and the fixed post-hoc evaluation discs
+score different populations — not yet confirmed. Levers 3 and 4 are still unverified on data.
 
 ## Predictions to check, not assume
 

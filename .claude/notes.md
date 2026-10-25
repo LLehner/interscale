@@ -6,6 +6,29 @@ is `## <date> — <what the test was about>`, then **What worked** and **What do
 settings and the reasoning live in the plan files (`global_plan.md`, `attention_plan.md`, ...); this
 file keeps only the points.
 
+## Major improvements so far
+
+Not an entry: a standing, updated index of the changes that actually moved a number, most recent first.
+Everything below it stays append-only. Full numbers are in the dated entry named.
+
+- **Distance prior on a global-only model** (2026-10-24): `pe.distance.kind: scales` + the raw own-cell
+  skip reads synth_spot's short-range receivers at 0.94-0.98 (every earlier global-only arm: ~0), best
+  programme mean so far (0.728). **Held over 3 seeds** (2026-10-25: 0.909 ± 0.003, programme mean 0.729).
+- **Programme masking on legnini** (2026-10-24): every trained arm first reaches its bar (0.77-0.80
+  against 0.75).
+- **Context query + additive decoder** (2026-10-23): separates the dual model's parts with no cost to the
+  score (0.842 against 0.843) -- the context part carries only the rings, the local part everything else.
+- **Additive decoder alone** (2026-10-23): dual sum 0.820 -> 0.843, first arm to reach the programme bar
+  on its mean.
+- **Raw (full-rank) own-cell skip** (2026-10-23): closes the mirror-programme gap that the token-rank skip
+  left open, programme mean 0.577 -> 0.611.
+- **Isotropic Fourier attention bias** (2026-10-19/20): the first architecture change that made the
+  transformer do more than a cell's own genes. Without position, `lin_none` = `ref_own` (0.405); with it,
+  `lin_fourier` 0.764-0.775, `joint_fourier`'s global head 0.820, against the bar's 0.682 -- the gain is
+  the ring programmes (M7/M8), which only the distance to a visible source gives. Beat RoPE in every arm.
+- **Centred targets + more steps** (2026-10-14, round 3a): the first thing that broke the gene-mean floor
+  every earlier round had converged to, before which no architecture change had anything to work with.
+
 ---
 
 ## 2026-10-20 — Programme masking on synth_spot (`response_masking`: 11 arms, 19 runs, 3 seeds, 100 epochs)
@@ -570,3 +593,190 @@ slides (dual additive model, n_embed 8, one transformer layer, 30% of the cells 
   so `orth_gene_corr` is 0 there and does nothing; under gene masking it works.
 - The toy runs say the terms can lower redundancy; not whether that separates the scales or costs the global part its long-range
   programmes. That is the sweep's question.
+
+## 2026-10-23 — The additive decoder of the dual model under programme masking (D3.1, `additive_decoder`: `joint_fourier` and `add_fourier` at 3 seeds, `add_fourier_l01`, `add_fourier_l2g`, `add_fourier_pool500`, `joint_fourier_pool500` at 1 seed; synth_spot, results in `results/22_10_results/additive_decoder`)
+
+**What worked**
+- The sum beats the plain dual model's global head: centred cosine 0.843 against 0.820 (seed spread 0.005), programme mean 0.687
+  against 0.628, wins / ties / losses against the bar 5/12/7 against 3/12/9. The first arm whose programme mean reaches the bar
+  (`ref_own+context` 0.685). The gain is on the mirror programmes (MC1 0.55 → 0.73, MC4 0.26 → 0.48, MC6 0.48 → 0.60) and M11
+  (0.54 → 0.65); the rings hold (0.96 / 0.96).
+- A small local term costs the sum nothing and makes the local part a predictor: `add_fourier_l01` (weights 0.1 / 0.9, one seed)
+  sum 0.833, programme mean 0.689, local part alone 0.522 (the plain model's local head 0.506), against 0.127 with the loss on the
+  sum only.
+- The additive decoder makes the pooled dual model work: `add_fourier_pool500` 0.772 against `joint_fourier_pool500`'s global head
+  0.626, the sparse programmes 0.79 against 0.08 (the local part says which spot is a receiver), at 0.235 against 0.809 GiB. Still
+  0.07 below the per-cell sum (rings 0.83 / 0.90 against 0.96).
+- The integrated-gradients sender ranks (built 2026-10-20, first run on data here) find the near senders: the global head ranks
+  the short-range senders at 0.98 and M11's (within 500 µm) at 0.96, the untrained twin 0.48-0.55; the local head 0.95-0.99
+  short, 0.69 mid (out of its reach). The attention check's pooled ranks (2026-10-21) hid this: of 11,809 planted pairs, 273
+  are short and 64 mid.
+
+**What doesn't work**
+- Without a context-only global embedding the global part repeats the local one: it carries 60% of the short-range receivers'
+  variance, and on the mirror programmes the parts work against each other (attribution norms 1.38 global and 1.63 local on MC4,
+  1.08 / 0.83 on MC1).
+- The "part alone" rows (`local`, `global_part`) of an additive arm cannot be read as scores: each decoder keeps its own bias and
+  the centred cosine centres on the gene's training mean, so a part alone carries an offset (`local` raw SCE 0.067-0.24). The
+  attribution shares, which centre each part on its own mean, are the read.
+- Staged (`add_fourier_l2g`): 0.750, 2/9/13, worse than joint.
+- What no arm reaches: M11 0.65 against the bar's 0.92 (a 150 µm kernel), the stripe and the cone (MC12 / MC13 0.18 / 0.18
+  against the oracle's 1.00 / 0.83), the distance part of the sparse responses (MC20 / MC21 0.63 / 0.50 against 1.00).
+- Planted senders of the dense, sparse and directional programmes stay at 0.52-0.60: those predictions do not use the senders.
+- An IG rank says the prediction depends on the sender's driver among cells as far, not that attention selected it: a fixed
+  kernel that reads the driver would rank the sender first too. It has no model-free bar yet.
+
+## 2026-10-23 — The context query under programme masking (D1.2, `context_query`: `ctx_fourier_skip`, `add_fourier`, `add_ctx_fourier` at 3 seeds, `ctx_fourier`, `ctx_fourier_skipraw`, `add_ctx_fourier_nocenter`, `ctx_joint_fourier` at 1 seed, 2 twins; synth_spot)
+
+**What worked**
+- Context query and additive decoder together (`add_ctx_fourier`) separate the parts at no cost: sum 0.842 against 0.843 for
+  `add_fourier` (seed spread 0.002 / 0.005), programme mean 0.691, 4/14/6. The local part now carries all of the short-range
+  receivers' variance (1.00, was 0.40), the sparse responses (1.00), M11 (0.99) and the mirror programmes (0.88-0.92); the
+  context part the rings (0.76 for M7, 1.00 for M8) and 0.84 of the long-range group. The norms equal the shares (no cancelling,
+  MC4 0.34 / 0.94 against 1.38 / 1.63 without the query).
+- So the decomposition answers what the model learned from beyond the cell's neighbourhood on synth_spot: the rings, and nothing
+  else that the cell and its GCN neighbourhood do not already give.
+- A global-only context-only model loses exactly what the plan said: `ctx_fourier` keeps the rings (0.94 / 0.97) and drops the
+  mirror programmes (0.02-0.09) and the sparse responses (~0); the own-cell skip brings them back (`ctx_fourier_skip` 0.743
+  against `lin_fourier_skip` 0.761, sparse 0.92-0.98). The feared loss of the sparse programmes under two additive parts did not
+  show: within their receivers every model, and `ref_own`, reads 0.93 / 0.93 / 0.95 / 0.99 on MC16-MC19.
+
+**What doesn't work**
+- The context query in the plain dual decoder (`ctx_joint_fourier`) is worse: the global head 0.709, 0.007 on the short-range
+  receivers and 0.03 on the sparse responses, since it has to predict them alone. D1 needs D3.1.
+- The context part still ranks the short-range senders at 0.85 and M11's at 0.83 although it cannot see the cell. A likely
+  reason (not checked): the long-range mask blocks the keys within two hops, but keys three to four hops away carry GCN tokens
+  that hold the receiver's neighbours. "Context" is everything but the cell, not everything beyond its neighbourhood. These
+  ranks are also coarse: the completeness gap of the context part is 0.17-0.27 (over 0.1: too few integration steps).
+- `add_ctx_fourier_nocenter` (one seed) 0.825 against 0.842: exact blindness costs 0.017, unexplained, one seed.
+- Global-only models never pick the near senders, context query or not: short 0.51-0.53, mid 0.51-0.55.
+- The mirror programmes stay below `ref_own` in the dual sum (MC1 0.73 against 0.84): the local part is the GCN token, rank at
+  most `n_embed`, the limit the raw skip removed in the global-only model (below).
+
+## 2026-10-23 — The full-rank own-cell skip and the re-evaluated global decoders (`global_decoders`: `lin_fourier`, `lin_fourier_skip`, `lin_fourier_skipraw` at 3 seeds, nonlinear, LSE and three pooled 500 µm arms at 1 seed; synth_spot)
+
+**What worked**
+- The raw skip closes the mirror gap: MC1 0.63 → 0.80 (`ref_own` 0.84), MC2 0.56 → 0.66 (0.68), MC4 0.49 → 0.66 (0.68), MC6
+  0.60 → 0.66 (0.67). Programme mean 0.577 → 0.611, 5/10/9 → 6/13/5. This answers the 2026-10-22 question: the token skip's
+  rank was the limit, not the training.
+- Pooled 500 µm tokens with the raw skip are the best global-only arm (one seed): programme mean 0.625, 4/13/7; the short-range
+  receivers 0.21-0.28 (the patch holds the neighbours), against 0.00-0.02 for every per-cell global-only arm.
+- The re-evaluation adds what the 2026-10-22 read lacked: the oracle (all arms 21-23 losses against it) and the shares (own cell
+  0.07 of the variance overall, 0.67-0.94 on the mirror programmes).
+
+**What doesn't work**
+- Per-cell global-only models stay blind to the short-range programmes (0.00-0.02, within receivers −0.2 to −0.8) and to M11
+  (0.16-0.20), and rank every sender class at 0.50-0.59.
+- The overall cosine hardly moves with the skip (0.761 → 0.769): it is carried by the long-range genes.
+
+## 2026-10-23 — Channel masking on synth_spot, evaluated on the programme (T3, `channel_masking`: `lin_fourier_ch30` and `_ch50` at 3 seeds, `joint_fourier_ch30` and `_ch50` at 1 seed, a twin)
+
+**What worked**
+- The evaluation is the programme's: the programme mask is drawn explicitly (`EVAL_MASK_GENES`), the references equal the other
+  sweeps' to three decimals, the untrained twin is at 0.
+- The arms learned something above the twin (MC25 0.54-0.72, MC1 0.33-0.35, MC10/MC11 0.44).
+
+**What doesn't work**
+- Channel masking does not transfer to the programme: global-only 0.245 (30%) and 0.221 (50%) against 0.764 for the same model
+  trained on the programme and 0.405 for `ref_own`; programme mean 0.16 / 0.15, 0/1/23. Even the rings (0.20 against 0.94)
+  and the sparse responses, which only need the spot's own receptor (0.12 against `ref_own`'s 0.79). The joint model's GCN head
+  reads 0.087 (0.506 under programme masking). Every sender class at 0.47-0.53.
+- 50% is not closer than 30%, against the sweep's expectation.
+- The model hardly fits its own task: training loss 0.76-0.83 (0.14-0.29 in the programme-masking sweeps; other hidden entries, so
+  only roughly comparable), validation SCE 0.12-0.17 against 0.04-0.07. A likely cause, not checked: 170 of synth_spot's 253
+  genes are noise, so about two thirds of each step's hidden entries are noise and dominate the per-cell SCE, while the 29
+  programme genes are hidden in 30% of the steps. Not yet known whether the model fails its own random masks or only the transfer.
+
+## 2026-10-24 — The local / global split on synth_spot, with a distance prior (`local_global_split`: cells and programme tasks; `add_ctx_fourier`, `add_ctx_fourier_l01`, `add_ctx_dist` at 3 seeds, `add_fourier`, `add_ctx_fourier_dist`, `add_ctx_dist_frozen` at 1, and in the programme task `lin_fourier_skipraw`, `lin_dist_skipraw` at 1; results in `results/local_global_split/synth_spot_*`)
+
+The distance prior is `pe.distance.kind: scales` (four Gaussian windows, geometric over 290-3000 µm for the dual arms, which keep the
+long-range mask, and 100-3000 µm for the global-only ones). Moran's I against the neighbourhood size (`evaluation.gene_scales`) per
+gene, over all 253 genes in the cells task and over the 29 hidden genes in the programme task.
+
+**What worked**
+- A distance window gives a global-only model the short range. `lin_dist_skipraw` (one seed) reads the short-range receivers at
+  0.97 / 0.97 / 0.94 (R1, R2, R3/R4; oracle 1.00), within their receivers 0.97 / 0.98 / 0.94, against 0.84 / 0.84 / 0.68 for
+  `ref_own+context` and the dual models' GCN path, and 0.01 for the same model with the Fourier bias. It ranks the planted
+  short-range senders at 0.94-1.00 (twin ~0.5; Fourier 0.43-0.55), and the context part carries those programmes whole (share
+  1.00). Its programme mean, 0.728 with 8 wins / 14 ties / 2 losses against the bar, and the whole-cell 0.905 are the best of any
+  model so far (dual sums 0.83-0.85). Everything else equals `lin_fourier_skipraw`.
+- With the prior the dual model's split follows the genes' scales. Spearman of a gene's measured scale with its global share,
+  per seed: cells task `add_ctx_dist` 0.30 / 0.40 / 0.52 against `add_ctx_fourier` -0.27 / -0.14 / -0.23 (twins 0.19 and 0.00);
+  the share against the planted scale 0.55 / 0.71 / 0.60 against 0.09 / 0.26 / 0.21. Programme task 0.48 / 0.67 / 0.55 against
+  0.23 / 0.35 / 0.32. The planted-global class gets a median global share of 0.14 (local class 0.01). Learned and frozen
+  scales give the same (0.33 frozen, one seed).
+- At no cost to the prediction: every dual arm's sum is within 0.03 of `add_ctx_fourier` on every programme (seed spread up to
+  0.04), cells-task cosine 0.77 for all.
+
+**What doesn't work**
+- In the dual model the prior changes no score: the long-range mask blocks the 2-hop GCN's reach and the windows start at 290 µm,
+  so the short range stays with the GCN (0.56-0.68), below what the global-only window reads. Its only visible moves are the cone
+  (global share of M10→MC13 0.29 → 0.47-0.64; within receivers 0.42 → 0.49-0.63, one seed each) and the mid-range sender rank
+  (M11 0.88 → 0.99).
+- M11 (single sources within 500 µm) is unsolved by every arm: dual 0.64-0.67, global-only 0.21-0.22 (within receivers 0.01),
+  bar 0.92. The stripe and the cone stay at ~0.2 against the oracle's 1.00 / 0.83.
+- Under cell masking the global part carries little even with the prior (median share 0.07-0.10; without it 0.003): with 70% of
+  the cells visible the GCN reads nearly everything. Every arm reads the spatially variable genes at 0.77, below a 150 µm kernel
+  (0.82): the reconstruction is still under a smoother (K1).
+- The integrated gradients do not add up for the global part of the distance arms (completeness gap 0.45-0.62, against 0.13-0.17
+  without the prior): its sender ranks are not readable at RESPONSE_STEPS = 5.
+- `lin_dist_skipraw` is one seed: the decisive result rests on one run. The prior costs ~1.4x time per epoch (3.2 against 2.2 s)
+  and +0.3 GiB.
+
+## 2026-10-24 — The local / global split on legnini, with a distance prior (`local_global_split`, the same arms; windows 55-1000 µm dual, 15-1000 µm global-only; results in `results/local_global_split/legnini_*`)
+
+**What worked**
+- Programme masking on legnini (identity code + SHH readouts hidden in every cell): every trained arm is at or above the best
+  reference, a first on legnini. Whole cell 0.77-0.80 against 0.75 (`ref_own+context`); per program mean 0.74-0.77 against 0.728,
+  1-2 wins, no loss. The gains: motor neuron 0.59-0.66 against 0.53, intermediate dorsal 0.84-0.85 against 0.79; ventral
+  progenitor +0.01-0.04, BMP dorsal +0.02. Seed spread 0.000-0.012.
+- With the prior the context part carries about half of the identity code (ventral progenitor 0.26 → 0.44, motor neuron
+  0.29 → 0.50, intermediate dorsal 0.30 → 0.49, BMP dorsal 0.49 → 0.73), while the floor plate (FOXA2) stays wholly local; the
+  scores do not move (within 0.01).
+
+**What doesn't work**
+- No arm separates from the others on legnini's scores: dual, global-only, prior or not, all 0.77-0.80. The SHH readouts tie the
+  reference (0.57-0.63 against 0.61).
+- Cells task: no split by scale (`add_ctx_dist` Spearman 0.00 / 0.15 / 0.03 against its twin's 0.09; `add_ctx_fourier`
+  -0.16 / -0.08 / -0.18). legnini's genes vary over a narrow band (median scale 57-100 µm), about the GCN's 55 µm reach. Every arm
+  reads the variable genes at 0.56, level with a 15-40 µm kernel (0.57).
+- In the programme task the untrained twins already reach a Spearman of 0.29-0.42 on the 18 genes: that number cannot be read
+  there.
+- Two test organoids; locally the two legnini yamls name different data files (legnini23_pp.h5ad and legnini23_split_pp.h5ad), so
+  the two tasks' absolute numbers are compared with care.
+
+## 2026-10-25 — The distance window over seeds, a range aimed at M11, PCA and scVI tokens (`synth_spot_window`: `lin_dist_skipraw` 100-3000 µm, `lin_dist_m11_skipraw` 100-1000 µm, `pca_dist_m11_skipraw`, `scvi_dist_m11_skipraw` at 3 seeds, 3 twins; GlobalModel with the raw own-cell skip, programme masking; results in `results/distance_window`)
+
+**What worked**
+- The window result holds over seeds: `lin_dist_skipraw` 0.909 ± 0.003 (one seed on 2026-10-24: 0.905), programme mean 0.729,
+  8 / 14 / 2 against the bar; short-range receivers 0.97 / 0.97 / 0.95 (seed SD at most 0.014), their planted senders ranked
+  0.98. Still the best model (dual sums 0.83-0.85).
+- 100-1000 µm costs nothing: 0.905 ± 0.001, 0.730, 8 / 14 / 2. With no window starting past 1 mm the rings hold (M7 0.95, M8
+  0.93; per gene only MC11, 4 mm, drops, 0.93 → 0.89), and the mid-range sender rank rises (0.73 ± 0.10 → 0.83 ± 0.05).
+- The windows hardly move: every head but the narrowest ends within ~20% of its start (215 → 208-237, 464 → 459-482,
+  1000 → 819-843 µm); the narrowest goes 100 → 54-60 µm at strength ~1.5 in the linear arms, a nearest-neighbour head. The range
+  is set by the start, not learned.
+- What a token keeps decides what the context can read (model-free: the sweep's saved embeddings against synth_spot regenerated
+  at signal_scale 6, which reproduces the cluster PCA at R² 1.00). The PCA carries the ZINB background, batch, condition and
+  region markers at R² 0.99-1.00, S1 / S2 at 0.18 / 0.23, and M9, M10, M11 and the sparse sources and receptors MR16-MR22 at
+  0.00. scVI carries S1 / S2 at 0.01 but M1 / M3 at 0.93 / 0.86, and it is the only arm that wins M3 (0.79 against 0.61-0.65).
+
+**What doesn't work**
+- M11 is not a question of reach: heads end at ~210 and ~470 µm, around its 150 µm kernel, and it stays at 0.25 (100-1000)
+  against 0.22 (100-3000), `ref_own` 0.24, bar 0.92; the context part carries 0.17 of it. Not known yet whether the learning signal
+  from 3-6 single source spots per slide is the limit (a softmax mean over a ~220 µm window gives one spot a few percent), or the
+  competition with the other 28 hidden genes.
+- PCA and scVI tokens: 0.539 / 0.385, programme mean 0.61 / 0.57, short-range receivers 0.26 / 0.22, rings 0.61 / 0.39. They also
+  fit worse and generalise worse: train loss 0.23 / 0.27, validation 0.44 / 0.53, against 0.083 / 0.085 for the linear token.
+  Not checked: whether the gap is memorised per-spot noise (the PCA is mostly the ZINB background) or slide-level batch.
+- The within-receiver table rewards the receivers' level, not their variation: it centres on the training mean over all cells,
+  so the untrained twins read S2>R2 at 0.99-1.00 within receivers (R1 and R2 are constant within their receivers: nothing else
+  is there to score), and the seed SD on M11 within receivers is 0.17 (linear) and 0.39 (scVI).
+- 3 of the 8 wins (M3, M5, M10) are the bar falling below `ref_own` (0.46 / 0.58 / 0.16 against 0.61 / 0.69 / 0.24); the model only
+  matches `ref_own` there. The real wins are the short range and the rings.
+- Against the oracle 0 / 5 / 19 (0.73 against 0.98): M9 / M10 (0.22 / 0.23), M11, the sparse responses' distance part (MC20 /
+  MC21 0.67 / 0.58), the mirror programmes MC1-MC6 at `ref_own` (oracle 0.95-0.98).
+- Gene scales: `rho_ell_share` is higher for the PCA / scVI arms (0.45 / 0.35 against 0.06-0.09) because their context fails on
+  the short range, not because they split better; the summary's kernel columns read 0.001 under programme masking (they smooth
+  genes hidden everywhere). Neither reads a global-only programme run.
+- The PCA arm's sender ranks are not readable (completeness gap 0.21).
