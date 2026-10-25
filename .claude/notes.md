@@ -780,3 +780,31 @@ gene, over all 253 genes in the cells task and over the 29 hidden genes in the p
   the short range, not because they split better; the summary's kernel columns read 0.001 under programme masking (they smooth
   genes hidden everywhere). Neither reads a global-only programme run.
 - The PCA arm's sender ranks are not readable (completeness gap 0.21).
+
+## 2026-10-25 — Exact fused attention for whole sections (attention_plan.md stage 6, `attention.kind: fused`; code and toy models, no data)
+
+**What worked**
+- The fused attention is the dense model: outputs, maps and every gradient (tokens, projections, the window's scales and
+  strengths, spectral and Fourier coefficients) equal dense attention's to 1e-5, with the blocked diagonal, the long-range mask
+  (1 and 2 hops), padding, a subsampled graph, RoPE and centred queries and keys, in one block, in blocks of 3-4 queries and of
+  one; through the window sweep's GlobalModel too (per cell, subsampled, on pooled patches).
+- No S x S: with more than one block no op of a pass, backward included, returns a tensor with two axes over the sequence (the
+  dense model's does, the check's control); each block's mask is built when it runs and again for its backward pass, never kept.
+- SDPA takes the additive mask and returns its gradient: the CPU math path and the local GPU's memory-efficient kernel (held to
+  that kernel in the test) agree with explicit attention to ~5e-7; the window learns through it.
+- The default model is unchanged (harness IDENTICAL); a fused model starts from the dense model's weights and leaves the RNG
+  where dense does. 34 tests; 27 mutations, all caught after one test was strengthened.
+
+**What doesn't work**
+- A maskless SDPA, the first idea in roadmap T6, would not be the windowed model: without the long-range mask the dense model
+  blocks each cell's own key, and with an open diagonal the narrowest window head (57 µm, strength 1.44, 100 µm lattice) would
+  put about two thirds of its weight on the cell itself at equal content logits. The fused attention keeps the diagonal blocked,
+  so each block builds its mask.
+- Each block materialises its rows of the bias (heads x rows x tokens floats): bounded memory, but likely the dominant cost.
+  Folding the window into q and k (exact, rank 4) would remove it, but its terms cancel at mm coordinates (fp32, centring, and
+  the cluster kernel's accuracy to check), and the diagonal would still need a mask per block.
+- A "dropout did act" check written as `not allclose(...)` at default tolerances passed without any dropout: rounding between
+  the CPU kernels taken with and without a gradient already breaks `allclose` near zero. Ask for a difference of the effect's size.
+- Not measured: speed, memory and the kernel's precision on the cluster's GPUs at 10^4-10^5 cells
+  (`scripts/fused_attention_benchmark.py`). Not built for whole sections: an inference path without dense maps (the relevance in
+  `get_model_output`), readouts on sampled queries, the CosMx pipeline (T0), `visible_keys_only` with the fused attention.

@@ -19,7 +19,7 @@ The terms used below:
 
 ## Status
 
-Last updated 2026-10-23.
+Last updated 2026-10-25.
 
 | track | question | state | verified by | date |
 |---|---|---|---|---|
@@ -30,7 +30,7 @@ Last updated 2026-10-23.
 | T3 | masking strategies | **channel masking implemented, unverified** (2026-10-22): `dataset.mask_channel_fraction` (30% first, 50% the same code), 31 tests, 36 mutations, harness IDENTICAL; sweep `channel_masking` (8 runs, evaluated on the programme set via `EVAL_MASK_GENES`) **run and read 2026-10-23** (notes.md): it does not transfer (0.245 against 0.764 for the programme-trained model, below `ref_own`); training loss 0.76-0.83, so it hardly fits its own task -- diagnose before dropping it. The other new masks (structured, by cell type, same-type blocks) proposed | tests, harness, synth_spot data | 2026-10-23 |
 | T4 | interpretation beyond raw attention; attention sinks | **sender attribution built, unverified on data** (2026-10-20) — `response_influence(measure="attribution")`: integrated gradients from the training-mean cell on a programme's summed response genes, completeness check, hidden entries fixed, one random state along the path; 16 + 6 tests, 31 mutations caught. **First run on data 2026-10-23** (additive_decoder, context_query, global_decoders, channel_masking; notes.md): the dual models rank the short-range senders at 0.98 and M11's at 0.96 (twins 0.48-0.55), the dense, sparse and directional ones at 0.52-0.60, global-only models every class at 0.50-0.59; no model-free bar yet (a kernel that reads the driver would also rank the sender first). Not built: the other methods of the table below, the null key and registers, the permuted-slide baseline. **Not run on data**. **2026-10-21 (task 4 below): attention checked against torch and the readouts compared; run and read 2026-10-21 on the 13 + 3 `response_masking` checkpoints (notes.md): the attention is computed correctly (zero difference to the definition and to torch), no readout finds the planted senders (ranks 0.47-0.55, twins 0.48-0.52), gradient x input is the only one above its twin (+0.04-0.05), RoPE attention ranks the mid-range sender far below chance (0.09-0.35; pair counts missing, now kept)**: the vendored attention equals torch's stock `nn.MultiheadAttention` and encoder layer (tests, every mask form); relevance fixed (heads averaged per graph, tensors on the output's device, a target can be given); `evaluation.attention_check` (`check_attention` on the real inputs, `attention_readouts`: 7 readouts against planted pairs); 40 tests; of 15 mutations 14 caught (2 after two more tests), the survivor a redundant gradient clear; sweep `attention_check` (evaluation only, on the `response_masking` checkpoints), **not run**. Label-free flow (task 5) proposed | 2026-10-23 |
 | T5 | how cell-type driven attention is | proposed | | |
-| T6 | complexity vs tissue coverage ([attention_plan.md](attention_plan.md) stages 6, 8) | proposed | | |
+| T6 | complexity vs tissue coverage ([attention_plan.md](attention_plan.md) stages 6, 8) | proposed; **exact fused attention implemented, unverified on data** (2026-10-25, stage 6): `attention.kind: fused`, dense attention exactly (masks, every bias with a pair form, RoPE) by SDPA in blocks of queries, no S × S tensor; equal to dense to 1e-5 in outputs, maps and gradients, through the windowed GlobalModel too. Not built: the inference path without dense maps, readouts on sampled queries, the CosMx pipeline (T0) | 34 tests, harness | 2026-10-25 |
 | T7 | disease-specific interactions | proposed | | |
 | T8 | prior knowledge (NicheNet), downstream | proposed | | |
 | T9 | literature review and write-up | proposed | | |
@@ -836,6 +836,12 @@ What each backend can carry at that size:
 
 - **Build: SDPA, fused exact attention** (attention_plan.md stage 6). RoPE and the factor-form
   biases fold into q and k, so no S × S tensor is formed.
+  **Built 2026-10-25 (implemented, unverified on data), revised:** `attention.kind: fused` runs SDPA a block of
+  queries at a time, each block's mask built exactly (the blocked diagonal or the long-range mask's pairs, padding, the
+  block's rows of every bias with a pair form -- the distance window included) and recomputed for the backward pass:
+  the dense model exactly, with no S × S tensor once a sequence takes more than one block. Not the maskless SDPA of the
+  bullet below: the dense model blocks each cell's own key, and the window's narrowest head reads the neighbours
+  through that. Folding the window into q and k (rank 4, exact but cancelling at mm coordinates) is the later speed-up.
 - **Build: remove what blocks whole sections today.** Stage 8 lists some of these; the rest are in
   the code.
   - `pad_batch` subsamples above `max_seq_len`: set it to the largest section.

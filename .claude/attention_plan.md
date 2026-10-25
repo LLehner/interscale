@@ -17,7 +17,7 @@ Stages 5–8 and keeps every invariant listed there. Code paths are relative to 
 
 ## Status
 
-Last updated 2026-10-11. Same rules as the other plans: update this table in the same commit as the
+Last updated 2026-10-25. Same rules as the other plans: update this table in the same commit as the
 work, and a stage is `done` only when something external verified it. "Implemented, unverified" is
 a real state.
 
@@ -29,7 +29,7 @@ a real state.
 | 3 — low-rank biases (spectral bias into q/k; Fourier distance bias) | **implemented, unverified** — spectral: `U Wᵀ` equals the dense bias (two graphs of different size, one subsampled; CLS and padding zero); a zero bias leaves one side 0 and the other small (mutation-checked); a Performer's map converges to dense softmax with the same bias (TV 0.047 → 0.014 from m = 1024 to 16384 at a bias of ±1.2). Fourier (`pe.bias: [fourier]`): zero at init; each entry is the learned function of `p_key − p_query` (mutation-checked: a flipped sine sign fails); translation-invariant; isotropic is symmetric and invariant to a turn by 180°/directions, anisotropic is not; the default grid fits a ring at 1 mm with R² > 0.9; derived `max_wavelength`; through Performer and dense attention end to end, gradient reaching the coefficients. The directional variant is tagged `fourier-aniso` in checkpoint names (fixed 2026-10-12; both variants had shared one). 555 tests pass; harness IDENTICAL. **No real-data run yet** | 2026-10-11 |
 | 4 — global tokens and a null key | not started | | |
 | 5 — Exphormer-style sparse attention | **implemented, unverified** — with the pattern of every open pair it equals dense attention (outputs and maps; long-range mask, padding, a subsampled graph, distance + spectral + Fourier biases per pair, RoPE), and an Exphormer model on a complete graph equals the dense model at one seed, distance bias included; factorised and explicit paths agree; weights only along the pattern, every row with a key; edge types neutral at init, then steering; blocks exactly the long-range mask's pairs, the graph edges gone under it; finite on the complete-graph test at hops 1–3 and through 5 training steps; relevance runs; trains through `_common_step`; adds only its edge-type weights and moves the global RNG as dense does; the pattern is redrawn only in training with `resample`, never from the global RNG. The bias pair form and the pattern builder (earlier commits) checked against the dense bias and mask. Nine mutations across the three commits, each caught. 596 tests pass; harness IDENTICAL. **No real-data run yet** | 2026-10-11 |
-| 6 — fused exact attention (SDPA) | not started | | |
+| 6 — fused exact attention (SDPA) | **implemented, unverified on data** (2026-10-25) — `attention.kind: fused`: dense attention exactly (the blocked diagonal and the long-range mask as blocked pairs, every bias with a pair form, RoPE), computed by SDPA a block of queries at a time with each block's mask built when it runs and recomputed for the backward pass, so no S x S tensor once a sequence takes more than one block; outputs, maps and every gradient equal dense attention's to 1e-5, through the windowed GlobalModel too (per cell, subsampled, pooled); not run on the cluster (speed, memory, kernel precision at 10^4-10^5 cells; `scripts/fused_attention_benchmark.py`) | 34 tests, 27 mutations caught, harness IDENTICAL | 2026-10-25 |
 | 7 — inducing points (optional) | not started | | |
 | 8 — beyond the window (whole slides; FlexAttention) | not planned in detail | | |
 | 9 — sparse normalisers (entmax, top-k), expression bias, attention flow; legnini sweep | **implemented, unverified** — entmax is alpha-entmax of the dense logits with one alpha per head (learned as 1 + sigmoid(a) from 1.5, or fixed), exact zeros, never weight on a blocked key; top-k keeps exactly k keys per query (ties at the cut no longer stretch the budget) and is dense softmax when k covers every key; the expression bias ranks keys by RMS expression distance over the genes both cells show, gives every pair with a wholly hidden cell one learned value per head, ignores padding, starts at zero; through a real GlobalModule no hidden value reaches a prediction under either backend with distance + expression biases. Attention records carry the mask's open keys, so diagnostics and the flow no longer read a sparse backend's zeros as blocked keys. `evaluation.attention_flow`: uniform attention is explained by both expectations (KL 0, exact uniform sums), attention by distance alone by the distance expectation only, label flows sum to 1, masks survive the disc draws. 10 mutations, each caught (3 had first survived and led to stronger tests); 848 tests pass; harness IDENTICAL; the legnini script smoke-trained (all 5 arms) and evaluated (with twins, maps) on a legnini-shaped stub on the CPU. **Not run on data** | 2026-10-18 |
@@ -596,23 +596,87 @@ is purely long range; under `GlobalModel` they stay, as in Exphormer.
 
 ### 6 — fused exact attention
 
-`attention.fused: true` (dense only): training and validation steps take SDPA (`need_weights=False`),
-and `evaluate()` keeps the explicit path. Key padding is merged into the mask once per batch rather
-than once per layer.
+*First planned as a flag on dense (`attention.fused: true`) handing SDPA the dense mask; revised and built
+2026-10-25 as below. Why the revision:* the windowed global-only model (notes.md, 2026-10-25) is the DP1 candidate and
+the user wants it on CosMx, whole sections of 47k-100k cells (roadmap T6), where one head's dense mask is 10^10
+entries -- so the mask itself may not be formed. And roadmap T6's "SDPA without a mask" would not be that model: without
+the long-range mask the dense model still blocks each cell's attention to itself (`attn_mask_diagonal`), and the
+window's narrowest head (~57 µm on a 100 µm lattice) reads the neighbours, not the cell; an open diagonal would hand it
+mostly the cell itself.
 
-- **Kernel eligibility.** In fp32 only the memory-efficient kernel can be chosen (FlashAttention
-  needs fp16/bf16). If it refuses the head width, SDPA silently falls back to the math kernel and
-  saves nothing. Check it in a GPU test with `sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION])`, and
-  zero-pad the heads if needed (logits unchanged, pass `scale`).
-- **SDPA's boolean mask means "attend"**, the opposite of MHA's. A test hands it the MHA-convention
-  mask and must fail.
-- **Dropout:** the fused kernel has its own RNG stream, so fused runs are paired with explicit runs
-  by seed, not identical.
-- **Verify:**
-  - Outputs and gradients equal the explicit path to 1e-5 at dropout 0, with the mask, both biases,
-    RoPE, padding and a subsampled graph.
-  - The validator rejects fused together with the entropy loss.
-  - On the cluster: memory and steps/s against the explicit path over a range of S.
+**Design (as built).**
+- *A backend of its own,* `attention.kind: fused` (`attention.FusedAttention`), not a flag: it takes its mask as a
+  `StructuredMask` (the blocked pairs, `blocked_pairs`: the diagonal, or the long-range mask's k-hop pairs), never as
+  the dense `[B * heads, S + 1, S + 1]` mask, and the registry fixes the mask form per kind (`mask="pairs"`).
+- *The same function as dense attention:* the softmax of `q . k / sqrt(d) + bias` over every key neither blocked nor
+  padding, the blocked diagonal included.
+- *Blocks of queries.* `F.scaled_dot_product_attention` runs on `rows = chunk_pairs // (B * L)` queries at a time
+  (`L` tokens, CLS included), each against every key, with that block's additive mask `[B, heads, rows, L]`: its rows'
+  biases, `-inf` at its blocked pairs and padded keys. A query's row is whole within its block, so no softmax is
+  split; the mask is a float one (no boolean-convention trap). A block's mask is built when the block runs and
+  dropped after; in training with more than one block every block runs under activation checkpointing
+  (`torch.utils.checkpoint`, non-reentrant), so none is kept for the backward pass. `attention.fused.chunk_pairs`
+  (default 2^24) bounds a block: synth_spot's 2,501 tokens fit in one, a 100k-cell section takes ~600 of ~170 rows.
+- *Biases* (`bias_forms={"pairs"}`): every bias with a pair form, read a block of rows at a time by
+  `AttentionBias.rows` (`StructuredMask.bias_rows`): a distance bias (all kinds, both window shapes) from the rows'
+  exact distances (`cdist` without the matrix-product shortcut, as the dense form -- it would lose µm at a section's
+  global coordinates), a low-rank bias (Fourier, spectral) from its factors' rows, any other from its pair form. The
+  expression bias (dense only) is refused.
+- *Maps* (`need_weights`): the same mask over all rows and an explicit softmax, the output computed from the returned
+  map, so relevance, the diagnostics and `evaluate()` read it as from dense attention (S x S, as there).
+- *Dropout:* SDPA's own stream, so in training a fused run pairs with a dense one by seed, not bit for bit.
+- *Kernel:* in fp32 SDPA picks the memory-efficient kernel on the GPU (FlashAttention needs fp16/bf16), which takes
+  an additive mask and returns its gradient (the window's scales and strengths learn through it).
+
+**Not here (later):**
+- Folding a low-rank bias into q and k instead of building each block's bias. The Gaussian window is exactly rank 4 in
+  the coordinates (`-s |x_q - x_k|^2 / 2l^2` expanded), which would let SDPA run with no materialised bias -- several
+  times faster -- but the expansion cancels: terms of `s |x|^2 / 2l^2` (~10^5 at a 5 mm section and a 15 µm window)
+  sum to the few-unit logits of near pairs, so it needs centred coordinates, fp32, and a check that the cluster's
+  kernel is fp32-accurate (not TF32). And it still needs the blocked diagonal per block.
+- An inference path without the relevance rollout and the dense `_attn_matrix` (`get_model_output`), and the
+  evaluation readouts on sampled queries: whole sections need them (T6).
+- `attention.visible_keys_only` (a key mask per block would do; refused for now, as for every non-dense mask).
+
+#### How Stage 6 was built
+
+- `FusedAttention._attend`: the blocked pairs sorted by query once per call, each block's slice found by
+  `searchsorted`; `_block_mask` scatters them, adds key padding and the block's biases; `block_rows` sizes a block.
+- `AttentionBias.rows(...) -> read(start, stop)`: the padded coordinates and the factors prepared once per pass (the
+  factors carry the gradient to the Fourier and spectral coefficients); the window's parameters are applied inside each
+  block, so a recomputed block takes their gradient again.
+- `common_step_local_to_global` hands a `pairs`-mask backend the rows reader when it carries the pair form, the factors
+  otherwise (the Performer, as before); `StructuredMask` gained the field `bias_rows`.
+- **Verified** (`tests/test_fused_attention.py`, 34 tests, every parameter stirred off its initialisation):
+  - `rows` equals the dense bias for every kind with a pair form (profile, linear, both window shapes, spectral,
+    Fourier, a pair-only bias), blocks of any size including the CLS row, two graphs (one subsampled, one padded), and
+    at 50 mm coordinates with a 20 µm window; its gradient equals the dense form's.
+  - The layer equals dense attention -- outputs, maps and the gradients of the tokens, the projections and every bias
+    parameter, to 1e-5 -- at 0, 1 and 2 hops, with padding, a subsampled graph, the window, spectral and Fourier
+    biases and RoPE, in one block, blocks of 3 rows and of 1; a cell's own key gets weight 0.
+  - Through the real model: the window sweep's GlobalModel (window, RoPE, centred queries and keys, raw own-cell skip,
+    programme masking) built dense and fused at one seed has the same weights and, stirred, the same predictions and
+    every parameter's gradient -- in one block, in blocks of 4 queries, one query per block on a subsampled graph,
+    and on pooled patches; a transformer under the long-range mask too.
+  - No op of a pass in blocks, backward included, returns a tensor with two axes over the sequence (the dense model's
+    does: the check's control); each block's biases are computed once per pass and again for its backward (and once
+    without a gradient or with one block).
+  - Dropout: the recomputed blocks give the gradient of the forward pass that ran (checked against no recomputation
+    from the same random state); the explicit path drops in training; nothing is dropped in evaluation, where a fused
+    layer equals a dense one at dropout 0.5.
+  - A fused model starts from the dense model's weights and leaves the RNG where dense does; the validator takes every
+    bias with a pair form and RoPE, refuses the expression bias, the entropy loss, visible keys only, `chunk_pairs` < 1;
+    the checkpoint tag is `attn-fused`.
+  - On the local GPU (a Pascal card, toy tensors): the memory-efficient kernel, the mask's gradient included, equals
+    dense attention through the windowed model to 1e-4, with SDPA held to that kernel (no silent math fallback).
+  - 27 mutations of the new code, all caught; one ("the fused path never drops") first survived because "dropout did
+    act" was an `allclose` at default tolerances, which rounding between the CPU kernels already broke -- the test now
+    asks for a difference of dropout's size. Harness IDENTICAL (5 cases, 15 epoch records); 1,355+ tests pass.
+- **For the cluster:** `scripts/fused_attention_benchmark.py` builds the windowed global module dense and fused (same
+  weights) on synthetic sections of `--cells` cells (`--density` per mm², around `--offset-um`), and reports seconds per
+  training step, peak GPU memory, and, where dense fits, the largest output difference and the window gradient's
+  relative difference. At toy size on the CPU: 6-7e-7 and 1-2e-7, also 50 mm from the origin.
+- **Not verified:** speed and memory on the cluster's GPUs at 10^4-10^5 cells, and the kernel's precision there.
 
 ### 7 — inducing points (optional)
 

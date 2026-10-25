@@ -205,6 +205,24 @@ vector is laid out with `pad_like` from this call's `index_nodes` -- never a sec
 subsampling. It must run *before* the bias is merged into the mask. Needs a dense-mask backend (the validator names which) and
 cells hidden whole (not with `mask_genes`, pooling, or gene masking without discs). Checkpoint tag `-vk` in the attention part.
 
+### Exact fused attention (`attention.kind: fused`; `.claude/attention_plan.md`, stage 6)
+
+`attention.FusedAttention` is dense softmax attention, exactly, computed by `F.scaled_dot_product_attention` a block of queries at a
+time, so a sequence of ~10^5 cells (a whole CosMx section) forms no `S x S` tensor. Invariants:
+
+- **It is the dense model.** It takes its mask as a `StructuredMask` of blocked pairs (`mask="pairs"`): without the long-range mask
+  that is each cell's own key (`attn_mask_diagonal`'s diagonal), with it the k-hop pairs -- never an open diagonal. Biases come a block
+  of rows at a time from `AttentionBias.rows` (`StructuredMask.bias_rows`), rows of exactly the dense bias: every bias with a pair form
+  (distance in every kind, Fourier, spectral); the expression bias, `visible_keys_only` and the entropy loss are refused.
+- **No block is kept.** `rows = chunk_pairs // (B * L)` queries per block (`attention.fused.chunk_pairs`, default 2^24); each block's
+  additive mask is built when it runs and, in training with more than one block, rebuilt in the backward pass (non-reentrant
+  `torch.utils.checkpoint`). Anything a block computes must stay inside the block function; a tensor of all blocks kept outside it is the
+  `S x S` memory again. One block (synth_spot's 2,501 tokens) is plain SDPA with the whole mask.
+- **Exact distances.** `rows` takes `cdist` without the matrix-product shortcut, as the dense form: at a section's global coordinates
+  (tens of mm) the shortcut loses whole µm, which a 15-20 µm window turns into wrong logits.
+- **Maps only when read** (`need_weights`): the explicit path, the output computed from the returned map (relevance hooks it).
+- **Dropout** is SDPA's own stream: fused and dense agree at dropout 0 or in evaluation, and pair by seed in training.
+
 ### Regime losses and the own-cell skip (`tl/depth.py`, `.claude/decoder_plan.md`)
 
 `optim.regime_loss` (default `kind: none`, every run as before) gives each head of the dual decoder the hidden cells of
