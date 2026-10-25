@@ -234,13 +234,14 @@ class TransformerNodeEncoderHook(GlobalModule):
         if self.attention_spec.mask in ("pairs", "pattern"):
             # The same blocked set as the dense masks below, as a list of pairs. A backend that never
             # forms the S x S matrix takes it this way, with the attention biases in the form it
-            # carries: low-rank factors it folds into its queries and keys (Performer), or the bias
-            # of each pair of the sparse pattern it attends along (Exphormer). All of it laid out
-            # from this call's index_nodes.
+            # carries: low-rank factors it folds into its queries and keys (Performer), the bias of
+            # each pair of the sparse pattern it attends along (Exphormer), or the bias a block of
+            # query rows at a time, computed when the block runs (fused). All of it laid out from
+            # this call's index_nodes.
             hops = self.local_mask_hops if self.long_range_attention else 0
             edge_index = getattr(batched_data, "edge_index", None)
             blocked = blocked_pairs(edge_index, batched_data.batch, index_nodes, n_hops=hops, device=emb.device)
-            factors = pattern = pattern_types = pair_bias = None
+            factors = pattern = pattern_types = pair_bias = bias_rows = None
             if self.attention_spec.mask == "pattern":
                 pattern, pattern_types = self.attention_spec.pattern(
                     self.attention_cfg,
@@ -257,11 +258,15 @@ class TransformerNodeEncoderHook(GlobalModule):
                     pair_bias = self.attention_bias.pairs(
                         batched_data, index_nodes, src_padding_mask, pattern, dtype=emb.dtype, device=emb.device
                     )
+            elif self.attention_bias is not None and "pairs" in self.attention_spec.bias_forms:
+                bias_rows = self.attention_bias.rows(
+                    batched_data, index_nodes, src_padding_mask, dtype=emb.dtype, device=emb.device
+                )
             elif self.attention_bias is not None:
                 factors = self.attention_bias.factors(
                     batched_data, index_nodes, src_padding_mask, dtype=emb.dtype, device=emb.device
                 )
-            attention_mask = StructuredMask(blocked, factors, pattern, pattern_types, pair_bias)
+            attention_mask = StructuredMask(blocked, factors, pattern, pattern_types, pair_bias, bias_rows)
         elif self.long_range_attention and self.local_mask_hops > 0:
             # Block everything the local component has already seen, so the transformer can only
             # contribute what the GNN could not.

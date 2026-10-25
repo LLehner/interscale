@@ -37,6 +37,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
+from torch.utils.checkpoint import checkpoint
 from torch_geometric.utils import softmax as scatter_softmax
 
 from interscale.module.global_modules.transformer_utils import apply_rotary
@@ -45,7 +46,7 @@ from interscale.tl.masking import PATTERN_EDGE_TYPES, attention_pattern
 #: Forms in which an attention bias can be handed to a backend: ``dense``, the ``[B * heads, S, S]``
 #: float mask it is merged into today; ``factors``, low-rank ``U, W`` with ``bias = U W^T``, which a
 #: backend folds into its queries and keys; ``pairs``, the bias of each pair of a list, for a backend
-#: that attends along one.
+#: that attends along one -- or along every pair, a block of query rows at a time (fused).
 BIAS_FORMS = ("dense", "factors", "pairs")
 
 
@@ -65,6 +66,10 @@ class StructuredMask(NamedTuple):
     ``(graph, query, key)`` positions it attends along (blocked pairs already removed), ``pair_types``
     ``[E]`` their edge types (``tl.masking.PATTERN_EDGE_TYPES``), and ``pair_bias`` ``[E, heads]``
     the attention biases on them (``AttentionBias.pairs``), or None.
+
+    For a backend that attends to every pair a block of query rows at a time (fused): ``bias_rows``,
+    when attention biases are on, is ``(start, stop) -> [B, heads, stop - start, S + 1]``, the rows
+    ``start..stop`` of the dense bias (``AttentionBias.rows``), computed when a block asks for them.
     """
 
     blocked: torch.Tensor
@@ -72,6 +77,7 @@ class StructuredMask(NamedTuple):
     pairs: torch.Tensor | None = None
     pair_types: torch.Tensor | None = None
     pair_bias: torch.Tensor | None = None
+    bias_rows: Callable | None = None
 
 
 @dataclass(frozen=True)
@@ -669,6 +675,104 @@ class ExphormerAttention(ProjectedAttention):
         return out.view(n_rows, seq_len, head_dim), None
 
 
+class FusedAttention(ProjectedAttention):
+    """Dense softmax attention, exactly, computed by PyTorch's fused kernel a block of query rows at a time.
+
+    The same function as dense attention -- the softmax of ``q . k / sqrt(d) + bias`` over every key that is
+    neither blocked nor padding -- with no ``S x S`` tensor once a sequence takes more than one block, which is
+    what lets a whole section of ~10^5 cells run (``.claude/attention_plan.md``, stage 6).
+
+    * **The mask** comes as blocked pairs (:class:`StructuredMask`): each cell's attention to itself without the
+      long-range mask (``attn_mask_diagonal``), the k-hop pairs with it. So this is the dense model, the blocked
+      diagonal included, not attention that also lets a cell read itself.
+    * **Blocks.** ``F.scaled_dot_product_attention`` runs on ``rows = chunk_pairs // (B * L)`` queries at a time
+      (``L`` tokens per sequence, CLS included), each against every key, with its own additive mask
+      ``[B, heads, rows, L]``: its rows' biases (``StructuredMask.bias_rows``), ``-inf`` at its blocked pairs and
+      at padded keys. A block's mask is built when the block runs and dropped after; in training, with more than
+      one block, every block runs under activation checkpointing, so none is kept for the backward pass either.
+      A query's row is whole within its block, so blocking changes no softmax.
+    * **Maps.** Asked for weights, the same mask over all rows at once and an explicit softmax, so a gradient
+      hook on the map sees the gradient through it.
+    * **Dropout** is the fused kernel's own, from its own random stream: in training a fused model and a dense
+      one pair by seed but differ in which weights are dropped.
+    """
+
+    def __init__(
+        self, embed_dim: int, num_heads: int, head_dim: int, *, dropout: float = 0.0, chunk_pairs: int = 2**24
+    ):
+        super().__init__(embed_dim, num_heads, head_dim, dropout=dropout)
+        if int(chunk_pairs) < 1:
+            raise ValueError(f"chunk_pairs must be >= 1, got {chunk_pairs}.")
+        self.chunk_pairs = int(chunk_pairs)
+
+    def extra_repr(self) -> str:
+        return super().extra_repr() + f", chunk_pairs={self.chunk_pairs}"
+
+    def block_rows(self, n_graphs: int, seq_len: int) -> int:
+        """Queries per block: as many as keep a block within ``chunk_pairs`` query-key pairs, at least one."""
+        return max(1, self.chunk_pairs // (n_graphs * seq_len))
+
+    @staticmethod
+    def _block_mask(context, blocked, padding, start, stop, n_graphs, seq_len, dtype, device) -> torch.Tensor:
+        """The additive mask of query rows ``start..stop``: ``[B, heads or 1, rows, L]``, ``-inf`` where blocked or padded.
+
+        ``blocked`` are the ``(graph, query, key)`` pairs with a query in the block, ``padding`` ``[B, L]``.
+        """
+        graph, query, key = blocked
+        closed = torch.zeros(n_graphs, stop - start, seq_len, dtype=torch.bool, device=device)
+        closed[graph, query - start, key] = True
+        if padding is not None:
+            closed |= padding[:, None, :]
+        if context.bias_rows is None:
+            logits = torch.zeros(n_graphs, 1, stop - start, seq_len, dtype=dtype, device=device)
+        else:
+            logits = context.bias_rows(start, stop).to(dtype)
+        return logits.masked_fill(closed[:, None], float("-inf"))
+
+    def _attend(self, q, k, v, padding, attn_mask, need_weights, context):
+        if attn_mask is not None or not isinstance(context, StructuredMask):
+            raise ValueError(
+                "the fused attention takes its mask as a StructuredMask (blocked pairs, the biases by rows), never as "
+                "a dense attention mask; common_step_local_to_global builds it."
+            )
+        n_rows, seq_len, head_dim = q.shape
+        n_graphs = n_rows // self.num_heads
+        q, k, v = (t.view(n_graphs, self.num_heads, seq_len, head_dim) for t in (q, k, v))
+        args = (n_graphs, seq_len, q.dtype, q.device)
+
+        if need_weights:
+            mask = self._block_mask(context, tuple(context.blocked), padding, 0, seq_len, *args)
+            weights = torch.softmax((q / math.sqrt(head_dim)) @ k.transpose(-2, -1) + mask, dim=-1)
+            weights = weights.reshape(n_rows, seq_len, seq_len)
+            if self.training and self.dropout > 0.0:
+                weights = F.dropout(weights, p=self.dropout)
+            # The output from the very tensor returned, so a gradient hook on the map (relevance) sees its gradient.
+            return weights @ v.reshape(n_rows, seq_len, head_dim), weights
+
+        # The blocked pairs sorted by query once, so each block takes its own as one slice.
+        rows = self.block_rows(n_graphs, seq_len)
+        graph, query, key = context.blocked
+        order = torch.argsort(query)
+        graph, query, key = graph[order], query[order], key[order]
+        starts = list(range(0, seq_len, rows))
+        edges = torch.tensor(starts + [seq_len], device=query.device, dtype=query.dtype)
+        bounds = torch.searchsorted(query, edges).tolist()
+        dropout = self.dropout if self.training else 0.0
+
+        def block(q_rows, k_all, v_all, start, stop, lo, hi):
+            blocked = (graph[lo:hi], query[lo:hi], key[lo:hi])
+            mask = self._block_mask(context, blocked, padding, start, stop, *args)
+            return F.scaled_dot_product_attention(q_rows, k_all, v_all, attn_mask=mask, dropout_p=dropout)
+
+        recompute = torch.is_grad_enabled() and len(starts) > 1
+        outs = []
+        for i, start in enumerate(starts):
+            stop = min(start + rows, seq_len)
+            inputs = (q[:, :, start:stop], k, v, start, stop, bounds[i], bounds[i + 1])
+            outs.append(checkpoint(block, *inputs, use_reentrant=False) if recompute else block(*inputs))
+        return torch.cat(outs, dim=2).reshape(n_rows, seq_len, head_dim), None
+
+
 # --------------------------------------------------------------------------- registry entries
 
 
@@ -856,6 +960,31 @@ def _exphormer_pattern(attention_cfg, *, edge_index, batch, index_nodes, blocked
 def _build_exphormer(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
     return ExphormerAttention(
         embed_dim, num_heads, head_dim, dropout=dropout, edge_type=str(attention_cfg.exphormer.edge_type)
+    )
+
+
+def _validate_fused(attention_cfg):
+    fused = attention_cfg.get("fused", None)
+    if fused is None:
+        raise ValueError("attention.kind 'fused' needs the attention.fused block.")
+    if int(fused.chunk_pairs) < 1:
+        raise ValueError(
+            f"attention.fused.chunk_pairs (query-key pairs per block of queries) must be >= 1, got {fused.chunk_pairs}."
+        )
+
+
+@register_attention(
+    "fused",
+    validate=_validate_fused,
+    mask="pairs",
+    bias_forms=frozenset({"pairs"}),
+    rotary=True,
+    training_maps=False,
+    note="The fused attention reads each bias a block of query rows at a time, which takes a bias with a pair form.",
+)
+def _build_fused(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
+    return FusedAttention(
+        embed_dim, num_heads, head_dim, dropout=dropout, chunk_pairs=int(attention_cfg.fused.chunk_pairs)
     )
 
 

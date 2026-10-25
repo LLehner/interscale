@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Exact fused attention (`attention.kind: fused`; attention_plan.md, stage 6): dense softmax attention, exactly -- each cell's own
+  key blocked without the long-range mask, the k-hop pairs with it, every attention bias with a pair form, RoPE -- computed by
+  `F.scaled_dot_product_attention` a block of queries at a time (`attention.fused.chunk_pairs` query-key pairs per block, default
+  2^24). Each block's additive mask is built when it runs and, in training with more than one block, rebuilt for the backward pass
+  (activation checkpointing), so no `S x S` tensor is formed: whole sections of ~10^5 cells. Maps only when read (explicit path).
+  `AttentionBias.rows` reads the biases a block of query rows at a time (exact distances, factor rows, or the pair form);
+  `StructuredMask.bias_rows` carries it.
 - Orthogonality terms (`train.orthogonality`; decoder_plan.md, D4): eight scale-free auxiliary losses in [0, 1], each its own
   weight `optim.aux_loss_weights.orth_<name>` (default 0: never built). Between the dual model's local and global embedding
   over cells: linear CKA (`orth_cka`), mean squared canonical correlation (`orth_cca`), RBF kernel CKA (`orth_kernel_cka`),

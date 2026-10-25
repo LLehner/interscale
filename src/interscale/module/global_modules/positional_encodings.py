@@ -1155,6 +1155,65 @@ class AttentionBias(nn.Module):
             total = total + encoder.pairs(*inputs[key_name], graph[rows], query[rows], key[rows])
         return out.index_put((rows,), total)
 
+    def rows(self, batched_data, index_nodes, src_padding_mask, dtype, device):
+        """The enabled biases a block of query rows at a time: ``(start, stop) -> [B, heads, stop - start, S + 1]``.
+
+        Rows ``start..stop`` of :meth:`forward`'s bias, laid out like it -- zero at CLS and padding -- for a backend
+        that attends to every pair but never forms the whole ``S x S`` bias (fused). What every row needs is
+        prepared here once per pass: the padded coordinates and each low-rank bias's factors. A call computes only
+        its rows: a bias of distances from the rows' exact distances (``cdist`` without the matrix-product shortcut,
+        as :meth:`forward`), a low-rank bias from its factors' rows, any other bias with a pair form from that form.
+        """
+        batch = batched_data.batch.to(device=device, dtype=torch.long)
+        n_graphs, seq_len = src_padding_mask.shape
+        pad = src_padding_mask.to(device=device, dtype=torch.bool)
+
+        inputs, distances, factors, pairwise = {}, [], [], []
+        for name, encoder in self.encoders.items():
+            # Coordinates rather than the pairwise distances the dense distance bias takes.
+            key = "pos_coords" if self.requires[name] in ("pos", "pos_coords") else self.requires[name]
+            if key not in inputs:
+                inputs[key] = self._inputs(key, batched_data, batch, index_nodes, seq_len, dtype, device)
+            if self.requires[name] == "pos":
+                distances.append(encoder)
+            elif hasattr(encoder, "factors"):
+                factors.append(encoder.factors(*inputs[key]))
+            elif hasattr(encoder, "pairs"):
+                pairwise.append((encoder, key))
+            else:
+                raise ValueError(
+                    f"the attention bias '{name}' has neither a pair form nor a low-rank form; only a dense attention takes it."
+                )
+
+        def read(start: int, stop: int) -> torch.Tensor:
+            cells = min(stop, seq_len)  # the rows from seq_len on are CLS, whose bias is 0
+            out = torch.zeros(n_graphs, self.n_heads, stop - start, seq_len + 1, dtype=dtype, device=device)
+            if start >= cells:
+                return out
+            bias = 0
+            if distances:
+                pos = inputs["pos_coords"][0]
+                dist = torch.cdist(pos[:, start:cells], pos, compute_mode="donot_use_mm_for_euclid_dist")
+                for encoder in distances:
+                    bias = bias + encoder(dist)  # [B, heads, rows, S]
+            for left, right in factors:
+                bias = bias + left[..., start:cells, :] @ right.transpose(-1, -2)
+            if pairwise:
+                graph, query, key = torch.meshgrid(
+                    torch.arange(n_graphs, device=device),
+                    torch.arange(start, cells, device=device),
+                    torch.arange(seq_len, device=device),
+                    indexing="ij",
+                )
+                for encoder, name in pairwise:
+                    values = encoder.pairs(*inputs[name], graph.reshape(-1), query.reshape(-1), key.reshape(-1))
+                    bias = bias + values.view(n_graphs, cells - start, seq_len, self.n_heads).permute(0, 3, 1, 2)
+            bias = bias.masked_fill(pad[:, None, start:cells, None] | pad[:, None, None, :], 0.0)
+            out[:, :, : cells - start, :seq_len] = bias
+            return out
+
+        return read
+
     def factors(self, batched_data, index_nodes, src_padding_mask, dtype, device):
         """The enabled biases in low-rank form: ``(U, W)``, each ``[B * heads, S + 1, r]``.
 

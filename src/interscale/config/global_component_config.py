@@ -253,5 +253,14 @@ def get_global_component_cfg(cfg, global_component_name):
         # biases and mask included), softmax among them: a hard budget of k keys per query.
         att.topk = CN()
         att.topk.k = 32
+        # `fused`: dense softmax attention, exactly -- the same masks (a cell never attends to itself without the
+        # long-range mask) and biases -- computed by PyTorch's fused kernel (SDPA) a block of queries at a time, so
+        # no S x S tensor is formed once a sequence takes more than one block: whole sections of ~10^5 cells.
+        # `chunk_pairs` bounds a block: chunk_pairs // (graphs x tokens) queries, each against every key; a
+        # block's additive mask and biases hold heads x chunk_pairs floats (2^24: ~0.3 GB at 4 heads, a few times
+        # that while its biases are computed). Carries every bias with a pair form (distance, fourier, spectral),
+        # RoPE and the long-range mask; maps only when read (explicit path, S x S).
+        att.fused = CN()
+        att.fused.chunk_pairs = 16777216
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

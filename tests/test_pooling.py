@@ -372,7 +372,7 @@ def test_the_single_decoder_combined_model_pools_too():
     assert any(p.grad is not None and torch.count_nonzero(p.grad) > 0 for p in module.local_module.parameters())
 
 
-@pytest.mark.parametrize("attention", ["performer", "entmax", "topk"])
+@pytest.mark.parametrize("attention", ["performer", "entmax", "topk", "fused"])
 def test_other_attention_backends_run_on_patches(attention):
     graphs = [_lattice(6, seed=7)]
     batch = _batch(graphs)

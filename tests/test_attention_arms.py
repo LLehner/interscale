@@ -250,6 +250,8 @@ def test_the_script_writes_the_file(base, tmp_path):
             "entmax_fourier",
             "exphormer",
             "exphormer_fourier",
+            "fused",
+            "fused_fourier",
             "linear",
             "performer",
             "performer_fourier",
