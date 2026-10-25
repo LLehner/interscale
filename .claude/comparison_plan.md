@@ -190,11 +190,36 @@ The report is `results.md`-style (sections per question, a summary on top), with
   - Attention rows for sampled queries under fused attention; an inference path without dense maps (T6).
   - The table writers in the sweep's evaluation, the runners per baseline, the comparison script and its figures.
 
+## Whole sections, no sliding windows (asked 2026-10-25; to settle in the next chat)
+
+The user wants the next CosMx run on whole slides, not sliding windows (roadmap T6 had decided it already).
+
+- **The sample is a section, not a physical slide.** Each slide holds two separate pieces of tissue, one ND and one T1D donor,
+  5.6-7.9 mm apart (slide 1: 108,711 cells, 2: 126,421, 3: 151,595). One sequence per slide would put two donors in one
+  attention sequence (CLS, centring and the widest heads would mix them) and break every per-donor readout. So the unit is
+  `section` (`slide_condition`): 47k-100k cells. Assumed, **to confirm with the user**.
+- **What runs at that size today:** the global-only windowed model (fused attention; speed unmeasured) and the GCN models.
+  **Not:** the dual arms with the context query (`dual_ctx`, `dual_ctx_orth`): `context_only: query` needs queries different
+  from keys, and the transformer refuses every backend but torch's dense attention for it (`transformer_encoder.py`, ~l.153).
+  **Not yet:** the evaluation -- `masked_probing.reference_predictions` forms a dense float64 `cdist` per section (~80 GB at
+  100k cells), and relevance / attention diagnostics form full maps.
+- **Open choice for the dual arms:** (a) extend the fused attention to the context query (same blocks; queries from the query
+  stream, keys and values from the cells' tokens; recommended: without it the global part mostly copies the local one), or
+  (b) run the dual arms without the context query, under the long-range mask the fused attention already supports (quicker;
+  weaker local-vs-global readouts).
+- **To build either way (C2):** the smoother references on neighbour lists, IG attributions on sampled receivers, an inference
+  path without dense maps (`get_model_output`), readouts on sampled queries.
+- **Far fewer optimiser steps:** one step = one section, 2 training sections per fold -> 2 steps per epoch (100 epochs = 200
+  steps; synth_spot runs had 2,400). More epochs will be needed, and seconds per step at 100k cells are unknown: run
+  `scripts/fused_attention_benchmark.py --cells 2500 10000 30000 50000 100000 --offset-um 50000` on a cluster GPU first
+  (also reports fused-vs-dense agreement and peak memory).
+
 ## Decisions still open
 
 1. **Pixel size:** 0.18 µm (proposed from the FOV size) -- to confirm from the paper.
 2. **CosMx settings:** k = 8, the hops curve at 1-3, the disc and random-cell rates, the window range (proposed under C1).
 3. **Positive controls:** the user's check of the draft list.
+4. **Whole sections:** the unit is the section (above); the dual arms' route, (a) or (b); epochs after the benchmark.
 
 ## Order
 
