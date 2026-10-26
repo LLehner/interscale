@@ -761,3 +761,19 @@ def test_the_readouts_read_the_dense_model_alike():
     planted_b = b["hier_planted"].set_index(["layer", "range_class", "head", "metric"])["value"].loc[planted_a.index]
     assert np.allclose(planted_a.to_numpy(), planted_b.to_numpy(), atol=1e-4, equal_nan=True)
     assert np.allclose(a["hier_profile"]["share"], b["hier_profile"]["share"], atol=1e-5)
+
+
+def test_the_direction_prior_keeps_its_gradients_bounded_when_a_parent_reads_itself():
+    """A narrow head's parent reads mostly itself, so its coarse arrow is near zero. Normalised by its own length, the cosine
+    sent gradients of ~1e11 through it and Adam froze the model (synth_spot Stage A, 2026-10-26); softened, the gradients are
+    of the size the other modes get."""
+    batch = _batch((12,))
+    sizes = {}
+    for direction in (False, True):
+        module = _build(_config({"prior_mode": "soft", "levels": [4, 16], "readout": "concat", "direction_prior": direction}, dropout=0.1))
+        module.train()
+        random.seed(0)
+        out = module._common_step(batch, "regression", "node")
+        ((out.y_pred - out.y_true) ** 2).mean().backward()
+        sizes[direction] = max(float(p.grad.abs().max()) for p in module.parameters() if p.grad is not None)
+    assert sizes[True] < 10 * sizes[False], sizes

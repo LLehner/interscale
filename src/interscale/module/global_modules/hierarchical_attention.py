@@ -294,10 +294,17 @@ def coarse_direction(keys, weights, centroid, n_tokens):
     return target, conf
 
 
-def cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Cosine of the last dims, 0 where either is zero."""
-    na, nb = a.norm(dim=-1), b.norm(dim=-1)
-    return (a * b).sum(-1) / (na * nb).clamp_min(1e-12)
+def direction_cosine(offsets: torch.Tensor, arrow: torch.Tensor, scale) -> torch.Tensor:
+    """The cosine of the angle between ``offsets`` and ``arrow`` (last dims), softened for short arrows.
+
+    The arrow is normalised by ``sqrt(|arrow|^2 + scale^2)`` instead of ``|arrow|``: an arrow much shorter than ``scale`` (a
+    parent that reads mostly itself, as every narrow head does) carries no direction, and the gradient through it is bounded
+    by ``1 / scale``. Dividing by ``|arrow|`` itself sent gradients of ~1e11 through near-zero arrows, and Adam then froze every
+    parameter (synth_spot Stage A, 2026-10-26). The offsets carry no gradient; a zero offset (a key on its query) gives 0.
+    """
+    unit = offsets / offsets.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    soft = arrow / (arrow.pow(2).sum(-1, keepdim=True) + scale**2).sqrt()
+    return (unit * soft).sum(-1)
 
 
 def _weight(shape, init, learnable):
@@ -475,6 +482,12 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
             return None
         return ctx.coarse_biases[level]
 
+    @staticmethod
+    def _arrow_scale(hier, level: int) -> float:
+        """The length below which a parent's coarse arrow at ``level - 1`` carries no direction: that level's median cluster
+        spread (µm), at least 1 µm."""
+        return max(float(hier.spread[level - 1].float().median()), 1.0)
+
     def _lam(self, level: int) -> torch.Tensor:
         return self.prior_lambda[level - 1]
 
@@ -576,7 +589,7 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
                 n_par,
             )
             arrow = target - hier.centroid[level - 1].to(q.dtype)[pq][None]  # [H, n, 2]
-            cos = cosine(offsets[None], arrow[:, :, None, :])  # [H, n, n]
+            cos = direction_cosine(offsets[None], arrow[:, :, None, :], self._arrow_scale(hier, level))  # [H, n, n]
             term = self._mu(level)[:, None, None] * conf[:, :, None] * cos
             scores = scores + F.pad(term, (0, 1))
         a = parent_rows[:, :, pk]  # [H, n, n + 1]: A^{l-1}_{p(i), p(j)}
@@ -667,6 +680,7 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
             keys, weights = prior_rows(prior, torch.arange(n_par, device=pos.device), n_par)
             target, conf = coarse_direction(keys, weights, hier.centroid[level - 1].to(q_all.dtype), n_par)
             direction = (target - hier.centroid[level - 1].to(q_all.dtype)[None], conf)  # [H, P, 2], [H, P]
+            arrow_scale = self._arrow_scale(hier, level)
         kbar = None
         if mode == "factorized_percell":
             _, kbar, _ = self._project(level, L, tokens[level - 1], cls, keys_only=True)
@@ -692,7 +706,7 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
             scores = scores.masked_fill(blocked, float("-inf"))
             if direction is not None:
                 arrow, conf = direction[0][:, groups], direction[1][:, groups]  # [H, G, 2], [H, G]
-                cos = cosine(offsets[None], arrow[:, :, None, None, :])  # [H, G, m, K]
+                cos = direction_cosine(offsets[None], arrow[:, :, None, None, :], arrow_scale)  # [H, G, m, K]
                 term = (self._mu(level)[:, None, None, None] * conf[:, :, None, None] * cos).permute(1, 0, 2, 3)
                 scores = scores + F.pad(term, (0, 1))
             slot = torch.arange(kid.shape[1], device=kid.device) // m

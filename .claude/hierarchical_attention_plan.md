@@ -18,7 +18,7 @@ plans': a stage is `done` only when a run has been read; "implemented, unverifie
 | T8 export | **implemented**: `read_vec`, its exact coarse + refinement split, entropy, mean distance, top-5 targets, per slide as npz; quiver plots with planted senders | tests 8-9 | 2026-10-26 |
 | T9 scenarios | **synth_spot as MIX** (decided 2026-10-26); its range classes stand for S1 (`short`), S2 (`mid`), S3 / S4 (`dense` / `sparse`), directional; the loss caveat is met by programme masking. Not built: the scenario generator (S0, S5-S7 as separate slide families, a parametric S2, SCALE) | | |
 | T10 metrics | **implemented** (`evaluation.hierarchy_readouts`): sender lift, pair AUPRC, arrow angle, routing recall per level, distance profile, routing health; the dense model is read by the same code from its maps. CosMx: hidden-cell scores by disc depth against k-NN smoothers (no dense distance matrix). Not built: LR plausibility, replicate consistency | tests | 2026-10-26 |
-| T11 sweeps | **written, not run** (`notebooks_and_scripts/slurm/hierarchical/`): synth_spot Stage A (8 arms x 3 seeds) and a one-seed screen (18 arms), 300 epochs; CosMx feasibility gate, fast (gcn + 5 routed arms) and slow (fused `full`, `dual_add_dist`) parts on 3 folds, 1,000 epochs. Checked by the real `sweep_common` list mode and the evaluation hooks on stub data | stub runs | 2026-10-26 |
+| T11 sweeps | **Stage A first read 2026-10-26** (20 of 24 runs, notes.md): `hier_none` within 0.01 of `full` (0.939 against 0.947, programme mean 0.779 / 0.789), faster; every prior costs (fpc 0.864, fac 0.769), most likely through the windows shared with the coarse levels confining narrow heads to their own cluster; `hier_soft_dir` invalid (gradient explosion in the direction prior, fixed the same day, to rerun); `hier_soft` missing. Submitted 2026-10-26: two job-array sbatch files (`slurm/synth_spot_hier.sbatch`, `slurm/cosmx_hier.sbatch`; yamls and scripts flat in `yaml/`, `scripts/`; local copy in `notebooks_and_scripts/slurm/hierarchical/`). synth_spot Stage A (8 arms x 3 seeds = 24 runs, 300 epochs, 8 h per run) started first; the one-seed screen (18 arms, `HIER_PART=screen`) and CosMx (fold 0: gcn, hier_soft, hier_fac, hier_fpc, 1,000 epochs, 24 h per run; builds `inputs.h5ad` itself) are queued or to follow. Checked only on stub data | stub runs | 2026-10-26 |
 
 ## Implementation in the repo (2026-10-26)
 
@@ -52,6 +52,32 @@ discs only; ~2,000 steps (1,000 epochs, 2 training sections per fold) and a lean
     mask, the context query, `visible_keys_only`, `remask`, pooling, losses reading attention maps.
   - Readouts that index attention cell by cell get the dense mode's cell-level maps; routed models give none, so read them by
     `hierarchy_readouts`, integrated gradients and head scores.
+
+### Reading the first results (written 2026-10-26, before any run was read)
+
+Results: `MA/26_10_results/hier_synth_spot_A/` (also `_screen`, `hier_cosmx_fast`, `hier_cosmx_slow`); `results.md` per sweep, rebuilt from the
+finished runs with `INTERSCALE_MODE=report HIER_PART=<A|screen|fast|slow> python scripts/<synth_spot_hier|cosmx_hier>.py`; fields (npz and quiver
+plots of two test slides) in `fields/<run>/`. Run index in an array = arms x seeds in the yaml's order (gcn 0-2, dual_add_ctx_dist 3-5, full 6-8,
+hier_none 9-11, hier_soft 12-14, hier_fac 15-17, hier_fpc 18-20, hier_soft_dir 21-23); a failed run is rerun with `sbatch --array=<k>`.
+
+Read, in this order (synth_spot Stage A, 3 seeds, paired by seed):
+1. Programme mean and wins / ties / losses against `ref_own+context`, per mode, against `full` (0.952 whole cell at 300 epochs in the M11 sweep, one seed, programme mean
+   0.800), `gcn` and the dual model. The oracle bar is 0.983. Judge by centred cosine, not R^2.
+2. Per range class (`short`, `mid`, `sparse`, `dense`, `directional`): `hier_planted` -- `sender_lift` (1 is chance), `pair_auprc` against `pair_auprc_chance`, `arrow_angle_deg`
+   (90 is random) -- hierarchical modes against `full`. The twins (`full_untrained`, `hier_soft_untrained`) are the floor.
+3. `fields/*.png`: do receivers point at their sources; coarse part (which cluster) against refinement (where inside it).
+4. `hier_health`: `coarse_entropy`, `never_selected`, the learned lambda and mu per head and level; `hier_windows`: where the distance windows ended; `hier_stats`: cluster sizes and build time.
+5. Then the screen (one seed, so only differences far above the seed spread of Stage A count): `scr_random` is the floor for the hierarchy; routed top-k against dense by
+   `routing_recall_l1/_l2` and `sender_in_keys`.
+CosMx: `heads_by_depth` / `heads_cells` against the k-NN smoothers (8, 32, 128) and the section mean, time and peak memory in the `training` table (efficiency/*).
+
+Known caveats to remember when reading: the 8 h / 24 h limits are guesses; CosMx time per epoch on a whole section was never measured (the feasibility script `cosmx_feasibility.py`
+stayed local, unused); `visible_keys_only`-style sinks are not addressed; routed attention gives no cell-level maps, so rollout / relevance readouts do not apply; the CosMx masking
+rates (20% random cells, 60 um discs over 10%) are my choice of the comparison plan's proposal.
+
+Not built (the next steps if the results warrant): the scenario generator (S0, S5-S7 as separate slide families, a parametric S2, SCALE), `metis` / `quadtree` / `obs_label` clusters,
+`multi_token` pooling, the local path and merges (T5), FlexAttention, `gumbel`, the regularisers (T7), LR plausibility and replicate consistency on CosMx, the exact dense CosMx arms (slow part) and
+folds 1-2. Append a dated, titled entry to notes.md after reading (it is append-only), update this file's status table, and the roadmap's T6b row.
 
 ---
 

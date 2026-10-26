@@ -808,3 +808,33 @@ gene, over all 253 genes in the cells task and over the 29 hidden genes in the p
 - Not measured: speed, memory and the kernel's precision on the cluster's GPUs at 10^4-10^5 cells
   (`scripts/fused_attention_benchmark.py`). Not built for whole sections: an inference path without dense maps (the relevance in
   `get_model_output`), readouts on sampled queries, the CosMx pipeline (T0), `visible_keys_only` with the fused attention.
+
+## 2026-10-26 — Hierarchical attention on synth_spot, Stage A, first read (20 of 24 runs; results in `results/26_10_results/hier_synth_spot_A`)
+
+Programme task, 300 epochs, 3 seeds (hier_fac 2: s42 missing; hier_soft all 3 missing, cause unknown). Two coarse levels (16 regions
+of ~156 spots, 256 clusters of ~10), dense candidates, readout concat, the distance windows (100-3000 µm) shared by every level.
+Centred cosine on hidden entries, whole cell / programme mean (24 programmes) / wins-ties-losses against `ref_own+context` (±0.02):
+full 0.947 ± 0.002 / 0.789 / 11-11.7-1.3; hier_none 0.939 ± 0.003 / 0.779 / 11-11-2; hier_fpc 0.864 ± 0.022 / 0.734; dual_add_ctx_dist
+0.862 / 0.726; hier_fac 0.769 / 0.703; gcn 0.512 / 0.591; hier_soft_dir 0.398 / 0.561 (invalid, below). Bar 0.682, oracle 0.995.
+
+**What worked**
+- Levels without a prior, joined by the readout (`hier_none`), are within 0.01 of the dense windowed model everywhere (whole cell
+  -0.008, programme mean -0.010), keep the short range (R1-R4 0.98-0.99), the rings (M7 / M8 0.96) and M21 (0.98), and run faster
+  on 2,500 spots (2.0 against 2.5 s per epoch; 1.4 against 1.1 GiB). Its attention finds planted senders at least as well:
+  pair AUPRC short 0.45 (full 0.33), mid 0.15 (full 0.03); integrated-gradients sender rank mid 1.00, short 0.97, dense 0.75 (full 0.81).
+- Where a learned prior weight could switch the prior off, the model did: `hier_fpc` drove lambda of the narrowest head at the cell
+  level to ~0 (0.06 / 0.16 / -0.02 in layer 0, -0.29 / -0.36 / -0.15 in layer 1), the other heads stayed at ~0.6-1.
+
+**What doesn't work**
+- Every prior costs, the more the harder: none 0.939 > fpc 0.864 > fac 0.769. The losses are the short range (S1-S3: fac 0.74-0.77,
+  fpc 0.80-0.87 against 0.98), M11 (fac 0.36, fpc 0.53, none 0.81, full 0.90), the rings and M19 / M21. Likely cause: the cells'
+  windows are shared with the coarse levels, so a narrow head's parent (cluster centroids ~300 µm apart against a ~50 µm window)
+  reads only its own cluster, and the prior then confines the head to it; most spots of a 10-spot cluster sit at its boundary, so
+  their nearest neighbours are cut off (the plan's S5). Not yet tested: `coarse_bias: own / none`, lambda starting at 0.
+- `hier_soft_dir` is invalid: the direction prior divided by the length of the parent's coarse arrow, which is ~0 when a parent reads
+  itself; gradients reached ~1e11 on a toy model, Adam froze the model (lambda, mu and the windows ended exactly at their start, short
+  range ~0.02). Fixed 2026-10-26 (`direction_cosine`: arrow normalised by sqrt(|v|^2 + spread^2), a test); rerun it.
+- The arrow angle (`arrow_angle_deg`, head mean) does not read: the untrained twin already scores 31° on dense / sparse, as wide heads
+  pull every head-mean `read_vec` to the slide centre. Read arrows per head (the narrow ones) or by the top-k targets instead.
+- CLS takes 15-35% of the head-mean weight (soft_dir most); the soft prior gives CLS its parent's weight undivided while a cluster's is
+  split over its children -- not the cause of the collapse, but a bias to check once hier_soft is in.
