@@ -172,6 +172,70 @@ def get_global_component_cfg(cfg, global_component_name):
         pool.n_patches = 0
         pool.offset = 0.0
         pool.features = []
+        # Hierarchical coarse-to-fine attention (`.claude/hierarchical_attention_plan.md`). `kind`: `none` (the transformer as
+        # before) or `coarse_to_fine`: every layer pools the cells into a cluster hierarchy of each slide (built from positions
+        # alone, cached per slide), attends densely among the coarsest clusters and CLS, then level by level among finer ones,
+        # steered by the attention of the level above (`prior_mode`), and fuses each cell's output with its ancestors'
+        # (`readout`). Dense attention backend at the default head width; no RoPE, long-range mask, context query,
+        # visible-keys-only mask or pooling; biases of distance or offset only (distance, fourier).
+        hier = cfg.model.global_component.parameters.hierarchy = CN()
+        hier.kind = "none"
+        # The coarse levels, coarsest first: clusters per slide (`levels`), or cells per cluster (`cells_per_cluster`, which
+        # keeps a cluster's size across slides of different size). Exactly one is set. `levels: [n]` with n = cells makes
+        # singleton clusters (with prior soft, lambda 0, dense candidates: the dense transformer exactly).
+        hier.levels = []
+        hier.cells_per_cluster = []
+        # How every finer level splits its parents: `kdtree` (balanced splits by cell count across the longer side) or
+        # `random` (a balanced random partition, the negative control).
+        hier.builder = "kdtree"
+        # The top level: `tree` (the builder over all cells) or `patches` (a square grid of side `patch_size_um`, or about
+        # levels[0] patches when it is 0; patches under `min_cells` cells merge into the nearest larger one).
+        hier.top_level = CN()
+        hier.top_level.mode = "tree"
+        hier.top_level.patch_size_um = 0.0
+        hier.top_level.min_cells = 1
+        # A second hierarchy with boundaries elsewhere (kdtree on coordinates turned by 45 degrees, the grid moved by half a
+        # patch); the layers alternate between the two (Swin's shifted windows).
+        hier.shift = False
+        # Spatial neighbour clusters per cluster (by centroid): always candidates under routing, besides the cluster itself.
+        hier.neighbors = 8
+        # Cluster tokens from their children: `mean` over the visible cells, or `attn_pool` (a learned query per level,
+        # starting as the mean). `pool_features`: any of `count` (log visible cells) and `spread` (log spatial spread),
+        # each a learned vector starting at zero.
+        hier.pooling = "mean"
+        hier.pool_features = []
+        # How the level above steers a level: `none`, `soft` (+ lambda_h log(P + eps), P = A_parent / n_children),
+        # `factorized` (parent weight x within-cluster softmax), `factorized_percell` (each query weighs the clusters itself).
+        hier.prior_mode = "soft"
+        hier.size_correction = True
+        # + mu_h conf cos(x_j - x_i, the parent's coarse arrow): a direction prior.
+        hier.direction_prior = False
+        # lambda and mu: their start, and `per_head` / `global` learned, or `fixed`. One per level (and head).
+        hier.lambda_init = 1.0
+        hier.lambda_learnable = "per_head"
+        hier.mu_init = 0.5
+        hier.mu_learnable = "per_head"
+        # `per_layer`: each layer's prior from its own coarse attention; `once`: from the first layer's.
+        hier.prior_refresh = "per_layer"
+        # One set of attention weights for every level (true), or a copy per coarse level learned apart.
+        hier.share_level_params = True
+        # The distance bias between cluster centroids at the coarse levels: `shared` (the cells' bias), `own` (a copy per
+        # level, learned apart) or `none`.
+        hier.coarse_bias = "shared"
+        # A cell's output fused with its ancestors': `none`, `concat` (a learned linear map of [cell, ancestors], starting
+        # at the cell alone), `transformer` (the cell attends over itself and its ancestors).
+        hier.readout = "none"
+        # Which keys each level >= 1 attends to: `dense` (every token of the level) or `routed` (the children of each
+        # parent's top-k targets (`topk`, per level or one for all), of its spatial neighbours and of `explore_n`
+        # exploration parents (`uniform` or `prior_sampled`, training only), at most `cap_per_query` keys per query).
+        # `chunk_pairs` bounds one block of routed queries (heads x queries x keys scores).
+        hier.candidates = CN()
+        hier.candidates.mode = "dense"
+        hier.candidates.topk = [8]
+        hier.candidates.explore_n = 0
+        hier.candidates.explore_strategy = "uniform"
+        hier.candidates.cap_per_query = 512
+        hier.candidates.chunk_pairs = 16777216
         # Re-masking before the transformer (GraphMAE's re-mask; `.claude/roadmap.md`, T2). Cells are masked
         # once, in the input, and the local component mixes a hidden cell's visible neighbours into its
         # token, so the transformer gets a hidden cell's neighbourhood in that cell's own token and the

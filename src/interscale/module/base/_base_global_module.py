@@ -671,6 +671,7 @@ class GlobalModule(BaseModule):
         if module_name == "self-attn-transformer":
             from interscale.module.global_modules import TransformerNodeEncoderHook
             from interscale.module.global_modules.attention import attention_head_dim
+            from interscale.module.global_modules.hierarchical_attention import hierarchy_settings
             from interscale.module.global_modules.pooling import build_pooling
             from interscale.module.global_modules.positional_encodings import build_positional_encodings
             from interscale.train.losses import LOSSES_READING_ATTENTION
@@ -697,6 +698,7 @@ class GlobalModule(BaseModule):
                 own_cell_skip=bool(cfg.model.decoder.get("own_cell_skip", False)),
                 own_cell_skip_input=str(cfg.model.decoder.get("own_cell_skip_input", "embedding")),
                 context_only=params.get("context_only", "none"),
+                hierarchy=hierarchy_settings(cfg),
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,
             )

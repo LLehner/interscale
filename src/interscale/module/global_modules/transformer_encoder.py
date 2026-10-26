@@ -13,6 +13,13 @@ from interscale.module.global_modules.attention import (
     attention_kind,
     build_attention_factory,
 )
+from interscale.module.global_modules.hierarchical_attention import (
+    COARSE_BIAS,
+    GraphLayout,
+    HierarchicalContext,
+    HierarchicalEncoderLayer,
+)
+from interscale.module.global_modules.hierarchy import HierarchyCache
 from interscale.module.global_modules.transformer_encoder_layer import CustomTransformerEncoderLayer
 from interscale.tl import (
     SelfAttentionRelevance,
@@ -72,6 +79,7 @@ class TransformerNodeEncoderHook(GlobalModule):
         return_attention_maps: bool = False,
         attention=None,
         attention_seed: int = 0,
+        hierarchy=None,
         **base_module_kwargs,
     ):
 
@@ -115,18 +123,43 @@ class TransformerNodeEncoderHook(GlobalModule):
         )
 
         # Create Transformer Encoder
-        encoder_layer = CustomTransformerEncoderLayer(
-            self.n_embed,
-            self.n_heads,
-            self.dim_feedforward,
-            self.dropout_global,
-            self.act_func,
-            norm_first=True,
-            attention_factory=attention_factory,
-            center_qk=bool(attention.get("center_qk", False)) if attention is not None else False,
-        )
+        center_qk = bool(attention.get("center_qk", False)) if attention is not None else False
+        # `hierarchy` (`hierarchical_attention.HierarchySettings`, or None): every layer makes a coarse-to-fine pass over a
+        # cluster hierarchy of each slide instead of attending over every pair (`.claude/hierarchical_attention_plan.md`).
+        # Its layers are the dense layer with another attention block, built from the same draws, so every weight they share
+        # is the dense model's at the same seed.
+        self.hierarchy = hierarchy
+        if hierarchy is not None:
+            if self.attention_kind != "dense" or self.head_dim != self.n_embed // self.n_heads:
+                raise ValueError(
+                    "the hierarchical attention computes its own attention with the dense layer's projections: use "
+                    f"attention.kind dense at the default head width (got {self.attention_kind!r}, head width {self.head_dim})."
+                )
+            encoder_layer = HierarchicalEncoderLayer(
+                self.n_embed,
+                self.n_heads,
+                self.dim_feedforward,
+                self.dropout_global,
+                self.act_func,
+                settings=hierarchy,
+                center_qk=center_qk,
+            )
+        else:
+            encoder_layer = CustomTransformerEncoderLayer(
+                self.n_embed,
+                self.n_heads,
+                self.dim_feedforward,
+                self.dropout_global,
+                self.act_func,
+                norm_first=True,
+                attention_factory=attention_factory,
+                center_qk=center_qk,
+            )
         encoder_norm = nn.LayerNorm(self.n_embed)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, self.num_layers, norm=encoder_norm)
+        if hierarchy is not None:
+            for index, layer in enumerate(self.transformer_encoder.layers):
+                layer.layer_index = index
 
         self.norm_input = nn.LayerNorm(self.n_embed)
         self.cls_embedding = nn.Parameter(torch.randn([1, 1, self.n_embed], requires_grad=True))
@@ -168,6 +201,30 @@ class TransformerNodeEncoderHook(GlobalModule):
         # batch in `common_step_local_to_global` and applied to queries and keys in every layer by
         # `forward`. None -- nothing registered, the attention is the one from before PEs.
         self.rotary_encoding = rotary_encoding
+        if hierarchy is not None:
+            if hierarchy.coarse_bias not in COARSE_BIAS:
+                raise ValueError(f"hierarchy.coarse_bias must be one of {COARSE_BIAS}, got {hierarchy.coarse_bias!r}.")
+            if (
+                rotary_encoding is not None
+                or self.context_only != "none"
+                or self.visible_keys_only
+                or long_range_attention
+            ):
+                raise ValueError(
+                    "the hierarchical attention carries no rotary encoding, context-only queries, visible-keys-only "
+                    "mask or long-range mask."
+                )
+            # The coarse levels' distance bias between centroids: the cells' own biases (`shared`), a copy per level learned
+            # apart (`own`, copied without drawing), or none.
+            if attention_bias is not None and hierarchy.coarse_bias == "own":
+                import copy
+
+                self.hier_coarse_bias = nn.ModuleList(copy.deepcopy(attention_bias) for _ in range(hierarchy.n_levels))
+            # Hierarchies by slide (built once from the positions), and the generator of the routed exploration draws.
+            self.hierarchy_cache = HierarchyCache()
+            self.hierarchy_generator = torch.Generator().manual_seed(self.attention_seed + 7919)
+        # Set only inside `recording_hierarchy`: the list every hierarchical layer appends its export to.
+        self._hierarchy_record = None
         # Whether a training step hands every layer's attention map to its loss (the attention
         # entropy loss reads them). Off, `forward` keeps no map unless asked for relevance.
         self.return_attention_maps = bool(return_attention_maps)
@@ -230,6 +287,15 @@ class TransformerNodeEncoderHook(GlobalModule):
             if eval_step
             else keep_indices,  # Add parameter to ensure masked nodes are kept (not during evaluation)
         )
+
+        if self.hierarchy is not None:
+            # No S x S mask: the layers attend along the hierarchy, laid out from this call's index_nodes.
+            context = self._hierarchical_context(batched_data, index_nodes, src_padding_mask, eval_step, emb.device)
+            if self._attention_record is not None:
+                self._attention_record.append(
+                    {"index_nodes": index_nodes, "src_padding_mask": src_padding_mask.detach()}
+                )
+            return GlobalInput(padded_emb, src_padding_mask, index_nodes, context, None)
 
         if self.attention_spec.mask in ("pairs", "pattern"):
             # The same blocked set as the dense masks below, as a list of pairs. A backend that never
@@ -331,6 +397,66 @@ class TransformerNodeEncoderHook(GlobalModule):
         if self.context_only != "none":
             given.queries = self._query_encoding(node_encoding, batched_data, index_nodes, padded_emb)
         return given
+
+    def _hierarchical_context(
+        self, batched_data, index_nodes, src_padding_mask, eval_step: bool, device
+    ) -> HierarchicalContext:
+        """The pass's :class:`~interscale.module.global_modules.hierarchical_attention.HierarchicalContext`.
+
+        Per graph, the kept cells (``index_nodes``, so a subsampled graph is built on the cells that are in the sequence) in
+        sequence order: their positions in µm, which of them is hidden whole (none on a clean pass), and the hierarchy built
+        from the positions alone (cached per slide), or two under ``shift``.
+        """
+        settings = self.hierarchy
+        pos = getattr(batched_data, "pos", None)
+        if pos is None:
+            raise ValueError(
+                "the hierarchical attention builds its clusters from cell coordinates, but the graphs carry no `pos`. "
+                "Set dataset.spatial_key (e.g. 'spatial')."
+            )
+        pos = pos[:, :2].to(device=device, dtype=torch.float32) * float(settings.spatial_unit_um)
+        hidden = self.wholly_hidden(batched_data).to(device) if not eval_step else None
+        batch = batched_data.batch.to(device=device, dtype=torch.long)
+        seq_len = src_padding_mask.shape[1]
+        graphs = []
+        for g, kept in enumerate(index_nodes):
+            rows = (batch == g).nonzero().squeeze(1)[torch.as_tensor(kept, dtype=torch.long, device=device)]
+            where = pos[rows]
+            visible = (~hidden[rows]).float() if hidden is not None else torch.ones(len(rows), device=device)
+            hierarchies = [self.hierarchy_cache.get(where, **settings.build_kwargs(False)).to(device)]
+            if settings.shift:
+                hierarchies.append(self.hierarchy_cache.get(where, **settings.build_kwargs(True)).to(device))
+            graphs.append(GraphLayout(seq_len - len(kept), where, visible, hierarchies, list(kept)))
+        coarse = None
+        if self.attention_bias is not None and settings.coarse_bias == "shared":
+            coarse = [self.attention_bias] * settings.n_levels
+        elif self.attention_bias is not None and settings.coarse_bias == "own":
+            coarse = list(self.hier_coarse_bias)
+        context = HierarchicalContext(
+            graphs,
+            bias=self.attention_bias,
+            coarse_biases=coarse,
+            generator=self.hierarchy_generator,
+            training=self.training,
+        )
+        context.record = self._hierarchy_record
+        return context
+
+    @contextmanager
+    def recording_hierarchy(self):
+        """Record every hierarchical pass made inside: per layer and graph, the hierarchy, the cells' positions and each
+        level's attention (dense ``[H, n_l(+1), n_l + 1]``, or the routed rows), detached on the CPU, plus lambda and mu.
+
+        Yields the list the layers append to (``HierarchicalEncoderLayer._export``). The flag is restored on exit.
+        """
+        if self.hierarchy is None:
+            raise ValueError("recording_hierarchy: this transformer is not hierarchical.")
+        record, saved = [], self._hierarchy_record
+        self._hierarchy_record = record
+        try:
+            yield record
+        finally:
+            self._hierarchy_record = saved
 
     def _query_encoding(self, node_encoding, batched_data, index_nodes, padded_emb) -> torch.Tensor:
         """``[S, B, E]``: the node encodings the tokens were given, alone, laid out as the tokens (zeros without any).
@@ -491,7 +617,14 @@ class TransformerNodeEncoderHook(GlobalModule):
         src_padding_mask = torch.cat([src_padding_mask, zeros], dim=1)
         key_padding_mask = src_padding_mask
         # A StructuredMask (blocked pairs) is not a tensor the encoder could merge: it reaches the
-        # layers as their per-batch context, and the encoder gets no dense mask.
+        # layers as their per-batch context, and the encoder gets no dense mask. So does the hierarchy's context.
+        hierarchical = isinstance(mask, HierarchicalContext)
+        if hierarchical != (self.hierarchy is not None):
+            raise ValueError(
+                "this transformer is hierarchical; forward() needs the HierarchicalContext common_step_local_to_global returned."
+                if self.hierarchy is not None
+                else "forward() got a HierarchicalContext, but this transformer is not hierarchical."
+            )
         structured = isinstance(mask, StructuredMask)
         if structured != (self.attention_spec.mask in ("pairs", "pattern")):
             raise ValueError(
@@ -499,7 +632,7 @@ class TransformerNodeEncoderHook(GlobalModule):
                 + ("a dense tensor" if self.attention_spec.mask == "dense" else "a StructuredMask")
                 + ", the form common_step_local_to_global builds for it."
             )
-        if mask is not None and not structured and mask.is_floating_point():
+        if mask is not None and not structured and not hierarchical and mask.is_floating_point():
             # A float mask (an attention bias merged in) needs a float key-padding mask, or torch
             # warns on every layer that mixing the two types is deprecated. The boolean one is
             # still what this method returns, for the callers that drop padding by it.
@@ -512,10 +645,14 @@ class TransformerNodeEncoderHook(GlobalModule):
         for encoder in self.transformer_encoder.layers:
             encoder.rotary = rotary
             encoder.attention_context = mask if structured else None
+            if hierarchical:
+                encoder.hier_context = mask
         try:
             if self.context_only == "none":
                 transformer_out = self.transformer_encoder(
-                    padded_h_node, src_key_padding_mask=key_padding_mask, mask=None if structured else mask
+                    padded_h_node,
+                    src_key_padding_mask=key_padding_mask,
+                    mask=None if structured or hierarchical else mask,
                 )  # (S, B, h_d)
             else:
                 transformer_out = self._read_context(queries, padded_h_node, key_padding_mask, mask)  # (S, B, h_d)
@@ -523,6 +660,8 @@ class TransformerNodeEncoderHook(GlobalModule):
             for encoder in self.transformer_encoder.layers:
                 encoder.rotary = None
                 encoder.attention_context = None
+                if hierarchical:
+                    encoder.hier_context = None
 
         attn_matrices = []
         for encoder in self.transformer_encoder.layers:
@@ -532,7 +671,7 @@ class TransformerNodeEncoderHook(GlobalModule):
             encoder.register_hook = False
             encoder.keep_maps = False
 
-        if len(attn_matrices) > 0:
+        if len(attn_matrices) > 0 and all(m is not None for m in attn_matrices):
             final_attn = torch.stack(attn_matrices)
         else:
             final_attn = None

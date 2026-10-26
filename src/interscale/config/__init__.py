@@ -257,6 +257,13 @@ def _validate_orthogonality(cfg):
         )
 
 
+def _validate_val_interval(cfg):
+    """``optim.check_val_every_n_epoch``: a positive integer."""
+    every = cfg.optim.get("check_val_every_n_epoch", 1)
+    if not isinstance(every, int) or isinstance(every, bool) or every < 1:
+        raise ValueError(f"optim.check_val_every_n_epoch must be a positive integer, got {every!r}.")
+
+
 def _validate_optim(cfg):
     """Reject configs whose training-length settings stop a run inside the LR warm-up.
 
@@ -579,6 +586,86 @@ def _validate_pooling(cfg):
         raise ValueError(f"{where}: optim.loss {cfg.optim.loss!r} reads cell-by-cell attention maps, which patches do not give.")
 
 
+def _validate_hierarchy(cfg):
+    """``hierarchy`` (coarse-to-fine attention): known settings, coarse levels, and nothing it cannot carry."""
+    from interscale.module.global_modules import hierarchical_attention as ha
+    from interscale.module.global_modules.hierarchy import HIERARCHY_BUILDERS, TOP_LEVEL_MODES
+
+    params = cfg.model.global_component.get("parameters", None)
+    hier = params.get("hierarchy", None) if params is not None else None
+    if hier is None or hier.get("kind", "none") == "none":
+        return
+    where = "model.global_component.parameters.hierarchy"
+    if hier.kind not in ha.HIERARCHY_KINDS:
+        raise ValueError(f"{where}.kind must be one of {ha.HIERARCHY_KINDS}, got {hier.kind!r}.")
+    choices = {
+        "builder": (hier.builder, HIERARCHY_BUILDERS),
+        "top_level.mode": (hier.top_level.mode, TOP_LEVEL_MODES),
+        "pooling": (hier.pooling, ha.HIER_POOLINGS),
+        "prior_mode": (hier.prior_mode, ha.PRIOR_MODES),
+        "lambda_learnable": (hier.lambda_learnable, ha.LEARNABLE),
+        "mu_learnable": (hier.mu_learnable, ha.LEARNABLE),
+        "prior_refresh": (hier.prior_refresh, ha.PRIOR_REFRESH),
+        "coarse_bias": (hier.coarse_bias, ha.COARSE_BIAS),
+        "readout": (hier.readout, ha.READOUTS),
+        "candidates.mode": (hier.candidates.mode, ha.CANDIDATE_MODES),
+        "candidates.explore_strategy": (hier.candidates.explore_strategy, ha.EXPLORE_STRATEGIES),
+    }
+    for key, (value, allowed) in choices.items():
+        if value not in allowed:
+            raise ValueError(f"{where}.{key} must be one of {allowed}, got {value!r}.")
+    unknown = sorted(set(hier.pool_features) - set(ha.HIER_POOL_FEATURES))
+    if unknown:
+        raise ValueError(f"{where}.pool_features names {unknown}; choose from {list(ha.HIER_POOL_FEATURES)}.")
+    if len(hier.levels) and len(hier.cells_per_cluster):
+        raise ValueError(f"{where}: give levels (clusters per coarse level) or cells_per_cluster, not both.")
+    sizes = list(hier.levels) or list(hier.cells_per_cluster)
+    if any(float(v) <= 0 for v in sizes):
+        raise ValueError(f"{where}: every entry of levels / cells_per_cluster must be positive, got {sizes}.")
+    if hier.top_level.mode == "patches" and not sizes and hier.top_level.patch_size_um <= 0:
+        raise ValueError(f"{where}.top_level.mode patches needs patch_size_um, or a first entry of levels / cells_per_cluster.")
+    if not sizes and hier.prior_mode != "none":
+        raise ValueError(f"{where}: no coarse level (levels and cells_per_cluster empty) leaves prior_mode nothing to read.")
+    if hier.prior_mode == "none" and hier.readout == "none" and sizes:
+        raise ValueError(
+            f"{where}: with prior_mode none and readout none the coarse levels reach no cell; set a readout (concat or "
+            "transformer) or a prior."
+        )
+    if hier.candidates.mode == "routed" and (min(hier.candidates.topk or [0]) < 1 or hier.candidates.cap_per_query < 1):
+        raise ValueError(f"{where}.candidates: routed needs topk >= 1 and cap_per_query >= 1.")
+    if hier.candidates.explore_n < 0 or hier.neighbors < 0 or hier.candidates.chunk_pairs < 1:
+        raise ValueError(f"{where}: explore_n and neighbors must not be negative, chunk_pairs must be positive.")
+    if cfg.dataset.get("spatial_key", None) is None:
+        raise ValueError(f"{where} builds its clusters from positions, so it needs dataset.spatial_key.")
+    if params.get("long_range_attention", False):
+        raise ValueError(f"{where} has no long-range mask; set long_range_attention: false.")
+    if params.get("context_only", "none") != "none":
+        raise ValueError(f"{where} cannot read with separate queries (context_only); set it to none.")
+    if params.get("remask", "none") != "none":
+        raise ValueError(f"{where}: remask is not carried by the hierarchical attention yet.")
+    pooling = params.get("pooling", None)
+    if pooling is not None and pooling.get("kind", "none") != "none":
+        raise ValueError(f"{where} pools cells itself; set pooling.kind none.")
+    attention = params.get("attention", None)
+    if attention is not None:
+        if attention.get("kind", "dense") != "dense" or int(attention.get("head_dim", 0)) not in (0, cfg.model.n_embed // params.n_heads):
+            raise ValueError(f"{where} computes its own attention: use attention.kind dense at the default head width.")
+        if attention.get("visible_keys_only", False):
+            raise ValueError(f"{where}: attention.visible_keys_only is not carried by the hierarchical attention.")
+    pe = params.get("pe", None)
+    if pe is not None:
+        bad = sorted(set(pe.get("bias", [])) & {"spectral", "expression"}) + sorted(pe.get("rotary", []))
+        if bad:
+            raise ValueError(
+                f"{where} places biases by the distance or offset of two tokens, clusters included: {bad} cannot be. "
+                "Use the distance or fourier bias."
+            )
+    from interscale.train.losses import LOSSES_READING_ATTENTION
+
+    if cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION:
+        raise ValueError(f"{where}: optim.loss {cfg.optim.loss!r} reads attention maps in training, which the hierarchy does not form.")
+
+
 def _validate_remask(cfg):
     """``remask`` (a learned token for wholly hidden cells before the transformer): a known kind, whole cells masked."""
     from interscale.module.base._base_global_module import REMASK_KINDS
@@ -721,6 +808,7 @@ def _validate(cfg):
     ran for a config file, which is every real run.
     """
     _validate_optim(cfg)
+    _validate_val_interval(cfg)
     _validate_block_mask(cfg)
     _validate_masking(cfg)
     _validate_objective(cfg)
@@ -729,6 +817,7 @@ def _validate(cfg):
     _validate_pe(cfg)
     _validate_attention(cfg)
     _validate_pooling(cfg)
+    _validate_hierarchy(cfg)
     _validate_remask(cfg)
     _validate_context_only(cfg)
     _validate_regime_loss(cfg)

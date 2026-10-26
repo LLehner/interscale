@@ -144,6 +144,58 @@ def _pooling_tag(cfg) -> str:
     return f"pool-{pooling.kind}{'-' if size.startswith('n') else ''}{size}{offset}{features}_"
 
 
+def _hierarchy_tag(cfg) -> str:
+    """``hier-...`` for the hierarchical attention (every setting away from its default), else ``""``.
+
+    Builder and top level, the coarse levels (``l<counts>`` or ``c<cells per cluster>``), the prior mode, then only what differs
+    from the defaults, so a sweep over any of them never overwrites a checkpoint.
+    """
+    params = cfg.model.global_component.get("parameters", None)
+    hier = params.get("hierarchy", None) if params is not None else None
+    if hier is None or hier.get("kind", "none") == "none":
+        return ""
+    top = hier.top_level
+    tag = f"hier-{hier.builder}"
+    if top.mode == "patches":
+        tag += "-pt" + (f"{float(top.patch_size_um):g}um" if top.patch_size_um > 0 else "")
+    if int(top.min_cells) != 1:
+        tag += f"-mc{int(top.min_cells)}"
+    if len(hier.levels):
+        tag += "-l" + "x".join(str(int(c)) for c in hier.levels)
+    elif len(hier.cells_per_cluster):
+        tag += "-c" + "x".join(f"{float(c):g}" for c in hier.cells_per_cluster)
+    tag += "-" + {"none": "pnone", "soft": "soft", "factorized": "fac", "factorized_percell": "fpc"}[hier.prior_mode]
+    if not hier.size_correction:
+        tag += "-nosc"
+    if hier.direction_prior:
+        tag += "-dir"
+        if float(hier.mu_init) != 0.5 or hier.mu_learnable != "per_head":
+            tag += f"-mu{float(hier.mu_init):g}{hier.mu_learnable[0]}"
+    if float(hier.lambda_init) != 1.0 or hier.lambda_learnable != "per_head":
+        tag += f"-lam{float(hier.lambda_init):g}{hier.lambda_learnable[0]}"
+    if hier.prior_refresh == "once":
+        tag += "-once"
+    if not hier.share_level_params:
+        tag += "-nshare"
+    if hier.coarse_bias != "shared":
+        tag += f"-cb{hier.coarse_bias}"
+    if hier.readout != "none":
+        tag += f"-ro{hier.readout[:2]}"
+    if hier.pooling != "mean":
+        tag += "-ap"
+    if len(hier.pool_features):
+        tag += "-f" + "".join(f[0] for f in hier.pool_features)
+    if hier.shift:
+        tag += "-sh"
+    if int(hier.neighbors) != 8:
+        tag += f"-nb{int(hier.neighbors)}"
+    cand = hier.candidates
+    if cand.mode == "routed":
+        tag += "-rt" + "x".join(str(int(k)) for k in cand.topk) + f"e{int(cand.explore_n)}"
+        tag += ("p" if cand.explore_strategy == "prior_sampled" else "") + f"c{int(cand.cap_per_query)}"
+    return tag + "_"
+
+
 def _decoder_tag(cfg) -> str:
     """``dec-<type>[-skip|-skipraw]_`` for a decoder other than the plain linear one or with the own-cell skip, else ``""``.
 
@@ -280,6 +332,7 @@ def get_model_filename_prefix(cfg, local_component: bool, global_component: bool
             + _embedding_tag(cfg)
             + _positional_encoding_tag(cfg)
             + _attention_tag(cfg)
+            + _hierarchy_tag(cfg)
             + _pooling_tag(cfg)
             + _decoder_tag(cfg)
             + _training_tag(cfg)
@@ -294,6 +347,7 @@ def get_model_filename_prefix(cfg, local_component: bool, global_component: bool
             file_name_prefix
             + _positional_encoding_tag(cfg)
             + _attention_tag(cfg)
+            + _hierarchy_tag(cfg)
             + _pooling_tag(cfg)
             + _decoder_tag(cfg)
             + _training_tag(cfg)

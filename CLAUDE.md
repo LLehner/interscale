@@ -51,6 +51,12 @@ losses on the embeddings -- is proposed in [`.claude/decoder_plan.md`](.claude/d
 with the same layout. Read it before touching the decoders, `DualDecoderCombinedModule` or the
 per-head losses, and update its status table in the same commit as the work it describes.
 
+Hierarchical coarse-to-fine attention for the global component (a cluster hierarchy per slide, each level's attention
+steered by the level above, routed key sets for whole CosMx sections) is planned in
+[`.claude/hierarchical_attention_plan.md`](.claude/hierarchical_attention_plan.md): the user's plan, with a status table and
+how it was built on top. Read it before touching `hierarchy.py`, `hierarchical_attention.py` or the hierarchy's path through
+`common_step_local_to_global`, and update its status table in the same commit as the work it describes.
+
 ## Common commands
 
 This project uses `hatch` as the primary project manager (also works with `uv` or `pip`; see `docs/installation.md`).
@@ -222,6 +228,31 @@ time, so a sequence of ~10^5 cells (a whole CosMx section) forms no `S x S` tens
   (tens of mm) the shortcut loses whole µm, which a 15-20 µm window turns into wrong logits.
 - **Maps only when read** (`need_weights`): the explicit path, the output computed from the returned map (relevance hooks it).
 - **Dropout** is SDPA's own stream: fused and dense agree at dropout 0 or in evaluation, and pair by seed in training.
+
+### Hierarchical coarse-to-fine attention (`hierarchy.kind: coarse_to_fine`; `.claude/hierarchical_attention_plan.md`)
+
+`model.global_component.parameters.hierarchy` (default `kind: none`: nothing built) replaces every encoder layer by a
+`HierarchicalEncoderLayer`: the dense layer (same projections, FFN, norms, residuals) with an attention block that pools the
+cells into a per-slide cluster hierarchy (`hierarchy.py`: kdtree / random, a tree or patch top level, cached by the slide's
+positions), attends densely among the coarsest clusters and CLS, then level by level with a prior from the level above
+(`prior_mode`: none, soft, factorized, factorized_percell; `direction_prior`), over every token (`candidates.mode: dense`) or
+the children of each parent's top-k targets and spatial neighbours (`routed`, a padded gather a block of parents at a time,
+never an `S x S` tensor), and fuses each cell with its ancestors (`readout`). Invariants:
+
+- **No `S x S` mask.** `common_step_local_to_global` returns a `HierarchicalContext` (per graph: the kept cells' positions in
+  µm, which are hidden whole, the hierarchy, laid out from this call's `index_nodes`) as `GlobalInput.attention_mask`; `forward`
+  hands it to the layers as `hier_context`, set and cleared around the call like `rotary`.
+- **The dense model is a special case.** Prior soft, lambda 0, dense candidates and singleton clusters (`cells_per_cluster:
+  [1]`) or no coarse level give the dense transformer's predictions and gradients exactly (tested), because every added
+  parameter is zero or drawn from a private generator, CLS stays an open key with bias 0 at every level, and the cell level
+  blocks a cell's own key. Keep all three when changing the layer.
+- **Positions alone build the hierarchy; hidden cells weigh 0 in every pooled token** (a cluster with no visible cell is a
+  learned token). Exploration draws only from the module's own generator.
+- **Readouts.** `recording_hierarchy()` exports each layer's per-level attention (dense, or `SparseRows` when routed);
+  `evaluation.hierarchy_readouts` reads hierarchical and dense models alike (sender lift, pair AUPRC, arrow angle, routing
+  recall, health, fields). Dense candidates also hand `forward` cell-level maps; routed models hand none.
+- Refused (validator): other backends or head widths, RoPE, spectral / expression biases, the long-range mask, the context
+  query, `visible_keys_only`, `remask`, pooling, losses reading attention maps; prior none without a readout.
 
 ### Regime losses and the own-cell skip (`tl/depth.py`, `.claude/decoder_plan.md`)
 

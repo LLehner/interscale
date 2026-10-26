@@ -420,6 +420,7 @@ class NodeMaskingTrainingPlan:
                 logger=logger,
                 deterministic=True,  # ensure reproducibility
                 accelerator=self._cfg.optim.accelerator,  # Default to CPU (can be overridden via trainer_kwargs)
+                check_val_every_n_epoch=int(self._cfg.optim.get("check_val_every_n_epoch", 1)),
                 **trainer_kwargs,
             )
 

@@ -34,6 +34,10 @@ def get_optim_cfg(cfg):
     cfg.optim.seed = 40
     cfg.optim.cross_corr = "cell"  # Currently cell is the only one that really works
     cfg.optim.n_epochs = 100
+    # Validate every this many epochs (Lightning's check_val_every_n_epoch). 1, every epoch, is the model from before
+    # this key. Where an epoch is two optimiser steps on whole sections (CosMx), each validation pass costs about as
+    # much as the training steps; a larger value saves that and checkpoints from the validated epochs only.
+    cfg.optim.check_val_every_n_epoch = 1
     cfg.optim.early_stopping = True
     cfg.optim.patience = 5  # EarlyStopping patience in epochs
     cfg.optim.min_delta = 0.0  # EarlyStopping min_delta
