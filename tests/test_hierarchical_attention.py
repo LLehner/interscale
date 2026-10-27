@@ -770,10 +770,147 @@ def test_the_direction_prior_keeps_its_gradients_bounded_when_a_parent_reads_its
     batch = _batch((12,))
     sizes = {}
     for direction in (False, True):
-        module = _build(_config({"prior_mode": "soft", "levels": [4, 16], "readout": "concat", "direction_prior": direction}, dropout=0.1))
+        module = _build(
+            _config(
+                {"prior_mode": "soft", "levels": [4, 16], "readout": "concat", "direction_prior": direction},
+                dropout=0.1,
+            )
+        )
         module.train()
         random.seed(0)
         out = module._common_step(batch, "regression", "node")
         ((out.y_pred - out.y_true) ** 2).mean().backward()
         sizes[direction] = max(float(p.grad.abs().max()) for p in module.parameters() if p.grad is not None)
     assert sizes[True] < 10 * sizes[False], sizes
+
+
+def _flat_content(module):
+    """Every layer's query and key projections zeroed: each attention row is its position biases alone."""
+    with torch.no_grad():
+        for name, p in module.named_parameters():
+            if name.endswith("self_attn.in_proj_weight") or name.endswith("self_attn.in_proj_bias"):
+                p[: 2 * E] = 0.0
+    return module
+
+
+@pytest.mark.parametrize("hierarchy", [None, {"prior_mode": "none", "levels": [4, 16], "readout": "concat"}])
+def test_the_window_baseline_is_the_attention_when_the_content_is_flat(hierarchy, tmp_path):
+    """With equal content logits a head reads where its window points, so trained minus window is zero; stirred, it is not.
+    The per-head arrays agree with the head mean they average to."""
+    from interscale.evaluation.hierarchy_readouts import hierarchy_readouts
+
+    graph = _lattice(8, seed=2)
+    graph.obs_names = torch.arange(64) + 1
+    common = {
+        "prediction_task": "regression",
+        "prediction_level": "node",
+        "device": torch.device("cpu"),
+        "export_dir": tmp_path,
+    }
+    module = _flat_content(_stir(_build(_config(hierarchy))))
+    hierarchy_readouts(module, [graph], graph_names=["flat"], **common)
+    flat = np.load(tmp_path / "flat.npz")
+    assert np.abs(flat["read_vec_heads"]).max() > 1.0  # the windows do point somewhere (not a vacuous zero)
+    assert np.allclose(flat["window_vec_heads"], flat["read_vec_heads"], atol=1e-3)
+    _stir(module, seed=5, scale=1.0)
+    hierarchy_readouts(module, [graph], graph_names=["stirred"], **common)
+    stirred = np.load(tmp_path / "stirred.npz")
+    assert not np.allclose(stirred["window_vec_heads"], stirred["read_vec_heads"], atol=1e-1)
+    assert np.allclose(stirred["cell_mass_heads"].mean(0), stirred["cell_mass"], atol=1e-6)
+    assert stirred["top_targets_heads"].shape == (H, 64, 5) and np.array_equal(stirred["top_targets"].shape, (64, 5))
+    # Each head's top target is the cell that head weighs most in its own recorded row.
+    from interscale.evaluation.hierarchy_readouts import cell_rows, fields
+
+    if hierarchy is not None:
+        batch = Batch.from_data_list([graph])
+        with torch.no_grad(), module.recording_hierarchy() as record:
+            module._common_step(batch, "regression", "node")
+        keys, weights = cell_rows(record[-1])
+        got = fields(record[-1])
+        cells = (keys >= 0) & (keys < 64)
+        best = keys.expand_as(weights).gather(-1, torch.where(cells, weights, -1.0).argmax(-1, keepdim=True))[..., 0]
+        assert np.array_equal(got["top_targets_heads"][:, :, 0], best.numpy())
+
+
+def test_the_dependence_field_adds_up_and_names_the_programmes(tmp_path):
+    """The receivers' integrated gradients come with the fields: programmes travel along, the contributions add up to the
+    response's change (more points where they did not), the generators and the parameters' gradients are untouched."""
+    from interscale.evaluation.hierarchy_readouts import hierarchy_readouts
+
+    graph = _lattice(8, seed=2)
+    graph.obs_names = torch.arange(64) + 1
+    edges = pd.DataFrame(
+        {
+            "sender": [9, 9, 50, 50],
+            "receiver": [10, 18, 41, 42],
+            "range_class": ["short", "short", "mid", "mid"],
+            "program": ["S1>g0", "S1>g0", "M1>g1", "M1>g1"],
+        }
+    )
+    module = _stir(_build(_config({"prior_mode": "soft", "levels": [4, 16], "readout": "concat"})))
+    state = torch.random.get_rng_state()
+    hierarchy_readouts(
+        module,
+        [graph],
+        prediction_task="regression",
+        prediction_level="node",
+        device=torch.device("cpu"),
+        edges=edges,
+        export_dir=tmp_path,
+        graph_names=["slide"],
+        dependence_genes=lambda program: [0] if program.endswith("g0") else [1],
+        dependence={"steps": 2, "retry_steps": 24, "gap_limit": 0.1, "top": 8},
+    )
+    assert torch.equal(torch.random.get_rng_state(), state)
+    assert all(p.grad is None for p in module.parameters())
+    z = np.load(tmp_path / "slide.npz")
+    assert sorted(set(z["planted_program"])) == ["M1>g1", "S1>g0"]
+    assert sorted(z["dep_receiver"].tolist()) == [10, 18, 41, 42] and set(z["dep_class"]) == {"short", "mid"}
+    assert (
+        z["dep_top_cells"].shape == (4, 8) and not (z["dep_top_cells"] == z["dep_receiver"][:, None]).any()
+    )  # own cell apart
+    assert ((z["dep_sender_share"] >= 0) & (z["dep_sender_share"] <= 1)).all()
+    assert np.allclose(z["dep_sender_chance"], 1 / 63)
+    # The retry: exactly the queries over the limit at 2 points are integrated again at 24, and keep that result.
+    from torch_geometric.data import Batch
+
+    from interscale.evaluation.receptive_field import _frozen_parameters, receiver_dependence
+
+    batch = Batch.from_data_list([graph])
+    batch.obs_names = graph.obs_names
+    module.eval()
+    direct = {}
+    for steps in (2, 24):
+        with _frozen_parameters(module):
+            found = receiver_dependence(
+                module,
+                batch,
+                edges,
+                lambda program: [0] if program.endswith("g0") else [1],
+                prediction_task="regression",
+                pos_um=batch.pos.double(),
+                steps=steps,
+                retry_steps=0,
+            )
+        direct[steps] = dict(zip(found["dep_receiver"].tolist(), found["dep_gap"].tolist(), strict=True))
+    for receiver, used, gap in zip(
+        z["dep_receiver"].tolist(), z["dep_steps"].tolist(), z["dep_gap"].tolist(), strict=True
+    ):
+        assert used == (24 if direct[2][receiver] > 0.1 else 2)
+        assert np.isclose(gap, direct[used][receiver], rtol=1e-6)
+    assert 24 in set(z["dep_steps"].tolist())  # the toy does exercise the retry
+    # `graphs` limits the dependence to the first exported graphs; the attention fields of the rest are exported all the same.
+    hierarchy_readouts(
+        module,
+        [graph, graph],
+        prediction_task="regression",
+        prediction_level="node",
+        device=torch.device("cpu"),
+        edges=edges,
+        export_dir=tmp_path,
+        graph_names=["first", "second"],
+        dependence_genes=lambda program: [0] if program.endswith("g0") else [1],
+        dependence={"graphs": 1, "steps": 2, "retry_steps": 0},
+    )
+    assert "dep_receiver" in np.load(tmp_path / "first.npz") and "dep_receiver" not in np.load(tmp_path / "second.npz")
+    assert "window_vec_heads" in np.load(tmp_path / "second.npz")

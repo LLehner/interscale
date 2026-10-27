@@ -553,6 +553,122 @@ def _program_attribution(
     return {name: (total[name], change[name].to(total[name].device)) for name in total}
 
 
+def receiver_dependence(
+    module,
+    batch,
+    pairs: pd.DataFrame,
+    edge_genes,
+    *,
+    prediction_task: str,
+    pos_um: torch.Tensor,
+    baseline=None,
+    steps: int = 5,
+    retry_steps: int = 20,
+    gap_limit: float = 0.1,
+    receivers_per_program: int | None = None,
+    top: int = 32,
+    chunk: int = 64,
+    seed: int = 0,
+) -> dict[str, np.ndarray]:
+    """What each planted receiver's predicted response took from which cell, by integrated gradients: one graph's dependence field.
+
+    ``pairs``: ``sender``, ``receiver`` (node indices of ``batch``), ``range_class``, ``program``. Per programme, its receivers
+    whose response genes ``edge_genes(program)`` are all hidden (``receivers_per_program`` of them, a seeded sample; None: all)
+    are the queries of :func:`_program_attribution` with ``steps`` points; a query whose completeness gap exceeds ``gap_limit``
+    is integrated again with ``retry_steps`` and keeps that result. The module's mode, parameters' gradients and the global
+    generators are the caller's to guard (``response_influence`` does it the same way).
+
+    Returns, per query (``dep_`` arrays of equal length; cells as node indices of ``batch``): ``receiver``, ``program``,
+    ``range_class``, ``change`` (the response at the inputs minus at the baseline), ``gap`` (``|sum - change| / |change|``),
+    ``steps``; ``own`` (the receiver's own signed contribution over the sum of ``|contribution|``); ``vec`` ``[Q, 2]`` (µm, the
+    ``|contribution|``-weighted mean offset to the other cells: where the response comes from); ``sender_share`` (``|contribution|``
+    on its planted senders over all other cells') and ``sender_chance`` (their share of the other cells);
+    ``top_cells`` / ``top_values`` ``[Q, top]``: the other cells of largest ``|contribution|``, signed (-1 / 0 padded).
+    """
+    from interscale.evaluation.masked_probing import _model_heads
+
+    hidden = batch.gene_mask.bool()
+    rng = np.random.default_rng(seed)
+    queries, masks, programs, classes = [], [], [], []
+    for program, sub in pairs.groupby("program"):
+        columns = list(edge_genes(str(program)))
+        if not columns:
+            continue
+        covered = hidden[:, columns].all(dim=1).cpu().numpy()
+        receivers = np.unique(sub["receiver"].to_numpy())
+        receivers = receivers[covered[receivers]]
+        if receivers_per_program is not None:
+            receivers = _sample(receivers, receivers_per_program, rng)
+        genes = np.zeros(batch.x.shape[1], dtype=bool)
+        genes[columns] = True
+        for receiver in receivers:
+            queries.append(int(receiver))
+            masks.append(genes)
+            programs.append(str(program))
+            classes.append(str(sub["range_class"].iloc[0]))
+    if not queries:
+        return {}
+
+    def attribute(picked: list[int], n_steps: int):
+        contribution, change = [], []
+        for start in range(0, len(picked), chunk):
+            part = picked[start : start + chunk]
+            found = _program_attribution(
+                module,
+                batch,
+                [queries[k] for k in part],
+                [masks[k] for k in part],
+                baseline,
+                prediction_task,
+                n_steps,
+                _model_heads,
+            )
+            head = "global" if "global" in found else next(iter(found))
+            contribution.append(found[head][0].cpu())
+            change.append(found[head][1].cpu())
+        contribution, change = torch.cat(contribution), torch.cat(change)
+        gap = (contribution.sum(1) - change).abs() / change.abs().clamp_min(1e-12)
+        return contribution, change, gap
+
+    everyone = list(range(len(queries)))
+    contribution, change, gap = attribute(everyone, steps)
+    used = torch.full((len(queries),), int(steps))
+    redo = [k for k in everyone if not gap[k] <= gap_limit]  # NaN too
+    if redo and retry_steps > steps:
+        again, change_again, gap_again = attribute(redo, retry_steps)
+        index = torch.as_tensor(redo)
+        contribution[index], change[index], gap[index], used[index] = again, change_again, gap_again, int(retry_steps)
+
+    q = torch.as_tensor(queries)
+    size = contribution.abs()
+    size[torch.arange(len(q)), q] = 0.0  # the receiver's own cell is reported apart
+    total = size.sum(1).clamp_min(1e-30)
+    pos = pos_um.double().cpu()
+    vec = (size @ pos - total[:, None] * pos[q]) / total[:, None]
+    same = pairs.groupby(["receiver", "program"])["sender"].apply(lambda v: np.unique(v.to_numpy())).to_dict()
+    senders = torch.zeros_like(size, dtype=torch.bool)
+    for k, (r, p) in enumerate(zip(queries, programs, strict=True)):
+        senders[k, torch.as_tensor(same[(r, p)], dtype=torch.long)] = True
+    best = size.topk(min(top, size.shape[1]), dim=1)
+    signed = contribution.gather(1, best.indices)
+    return {
+        "dep_receiver": q.numpy(),
+        "dep_program": np.asarray(programs, dtype=str),
+        "dep_class": np.asarray(classes, dtype=str),
+        "dep_change": change.numpy(),
+        "dep_gap": gap.numpy(),
+        "dep_steps": used.numpy(),
+        "dep_own": (
+            contribution[torch.arange(len(q)), q] / (total + contribution[torch.arange(len(q)), q].abs())
+        ).numpy(),
+        "dep_vec": vec.float().numpy(),
+        "dep_sender_share": ((size * senders).sum(1) / total).numpy(),
+        "dep_sender_chance": (senders.sum(1) / max(batch.num_nodes - 1, 1)).double().numpy(),
+        "dep_top_cells": torch.where(best.values > 0, best.indices, torch.full_like(best.indices, -1)).numpy(),
+        "dep_top_values": torch.where(best.values > 0, signed, torch.zeros_like(signed)).float().numpy(),
+    }
+
+
 def response_influence(
     module,
     data_list,

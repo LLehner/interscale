@@ -809,6 +809,44 @@ gene, over all 253 genes in the cells task and over the 29 hidden genes in the p
   (`scripts/fused_attention_benchmark.py`). Not built for whole sections: an inference path without dense maps (the relevance in
   `get_model_output`), readouts on sampled queries, the CosMx pipeline (T0), `visible_keys_only` with the fused attention.
 
+## 2026-10-25 — Why the windowed global-only model does not read M11: hidden alone, 300 epochs, entmax (5 arms, seed 42, one run each; results in `results/m11_tests`)
+
+Arms: `lin_dist_m11_skipraw` (baseline, 100-1000 µm window, linear), `lin_dist_m11_e300` (the same for 300 epochs),
+`lin_dist_m11_only` and `ent_dist_m11_only` (only MC14 / MC15 hidden), `ent_dist_m11_skipraw` (entmax attention). The sweep yaml
+(`synth_spot_m11`) is no longer in the scripts folder (only a stale .pyc); the other arms run the window sweep's 100 epochs
+(`synth_spot_window.yaml`, 2,400 steps), which is the base the sweep was built on.
+
+**What worked**
+- M11 was undertrained, not out of reach: 300 epochs read it at 0.955 pooled (receivers alone 0.962) against 0.285 / 0.312 for the
+  same arm at the shorter run, bar 0.92 (0.95 in receivers), oracle 0.99. The five discs of MC14 / MC15 are drawn in the held-out
+  slide's map (global part), and the planted sender ranks 1.00 (was 0.87) with a completeness gap of 0.09 (limit 0.1). The
+  attribution is 31x / 16x uniform within 300 / 500 µm of the receiver and under 1 beyond: the 500 µm kernel, nothing else.
+- The route changed, not only the score: the own-cell skip carried 0.75 of M11's variance at the shorter run and 0.05 at 300
+  epochs; the context part went 0.25 → 0.95 (global share of MC14 0.29 → 0.98, MC15 0.17 → 0.84).
+- The rest of the table moves with it (same seed): overall 0.904 → 0.952, programme mean 0.730 → 0.800, wins / ties / losses
+  against the bar 9 / 13 / 2 → 11 / 13 / 0, against the oracle 0 / 5 / 19 → 0 / 8 / 16; train loss 0.039, val 0.040 (0.089 /
+  0.085): no sign of overfitting. M19 / M20 (sparse responses) 0.65 / 0.55 → 0.94 / 0.90, S3/S4 0.93 → 0.98, short-range
+  receivers 0.95 → 0.98. The windows hardly move again (100 → 45 µm at strength 1.66, 1000 → 800).
+- Hiding M11's responses alone helps at the shorter run: 0.285 → 0.62 (ent 0.23 → 0.61), the context part 0.97 of the variance.
+  Part of the old failure was the competition with the 28 other hidden genes and the own-cell skip; the rest is length.
+
+**What doesn't work**
+- Entmax buys nothing: 0.23 against 0.29 with every gene hidden, 0.61 against 0.62 alone, overall 0.899 against 0.904. Its alphas
+  stay near the 1.5 start (1.41-1.66). It costs 2.1x the time per epoch (5.7 against 2.7 s) and 1.4x the memory (1.51 against
+  1.07 GiB). Not worth carrying.
+- M11 hidden alone at the shorter run stops at 0.62 (0.61 in receivers), below the bar's 0.91: the competition was not the whole
+  story. Its sender ranks (0.93 / 0.88) are not readable: completeness gaps 0.97 / 1.40. The baseline's (0.87 / 0.63) are not
+  either (0.22 / 0.62).
+- Still at the floor with 300 epochs: M9 (0.23, within receivers -0.54), M10 (0.25, oracle 0.83), the sparse responses' distance
+  part MC20 / MC21 (0.67 / 0.58, at `ref_own`), the mirror programmes M2-M6 (0.67-0.68 against oracle 0.95-0.98).
+- One seed. The earlier 3-seed window sweep had an SD of 0.17 on M11 within receivers at the short run; the gap here (0.31 →
+  0.96) is far beyond that, but the 300-epoch result is not replicated, and where in the 100-300 range M11 switches is unknown
+  (the training section keeps only the last epoch).
+
+**Consequence:** "M11 is unsolved by every arm" (notes 2026-10-23 to 2026-10-25) holds for 100 epochs only; the same may hold for
+the other programmes that sit at `ref_own` (M9, M10, MC20 / MC21, mirror) and for the PCA / scVI arms. A 300-epoch linear
+run costs about 13 minutes (2.6 s per epoch).
+
 ## 2026-10-26 — Hierarchical attention on synth_spot, Stage A, first read (20 of 24 runs; results in `results/26_10_results/hier_synth_spot_A`)
 
 Programme task, 300 epochs, 3 seeds (hier_fac 2: s42 missing; hier_soft all 3 missing, cause unknown). Two coarse levels (16 regions
@@ -838,3 +876,64 @@ full 0.947 ± 0.002 / 0.789 / 11-11.7-1.3; hier_none 0.939 ± 0.003 / 0.779 / 11
   pull every head-mean `read_vec` to the slide centre. Read arrows per head (the narrow ones) or by the top-k targets instead.
 - CLS takes 15-35% of the head-mean weight (soft_dir most); the soft prior gives CLS its parent's weight undivided while a cluster's is
   split over its children -- not the cause of the collapse, but a bias to check once hier_soft is in.
+
+## 2026-10-27 — Hierarchical attention, Stage A complete (soft, soft_dir rerun, fac s42) and CosMx fold 0 (results in `results/26_10_results/hier_synth_spot_A`, `hier_cosmx_fast`)
+
+synth_spot, programme task, 300 epochs, 3 seeds each (all 24 runs + 2 twins). Centred cosine whole cell ± SD / programme mean / wins-losses
+against `ref_own+context`: full 0.947 ± 0.002 / 0.789 / 11-1.3; hier_none 0.939 ± 0.003 / 0.779 / 11-2; hier_soft_dir 0.892 ± 0.009 / 0.740;
+hier_soft 0.887 ± 0.015 / 0.736; hier_fpc 0.864 ± 0.022 / 0.734; dual_add_ctx_dist (global head) 0.862 / 0.726; hier_fac 0.771 ± 0.010 / 0.707;
+gcn 0.512 / 0.591. Both twins -0.006.
+
+**What worked**
+- `hier_none` stays the hierarchical arm to carry: 0.01 below dense over 3 seeds, everything else 0.05-0.18 below.
+- `soft` keeps the short range (S1-S4 0.96-0.98), unlike fac / fpc (0.75-0.87): the narrowest head switches its prior off at the cell level
+  in layer 1 in every prior mode (lambda 1.0 → -0.02 soft / soft_dir, -0.27 fpc).
+- The repaired direction prior trains (mu 0.3-0.9, no freeze): soft_dir is a valid run now.
+
+**What doesn't work**
+- Every prior still costs. The soft prior's loss is mid range and dense: M11 0.32 (none 0.81, full 0.90), M19 0.65 (0.84 / 0.89), M8 0.88
+  (0.96). Train / val loss 0.066 / 0.099 against 0.041 / 0.057 for none: it fits less, not overfits.
+- The attention is not where M11 fails: soft's head 1 puts more weight on M11's senders than full's (layer-1 sender lift 175 against 90,
+  AUPRC 490x against 174x chance). M11 within receivers swings 0.10-0.83 by seed in the prior arms (fac 0.10-0.57, soft 0.10-0.42, fpc
+  0.38-0.83) and the context share swings with it: the "M11 has switched or not" pattern of the m11 sweep. The priors slow the switch.
+- The direction prior adds nothing: soft_dir - soft = +0.005 whole cell (inside the seed SD), and the directional class (M9 0.22, M10 0.25)
+  stays at the floor in every arm, dense included.
+- Most lambdas end near their 1.0 start (0.6-1.0): apart from the narrow head the prior weight hardly learns in 300 epochs.
+
+CosMx fold 0 (one seed, 1,000 epochs, whole sections, routed: ~100 keys per query at level 1, ~300-330 at the cell level, 205-401 regions of
+250 cells, clusters of 25; no twin, no hier_none, no dense arm). Centred cosine on hidden cells: hier_fac 0.189, hier_soft 0.183, hier_fpc
+0.180, gcn 0.069; references knn8 0.172, knn32 0.220, knn128 0.244, section mean 0.209.
+
+**What worked**
+- Whole sections per pass are cheap: 6.5 GiB peak, 3.4-3.6 s per epoch (0.7 steps/s), ~1 h per 1,000-epoch run, not the 24 h guessed.
+  never_selected 0 at every level.
+- The hierarchical arms hold across depth (0.21 → 0.16 from 0-12 to >40 µm); the GCN falls below zero beyond 25 µm (-0.03, -0.11).
+
+**What doesn't work**
+- No arm beats a smoother: all below knn32, knn128 and the section mean at every depth; the prior modes are indistinguishable (0.180-0.189).
+- Little was learned: attention lift over uniform 0.8-1.2 beyond 15 µm (5.7-14x at 0-15 µm), windows within ~10% of their start
+  (7 / 43-57 / 238-243 / 974-1092 µm), lambdas 0.6-1.0 bar the narrowest head. Train 0.75 / val 0.83. Same signature as the
+  underfitting reads (legnini round 2, synth_spot at 100 epochs). ~2,500 steps only.
+- Test section 3_ND is ~9 separate tissue blocks over ~7 mm: the region level spans gaps between blocks; head-mean arrows are short and
+  say nothing.
+
+**Next:** CosMx first: train 10-20x longer (the time allows it), add `hier_none` and an untrained twin, read the loss curve before new arms.
+Priors: only with lambda starting at 0 (soft = none at the start) and `coarse_bias: own`; drop the direction prior.
+
+## 2026-10-27 — The field export per head, the own-window baseline and the dependence field (code, tests, a stub on generated synth_spot; no run)
+
+Built for the next sweeps (decided 2026-10-26): `hierarchy_readouts.fields` exports per head cell mass, top-5 and `window_vec_heads`
+(the head's trained position biases alone over the same keys, scaled to its cell mass), the planted programmes, and
+`receptive_field.receiver_dependence` (IG per receiver, retried with more points over a 0.1 completeness gap); `fields_by_class.py`
+draws them and runs after every export. Sweeps written, not run: synth_spot Stage B, the Stage A fields re-read, CosMx `long`.
+
+**What worked**
+- Under flat content (query and key projections zeroed) the window baseline equals the attention exactly, dense and hierarchical;
+  in the stub figure the wide head's pull to the slide centre disappears once its own window is subtracted.
+- The retry rule is pinned against direct calls; 7 mutations of the new code killed.
+
+**What doesn't work**
+- Completeness converges slowly where the response barely moves: a toy query at change -0.013 needed ~128 points for a gap under
+  0.1, and on stirred toy models 54-98 of 170 queries still missed 0.1 after 20. Read `dep_gap` next to `dep_change`.
+- The dependence is expensive: a backward pass per receiver and point (~0.05 s on the GPU); every receiver of a slide (~3,000)
+  would cost ~40 min per run, so the sweep takes 50 per programme on one slide (~10 min, estimated, not measured).

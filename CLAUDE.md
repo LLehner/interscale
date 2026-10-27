@@ -250,7 +250,11 @@ never an `S x S` tensor), and fuses each cell with its ancestors (`readout`). In
   learned token). Exploration draws only from the module's own generator.
 - **Readouts.** `recording_hierarchy()` exports each layer's per-level attention (dense, or `SparseRows` when routed);
   `evaluation.hierarchy_readouts` reads hierarchical and dense models alike (sender lift, pair AUPRC, arrow angle, routing
-  recall, health, fields). Dense candidates also hand `forward` cell-level maps; routed models hand none.
+  recall, health, fields). Dense candidates also hand `forward` cell-level maps; routed models hand none. The exported fields
+  carry per head the cell mass, the top-k targets and `window_vec_heads` (where the head's own trained position biases alone
+  would read over the same keys, scaled to its cell mass: the baseline of a trained head, in place of an untrained twin), the
+  planted pairs with their programmes, and with `dependence_genes` each receiver's integrated-gradients dependence
+  (`receptive_field.receiver_dependence`: a query over the completeness limit is integrated again with more points).
 - Refused (validator): other backends or head widths, RoPE, spectral / expression biases, the long-range mask, the context
   query, `visible_keys_only`, `remask`, pooling, losses reading attention maps; prior none without a readout.
 

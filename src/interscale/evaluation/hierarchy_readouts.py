@@ -271,8 +271,40 @@ def distance_profile(entry: dict, bins_um: Sequence[float], max_queries: int = 5
     return rows
 
 
-def fields(entry: dict, top: int = 5) -> dict[str, np.ndarray]:
-    """The T8 vector fields of one layer and graph, head-mean and per head, as arrays (what :func:`export_fields` saves)."""
+def window_rows(keys: torch.Tensor, pos: torch.Tensor, bias, block: int = 4096) -> torch.Tensor | None:
+    """``[H, n, K]``: each head's position biases alone (its distance window; no content, no prior) as attention over the same
+    cell keys, the cell's own key, CLS and padding left out, each row summing to 1 (0 without an open key). None without a bias.
+
+    The baseline a head's trained row is read against: what its window would read with every content logit equal.
+    """
+    from interscale.module.global_modules.hierarchical_attention import offset_bias
+
+    if bias is None:
+        return None
+    n = len(pos)
+    device = next(bias.parameters(), torch.empty(0)).device
+    out = []
+    with torch.no_grad():
+        for start in range(0, n, block):
+            k = keys[start : start + block]
+            rows = torch.arange(start, start + len(k))[:, None]
+            open_cells = (k >= 0) & (k < n) & (k != rows)
+            offsets = pos[k.clamp(0, n - 1)] - pos[rows]  # [b, K, 2]
+            logits = offset_bias(bias, offsets.to(device)).float().cpu()  # [b, K, H]
+            logits = logits.masked_fill(~open_cells[..., None], float("-inf"))
+            w = torch.softmax(logits, dim=1).nan_to_num(0.0)  # a row with no open key: zeros
+            out.append(w.permute(2, 0, 1))
+    return torch.cat(out, dim=1)
+
+
+def fields(entry: dict, top: int = 5, bias=None) -> dict[str, np.ndarray]:
+    """The T8 vector fields of one layer and graph, head-mean and per head, as arrays (what :func:`export_fields` saves).
+
+    Per head: ``read_vec_heads``, ``cell_mass_heads`` (the weight on cells, the rest on CLS) and the ``top`` attended cells
+    (``top_targets_heads``, ``top_weights_heads``; the head mean's as ``top_targets`` / ``top_weights``). With ``bias`` (the
+    model's position biases at the cell level): ``window_vec_heads``, where the head's window alone would read over the same
+    keys, scaled to its trained cell mass -- ``read_vec_heads - window_vec_heads`` is what content (and the prior) added.
+    """
     hier, pos = entry["hierarchy"], entry["pos_um"].float()
     keys, weights = cell_rows(entry)
     n = len(pos)
@@ -284,9 +316,14 @@ def fields(entry: dict, top: int = 5) -> dict[str, np.ndarray]:
         "read_vec": read.mean(0).numpy(),
         "read_vec_heads": read.numpy(),
         "cell_mass": mass.mean(0).numpy(),
+        "cell_mass_heads": mass.numpy(),
         "entropy": stats["entropy"].mean(0).numpy(),
         "mean_distance_um": stats["mean_distance_um"].mean(0).numpy(),
     }
+    window = window_rows(keys, pos, bias)
+    if window is not None:
+        window_vec, _ = read_vectors(keys, window * mass[..., None], pos)
+        out["window_vec_heads"], out["window_vec"] = window_vec.numpy(), window_vec.mean(0).numpy()
     if hier.n_levels > 0:
         parent, centroid = hier.up[-1].cpu(), hier.centroid[-2].cpu().float()
         coarse, refine = decompose(keys, weights, pos, parent, centroid)
@@ -294,12 +331,14 @@ def fields(entry: dict, top: int = 5) -> dict[str, np.ndarray]:
         for level in range(hier.n_levels):
             out[f"assign_l{level}"] = hier.assign[level].cpu().numpy()
     cells = (keys >= 0) & (keys < n)
-    w = torch.where(cells, weights.mean(0), torch.zeros_like(weights[0]))
-    best = w.topk(min(top, w.shape[1]), dim=-1)
-    out["top_targets"] = torch.where(
-        best.values > 0, keys.gather(-1, best.indices), torch.full_like(best.indices, -1)
-    ).numpy()
-    out["top_weights"] = best.values.numpy()
+    per_head = torch.cat([weights, weights.mean(0, keepdim=True)])  # heads, then their mean
+    w = torch.where(cells, per_head, torch.zeros_like(per_head))
+    best = w.topk(min(top, w.shape[-1]), dim=-1)
+    targets = torch.where(
+        best.values > 0, keys.expand_as(w).gather(-1, best.indices), torch.full_like(best.indices, -1)
+    )
+    out["top_targets"], out["top_weights"] = targets[-1].numpy(), best.values[-1].numpy()
+    out["top_targets_heads"], out["top_weights_heads"] = targets[:-1].numpy(), best.values[:-1].numpy()
     return out
 
 
@@ -317,11 +356,18 @@ def hierarchy_readouts(
     export_dir: str | Path | None = None,
     export_graphs: int = 0,
     graph_names: Sequence[str] | None = None,
+    dependence_genes=None,
+    dependence: dict | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Every readout above, over the graphs of ``data_list`` under the masks they carry (the module corrupts its input as in
     training). ``layers``: which layers' planted metrics and profiles to report (default: all). ``export_dir``: write the
-    last-layer fields of the first ``export_graphs`` graphs (0: every graph) there (``<name>.npz``, with the planted pairs in
-    sequence positions when there are any). Consumes no RNG and leaves the module's mode as it was.
+    last-layer fields of the first ``export_graphs`` graphs (0: every graph) there (``<name>.npz``: :func:`fields` with the
+    model's own windows as the baseline, and the planted pairs with their programmes in sequence positions when there are
+    any). With ``dependence_genes`` (``program -> [columns]``, as ``response_influence`` takes it) and planted programmes, each
+    exported graph also gets its receivers' dependence field (``receptive_field.receiver_dependence``, ``dep_*`` arrays, cells
+    in sequence positions); ``dependence`` passes that function's settings (``baseline``, ``steps``, ``retry_steps``,
+    ``gap_limit``, ``receivers_per_program``, ``top``), and ``graphs``: only the first that many exported graphs (0: all; the
+    dependence costs a backward pass per receiver and integration point). Consumes no RNG and leaves the module's mode as it was.
 
     Returns ``hier_planted`` (layer, range_class, head, metric, value, n_receivers), ``hier_health``, ``hier_profile`` and
     ``hier_stats`` (per graph: the hierarchy's sizes and build time), each only when it has rows.
@@ -353,9 +399,10 @@ def hierarchy_readouts(
                 name = graph_names[g] if graph_names is not None else f"graph{g}"
                 n_layers = len(record)
                 chosen = {(layer % n_layers) for layer in layers} if layers is not None else set(range(n_layers))
-                pairs = None
+                pairs = found_nodes = None
                 if edges is not None:
                     found = graph_edges(edges, batch.obs_names)
+                    found_nodes = found.copy()  # the same pairs as node indices of the batch
                     nodes = record[0]["nodes"] if record and record[0]["nodes"] is not None else None
                     if nodes is not None and len(found):
                         place = pd.Series(np.arange(len(nodes)), index=np.asarray(nodes))
@@ -378,13 +425,25 @@ def hierarchy_readouts(
                             {"graph": name, "layer": layer, **row} for row in distance_profile(entry, distance_bins_um)
                         ]
                 if export_dir is not None and record and (not export_graphs or g < export_graphs):
-                    arrays = fields(record[-1])
+                    arrays = fields(record[-1], bias=getattr(transformer, "attention_bias", None))
                     if pairs is not None:
                         arrays |= {
                             "planted_sender": pairs["sender"].to_numpy(),
                             "planted_receiver": pairs["receiver"].to_numpy(),
                             "planted_class": np.asarray(pairs["range_class"].astype(str).tolist(), dtype=str),
                         }
+                        if "program" in pairs:
+                            arrays["planted_program"] = np.asarray(pairs["program"].astype(str).tolist(), dtype=str)
+                        settings = dict(dependence or {})
+                        dependence_graphs = int(settings.pop("graphs", 0))
+                        if (
+                            dependence_genes is not None
+                            and "program" in pairs
+                            and (not dependence_graphs or g < dependence_graphs)
+                        ):
+                            arrays |= _dependence(
+                                module, batch, found_nodes, record, dependence_genes, prediction_task, settings
+                            )
                     np.savez_compressed(Path(export_dir) / f"{name}.npz", **arrays)
     finally:
         module.train(was_training)
@@ -412,6 +471,40 @@ def hierarchy_readouts(
     if stats:
         tables["hier_stats"] = pd.DataFrame(stats)
     return tables
+
+
+def _dependence(
+    module, batch, pairs_nodes, record, edge_genes, prediction_task, settings: dict
+) -> dict[str, np.ndarray]:
+    """``receptive_field.receiver_dependence`` of one graph, its cells moved to the export's sequence positions (a cell the
+    sequence left out goes: a receiver, or -1 in a top list).
+    """
+    from interscale.evaluation.receptive_field import _frozen_parameters, receiver_dependence
+
+    nodes = np.asarray(record[0]["nodes"]) if record[0]["nodes"] is not None else np.arange(batch.num_nodes)
+    if pairs_nodes is None or not len(pairs_nodes):
+        return {}
+    place = np.full(batch.num_nodes, -1, dtype=np.int64)
+    place[nodes] = np.arange(len(nodes))
+    unit = float(getattr(getattr(module, "global_module", module).attention_bias, "spatial_unit_um", 1.0) or 1.0)
+    with _frozen_parameters(module):
+        found = receiver_dependence(
+            module,
+            batch,
+            pairs_nodes,
+            edge_genes,
+            prediction_task=prediction_task,
+            pos_um=batch.pos[:, :2].double().cpu() * unit,
+            **settings,
+        )
+    if not found:
+        return {}
+    keep = place[found["dep_receiver"]] >= 0
+    out = {key: value[keep] for key, value in found.items()}
+    out["dep_receiver"] = place[out["dep_receiver"]]
+    top = out["dep_top_cells"]
+    out["dep_top_cells"] = np.where(top >= 0, place[top.clip(0)], -1)
+    return out
 
 
 def _dense_record(module, transformer, batch, prediction_task, prediction_level) -> list[dict]:
