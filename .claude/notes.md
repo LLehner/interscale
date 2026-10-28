@@ -937,3 +937,29 @@ draws them and runs after every export. Sweeps written, not run: synth_spot Stag
   0.1, and on stirred toy models 54-98 of 170 queries still missed 0.1 after 20. Read `dep_gap` next to `dep_change`.
 - The dependence is expensive: a backward pass per receiver and point (~0.05 s on the GPU); every receiver of a slide (~3,000)
   would cost ~40 min per run, so the sweep takes 50 per programme on one slide (~10 min, estimated, not measured).
+
+## 2026-10-27 — Hierarchical attention, Stage B: the priors repaired (lambda from 0, a window per coarse level; results in `results/27_10_results/hier_synth_spot_B`)
+
+synth_spot, programme task, 300 epochs, 4 arms x 3 seeds (`hier_fpc_l0_own_s43` missing: 11 runs) and 4 untrained twins (-0.006). Centred
+cosine on hidden entries, whole cell ± SD: `hier_soft_l0_own` 0.944 ± 0.006, `hier_soft_l0` 0.943 ± 0.003, `hier_soft_own` 0.916 ± 0.010,
+`hier_fpc_l0_own` 0.913 (2 seeds). Stage A for comparison: full 0.947 ± 0.002, hier_none 0.939 ± 0.003, soft 0.887 ± 0.015, fpc 0.864 ± 0.022.
+No `results.md` in the folder; read from `sections/`. The fields (`fields/`, `fields_by_class/`) not read yet.
+
+**What worked**
+- Lambda starting at 0 removes the soft prior's cost: `soft_l0` and `soft_l0_own` reach dense level (0.943 / 0.944 against 0.947), with the short
+  range at 0.98-0.99 (S1-S4) and M11 at 0.82-0.90 in every seed (Stage A soft 0.32, none 0.81, full 0.90); train / val loss 0.037-0.042 /
+  0.047-0.056, as hier_none.
+- A window of its own per coarse level helps when the prior starts on: `soft_own` 0.916 against Stage A soft's 0.887. Its narrowest level-1
+  window weakens (seed 44: 100 → 185 µm, strength 1.0 → 0.28; read for s44 only), so the coarse level confines the narrow heads less.
+
+**What doesn't work**
+- The prior learns nothing when it may stay off: in the lambda-from-0 arms the median |lambda| ends at 0.05-0.10 (max 0.24-0.32, a few wide
+  heads), so `soft_l0` is in effect `hier_none`. Where it starts on (`soft_own`) it stays on (median 0.70-0.91) and costs. No arm with a prior beats
+  hier_none or dense: the level above carries no information the cells' own windows lack on synth_spot.
+- `soft_own` still has the seed-dependent M11 switch (0.85 / 0.88 / 0.30); the own window adds nothing once lambda starts at 0 (0.944 against 0.943).
+- `fpc_l0_own` still loses the short range (S1-S4 0.83-0.90 against 0.98) and fits less (train 0.070, val 0.078-0.088): the factorized per-cell
+  prior hurts even from 0 (max |lambda| 0.53-0.92).
+- Directional class unchanged (M9 0.21-0.23, M10 0.24-0.26). Peak memory 2.0 GiB (Stage A hier_none 1.4); epoch times 1.2-5.7 s scatter by node.
+
+**Consequence:** on synth_spot carry `hier_none` (or soft from 0, which ends there); priors are not a lever here. The CosMx long run's
+`hier_soft_l0_own` arm is safe (it cannot do worse than none) but will most likely read as hier_none.

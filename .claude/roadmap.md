@@ -19,12 +19,12 @@ The terms used below:
 
 ## Status
 
-Last updated 2026-10-25.
+Last updated 2026-10-26.
 
 | track | question | state | verified by | date |
 |---|---|---|---|---|
 | T0 | infrastructure: seeds, per-arm evaluation, inputs, CosMx | **implemented, unverified** (2026-10-19; CosMx deferred by the user) — seed axis, run selection for job arrays, per-run section files, timing, cached references, `Precomputed` under programme masking, `pca_fit: train`; every mutation caught (two survivors led to a stronger test and a simplification), harness IDENTICAL; the sweep script checked on a stub synth_spot with untrained models. **Not run on data** | 2026-10-19 |
-| T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; legnini programme masking built 2026-10-20 (`legnini_programme`, decided gene set in legnini_plan.md; not run); sender ranks unreadable (gradient magnitude) → replaced 2026-10-20 by an integrated-gradients attribution, sparse programmes also scored within their receivers, per-programme wins/ties/losses in the report (**built, not yet run: the 19 checkpoints await `MODE = "evaluate"`**). Details in global_plan.md. **Oracle bar built 2026-10-21** (`ref_oracle`, below): a ridge on the true drivers reaches 0.983 over the programmes on synth_spot, against 0.685 for `ref_own+context`, checked without any model. **Model-side options built 2026-10-21** (implemented, unverified on data): a distance prior with a length scale per head (`pe.distance.kind: scales`) and visible keys only (`attention.visible_keys_only`); 31 tests, 20 mutations caught, harness IDENTICAL. First arms read 2026-10-24 (`local_global_split`: a global-only model with the prior reads the short range at 0.94-0.98, one seed); sweep `synth_spot_window` written 2026-10-24 (3 seeds, a 100-1000 µm range aimed at M11, PCA and scVI tokens), not run; per-head roles (a bias per head set, the mask per head set) proposed in attention_plan.md, stage 10 | `response_masking` run (11 arms, 19 runs, 3 twins) | 2026-10-20 |
+| T1 | does the global model learn communication at all | second read 2026-10-20 (3 seeds, 19 runs): `joint_fourier` global head 0.820 ± 0.005 against the bar 0.682 and its local head 0.506, rings +0.3; per programme 3 wins / 12 ties / 9 losses against the bar (mirror programmes, M11, directional); pooled 500 µm loses the sparse responses; legnini programme masking built 2026-10-20 (`legnini_programme`, decided gene set in legnini_plan.md; not run); sender ranks unreadable (gradient magnitude) → replaced 2026-10-20 by an integrated-gradients attribution, sparse programmes also scored within their receivers, per-programme wins/ties/losses in the report (**built, not yet run: the 19 checkpoints await `MODE = "evaluate"`**). Details in global_plan.md. **Oracle bar built 2026-10-21** (`ref_oracle`, below): a ridge on the true drivers reaches 0.983 over the programmes on synth_spot, against 0.685 for `ref_own+context`, checked without any model. **Model-side options built 2026-10-21** (implemented, unverified on data): a distance prior with a length scale per head (`pe.distance.kind: scales`) and visible keys only (`attention.visible_keys_only`); 31 tests, 20 mutations caught, harness IDENTICAL. First arms read 2026-10-24 (`local_global_split`: a global-only model with the prior reads the short range at 0.94-0.98, one seed); sweep `synth_spot_window` **run and read 2026-10-25** (3 seeds): the window holds (0.909 ± 0.003, programme mean 0.729, 8 / 14 / 2), M11 is not a question of reach, PCA and scVI tokens drop the drivers; **M11 solved by 300 epochs** (`synth_spot_m11`, read 2026-10-25, one seed: 0.955, whole cell 0.952, programme mean 0.800, 11 / 13 / 0; M11's responses hidden alone 0.62; entmax no gain); per-head roles (a bias per head set, the mask per head set) proposed in attention_plan.md, stage 10. Week 1 review below: DP1 can be decided | `response_masking`, `local_global_split`, `synth_spot_window`, `synth_spot_m11` runs | 2026-10-25 |
 | T1b | coarse-grained tokens: pool cells into patches or niches before the global model | **grid pooling implemented, unverified** (2026-10-19) — `pooling.kind: grid` (`size_um` or `n_patches`), `count`/`std` features, 39 tests, an end-to-end run for GlobalModel and CombinedModel, every mutation caught (one survivor led to a stronger test), harness IDENTICAL; 5 pooled arms in `response_masking`. The `niche` assignment waits for the user's details; patch-level attention readouts not built. **Not run on data**. **2026-10-21: the decoder arms for the global-only model built** (own-cell skip `model.decoder.own_cell_skip`, `nonlinear` and `linear-lse` as sweep arms, the skip also on pooled tokens), implemented, unverified; sweep `global_decoders` (10 runs) **run and read 2026-10-22** (notes.md): pooled tokens with the skip match the per-cell model's programme mean (0.582 against 0.577, one seed) at about 1/25 of the tokens and 0.14 against 0.77 GiB; without the skip pooling loses the sparse programmes (0.00-0.03); the nonlinear and LSE decoders are worse. **2026-10-22: the full-rank skip `own_cell_skip_input: raw` built**, arms `lin_fourier_pool500_skipraw` and `lin_fourier_skipraw` added to the sweep, **run and read 2026-10-23** (notes.md): the raw skip closes the mirror gap to `ref_own` (programme mean 0.611, 3 seeds); pooled 500 µm + raw skip the best global-only arm (0.625, one seed) and the only one that reads short-range receivers (0.21-0.28) | 2026-10-23 |
 | T2 | disentangling local and global ([decoder_plan.md](decoder_plan.md)) | proposed; **re-masking before the transformer implemented, unverified** (2026-10-21, task 3 below) -- `remask: hidden`: a wholly hidden cell enters the transformer as one learned token instead of its GCN token; 16 tests, 8 mutations caught, harness IDENTICAL; sweep `remask_test` (8 runs) **run and read 2026-10-22** (notes.md): the mechanism works (with the long-range mask a rim cell's global head draws 94% of its influence from beyond 300 µm, was 7%; CKA local~global at the rim 0.89 → 0.78), at a cost of 0.02-0.05 at every depth with the mask on and none without it (where the copying moves into attention); no head beats the smoother. **D2.2, each head's loss on the hidden cells of its regime, implemented, unverified** (2026-10-21) -- `optim.regime_loss`, near / deep by the distance to the nearest visible cell; 55 tests with the own-cell skip (34 regime loss, 21 skip and decoders), 32 mutations all caught (two only after two more tests), harness IDENTICAL; sweep `regime_loss` (9 runs) **run and read 2026-10-22**: the heads specialise as assigned (the local head near the rim 0.443 → 0.483, the global head loses the rim 0.428 → 0.385 and holds deep) but no head beats the smoother in its own regime, and discs of 1000 µm make the global head worse everywhere (0.40 → 0.34). **D0, the yardsticks, implemented, unverified on data** (2026-10-21): ridge redundancy of the two embeddings per depth group, attribution shares of a head's parts (`StepOutput.parts`), 15 tests. **D3.1, the additive decoder of the dual model, implemented, unverified** (2026-10-22): `model.decoder.additive`, `y = W_l h_local + W_g h_global + b` with the loss on the sum, the parts for `attribution_shares`; 22 tests, 41 mutations caught (with the raw skip and the probe cost), harness IDENTICAL; sweep `additive_decoder` (10 runs) **run and read 2026-10-23** (notes.md): sum 0.843 against the plain global head's 0.820, programme mean at the bar (0.687); without D1 the parts repeat and cancel each other. **Cheaper disc evaluation** (2026-10-22): `max_train_rows` and `joint_embeddings` for the label and distance probes, `PROBE_*` in `sweep_common.py`; the new numbers are not comparable to the first disc sweeps'. **D1.2, the context-only global embedding, implemented, unverified** (2026-10-22): `model.global_component.parameters.context_only: query` -- the transformer's queries from one learned token plus the node encoding, reading the cells' input tokens, so a cell's global embedding does not hold the cell (bit for bit; 1 / S with `center_qk`); 36 tests, 38 mutations, harness IDENTICAL; sweep `context_query` (13 runs + 2 twins) **run and read 2026-10-23** (notes.md): `add_ctx_fourier` ties `add_fourier` (0.842) with the parts separated -- the context part carries the rings and nothing else. **Moran's I split (task 1) implemented, unverified on a trained model** (2026-10-23): `evaluation.gene_scales` -- per gene Moran's I against the k nearest cells (shells, sampled centres, a permutation null), its length scale, and each part's share of a decomposable prediction read on cell folds; without a model on synth_spot's test slides the measured scale ranks with the planted one at 0.59 over 53 variable genes and the short-range receivers show at the second shell (notes.md); 28 tests, 35 mutations caught (two only after stronger tests), harness IDENTICAL; sweep `gene_scales` (5 runs + 1 twin, cell masking) written, **not run**. **D4, the orthogonality terms, rewritten and implemented, unverified on synth_spot** (2026-10-23, decoder_plan.md): eight scale-free auxiliary losses (`orth_cka`, `orth_cca`, `orth_kernel_cka`, `orth_opl` as a control, `orth_gene_corr`, `orth_loadings`, `orth_decorrelation`, `orth_loading_ortho`); on a toy dual model without dropout a term lowers its measure at evaluation (CKA 0.998 → 0.10), with dropout training meets it with noise (train 0.02, validation 0.999), so terms that read cells refuse dropout; checkpoint names now carry every auxiliary weight; 55 tests, 43 mutations caught, harness IDENTICAL; the sweep (one over a variety of terms) to design with the user. **Sweep `local_global_split` run and read 2026-10-24** (notes.md: the distance prior gives a global-only model the short range, `lin_dist_skipraw` 0.94-0.98 on R1-R4 against 0.57-0.68 for the GCN, one seed; in the dual model it makes the split follow the genes' scales without changing a score; legnini programme masking at or above its bar for the first time) (slurm/local_global_split/; asked for by the user): synth_spot and legnini, each under two tasks over the same arms -- `cells` (every gene a target, Moran's I over all genes) and `programme` (the programme evaluation, Moran's I on the hidden genes, read on the evaluation's own mask) -- with `add_ctx_fourier`, `add_ctx_fourier_l01`, `add_fourier`, the distance-prior arms `add_ctx_dist`, `add_ctx_fourier_dist`, `add_ctx_dist_frozen` and, programme task only, `lin_fourier_skipraw`, `lin_dist_skipraw`; figures across arms (scale vs global share, Spearman per arm, the global part's share per programme). Embedding dimensions vs genes (task 2) proposed | tests, harness, synth_spot data | 2026-10-24 |
 | T3 | masking strategies | **channel masking implemented, unverified** (2026-10-22): `dataset.mask_channel_fraction` (30% first, 50% the same code), 31 tests, 36 mutations, harness IDENTICAL; sweep `channel_masking` (8 runs, evaluated on the programme set via `EVAL_MASK_GENES`) **run and read 2026-10-23** (notes.md): it does not transfer (0.245 against 0.764 for the programme-trained model, below `ref_own`); training loss 0.76-0.83, so it hardly fits its own task -- diagnose before dropping it. The other new masks (structured, by cell type, same-type blocks) proposed | tests, harness, synth_spot data | 2026-10-23 |
@@ -35,9 +35,105 @@ Last updated 2026-10-25.
 | T7 | disease-specific interactions | proposed | | |
 | T8 | prior knowledge (NicheNet), downstream | proposed | | |
 | T9 | literature review and write-up | proposed | | |
-| T10 | comparison with other methods: classification (manuscript Fig. 2), communication methods, spatially variable genes, spatial domains | proposed (asked for 2026-10-19) | | |
+| T10 | comparison with other methods: classification (manuscript Fig. 2), communication methods, spatially variable genes, spatial domains | **workflow planned and started** ([comparison_plan.md](comparison_plan.md), 2026-10-25; CosMx first, synth_spot as the calibration): shared inputs (the section layout from the global pixels), the LIANA+ consensus resource cut to the panel, the output tables, and 4 of 7 baselines (LIANA+, `ligrec`, Moran's I, logistic regression) run locally on a 2-FOV copy; AMICI, Steamboat, NicheCompass, the InterScale arms and readouts, Visium and IMC not started | local runs on a 2-FOV-per-section copy | 2026-10-25 |
 
-## Where we stand
+## Week 1 review (2026-10-26): summary, conclusions, to do
+
+Written on Monday of W2, the day of DP1. The next section ("Where we stand") is the starting point of 2026-10-19. Where this
+section's to-do list and W2's schedule below differ, the to-do list holds.
+
+### Summary against the plan
+
+W1's core is done: a task that can show communication, and a model that learns it. It came with more margin than planned, and
+five W2 builds came forward (D1.2 and D3.1, channel masking, D4, fused exact attention). The second half of the roadmap has not
+started: T5, T7, T8, T9, most of T10 and every CosMx run. It depends on things outside the code: CosMx in the pipeline, the fused
+attention's cost at 10^5 cells, the baselines' environments, the Visium and IMC data. So about 2-3 days ahead on the core, and on
+schedule at best overall. The CosMx path is the critical path.
+
+| track | planned by the end of W1 | state on 2026-10-26 |
+|---|---|---|
+| T0 | seeds, one job per run, inputs; the CosMx pipeline (Fri) | built and in use; the CosMx pipeline not built (deferred); the evaluation still forms a dense `cdist` per section (~80 GB at 100k cells) |
+| T1 | `response_masking` at 3 seeds, the oracle, the distance prior; DP1 on Monday of W2 | done, and past it: the windowed global-only model (below); DP1 can be decided |
+| T1b | grid pooling and its sweep | built, read at 500 µm; no pooled arm for CosMx (your decision of 2026-10-25; another pooling is being designed) |
+| T2 | D0 and D2.2 (W1); D1 + D3.1 (Monday of W2); D4 (Friday of W2) | D0, D2.2, re-masking, D1.2, D3.1 and the Moran's I split built and read; D4 built, its sweep not designed; task 2 not started |
+| T3 | new masks (W2) | channel masking built and read early (it does not transfer); structured and cell-type masks and masking_plan.md not started |
+| T4 | integrated gradients (W1), the benchmark (W2) | integrated gradients and the attention check built and read; the null key and registers, task 5 (label-free flow) and attribution_plan.md not started |
+| T6 | exact attention (Wednesday of W2) | fused exact attention built early; not benchmarked on the cluster |
+| T5, T7, T8, T9 | W2-W3 | not started |
+| T10 | the comparison harness (Fri) | comparison_plan.md; shared inputs and 4 of 7 baselines run locally; AMICI, Steamboat, NicheCompass, Visium and IMC not started |
+
+Slipped from W1: the legnini flow re-evaluation (K9), `legnini_programme`'s pooled arms, the `joint_rope` and `l2g_res`
+evaluations, masking_plan.md and attribution_plan.md, task 2. Built and never run in any arm: `attention.visible_keys_only`
+(2026-10-21) and the anisotropic Fourier bias (attention_plan.md stage 3, 2026-10-11).
+
+### Conclusions (the numbers are in notes.md)
+
+What holds:
+- **The task decides what the global model learns.** Programme masking (a response set hidden in every cell) is the only task
+  under which it learned communication. Every label-free one failed: discs (never above a smoother, K1), cell masking (the GCN
+  reads every smooth gene, K14), channel masking (0.245; it hardly fits its own task).
+- **The best model is GlobalModel + a distance window per head + the raw own-cell skip** (`lin_dist_skipraw`): 0.909 ± 0.003 over
+  3 seeds, programme mean 0.729, 8 / 14 / 2 against the bar; short-range receivers 0.95-0.97, their planted senders ranked 0.98. The
+  dual models reach 0.84, and the short range only through the GCN (0.56-0.68). A narrow attention head selects the sender; a
+  mean-aggregating GCN cannot.
+- **The dual model's decomposition works.** The context query and the additive decoder separate the parts at no cost (0.842
+  against 0.843); the context part carries the rings; with the distance prior the split follows the genes' scales (Spearman
+  0.30-0.52 over seeds).
+- **Training length is a confound** (`synth_spot_m11`, one seed). 300 epochs instead of 100 give 0.904 → 0.952 whole cell,
+  programme mean 0.730 → 0.800 and no loss against the bar; M11 goes 0.29 → 0.96 (within receivers 0.96, sender rank 1.00). The
+  earlier "100 against 200 epochs costs ~0.01" read the whole-cell cosine only, which the long-range genes dominate.
+- **Rare interactions get too little signal.** MC20 / MC23 and MC21 / MC24 follow identical rules (`_SparseProgramme` in
+  `synth_spot.py`) and differ only in receivers per slide: 20-50 against 200-500. At 300 epochs the frequent pair rose
+  0.65 / 0.55 → 0.94 / 0.90, while the rare pair did not move (0.67 / 0.58).
+- **The instruments.** The oracle bar (0.983) separates the model's limits from the task's. Integrated gradients read senders
+  where the completeness gap stays under 0.1. Raw attention, rollout and relevance do not find planted senders.
+
+What does not:
+- The models sit at or below a fixed kernel smoother on smooth genes, although such a kernel lies in their function class: 0.77
+  against 0.82 for a 150 µm kernel (synth_spot, cells task), level on legnini (0.56 against 0.57).
+- The directional programmes (M9's stripe, M10's cone) sit at 0.22-0.25 in every arm, against the oracle's 1.00 / 0.83. Every
+  bias that worked is isotropic.
+- The windows hardly move from their starting scales: the range is a choice, not something learned.
+- On legnini every arm is at or just above its bar, and none separates from another.
+- The model size has not varied since round 2: width 64, 4 heads, 2 layers; 24 slides x 100 epochs = 2,400 steps.
+
+### Decision points
+
+- **DP1 (today).** Proposed: the windowed global-only model (`lin_dist_skipraw`) as the base, with the decomposable dual model
+  `add_ctx_dist` as the alternative. Fix the epoch count first (K15): 300 epochs moved the numbers more than any arm did, on one
+  seed.
+- **DP2.** You decided cell masking with discs for CosMx on 2026-10-25, without T3's matrix. On synth_spot that is the setting
+  in which the global model only matched a smoother (K17); decision 11 below.
+- **DP3** waits on `scripts/fused_attention_benchmark.py` on a cluster GPU.
+- **DP4:** nothing built yet (T7).
+
+### To do in W2, in order
+
+1. **DP1, and scale the model before redesigning it (K15).** Epochs {100, 300, 600} x width {64, 256} x heads {4, 8} on the
+   windowed model. Run 3 seeds of the 300-epoch arm, and add per-programme validation curves (a callback) to see when each
+   programme stops improving. Compare synth_spot with three times the training slides at 100 epochs against 300 epochs, to tell
+   data from steps. Then rerun the negative verdicts that rest on 100 epochs: dual against global-only, PCA and scVI tokens,
+   channel masking, entmax.
+2. **The CosMx critical path.** Run the fused benchmark. Bring CosMx into the pipeline (T0). Build an evaluation without dense
+   maps (the smoother references on neighbour lists, readouts on sampled queries). Settle the training steps (K18).
+3. **A task for real data (K17).** Module masking: co-expression modules found on the training slides, each hidden in every
+   cell, with the targets cut to structured genes. Read it on synth_spot's programme evaluation, the transfer test that channel
+   masking failed. Next to it, an arm that gives a hidden cell its type and trains on the within-type residual (NCEM's framing).
+   If module masking works, each module's own-cell against context share becomes a label-free communication readout.
+4. **Rare interactions (K16).** Loss weighting (per gene, or by a cell's deviation from the gene mean) and sampling hidden cells
+   near rare events, read on the MC20 / MC23 and MC21 / MC24 pairs.
+5. **Ground truth on real geometry (K20).** Plant synth_spot-style programmes into CosMx's coordinates and cell types. The same
+   generator carries T7's condition-specific programmes (ND and T1D sections) and the comparison workflow's calibration
+   (comparison_plan.md, C5).
+6. **Cheap arms that never ran.** The anisotropic Fourier bias on the windowed model (K19); `visible_keys_only` with
+   `remask: hidden` on a disc task.
+7. **Pulled forward, independent of CosMx.** T5's metric on existing checkpoints (legnini clusters, synth_spot roles); T9's
+   annotated reading list.
+8. **Backlog, unchanged.** The D4 sweep (to design), task 2, task 5, the null key and registers, the legnini flow
+   re-evaluation.
+9. **To discuss:** one multi-scale attention model in place of GCN + transformer (decision 13).
+
+## Where we stand (2026-10-19, the starting point)
 
 ### The goals against what has been tested
 
@@ -104,6 +200,12 @@ read without synth_spot's planted design, so they also work on legnini and CosMx
 | K12 | Global's magnitudes are off under the centred SCE | The loss ignores scale | Nothing for now: raw SCE is at the smoother's (0.074 vs 0.071). 0c stays deferred unless a cosine reading needs it | – |
 | K13 | Whole sections (47k–100k cells) cannot run with dense per-cell attention; windows cut interactions at their borders | S² memory and compute in the number of cells | Pool cells into patches or niches first (T1b): S drops to ~100–2,000 and dense, exact attention fits; sparse and linear attention (T6) as the alternative | T1b, T6; W1–W2 |
 | K14 | Under cell masking the dual model's global part carries almost none of the genes the model predicts, the long-scale ones included (`local_global_split`, synth_spot cells task, 2026-10-24): the local part carries 62 of 64 spatially variable genes in a run; the median global share rises with the measured scale only with the distance prior (0.01 below 300 µm → 0.19 beyond 1.4 mm; without it 0.00 at every scale), while those genes are predicted at cosine 0.94–0.97. Plot A's "global" curves are the 1–2 genes the model does not predict (MC21, MC13, POI30: cosine ~0, the parts cancelling at norms ~2), so its orange median is drawn from shares that mean nothing | The task never needs the global part: Moran's I measures how far a gene's variation reaches, not how far one must look to predict a hidden value, and a smooth gene at a hidden cell equals its neighbours, most of which are visible at 30% masking, so the GCN reads every smooth gene whatever its scale. The global part only works where the neighbourhood lacks the information (programme task: it carries the rings). On unpredicted genes a share of a near-zero, self-cancelling sum is arbitrary (loss on the sum only: a component moves between the parts for free) | **To discuss (2026-10-25):** train the cells task with discs wider than the GCN's reach as well, and read each gene's share by depth -- deep in a disc a long-scale gene can only come from the global part, so its share there should approach 1 (needs a per-gene share by depth, a small extension of the disc evaluation); grey out genes the model does not predict in Plot A (cosine below ~0.3) and save each part's absolute size per gene; `l01` or `orth_gene_corr` against the cancelling | T2; W2 |
+| K15 | Programmes judged unsolved at 100 epochs are learned at 300 (M11 0.29 → 0.96, MC23 / MC24 0.65 / 0.55 → 0.94 / 0.90; whole cell 0.904 → 0.952; one seed, `synth_spot_m11`), and smooth genes stay below a 150 µm kernel (0.77 against 0.82) | Too few steps (24 slides x 100 epochs = 2,400), and possibly too little width: the 64-wide token was a rank limit for the own cell, which the raw skip closed. The size has not varied since round 2 | The scale grid of the week 1 review (epochs x width x heads), per-programme validation curves, more training slides; rerun the negative verdicts that rest on 100 epochs | T1; W2 |
+| K16 | Rare interactions are not learned: MC20 / MC21 (20-50 receivers per slide) stay at 0.67 / 0.58 at 300 epochs, while MC23 / MC24, the same rules with 200-500 receivers, reach 0.94 / 0.90 | The per-cell loss gives tens of receivers per slide about 1% of its weight | Loss weighting (per gene, or by a cell's deviation from the gene mean), sampling hidden cells near rare events, more examples per epoch | T1; W2 |
+| K17 | Only programme masking makes the global part learn communication; every label-free task fails (discs K1, cells K14, channel masking 0.245). The CosMx task decided on 2026-10-25 is cell masking with discs | Each label-free task is solved by the neighbourhood or by the cell itself. Under channel masking a hidden response can be read off its visible co-responders, and noise genes (170 of 253) dominate the loss | Module masking (co-expression modules hidden in every cell, structured genes as targets), tested for transfer on synth_spot's programme; an arm that gives a hidden cell its type and trains on the within-type residual; the interferon / MHC-I set as a co-primary CosMx task until one of them passes (decision 11) | T3; W2 |
+| K18 | On whole CosMx sections a fold gives 2 optimiser steps per epoch (one per section, two training sections), against synth_spot's 24 | One step is one section | Random crops of a few mm as training steps and whole sections at inference (not sliding windows; decision 12); sequence-level centring (`center_qk`) and CLS must then behave the same on crops and sections | T0, T6; W2 |
+| K19 | The directional programmes (M9's stripe, M10's cone) stay at 0.22-0.25 in every arm, against the oracle's 1.00 / 0.83 | Every bias that worked is isotropic | The anisotropic Fourier bias (built 2026-10-11, never run) on the windowed model, as a per-head role (attention_plan.md, 10a) if needed. On tissue, absolute direction does not carry between sections, so this is mainly synth_spot's | T1; W2 |
+| K20 | Every result we trust comes from a 100 µm lattice (the narrowest window converged to the nearest-neighbour spacing), and on legnini no arm separates from another | synth_spot's geometry is regular and its interactions are exact | Semi-synthetic data: synth_spot-style programmes planted into CosMx's coordinates and cell types, with known senders | T7, T10; W2 |
 
 ## Tracks
 
@@ -1112,7 +1214,11 @@ Drop first:
    - Label: `cell_type_coarse` (9 types) or `CellTypes_max` (14).
    - Graph radius: the manuscript used 60, 110 and 150.
    - Folds: the three provided splits, or two training slides per fold.
-3. **CosMx programme set.** The interferon and MHC class I set above, or channel masking only.
+
+   *Decided 2026-10-25 (comparison_plan.md):* coarse types for interactions, coarse and fine for classification; a k-NN graph,
+   its reach counted in hops; the three provided splits rotated as folds.
+3. **CosMx programme set.** The interferon and MHC class I set above, or channel masking only. *2026-10-25:* the training mask
+   is cell masking with discs (your decision); comparison_plan.md has the interferon / MHC-I set as a second task. See 11.
 4. **C3's six missing arms.** Drop them (proposed), or run them.
 5. **The tissue-level CLS analysis** (condition classifier with integrated gradients). Is it in
    scope? It is the only way to retest the manuscript's Fig. 4C/D.
@@ -1124,12 +1230,25 @@ Drop first:
    cells per patch at the median; CosMx 100/200 µm proposed),
    `grid` first and `niche` second (proposed), and whether W1's other items may slip to W2 to make
    room (D1.1 + D3.1 and joint LSE already moved).
-9. **CosMx coordinates.** Is `obsm['spatial']` in µm? The two coordinate sources give token counts 4×
-   apart, which matters for the patch sizes.
+9. ~~**CosMx coordinates.** Is `obsm['spatial']` in µm? The two coordinate sources give token counts 4×
+   apart, which matters for the patch sizes.~~ Answered 2026-10-25 (comparison_plan.md): `obsm['spatial']` holds each FOV's
+   local pixels, so the FOVs of a section lie on top of each other; the layout is `CenterX/Y_global_px`, at 0.18 µm per pixel
+   (to confirm from the paper).
 10. **T10 methods and data.** Proposed baselines: classification GCN, PCATransformer, logistic regression, MLP,
     composition classifier, CellCharter/BANKSY probes, GraphCompass; communication AMICI, Steamboat, NCEM, MISTy,
     LIANA+; domains BANKSY, CellCharter, STAGATE or GraphST, SpaGCN; SVGs Moran's I, SpatialDE, SPARK-X, nnSVG.
     Is a foundation-model baseline (scGPT, Nicheformer) wanted? I left it out.
+11. **CosMx task (2026-10-26).** Cell masking with discs alone, as decided on 2026-10-25, or with the interferon / MHC-I set as a
+    co-primary task until a label-free task passes the transfer test on synth_spot (K17)?
+12. **Training on crops (2026-10-26).** Random crops of a few mm as CosMx training steps, with whole sections at inference
+    (K18)?
+13. **One multi-scale attention model (2026-10-26).** The windowed model beats every dual model (0.909 against 0.84) and reads
+    the short range better than the GCN (0.97 against 0.56-0.68). With heads as distance bands and an additive read-out per head,
+    each gene's prediction is an exact sum of parts at known scales. Local against global then becomes a distance axis, the parts
+    cannot copy each other (K2), and the Moran's I curve gets a direct counterpart; Steamboat's ego, local and global heads are
+    the precedent. The band scales could come from the data's measured length scales (`gene_scales`), since the windows hardly
+    move from their start. It departs from the manuscript's GNN + transformer design: pursue it, or keep the dual model as the
+    decomposable arm?
 
 ## Rules for every track
 
