@@ -20,7 +20,9 @@ inside the hidden area a cell lies. That is where a dual decoder's local and glo
 compared fairly: a pass without masking (``get_model_output``) hands each head the values it is
 scored on. Next to them, :func:`reference_predictions` gives the bar any head must clear: averages
 of the visible entries of the same graph (slide mean, nearest cells, Gaussian kernels), which use
-no model at all.
+no model at all. :func:`visibility_scores` scores the same pass on the cells the model *was* given -- the visible cells,
+whose outputs no loss ever read under cell masking -- next to the hidden ones (``.claude/masking_plan.md``, M0): how much
+of a reconstruction score is the cell's own input.
 
 Regression is scored by **cosine similarity** between predicted and true vectors, per cell: over the
 whole gene vector (its hidden entries), and over a vector of covariates. Two versions, side by
@@ -66,10 +68,12 @@ from interscale.evaluation.online_probes import hidden_depth as _hidden_depth
 from interscale.tl.geome_utils import label_codes
 from interscale.tl.masking import sample_block_mask, sample_gene_set_mask
 
-MASK_KINDS = ("entries", "cells", "blocks", "gene_set")
+MASK_KINDS = ("entries", "cells", "blocks", "gene_set", "cells+blocks")
 
 
-def draw_masks(data_list, kind: str, rate: float, seed: int, radius: float | None = None, columns=None) -> None:
+def draw_masks(
+    data_list, kind: str, rate: float, seed: int, radius: float | None = None, columns=None, block_rate: float | None = None
+) -> None:
     """Hide entries or whole cells of every graph in ``data_list``, in place, from a private generator.
 
     Writes ``data.gene_mask`` ``[N, G]`` and ``data.mask`` ``[N]`` (its row-wise OR), the attributes
@@ -78,7 +82,9 @@ def draw_masks(data_list, kind: str, rate: float, seed: int, radius: float | Non
     hidden cell. ``"blocks"`` hides every gene of the cells in discs of ``radius`` (in the units of
     ``data.pos``) until ``rate`` of each graph's cells lie in one. ``"gene_set"`` hides the gene
     ``columns`` -- and nothing else -- in each cell with probability ``rate`` (1.0: every cell), as
-    ``dataset.mask_genes`` does in training; read it with ``mask_strategy="gene"``. The global torch
+    ``dataset.mask_genes`` does in training; read it with ``mask_strategy="gene"``. ``"cells+blocks"`` is cell masking
+    with discs as a config trains it (``mask_percentage`` and ``mask_block_*``): every gene of the cells hidden at
+    ``rate`` (0: none) and of the cells in discs of ``radius`` covering ``block_rate`` of each graph. The global torch
     generator is not touched.
     """
     if kind not in MASK_KINDS:
@@ -87,6 +93,13 @@ def draw_masks(data_list, kind: str, rate: float, seed: int, radius: float | Non
         raise ValueError(f"'blocks' needs a radius > 0 and a rate in (0, 1), got radius {radius} and rate {rate}.")
     if kind == "gene_set" and (columns is None or not len(columns) or not 0 < rate <= 1):
         raise ValueError(f"'gene_set' needs columns and a cell rate in (0, 1], got {columns} and {rate}.")
+    if kind == "cells+blocks" and not (
+        radius is not None and radius > 0 and block_rate is not None and 0 < block_rate < 1 and 0 <= rate < 1
+    ):
+        raise ValueError(
+            f"'cells+blocks' needs a cell rate in [0, 1), a radius > 0 and a disc share in (0, 1), got {rate}, {radius} and "
+            f"{block_rate}."
+        )
     gen = torch.Generator().manual_seed(int(seed))
     for data in data_list:
         n, g = data.x.shape
@@ -96,6 +109,12 @@ def draw_masks(data_list, kind: str, rate: float, seed: int, radius: float | Non
             gene_mask = (torch.rand(n, generator=gen) < rate)[:, None].expand(n, g).clone()
         elif kind == "gene_set":
             gene_mask = sample_gene_set_mask(n, g, columns, rate, generator=gen)
+        elif kind == "cells+blocks":
+            if getattr(data, "pos", None) is None:
+                raise ValueError("'cells+blocks' draws discs over cell coordinates, but a graph has no `pos`.")
+            cells = torch.rand(n, generator=gen) < rate
+            cells |= sample_block_mask(data.pos, radius, block_rate, generator=gen)
+            gene_mask = cells[:, None].expand(n, g).clone()
         else:
             if getattr(data, "pos", None) is None:
                 raise ValueError("'blocks' are drawn over cell coordinates, but a graph has no `pos`.")
@@ -664,6 +683,10 @@ class HeadPredictions:
         ``{head: {part: [N, G]}}`` for a head whose prediction is the sum of named parts (``StepOutput.parts``: the own-cell
         skip and the transformer's read-out; a residual dual decoder's local and global), rows as in ``heads``. What
         :func:`attribution_shares` reads. None where no head has more than one part.
+    near_hidden_um
+        ``[N]`` distance from each cell with no hidden entry to the nearest cell of its graph that has one, in µm; 0 for
+        every other cell and ``inf`` in a graph without a hidden cell. What :func:`visibility_scores` bins the visible
+        cells by. None when the graphs carry no ``pos``.
     """
 
     heads: dict[str, np.ndarray]
@@ -672,6 +695,7 @@ class HeadPredictions:
     depth_um: np.ndarray | None = None
     cells: np.ndarray | None = None
     parts: dict[str, dict[str, np.ndarray]] | None = None
+    near_hidden_um: np.ndarray | None = None
 
 
 def _weighted_mean(w: torch.Tensor, xv: torch.Tensor, vis: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
@@ -697,9 +721,10 @@ def reference_predictions(
     mean of gene ``g`` over the other cells of ``i``'s graph, counting only entries that are
     visible: ``sum_j w_ij v_jg x_jg / sum_j w_ij v_jg``. A hidden entry (``v = 0``) never enters any
     average, so no reference can read a value the model could not see, under cell, entry or block
-    masking alike, and a cell never averages itself.
+    masking alike, and a cell never averages itself -- so at a visible cell every reference is its
+    context alone (:func:`visibility_scores`).
 
-    * ``ref_slide_mean`` -- every cell weighted equally.
+    * ``ref_slide_mean`` -- every other cell weighted equally.
     * ``ref_label_mean`` -- with ``labels``: the cells sharing ``i``'s label (an oracle when the
       label is ground truth the model is not given, e.g. a region).
     * ``ref_kernel_<s>um`` -- a Gaussian of the distance, bandwidth ``s`` µm.
@@ -737,11 +762,13 @@ def reference_predictions(
         rows = torch.where(graph == g)[0]
         vis = (~hidden[rows]).double()
         xv = x[rows].double() * vis
-        slide = torch.nan_to_num(xv.sum(0) / vis.sum(0), nan=0.0)
+        total, count = xv.sum(0), vis.sum(0)
+        slide = torch.nan_to_num(total / count, nan=0.0)
         n = len(rows)
-        out["ref_slide_mean"][rows] = slide.expand(n, -1)
-
-        fallback = slide.expand(n, -1)
+        # The cell's own visible entry left out (a hidden entry was never in the sums, so a hidden cell's is unchanged).
+        others = count - vis
+        fallback = torch.where(others > 0, (total - xv) / others.clamp_min(1.0), slide.expand(n, -1))
+        out["ref_slide_mean"][rows] = fallback
 
         if labels is not None:
             lab = labels[rows]
@@ -1057,7 +1084,7 @@ def collect_head_predictions(
     module.eval()
     heads: dict[str, list[np.ndarray]] = {}
     part_chunks: dict[str, dict[str, list[np.ndarray]]] = {}
-    chunks = {"true": [], "hidden": [], "depth_um": [], "cells": []}
+    chunks = {"true": [], "hidden": [], "depth_um": [], "cells": [], "near_hidden_um": []}
     loader = DataLoader(dataset=data_list, shuffle=False, batch_size=batch_size, num_workers=0)
     try:
         with _rng_untouched(device), torch.no_grad():
@@ -1085,6 +1112,9 @@ def collect_head_predictions(
                 if spatial_unit_um is not None and pos is not None:
                     depth = _hidden_depth(pos, hidden.all(dim=1), batch.batch) * float(spatial_unit_um)
                     chunks["depth_um"].append(depth[idx].cpu().numpy())
+                    # The other way round: each visible cell's distance to the nearest cell with a hidden entry.
+                    near = _hidden_depth(pos, ~hidden.any(dim=1), batch.batch) * float(spatial_unit_um)
+                    chunks["near_hidden_um"].append(near[idx].cpu().numpy())
                 if references is not None:
                     if pos is None:
                         raise ValueError("references average over neighbours, but the graphs carry no `pos`.")
@@ -1119,6 +1149,7 @@ def collect_head_predictions(
         hidden=cat("hidden"),
         depth_um=cat("depth_um"),
         cells=cat("cells"),
+        near_hidden_um=cat("near_hidden_um"),
         parts={
             head: {part: np.concatenate(values) for part, values in named.items()}
             for head, named in part_chunks.items()
@@ -1159,6 +1190,7 @@ def blend_heads(pred: HeadPredictions, reference: str, *, weight: float = 0.5) -
         depth_um=pred.depth_um,
         cells=pred.cells,
         parts=pred.parts,
+        near_hidden_um=pred.near_hidden_um,
     )
 
 
@@ -1499,4 +1531,114 @@ def score_heads(
                         row[f"{name}_cosine"] = _pooled_cosine(p - offset, true - offset, keep)
                     rows.append(row)
             tables["by_group_depth"] = pd.DataFrame(rows)
+    return tables
+
+
+# --------------------------------------------------------------------------- hidden against visible cells (masking_plan.md, M0)
+
+#: The two groups of :func:`visibility_scores`.
+HIDDEN_CELLS, VISIBLE_CELLS = "hidden", "visible"
+
+
+def visible_view(pred: HeadPredictions) -> HeadPredictions:
+    """``pred`` as if its *visible* cells were the ones asked about: every entry of each cell with no hidden entry is
+    scored, nothing else.
+
+    The same predictions and the same references, so :func:`score_heads` scores the cells the model was given exactly as it
+    scores the hidden ones. Under cell masking those are the cells whose outputs no loss ever read; a clean pass (every
+    cell visible, as the manuscript's evaluations read) scores this kind of output. ``depth_um`` becomes each visible
+    cell's distance to the nearest hidden cell (``near_hidden_um``), so a depth table bins them by it.
+    """
+    hidden = np.asarray(pred.hidden, dtype=bool)
+    visible = ~hidden.any(axis=1)
+    return HeadPredictions(
+        heads=pred.heads,
+        true=pred.true,
+        hidden=np.broadcast_to(visible[:, None], hidden.shape).copy(),
+        depth_um=None if pred.near_hidden_um is None else np.where(visible, pred.near_hidden_um, 0.0),
+        cells=pred.cells,
+        parts=pred.parts,
+        near_hidden_um=pred.near_hidden_um,
+    )
+
+
+def visibility_scores(
+    pred: HeadPredictions,
+    genes: list[str],
+    *,
+    center: np.ndarray,
+    depth_bins_um: list[float] | None = None,
+    near_bins_um: list[float] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Every head of one masked pass scored on the hidden cells and, the same way, on the visible cells.
+
+    The question of ``.claude/masking_plan.md``, M0: how much of a reconstruction score is the cell's own input. On a
+    visible cell the identity (the input itself) scores 1, and the references leave the cell out
+    (:func:`reference_predictions`: a cell never averages itself, the slide mean included): what its context alone
+    says. A head near 1 there copies its input; one near the references fills every cell in from context,
+    its own input or not; one below them sits where no loss put it (under cell masking the loss reads hidden cells only).
+
+    Parameters
+    ----------
+    pred
+        From :func:`collect_head_predictions` over a masked pass, with ``spatial_unit_um`` (for the distances).
+    genes
+        Gene names, in the column order of ``pred``.
+    center
+        ``[G]`` the training mean of each gene: the centred cosine (:func:`score_heads`).
+    depth_bins_um
+        Bins of the hidden cells' depth (distance to the nearest visible cell), as for :func:`score_heads`.
+    near_bins_um
+        Bins of the visible cells' distance to the nearest hidden cell.
+
+    Returns
+    -------
+    dict
+        ``"groups"``: per group (hidden, visible) the cell count and every head's mean SCE and centred cosine;
+        ``"gap"``: per head, visible minus hidden for both metrics; ``"per_gene"``: per gene and head the pooled centred
+        cosine over hidden and over visible entries and their difference; ``"hidden_by_depth"`` and
+        ``"visible_by_distance"`` with the bins. Under programme masking no cell is visible as a whole: the visible group
+        is empty (``n_cells`` 0) and only ``"groups"`` is returned.
+    """
+    views = {HIDDEN_CELLS: pred, VISIBLE_CELLS: visible_view(pred)}
+    scored = {}
+    rows = []
+    for group, view in views.items():
+        if not np.asarray(view.hidden).any():
+            rows.append({"group": group, "n_cells": 0})
+            continue
+        bins = depth_bins_um if group == HIDDEN_CELLS else near_bins_um
+        if bins is not None and view.depth_um is None:
+            bins = None
+        scored[group] = score_heads(view, genes, center=center, depth_bins_um=bins, gene_metrics=("cosine",))
+        rows.append({"group": group} | scored[group]["cells"].iloc[0].to_dict())
+    tables = {"groups": pd.DataFrame(rows)}
+    if len(scored) < 2:
+        return tables
+    hidden_cells, visible_cells = (scored[g]["cells"].iloc[0] for g in (HIDDEN_CELLS, VISIBLE_CELLS))
+    gap = []
+    for head in pred.heads:
+        gap.append(
+            {
+                "head": head,
+                "sce_visible - hidden": float(visible_cells[f"{head}_sce"] - hidden_cells[f"{head}_sce"]),
+                "cosine_centred_visible - hidden": float(
+                    visible_cells[f"{head}_cosine_centred"] - hidden_cells[f"{head}_cosine_centred"]
+                ),
+            }
+        )
+    tables["gap"] = pd.DataFrame(gap)
+    per_gene = scored[HIDDEN_CELLS]["per_gene"][["gene", "n_hidden"]].rename(columns={"n_hidden": "n_hidden_cells"})
+    per_gene["n_visible_cells"] = scored[VISIBLE_CELLS]["per_gene"]["n_hidden"].to_numpy()
+    for head in pred.heads:
+        hidden_cos = scored[HIDDEN_CELLS]["per_gene"][f"{head}_cosine"].to_numpy()
+        visible_cos = scored[VISIBLE_CELLS]["per_gene"][f"{head}_cosine"].to_numpy()
+        per_gene[f"{head}_hidden"] = hidden_cos
+        per_gene[f"{head}_visible"] = visible_cos
+        per_gene[f"{head}_visible - hidden"] = visible_cos - hidden_cos
+    tables["per_gene"] = per_gene
+    if "by_depth" in scored[HIDDEN_CELLS]:
+        tables["hidden_by_depth"] = scored[HIDDEN_CELLS]["by_depth"]
+    if "by_depth" in scored[VISIBLE_CELLS]:
+        tables["visible_by_distance"] = scored[VISIBLE_CELLS]["by_depth"].rename(columns={"depth_um": "distance_to_hidden_um"})
     return tables
