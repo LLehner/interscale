@@ -57,6 +57,13 @@ steered by the level above, routed key sets for whole CosMx sections) is planned
 how it was built on top. Read it before touching `hierarchy.py`, `hierarchical_attention.py` or the hierarchy's path through
 `common_step_local_to_global`, and update its status table in the same commit as the work it describes.
 
+Three plans written 2026-10-29 for the focus until Tuesday 3 November (roadmap.md, the section after the status table), each with a
+status table: [`.claude/masking_plan.md`](.claude/masking_plan.md) (hidden vs visible scores, randomized vs pre-selected gene sets,
+Moran's I gene sets, niches as a mask unit; read it before touching `tl/masking.py` or the masking keys),
+[`.claude/lung_plan.md`](.claude/lung_plan.md) (the lung fibrosis data with niches, compared with the other tools), and
+[`.claude/interaction_readout_plan.md`](.claude/interaction_readout_plan.md) (a brief for a separate session: integrated gradients
+downstream, uncluttered sender-receiver figures, flow without cell types).
+
 ## Common commands
 
 This project uses `hatch` as the primary project manager (also works with `uv` or `pip`; see `docs/installation.md`).

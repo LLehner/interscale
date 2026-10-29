@@ -14,7 +14,7 @@ first, synth_spot the calibration where the truth is known, legnini the SHH cont
 | C0 — shared inputs: the CosMx input file, folds, LR resource, positive controls, the output tables | **implemented, not run on the cluster** (2026-10-25): `make_inputs.py` (coordinates from the global pixels, checked: no FOV overlap, nearest neighbours 7-8.7 µm), `make_resource.py` (LIANA+ consensus: 792 of 4,620 pairs have every subunit on the panel, 265 ligands), `tables.py` (the four schemas, checked writes, a timer); positive controls with the user | run on a 2-FOV-per-section copy (63,543 cells) locally | 2026-10-25 |
 | C1 — the settings, trained once per fold (InterScale arms) | proposed | | |
 | C2 — InterScale's readouts into the shared tables | proposed | | |
-| C3 — baselines into the same tables | **4 of 7 implemented** (2026-10-25): LIANA+ rank aggregate, `ligrec`, Moran's I (also within types), logistic regression (penalty chosen on the validation slide); AMICI, Steamboat, NicheCompass not yet | each run on the 2-FOV copy and its tables read back | 2026-10-25 |
+| C3 — baselines into the same tables | **4 of 7 implemented** (2026-10-25): LIANA+ rank aggregate, `ligrec`, Moran's I (also within types), logistic regression (penalty chosen on the validation slide); AMICI, Steamboat, NicheCompass not yet. **2026-10-29: the runner scripts were removed by the user** (below); to be written again | each run on the 2-FOV copy and its tables read back | 2026-10-29 |
 | C4 — the comparison: metrics, figures, report | proposed | | |
 | C5 — calibration on synth_spot (planted truth) and legnini (SHH) | proposed | | |
 | C6 — condition-specific interactions (T7) and NicheNet hypotheses (T8 b) | proposed | | |
@@ -23,6 +23,17 @@ first, synth_spot the calibration where the truth is known, legnini the SHH cont
 control): `tables.py` (the contract; pandas and numpy only, so every environment imports it), `make_inputs.py`,
 `make_resource.py`, `run_<method>.py`, `run_baseline.sbatch` (one step in a given conda environment). Library code for
 InterScale's readouts (C2) goes into the fork with tests.
+
+**Removed by the user on 2026-10-29** (they did not like the code). Only `make_inputs.py` remains, as a copy in
+`notebooks_and_scripts/slurm/hierarchical/scripts/`. `tables.py`, `make_resource.py`, the four runners and
+`run_baseline.sbatch` are to be written again from this plan's design (C0 has the schemas). Agree how with the user before
+writing, and put them in the fork (`scripts/comparison/`), under version control.
+
+**Second dataset: lung fibrosis (added 2026-10-29, lung_plan.md).** The same workflow on the lung fibrosis data, with niches. Its
+data is not ready yet. What it adds here: `niche` as a label column next to the cell types in every table (interactions by niche
+pair, SVG within niches, niche classification); its own positive controls (lung_plan.md L4); IPF vs control as the condition
+split. The C1 arms there are the hierarchical SOTA (`hier_none`) with the niche variants instead of the dual arms, because the
+context query does not run on whole sections (below, "Whole sections").
 
 ## Decisions (the user, 2026-10-25)
 

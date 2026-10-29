@@ -16,7 +16,7 @@ the same commit as the work.
 | D1.0 — re-masking before the transformer (hidden cells only) | **implemented, unverified** -- `remask: hidden` (roadmap.md, T2, task 3); sweep `remask_test` written, not run | 16 tests, 8 mutations, harness IDENTICAL | 2026-10-21 |
 | D1 — a context-only global embedding | **D1.2 implemented, unverified** -- `model.global_component.parameters.context_only: query` (2026-10-22): the transformer's queries from one learned token plus the node encoding, reading the cells' input tokens; sweep `context_query` (13 runs + 2 twins) **run and read 2026-10-23** (notes.md): with D3.1 (`add_ctx_fourier`, 3 seeds) the sum ties `add_fourier` (0.842 / 0.843) and the parts separate -- the local part carries the short-range, sparse, M11 and mirror programmes (shares 0.88-1.00), the context part the rings, no cancelling; in the plain dual decoder it costs (0.709). D1.1 not built (below) | 36 tests, 38 mutations, harness IDENTICAL; synth_spot | 2026-10-23 |
 | D2.2 — regime-assigned losses | **implemented, unverified** -- `optim.regime_loss` (roadmap.md, T2); sweep `regime_loss` written, not run | 34 tests, mutation-checked, harness IDENTICAL | 2026-10-21 |
-| D2 — different targets per head | D2.1 and D2.3 proposed | | |
+| D2 — different targets per head | D2.1 and D2.3 proposed; **D2.4 (gene-set targets from Moran's I: per-part losses, a set-loading term, read on held-out genes) proposed 2026-10-29**, after masking_plan.md M2 | | 2026-10-29 |
 | D3.0 — own-cell skip in a global-only model | **run and read 2026-10-22** (`global_decoders`, 3 seeds; notes.md): the mirror programmes rise (MC4 0.27 → 0.49, MC2 0.41 → 0.56, MC6 0.47 → 0.60), about half the gap to `ref_own`; nothing else drops. The full-rank read `own_cell_skip_input: raw` (2026-10-22) tests whether the other half is the skip's width: **run and read 2026-10-23** -- it was the width: MC1 0.63 → 0.80, MC4 0.49 → 0.66 (`ref_own` 0.84, 0.68), programme mean 0.577 → 0.611 (3 seeds) | 21 + 12 tests, mutation-checked, harness IDENTICAL; synth_spot | 2026-10-23 |
 | D3.1 — additive linear decoder in the dual model | **implemented, unverified** -- `model.decoder.additive` (2026-10-22): `y = W_l h_local + W_g h_global + b`, the loss on the sum; sweep `additive_decoder` (10 runs) **run and read 2026-10-23** (notes.md): the sum 0.843 against the plain global head's 0.820 (3 seeds), programme mean 0.687 at the bar; without D1 the global part repeats the local one (0.60 of the short-range variance) and the parts cancel on the mirror programmes; weights 0.1 / 0.9 keep the sum and give a readable local part; a part scored alone carries its decoder's bias (read the shares) | 22 tests, 41 mutations caught (with the raw skip and the probe cost), harness IDENTICAL; synth_spot | 2026-10-23 |
 | D3 — the rest | D3.2 (gated mixture) and D3.3 (FiLM) proposed | | |
@@ -145,6 +145,39 @@ Give the heads different targets, so they are not competing for one signal:
 3. **Programme targets.** The global head learns the programme task (the response genes hidden in
    every cell, predicted from their drivers), the local head whole-cell reconstruction: two masks per
    step, one loss each.
+4. **Gene-set targets from Moran's I (D2.4; asked 2026-10-29, point 4 of the focus list).** The local
+   and global gene sets of masking_plan.md M2 (Moran's I inside the GCN's reach vs at the largest range,
+   from the training slides, no labels) say which part *should* carry a gene. The question is whether
+   they can push the two embeddings apart. Three forms, cheapest first, all on the additive decoder
+   (D3.1) with the context query (D1.2), which already separates by construction, so the read is
+   whether the sets add to that:
+   - *D2.4a, per-part losses.* The sum keeps its loss on every hidden entry. Each part gets an extra loss on
+     its own set only: `w_p * L(part_local, y)[local set] + w_p * L(part_global, y)[global set]`. A part
+     is thereby rewarded for carrying its set alone, and nothing forbids it the other genes. Config:
+     `optim.part_targets: {local: [selectors], global: [selectors], weight: w_p}` (default off), the
+     selectors resolved on `var` as `mask_genes` are (`scale_set=local`). The per-part loss reads the
+     rows `StepOutput.parts` already exposes.
+   - *D2.4b, a loading term.* A scale-free share, as D4's terms: the fraction of the global decoder's
+     squared loadings that falls on the local set, plus the reverse, weighted by `orth_set_loadings`.
+     It works in gene space, so dropout does not affect it (unlike the terms that read cells, D4).
+   - *D2.4c, a probe against the wrong set* (adversarial, gradient reversal): not now, since it trains
+     less stably and needs a probe in the loop.
+
+   **Circularity.** A model trained on the sets cannot be read by the Moran's I yardstick on the same
+   genes (task 1's Plot A and its Spearman). So each set is split at random into a training half and a
+   held-out half (seeded, recorded in `var`), and only the training half enters D2.4a/b. The read is
+   on the held-out half: if the separation generalises, held-out local genes land on the local part
+   (`attribution_shares` per gene) and held-out global genes on the global part. Next to it, quantities
+   no term trained: `redundancy_table` and CKA between the embeddings, the label probes per embedding,
+   and the score of the sum (separation must not cost reconstruction).
+
+   **Where it can run.** The context query needs torch's dense attention (refused with fused attention
+   and with the hierarchy), so whole sections (CosMx, the lung data) are out until the fused attention
+   takes separate queries (comparison_plan.md, "Whole sections", route a). First synth_spot under
+   the `cells` task with discs (the planted scales are the truth: short-range receivers local, rings and
+   region genes global), then legnini. Arms: `add_ctx_dist` (base), `+part_targets` at two weights,
+   `+orth_set_loadings`, 3 seeds for the base and the better term; 300 epochs. Build after M2's
+   selection has passed its synth_spot check.
 
 ## D3 — combining the heads into one prediction
 

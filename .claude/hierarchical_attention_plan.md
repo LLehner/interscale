@@ -8,7 +8,8 @@ plans': a stage is `done` only when a run has been read; "implemented, unverifie
 | part | state | verified by | date |
 |---|---|---|---|
 | T0 input sources | **exists, no new key**: `raw` = GlobalModel with the `Linear` token; `pca` = `Precomputed` on `obsm['X_pca']`; `gnn_joint` = CombinedModel; `gnn_frozen` = CombinedModel with `optim.schedule: local_then_global` (or a GCN embedding through `Precomputed`). The hierarchy is an option of the global component, so it runs in every model type | -- | 2026-10-26 |
-| T1 hierarchy builder | **implemented, unverified on data**: `kdtree`, `random`; top level `tree` or `patches` (with `min_cells` merging); `shift` (kdtree on coordinates turned 45 degrees, the grid moved half a patch); levels as counts or cells per cluster; cached per slide by a fingerprint of its positions; build time and cluster sizes recorded. Not built: `quadtree`, `metis`, `leiden_spatial_expr`, `obs_label` and `split_by_space` | tests 1, 10-11 (`test_hierarchical_attention.py`) | 2026-10-26 |
+| T1 hierarchy builder | **implemented, unverified on data**: `kdtree`, `random`; top level `tree` or `patches` (with `min_cells` merging); `shift` (kdtree on coordinates turned 45 degrees, the grid moved half a patch); levels as counts or cells per cluster; cached per slide by a fingerprint of its positions; build time and cluster sizes recorded. Not built: `quadtree`, `metis`, `leiden_spatial_expr`, `obs_label` and `split_by_space` (**`obs_label` + `split_by_space: components` raised to P0 on 2026-10-29 for the lung niches**, lung_plan.md L2) | tests 1, 10-11 (`test_hierarchical_attention.py`) | 2026-10-26 |
+| literature, second round | **collected 2026-10-29** (section 10): H1-H9 (NSA, its point-cloud version, Erwin, MoBA, Focal / PVT, FMMformer / H-Transformer-1D, Point Transformer V3, Routing Transformer / Combiner, spatial-omics multi-level models); stages H-α (window branch + per-cell gate, focal candidates), H-β (contiguous tree order, per-layer rotation), H-γ (additive near / far read-out) proposed, after the CosMx `long` read | -- | 2026-10-29 |
 | T2 pooling | **implemented, unverified on data**: `mean` and `attn_pool` (a learned query per level, starting as the mean), over visible cells only; `count` / `spread` features. Not built: `multi_token` | tests | 2026-10-26 |
 | T3 layer, prior modes | **implemented, unverified on data**: `none`, `soft` (size correction toggle), `factorized`, `factorized_percell`, `direction_prior`; lambda / mu per head, global or fixed, per level; `prior_refresh` per_layer / once; `share_level_params`; a distance bias per level (`coarse_bias`: shared, own, none). The must-pass regression (lambda 0, singletons, dense) equals the dense transformer in predictions and every gradient | tests 2-4, 7 | 2026-10-26 |
 | T4 routing | **implemented, unverified on data**: per parent, the children of its top-k targets (max over heads), of its spatial neighbours (itself included) and of exploration parents (uniform or prior-sampled, training only, private generator), capped by `cap_per_query`; a padded gather a block of parents at a time, the cell level recomputed in the backward pass. With every parent selected it equals the dense model in every prior mode; no tensor over the cells' pairs is formed. Not built: FlexAttention, `threshold`, `gumbel`, the per-cell kNN LSE merge | test 5 (and no-matrix) | 2026-10-26 |
@@ -642,3 +643,51 @@ Run the stages in order and carry the best configuration of each stage forward. 
 - Rampášek et al., *GraphGPS*, 2022. Local message passing combined with global attention.
 - Shirzad et al., *Exphormer*, 2023. Sparse attention baseline for graph transformers.
 - Own design notes: `hierarchical_attention.txt`. Soft log-prior, residual and gated local path, sparse routing with an exploration budget; recommends adding the soft prior first and pruning afterwards.
+
+---
+
+## 10. More ideas from the literature (collected 2026-10-29)
+
+Asked for on 2026-10-29 (point 5 of the focus list, roadmap.md). What Stages A and B already showed narrows which ideas are worth
+building. On synth_spot the levels add nothing the cells' own windows lack: `hier_none` is within 0.01 of dense, and every prior
+costs or ends switched off. On CosMx the model runs on whole sections in ~1 h, but undertrained. So the ideas are ranked by
+three things a prior did not give: **(i)** cost and robustness at 10^5-10^6 cells, **(ii)** a readable split of each cell's output
+into near and far parts (the decomposition question of decoder_plan.md), **(iii)** a reason for the coarse level to carry
+information (content, not position). Papers marked *checked* were looked up on 2026-10-29; the others are from memory: read them
+before building on them.
+
+| # | source | the idea | what it would mean here | serves | priority |
+|---|---|---|---|---|---|
+| H1 | Yuan et al., *Native Sparse Attention* (NSA), arXiv 2502.11089, 2025 (*checked*) | three branches per query: attention to **compressed** block tokens, to the fine tokens of the **top-n blocks selected by the compressed scores**, and a **sliding window**; per query a gate `g ∈ [0,1]^3` (MLP + sigmoid) mixes them. The window has its own branch because local patterns learn faster and would otherwise shortcut the other two | our routed mode is compression + selection already. Add the window branch (the narrow windowed heads as their own path) and the per-cell gate. The gates are a per-cell near / selected-far / coarse share: a decomposable read-out for free, and the separate window branch is NSA's answer to "global copies local" | (ii), (i) | **high** |
+| H2 | *Natively Trainable Sparse Attention for Hierarchical Point Cloud Datasets*, arXiv 2508.10758, 2025 (*checked*: Erwin + NSA) | NSA's branches on a ball-tree hierarchy of points in space, not on sequences | the closest prior work to whole sections (points in 2-D, 10^5+); read first, before H1 is built | (i), (ii) | **high (read)** |
+| H3 | Zhdanov, Welling, van de Meent, *Erwin*, ICML 2025, arXiv 2502.17019 (*checked*) | ball tree; attention within fixed-size balls; the tree stored **contiguously** (pooling is a `view` + `mean`); a **rotated** tree in alternating layers for cross-ball mixing; U-Net coarsen / refine; positions relative to the ball centre + a distance bias with learned sigma | (a) order the cells by tree once per slide, so our padded gather becomes contiguous slices: speed on CosMx; (b) the rotation per layer in place of our one-off `shift` twin; (c) a U-Net variant: coarse layers carry the long range, fine layers refine, instead of every layer doing coarse-to-fine | (i) | medium |
+| H4 | Lu et al., *MoBA: Mixture of Block Attention*, arXiv 2502.13189, NeurIPS 2025 (*checked*) | parameter-free top-k gating **per query**: the score of a block is `q · mean(k_block)`; the own block is always in; layers can switch between full and sparse, with hybrids (some layers full) | routing per cell instead of per parent (today a parent's top-k, maximised over heads, is shared by its children), at the cost of one `q · mean(k)` per cluster; and a hybrid model: the last layer fused-dense, earlier layers routed | (i) | medium |
+| H5 | Yang et al., *Focal Transformer*, NeurIPS 2021; Wang et al., *Pyramid Vision Transformer*, ICCV 2021 (spatial-reduction attention) | each query sees fine tokens near it and **coarser pooled tokens the farther away**, by fixed rule; or keys / values pooled while queries stay fine | a routing-free candidate set: own fine window + every cluster token of the next level + every region token. Fixed cost, no top-k that can miss (routing recall), and it is exactly a near + far decomposition | (i), (ii) | medium (the baseline routed must beat) |
+| H6 | Nguyen et al., *FMMformer*, NeurIPS 2021; Zhu and Soricut, *H-Transformer-1D*, ACL 2021 | the fast multipole view: near field exact (banded), far field low rank or coarsened, the far interaction of two distant clusters computed once and handed to all children | a cell's output as an explicit sum `near(i) + far(i)`, the far part from unrefined coarse levels only. With the additive read-out it is the local / global decomposition by construction, inside one attention model (decision 13) | (ii) | medium |
+| H7 | Wu et al., *Point Transformer V3*, CVPR 2024 | serialise points by space-filling curves (Z-order, Hilbert and their transposes), attend within patches of the serial order, shuffle the curve between layers | a third hierarchy builder (`serialize`), nearly free to build at 10^6 cells, with nested patches as levels | (i) | low |
+| H8 | Roy et al., *Routing Transformer*, TACL 2021; Ren et al., *Combiner*, NeurIPS 2021 | clusters by **content** (online k-means on queries and keys) instead of position; Combiner: every key reachable either directly or through a structured summary of its group | a coarse level of expression clusters, so a receiver can read every sender-like cell wherever it sits. It is the one idea that gives the coarse level information the window lacks (iii). Risk: it is same-type attention (T5), and the clusters must come from visible values only | (iii) | low now; with T5 |
+| H9 | Spatia (arXiv 2507.04704), CellTransformer (ICML 2025 workshop; OpenReview h2bMZzUsUr), TERRA (preprint) (*checked*: abstracts only) | spatial-omics models with explicit levels: cell, niche (patches of cells), tissue; separate embeddings per level, fused at the end (TERRA: cell-intrinsic, spatially contextualised, neighbourhood) | the domain's own precedent for the lung niche roles (lung_plan.md L2, L3), and the papers to cite for them | write-up | cite |
+
+**Proposed stages, after the CosMx `long` read** (each one arm against `hier_none` and dense, synth_spot 3 seeds at 300 epochs, then CosMx fold 0):
+- **H-α (H1 + H5):** a window branch and a per-cell gate on top of `hier_none`, with the focal candidate set as the routing-free
+  variant. Read: the score, the gate shares per programme class (short-range receivers should take the window branch, rings the
+  coarse one), routing recall against focal.
+- **H-β (H3 a, b):** contiguous tree order and a per-layer rotation. Read: seconds per epoch and peak memory on CosMx at equal
+  score.
+- **H-γ (H6):** the additive near / far read-out, its parts into `StepOutput.parts`, so `attribution_shares` and the gene-scale
+  plots read it like the additive decoder.
+- Later: H4 (per-cell routing) if routing recall is the limit on CosMx; H8 with T5.
+
+**Niche labels as the top level (lung data, 2026-10-29).** `top_level.mode: obs_label` with `split_by_space: components` (T1 above)
+becomes P0 for lung_plan.md L2. Its annotation caveat (T1) decides how it is read: an upper-bound arm, not the default.
+
+**Sources of section 10** (looked up 2026-10-29; the rest of the table is from memory, to check before building):
+- H1 NSA: https://arxiv.org/abs/2502.11089
+- H2 NSA on hierarchical point clouds: https://arxiv.org/abs/2508.10758
+- H3 Erwin: https://arxiv.org/abs/2502.17019 (code: https://github.com/maxxxzdn/erwin)
+- H4 MoBA: https://arxiv.org/abs/2502.13189 (code: https://github.com/MoonshotAI/MoBA)
+- H9 Spatia: https://arxiv.org/abs/2507.04704; CellTransformer: https://openreview.net/forum?id=h2bMZzUsUr; TERRA (preprint):
+  https://www.researchgate.net/publication/411408062_Multi-scale_modeling_of_human_tissues_from_spatial_transcriptomics_with_TERRA
+- From memory, not looked up: Focal Transformer (Yang et al., NeurIPS 2021), PVT (Wang et al., ICCV 2021), FMMformer (Nguyen et al.,
+  NeurIPS 2021), H-Transformer-1D (Zhu and Soricut, ACL 2021), Point Transformer V3 (Wu et al., CVPR 2024), Routing Transformer
+  (Roy et al., TACL 2021), Combiner (Ren et al., NeurIPS 2021).
