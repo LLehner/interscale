@@ -19,6 +19,7 @@ from interscale.tl.masking import (
     resolve_mask_genes,
     sample_block_mask,
     sample_channel_mask,
+    sample_sets_mask,
     sample_gene_mask,
     sample_gene_set_mask,
     sample_node_mask,
@@ -40,11 +41,14 @@ def block_mask_kwargs(cfg) -> dict:
 
 
 def gene_set_mask_kwargs(cfg, adata) -> dict:
-    """The gene-set arguments of :class:`GraphAnnDataModule`: ``mask_genes`` resolved on ``adata.var``, or the channel fraction.
+    """The gene-set arguments of :class:`GraphAnnDataModule`: ``mask_genes`` resolved on ``adata.var``, the channel
+    fraction (and its pool), or the pool of whole sets.
 
-    A fixed gene set (programme masking, ``mask_gene_columns``) and a random one (channel masking,
-    ``mask_channel_fraction = dataset.mask_channel_fraction``) are two ways to name the hidden genes and the config
-    allows one. ``adata.var`` is read only when a fixed gene set is configured.
+    A fixed gene set (programme masking, ``mask_gene_columns``), a random one (channel masking,
+    ``mask_channel_fraction = dataset.mask_channel_fraction``, drawn from ``mask_channel_pool`` when
+    ``dataset.mask_channel_genes`` names one) and whole sets drawn from a pool (``mask_gene_sets``,
+    ``mask_sets_per_draw``) are three ways to name the hidden genes and the config allows one. ``adata.var`` is read
+    only when selectors are configured.
     """
     kwargs = {}
     selectors = list(cfg.dataset.get("mask_genes", []) or [])
@@ -53,6 +57,13 @@ def gene_set_mask_kwargs(cfg, adata) -> dict:
     channels = float(cfg.dataset.get("mask_channel_fraction", 0.0))
     if channels:
         kwargs["mask_channel_fraction"] = channels
+        pool = list(cfg.dataset.get("mask_channel_genes", []) or [])
+        if pool:
+            kwargs["mask_channel_pool"] = resolve_mask_genes(pool, adata.var)
+    sets = list(cfg.dataset.get("mask_gene_sets", []) or [])
+    if sets:
+        kwargs["mask_gene_sets"] = [resolve_mask_genes(list(one), adata.var) for one in sets]
+        kwargs["mask_sets_per_draw"] = int(cfg.dataset.get("mask_sets_per_draw", 1))
     return kwargs
 
 
@@ -71,6 +82,9 @@ class GraphAnnDataModule(pl.LightningDataModule):
         mask_block_fraction: float = 0.0,
         mask_gene_columns: Sequence[int] | None = None,
         mask_channel_fraction: float = 0.0,
+        mask_channel_pool: Sequence[int] | None = None,
+        mask_gene_sets: Sequence[Sequence[int]] | None = None,
+        mask_sets_per_draw: int = 1,
     ):
         """Manages loading and sampling schemes before loading to GPU.
 
@@ -106,6 +120,14 @@ class GraphAnnDataModule(pl.LightningDataModule):
             and draw it again with every redraw of a graph's mask -- every epoch for the training graphs, once
             at setup for validation and test (`dataset.mask_channel_fraction`). Cells are selected as for
             `mask_gene_columns`, which it excludes. 0 draws nothing. Defaults to 0.0.
+        mask_channel_pool (Sequence[int], optional): With `mask_channel_fraction`, the gene columns the channels are
+            drawn from (`dataset.mask_channel_genes`): `round(fraction * len(pool))` of them, every other column visible.
+            None: every gene. Defaults to None.
+        mask_gene_sets (Sequence[Sequence[int]], optional): Under `mask_strategy="gene"`, a pool of gene sets
+            (`dataset.mask_gene_sets`): at every draw `mask_sets_per_draw` of them are chosen at random
+            (`tl.masking.sample_sets_mask`) and their union is hidden in the selected cells, redrawn as channels are.
+            Excludes `mask_gene_columns` and `mask_channel_fraction`. Defaults to None.
+        mask_sets_per_draw (int, optional): Sets per draw of `mask_gene_sets`, from 1 to their number. Defaults to 1.
 
         Raises
         ------
@@ -151,6 +173,31 @@ class GraphAnnDataModule(pl.LightningDataModule):
             if self.mask_gene_columns is not None:
                 raise ValueError("mask_channel_fraction and mask_gene_columns both name the hidden gene set; give one.")
         self.mask_channel_fraction = float(mask_channel_fraction)
+        if mask_channel_pool is not None and len(mask_channel_pool):
+            if not self.mask_channel_fraction:
+                raise ValueError("mask_channel_pool is the pool channel masking draws from; it needs mask_channel_fraction.")
+            if len(set(mask_channel_pool)) < 2:
+                raise ValueError("a channel pool hides some of its genes and keeps some visible; it needs at least 2.")
+            self.mask_channel_pool = sorted({int(c) for c in mask_channel_pool})
+        else:
+            self.mask_channel_pool = None
+        if mask_gene_sets is not None and len(mask_gene_sets):
+            if mask_strategy != "gene":
+                raise ValueError("mask_gene_sets hides gene sets, which needs mask_strategy 'gene'.")
+            if self.mask_gene_columns is not None or self.mask_channel_fraction:
+                raise ValueError(
+                    "mask_gene_sets, mask_gene_columns and mask_channel_fraction each name the hidden genes; give one."
+                )
+            if any(not len(one) for one in mask_gene_sets):
+                raise ValueError("every set of mask_gene_sets needs at least one gene.")
+            if not 1 <= int(mask_sets_per_draw) <= len(mask_gene_sets):
+                raise ValueError(
+                    f"mask_sets_per_draw must be between 1 and the {len(mask_gene_sets)} sets, got {mask_sets_per_draw}."
+                )
+            self.mask_gene_sets = [sorted({int(c) for c in one}) for one in mask_gene_sets]
+        else:
+            self.mask_gene_sets = None
+        self.mask_sets_per_draw = int(mask_sets_per_draw)
         self.first_time = True
 
     def _nodewise_setup(self, stage: str | None) -> None:
@@ -238,13 +285,26 @@ class GraphAnnDataModule(pl.LightningDataModule):
         whole masked rows under "gene".
 
         With `mask_channel_fraction` (under "gene") the hidden genes are a random set, the same in every selected
-        cell and drawn anew by every call: the gene-set branch below with fresh columns.
+        cell and drawn anew by every call: the gene-set branch below with fresh columns (from `mask_channel_pool` when
+        given). With `mask_gene_sets` they are the union of `mask_sets_per_draw` sets of the pool, drawn the same way.
         """
         if self.mask_strategy == "gene" and self.mask_channel_fraction:
             gene_mask = sample_channel_mask(
                 data.num_nodes,
                 data.x.shape[1],
                 self.mask_channel_fraction,
+                self.mask_percentage,
+                self._sample_blocks(data),
+                pool=self.mask_channel_pool,
+            )
+            data.gene_mask = gene_mask
+            data.mask = gene_mask.any(dim=1)
+        elif self.mask_strategy == "gene" and self.mask_gene_sets is not None:
+            gene_mask = sample_sets_mask(
+                data.num_nodes,
+                data.x.shape[1],
+                self.mask_gene_sets,
+                self.mask_sets_per_draw,
                 self.mask_percentage,
                 self._sample_blocks(data),
             )

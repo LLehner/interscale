@@ -37,7 +37,16 @@ Two granularities are available, selected by ``mask_strategy``:
     ("these G_masked genes are always missing") cannot form. A random set rarely hides a whole programme
     together, so a hidden response can often be predicted from its visible co-responders in the same cell,
     which needs no communication: read it against ``ref_own``, and try a large fraction. Cells are selected
-    as for a gene set (``mask_percentage``, 1.0: every cell; discs select cells too).
+    as for a gene set (``mask_percentage``, 1.0: every cell; discs select cells too). ``dataset.mask_channel_genes``
+    names a pool to draw from instead of every gene (``round(fraction * pool)`` of it, the rest always visible): the
+    spatially variable genes, say, so a draw is not mostly noise genes, or a programme, so a random part of it is
+    hidden (``.claude/masking_plan.md``, M1).
+
+``"gene"`` with ``dataset.mask_gene_sets`` -- a pool of whole gene sets
+    Between a fixed programme and random channels: a list of gene sets (each a list of ``mask_genes`` selectors, e.g.
+    one planted programme's responses each), of which ``dataset.mask_sets_per_draw`` are drawn at random and their
+    union hidden, the same for every selected cell of a graph, drawn again as channels are. The hidden unit is a whole
+    set, so its co-members never give it away, but which set rotates (``.claude/masking_plan.md``, M1).
 
 Spatial blocks (``dataset.mask_block_fraction`` > 0) -- on top of either strategy
     Whole cells in discs of ``dataset.mask_block_radius_um`` (:func:`sample_block_mask`) are
@@ -98,12 +107,14 @@ def block_masking_on(cfg) -> bool:
 def hides_gene_set(cfg) -> bool:
     """Whether ``cfg`` hides a gene set rather than random entries or whole cells.
 
-    A programme (``dataset.mask_genes``: a fixed set) or channels (``dataset.mask_channel_fraction`` > 0: a random
-    set, redrawn). Either hides the set in the cells it selects and nothing else, so no cell is hidden whole, which
-    is what re-masking, the regime loss and visible-keys-only attention are about.
+    A programme (``dataset.mask_genes``: a fixed set), channels (``dataset.mask_channel_fraction`` > 0: a random
+    set, redrawn) or a pool of whole sets (``dataset.mask_gene_sets``: some of them, redrawn). Each hides its set in
+    the cells it selects and nothing else, so no cell is hidden whole, which is what re-masking, the regime loss and
+    visible-keys-only attention are about.
     """
     named = bool(list(cfg.dataset.get("mask_genes", []) or []))
-    return named or float(cfg.dataset.get("mask_channel_fraction", 0.0)) > 0
+    pooled = bool(list(cfg.dataset.get("mask_gene_sets", []) or []))
+    return named or pooled or float(cfg.dataset.get("mask_channel_fraction", 0.0)) > 0
 
 
 def sample_node_mask(num_nodes: int, pct: float, generator: torch.Generator | None = None) -> torch.Tensor:
@@ -230,28 +241,69 @@ def sample_gene_set_mask(
     return cells[:, None] & genes[None, :]
 
 
-def sample_channel_columns(num_genes: int, fraction: float, generator: torch.Generator | None = None) -> list[int]:
+def sample_channel_columns(
+    num_genes: int, fraction: float, generator: torch.Generator | None = None, pool=None
+) -> list[int]:
     """A random set of channels (gene columns) to hide: ``round(fraction * num_genes)`` of them, sorted.
 
     The count is exact, not a per-gene Bernoulli draw, so a draw is never empty and never everything: at least one
     gene is hidden and at least one stays visible, whatever the fraction. Every gene is equally likely to be in
-    the set, so over many draws each is hidden a ``fraction`` of the time.
+    the set, so over many draws each is hidden a ``fraction`` of the time. With ``pool`` the same holds within the
+    pool -- ``round(fraction * len(pool))`` of its columns, never none and never all of it -- and every column outside
+    it stays visible.
 
     Parameters
     ----------
     num_genes
         Number of genes (columns of ``data.x``); at least 2.
     fraction
-        Share of the genes to hide, in (0, 1).
+        Share of the genes (of the pool) to hide, in (0, 1).
+    generator
+        Optional RNG, for reproducible draws.
+    pool
+        The columns to draw from (``dataset.mask_channel_genes``, resolved), at least 2; None: every column, as before
+        (the same random numbers).
+    """
+    if not 0 < fraction < 1:
+        raise ValueError(f"the share of genes to hide must be in (0, 1), got {fraction}.")
+    if pool is None:
+        if num_genes < 2:
+            raise ValueError(
+                f"channel masking hides some genes and keeps some visible; {num_genes} genes cannot be split."
+            )
+        count = min(max(1, round(fraction * num_genes)), num_genes - 1)
+        return sorted(torch.randperm(num_genes, generator=generator)[:count].tolist())
+    pool = sorted({int(c) for c in pool})
+    if len(pool) < 2:
+        raise ValueError(f"a channel pool hides some of its genes and keeps some visible; {len(pool)} cannot be split.")
+    if pool[0] < 0 or pool[-1] >= num_genes:
+        raise ValueError(f"the channel pool names columns outside the {num_genes} genes: {pool}.")
+    count = min(max(1, round(fraction * len(pool))), len(pool) - 1)
+    chosen = torch.randperm(len(pool), generator=generator)[:count].tolist()
+    return sorted(pool[k] for k in chosen)
+
+
+def sample_set_columns(sets, per_draw: int, generator: torch.Generator | None = None) -> list[int]:
+    """The union of ``per_draw`` sets drawn at random from ``sets`` (lists of gene columns), sorted.
+
+    Every set is equally likely to be drawn, and no set twice in one draw.
+
+    Parameters
+    ----------
+    sets
+        The pool (``dataset.mask_gene_sets``, resolved), each non-empty.
+    per_draw
+        Sets per draw, from 1 to ``len(sets)``.
     generator
         Optional RNG, for reproducible draws.
     """
-    if num_genes < 2:
-        raise ValueError(f"channel masking hides some genes and keeps some visible; {num_genes} genes cannot be split.")
-    if not 0 < fraction < 1:
-        raise ValueError(f"the share of genes to hide must be in (0, 1), got {fraction}.")
-    count = min(max(1, round(fraction * num_genes)), num_genes - 1)
-    return sorted(torch.randperm(num_genes, generator=generator)[:count].tolist())
+    sets = [list(s) for s in sets]
+    if not sets or any(not s for s in sets):
+        raise ValueError("a pool of gene sets needs at least one set, and no empty one.")
+    if not 1 <= int(per_draw) <= len(sets):
+        raise ValueError(f"mask_sets_per_draw must be between 1 and the {len(sets)} sets, got {per_draw}.")
+    chosen = torch.randperm(len(sets), generator=generator)[: int(per_draw)].tolist()
+    return sorted({int(c) for k in chosen for c in sets[k]})
 
 
 def sample_channel_mask(
@@ -261,14 +313,33 @@ def sample_channel_mask(
     cell_rate: float,
     blocks: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
+    pool=None,
 ) -> torch.Tensor:
     """Hide a random gene set in a selection of cells: ``[num_nodes, num_genes]`` boolean.
 
-    One set of :func:`sample_channel_columns` per call, the same for every selected cell (so no neighbour shows a
-    hidden gene), then selected cells as in :func:`sample_gene_set_mask`: with probability ``cell_rate`` (1.0: every
-    cell) or when ``blocks`` marks them.
+    One set of :func:`sample_channel_columns` per call (from ``pool`` when given), the same for every selected cell (so
+    no neighbour shows a hidden gene), then selected cells as in :func:`sample_gene_set_mask`: with probability
+    ``cell_rate`` (1.0: every cell) or when ``blocks`` marks them.
     """
-    columns = sample_channel_columns(num_genes, fraction, generator)
+    columns = sample_channel_columns(num_genes, fraction, generator, pool=pool)
+    return sample_gene_set_mask(num_nodes, num_genes, columns, cell_rate, blocks, generator)
+
+
+def sample_sets_mask(
+    num_nodes: int,
+    num_genes: int,
+    sets,
+    per_draw: int,
+    cell_rate: float,
+    blocks: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Hide ``per_draw`` whole sets of a pool in a selection of cells: ``[num_nodes, num_genes]`` boolean.
+
+    One draw of :func:`sample_set_columns` per call, the same for every selected cell, then selected cells as in
+    :func:`sample_gene_set_mask`.
+    """
+    columns = sample_set_columns(sets, per_draw, generator)
     return sample_gene_set_mask(num_nodes, num_genes, columns, cell_rate, blocks, generator)
 
 

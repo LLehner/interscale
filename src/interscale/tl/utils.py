@@ -248,7 +248,9 @@ def _training_tag(cfg) -> str:
     ``lw<local>-<global>`` and ``frz-<components>``: a staged schedule, loss weights other than
     the default 0.5 / 0.5, and frozen components (``train._schedule``). ``gs<cell rate>-<selectors>``:
     a hidden gene set (``dataset.mask_genes``). ``ch<fraction>c<cell rate>``: channel masking, a random share of the
-    genes (``dataset.mask_channel_fraction``) in that share of the cells. ``rmk-<kind>``: re-masking before the transformer
+    genes (``dataset.mask_channel_fraction``) in that share of the cells, ``-p<selectors>`` added when the channels come from
+    a pool (``dataset.mask_channel_genes``). ``sets<k>of<n>c<cell rate>-<digest>``: a pool of ``n`` gene sets
+    (``dataset.mask_gene_sets``), ``k`` drawn at a time, the digest a hash of the sets' selectors. ``rmk-<kind>``: re-masking before the transformer
     (``model.global_component.parameters.remask``). ``ctx-<kind>``: a context-only global embedding
     (``model.global_component.parameters.context_only``). ``rgm<depth um>-<local>-<global>``: each head's loss on
     the hidden cells of its regime (``optim.regime_loss``). ``aux-<name><weight>-...``: every auxiliary loss with a
@@ -293,7 +295,18 @@ def _training_tag(cfg) -> str:
         parts.append(f"gs{float(cfg.dataset.mask_percentage):g}-{names}")
     channels = float(cfg.dataset.get("mask_channel_fraction", 0.0))
     if channels:
-        parts.append(f"ch{channels:g}c{float(cfg.dataset.mask_percentage):g}")
+        tag = f"ch{channels:g}c{float(cfg.dataset.mask_percentage):g}"
+        pool = list(cfg.dataset.get("mask_channel_genes", []) or [])
+        if pool:
+            tag += "-p" + "-".join(re.sub(r"[^A-Za-z0-9]+", "-", str(s)).strip("-") for s in pool)
+        parts.append(tag)
+    sets = [[str(g) for g in one] for one in (cfg.dataset.get("mask_gene_sets", []) or [])]
+    if sets:
+        import hashlib
+
+        digest = hashlib.sha1(repr(sets).encode()).hexdigest()[:8]
+        per_draw = int(cfg.dataset.get("mask_sets_per_draw", 1))
+        parts.append(f"sets{per_draw}of{len(sets)}c{float(cfg.dataset.mask_percentage):g}-{digest}")
     weights = {name: float(w) for name, w in dict(cfg.optim.get("aux_loss_weights", {})).items() if float(w) != 0.0}
     if weights:
         parts.append("aux-" + "-".join(f"{name}{w:g}" for name, w in sorted(weights.items())))

@@ -65,6 +65,18 @@ def get_dataset_cfg(cfg):
     # about), as for mask_genes, and discs select cells too. Not together with mask_genes; a Precomputed embedding
     # (made from all the genes) cannot be used. 0 (the default): off, and no random number is drawn.
     cfg.dataset.mask_channel_fraction = 0.0
+    # The pool channel masking draws from: selectors as for mask_genes (e.g. ["is_spatial=True"], or a programme to hide a
+    # random part of it); round(mask_channel_fraction * size of the pool) of its genes are hidden at each draw, every other
+    # gene stays visible. Empty (the default): every gene. Needs mask_channel_fraction > 0 (.claude/masking_plan.md, M1).
+    cfg.dataset.mask_channel_genes = []
+    # A pool of whole gene sets (mask_strategy "gene" only; .claude/masking_plan.md, M1): a list of sets, each a list of
+    # selectors as for mask_genes, e.g. [["MC7", "MC8", "MC9"], ["R1"]]. At every draw mask_sets_per_draw of them are chosen
+    # at random -- the same for every selected cell of a graph -- and their union is hidden, drawn again as channels are
+    # (every epoch for the training graphs, once at setup for validation and test). Between a fixed programme (mask_genes)
+    # and random channels: the hidden unit is a whole set, which set rotates. Not with mask_genes or channels; cells are
+    # selected by mask_percentage and discs as for them. Empty (the default): off, no random number drawn.
+    cfg.dataset.mask_gene_sets = []
+    cfg.dataset.mask_sets_per_draw = 1
 
     # Optional per-cell annotations attached to every PyG Data object when set. All default to
     # None, which attaches nothing and leaves the graphs byte-identical to before.

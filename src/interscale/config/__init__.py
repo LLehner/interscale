@@ -113,6 +113,41 @@ def _coerce_override_values(cfg, overrides):
     return coerced
 
 
+def _validate_gene_set_pool(cfg, gene_set: list, channels: float) -> None:
+    """``dataset.mask_gene_sets`` and ``mask_sets_per_draw`` (``.claude/masking_plan.md``, M1): a list of non-empty sets of
+    selectors, gene masking, no other hidden gene set beside it, and a draw size the pool can give."""
+    raw = list(cfg.dataset.get("mask_gene_sets", []) or [])
+    per_draw = int(cfg.dataset.get("mask_sets_per_draw", 1))
+    if not raw:
+        if per_draw != 1:
+            raise ValueError(f"dataset.mask_sets_per_draw {per_draw} draws from dataset.mask_gene_sets, which is empty.")
+        return
+    where = f"dataset.mask_gene_sets ({len(raw)} sets)"
+    if any(isinstance(one, str) or not isinstance(one, list | tuple) for one in raw):
+        raise ValueError(
+            f"{where}: each entry is a set, a list of selectors as for mask_genes, e.g. [[MC7, MC8], [R1]]; got {raw}."
+        )
+    if any(not len(one) for one in raw):
+        raise ValueError(f"{where}: every set needs at least one selector.")
+    if not 1 <= per_draw <= len(raw):
+        raise ValueError(f"dataset.mask_sets_per_draw must be between 1 and the {len(raw)} sets, got {per_draw}.")
+    if cfg.dataset.mask_strategy != "gene":
+        raise ValueError(f"{where} hides gene sets, which needs mask_strategy 'gene' (got {cfg.dataset.mask_strategy!r}).")
+    if gene_set or channels:
+        raise ValueError(
+            f"{where}, dataset.mask_genes and dataset.mask_channel_fraction each name the hidden genes: give one."
+        )
+    if cfg.dataset.mask_percentage < 1:
+        import warnings
+
+        warnings.warn(
+            f"{where} with dataset.mask_percentage {cfg.dataset.mask_percentage:g}: only that share of the cells hides "
+            "the drawn sets; the others show every gene, so a neighbour can give away a hidden one.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def _validate_masking(cfg):
     """Reject masking settings that would silently train on an uncorrupted input.
 
@@ -162,6 +197,13 @@ def _validate_masking(cfg):
                 UserWarning,
                 stacklevel=2,
             )
+    pool = list(cfg.dataset.get("mask_channel_genes", []) or [])
+    if pool and not channels:
+        raise ValueError(
+            f"dataset.mask_channel_genes {pool} is the pool channel masking draws from; it needs "
+            "dataset.mask_channel_fraction > 0."
+        )
+    _validate_gene_set_pool(cfg, gene_set, channels)
 
     if "regression" not in cfg.dataset.prediction_task:
         return
@@ -471,7 +513,7 @@ def _validate_visible_keys_only(cfg, params, kind, spec):
 
     if hides_gene_set(cfg):
         raise ValueError(
-            f"{where} blocks cells hidden whole, but a hidden gene set (dataset.mask_genes, or channel masking) hides none."
+            f"{where} blocks cells hidden whole, but a hidden gene set (dataset.mask_genes, channel masking or a pool of gene sets) hides none."
         )
     blocks = cfg.dataset.get("mask_block_fraction", 0.0) > 0
     if cfg.dataset.mask_strategy == "gene" and not blocks:
@@ -681,8 +723,8 @@ def _validate_remask(cfg):
 
     if hides_gene_set(cfg):
         raise ValueError(
-            f"{where} replaces the tokens of cells hidden whole, but a hidden gene set (dataset.mask_genes, or "
-            "channel masking) hides no cell whole: it would change nothing."
+            f"{where} replaces the tokens of cells hidden whole, but a hidden gene set (dataset.mask_genes, "
+            "channel masking or a pool of gene sets) hides no cell whole: it would change nothing."
         )
     blocks = cfg.dataset.get("mask_block_fraction", 0.0) > 0
     if cfg.dataset.mask_strategy == "gene" and not blocks:
@@ -756,8 +798,8 @@ def _validate_regime_loss(cfg):
 
     if hides_gene_set(cfg):
         raise ValueError(
-            f"{where} sorts cells hidden whole by their depth, but a hidden gene set (dataset.mask_genes, or "
-            "channel masking) hides no cell whole: every cell would be near."
+            f"{where} sorts cells hidden whole by their depth, but a hidden gene set (dataset.mask_genes, "
+            "channel masking or a pool of gene sets) hides no cell whole: every cell would be near."
         )
     blocks = cfg.dataset.get("mask_block_fraction", 0.0) > 0
     if cfg.dataset.mask_strategy == "gene" and not blocks:
@@ -864,7 +906,8 @@ def _validate_precomputed_embedding(cfg):
             "encodes all of its expression, so single hidden genes would still reach the model through it. "
             "Use mask_strategy node (or spatial blocks), or hide a gene set (dataset.mask_genes) with an "
             "embedding computed from the other genes (interscale.tl.record_embedding_genes). Channel masking "
-            "(dataset.mask_channel_fraction) hides every gene at some step, so no embedding is free of them."
+            "(dataset.mask_channel_fraction) and a pool of gene sets (dataset.mask_gene_sets) hide every gene at some step "
+            "(of their pool), so no embedding is free of them."
         )
 
 
