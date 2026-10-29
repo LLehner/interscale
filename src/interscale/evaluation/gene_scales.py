@@ -1147,3 +1147,427 @@ def plot_part_maps(
     if title:
         fig.suptitle(title, color=COLOURS["ink"], fontsize=10, x=0.01, ha="left")
     return fig
+
+
+# ------------------------------------------------------------------------------- scale sets (masking_plan.md, M2)
+
+#: How :func:`select_scale_sets` ranks the candidates by the fall of Moran's I from the local reach to the whole slide:
+#: ``relative`` -- ``(I_local - I_global) / I_local``, the share of the local autocorrelation that does not carry across the
+#: slide; ``absolute`` -- ``|I_local - I_global|``. Both put the genes with the smallest value in the global set and the
+#: largest in the local set. ``absolute`` mixes the size of a gene's pattern into its scale: a weakly patterned gene has
+#: a small difference whatever its scale, so it lands in the global set (on synth_spot 4 of the 10 "global" genes were the
+#: weak short-range receivers, notes.md 2026-10-29); ``relative`` divides the size out.
+SET_RULES = ("relative", "absolute")
+#: How :func:`scale_sets` reads Moran's I within the reach: ``max`` -- the largest over the neighbourhoods within 1, 2, ...,
+#: ``hops`` hops (a gene autocorrelated with its direct neighbours only is not diluted by the second hop); ``reach`` -- the
+#: neighbourhood of all ``hops`` hops at once.
+LOCAL_FORMS = ("max", "reach")
+#: The sets of :func:`select_scale_sets`; :data:`NONE` for every other gene.
+LOCAL_SET, GLOBAL_SET = "local", "global"
+#: Elements of one ``[centres, cells]`` block of inverse-distance weights in :func:`global_moran` (float64: 80 MB).
+GLOBAL_CHUNK_ELEMENTS = 10_000_000
+
+
+def _symmetric_adjacency(adjacency, graph: np.ndarray):
+    """``adjacency`` as a symmetric 0/1 CSR matrix without the diagonal; an edge between two graphs raises."""
+    import scipy.sparse as sp
+
+    a = sp.csr_matrix(adjacency, dtype=np.float64)
+    n = len(graph)
+    if a.shape != (n, n):
+        raise ValueError(f"the adjacency is {a.shape}, the cells are {n}.")
+    a = ((a + a.T) > 0).astype(np.float64).tocsr()
+    a.setdiag(0.0)
+    a.eliminate_zeros()
+    rows, cols = a.nonzero()
+    if np.any(graph[rows] != graph[cols]):
+        raise ValueError("the adjacency joins cells of different graphs (slides); build it per slide.")
+    return a
+
+
+def hop_neighbourhoods(adjacency, graph, hops: int) -> list:
+    """For ``h = 1 .. hops``, the 0/1 CSR matrix of the cells within ``h`` hops of each cell on ``adjacency`` (not itself).
+
+    ``adjacency`` is the graph the local component reads (e.g. the k-NN graph of ``dataset.spatial_neigbors_kwargs``), made
+    symmetric: a message passed along an edge reaches both ends after the GCN's normalisation. ``h`` hops is the reach of an
+    ``h``-layer GCN.
+    """
+    import scipy.sparse as sp
+
+    if int(hops) < 1:
+        raise ValueError(f"hops must be at least 1, got {hops}.")
+    graph = np.asarray(graph)
+    a = _symmetric_adjacency(adjacency, graph)
+    out, within = [], a.copy()
+    out.append(within)
+    for _ in range(int(hops) - 1):
+        within = ((within + within @ a) > 0).astype(np.float64).tocsr()
+        within.setdiag(0.0)
+        within.eliminate_zeros()
+        out.append(within)
+    return [sp.csr_matrix(m) for m in out]
+
+
+def _weighted_sums(z: np.ndarray, within) -> tuple[np.ndarray, np.ndarray]:
+    """``(sum_i z_i * mean of z over i's neighbours, sum_i z_i ** 2)`` per gene, over the cells that have a neighbour."""
+    degree = np.asarray(within.sum(axis=1)).ravel()
+    has = degree > 0
+    mean_nb = within @ z
+    mean_nb[has] /= degree[has, None]
+    return (z[has] * mean_nb[has]).sum(axis=0), (z[has] ** 2).sum(axis=0)
+
+
+def local_moran(values, graph, neighbourhoods: list) -> np.ndarray:
+    """``[hops, G]``: Moran's I with the row-standardised neighbourhood of each hop count, every cell a centre.
+
+    ``values`` ``[N, G]`` are z-scored per gene within each graph (:func:`_standardise`); the sums are pooled over the graphs.
+    A cell without a neighbour counts in neither sum. NaN where a gene is constant in every graph.
+    """
+    z = _standardise(values, np.asarray(graph))
+    found = []
+    for within in neighbourhoods:
+        total, norm_ = _weighted_sums(z, within)
+        found.append(_ratio(total, norm_))
+    return np.stack(found)
+
+
+def _floor_distance(pos: np.ndarray) -> float:
+    """The median distance from a cell to its nearest other cell, the floor of :func:`global_moran`'s distances."""
+    if len(pos) < 2:
+        return 1.0
+    d, _ = cKDTree(pos).query(pos, k=2)
+    found = float(np.median(d[:, 1]))
+    return found if found > 0 else 1.0
+
+
+def global_moran(values, graph, pos, *, n_centres: int | None = 2000, seed: int = 0) -> np.ndarray:
+    """``[G]``: Moran's I of each gene across the whole slide, with inverse-distance weights over every other cell.
+
+    Every other cell of the same graph is a neighbour, weighted by ``1 / max(d, d0)`` (``d0`` the graph's median
+    nearest-neighbour distance, so cells at almost the same position do not dominate) and row-standardised. In two dimensions
+    at a uniform density every distance band then carries about the same weight, so the statistic is the correlogram averaged
+    over the slide's whole range of distances: it needs no bandwidth and is set by each slide's own size. Uniform weights
+    would not do -- with every other cell weighted alike, Moran's I of a z-scored gene is exactly ``-1 / (n - 1)`` for every
+    gene. ``n_centres`` cells are drawn per graph (a private generator; None: all), the ratio estimator of
+    :func:`moran_by_rank` over them, pooled over the graphs. The cost is centres x cells x genes per graph.
+    """
+    graph = np.asarray(graph)
+    pos = np.asarray(pos, dtype=np.float64)
+    z = _standardise(values, graph)
+    rng = np.random.default_rng(seed)
+    total = np.zeros(z.shape[1])
+    norm_ = np.zeros(z.shape[1])
+    for g in pd.unique(graph):
+        rows = np.flatnonzero(graph == g)
+        if len(rows) < 2:
+            continue
+        p, zg = pos[rows], z[rows]
+        floor = _floor_distance(p)
+        take = (
+            np.arange(len(rows))
+            if n_centres is None or int(n_centres) >= len(rows)
+            else np.sort(rng.choice(len(rows), size=int(n_centres), replace=False))
+        )
+        step = max(1, GLOBAL_CHUNK_ELEMENTS // len(rows))
+        for start in range(0, len(take), step):
+            centre = take[start : start + step]
+            d = np.sqrt(((p[centre, None, :] - p[None, :, :]) ** 2).sum(-1))
+            w = 1.0 / np.maximum(d, floor)
+            w[np.arange(len(centre)), centre] = 0.0
+            w /= w.sum(axis=1, keepdims=True)
+            total += (zg[centre] * (w @ zg)).sum(axis=0)
+            norm_ += (zg[centre] ** 2).sum(axis=0)
+    return _ratio(total, norm_)
+
+
+def _local_statistic(curves: np.ndarray, form: str) -> tuple[np.ndarray, np.ndarray]:
+    """``(I_local [G], hop [G])``: the statistic of ``form`` (:data:`LOCAL_FORMS`) from :func:`local_moran`'s ``[hops, G]``.
+
+    ``hop`` is the hop count it was read at (1-based); NaN where the gene has no value.
+    """
+    if form == "reach":
+        found = curves[-1]
+        return found, np.where(np.isfinite(found), float(len(curves)), np.nan)
+    finite = np.isfinite(curves)
+    filled = np.where(finite, curves, -np.inf)
+    hop = filled.argmax(axis=0)
+    found = filled[hop, np.arange(curves.shape[1])]
+    some = finite.any(axis=0)
+    return np.where(some, found, np.nan), np.where(some, hop + 1.0, np.nan)
+
+
+def local_moran_null(
+    values, graph, neighbourhoods: list, *, form: str = "max", n_permutations: int = 20, seed: int = 0
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(mean [G], sd [G])`` of the local statistic with each gene's values shuffled among the cells of each graph.
+
+    The neighbourhoods stay, so the spread is the statistic's without spatial structure, taken through the same ``form``
+    (the maximum over hops is a maximum of the shuffles too). A private generator.
+    """
+    if int(n_permutations) < 2:
+        raise ValueError(f"a standard deviation needs at least 2 permutations, got {n_permutations}.")
+    values = np.asarray(values, dtype=np.float64)
+    graph = np.asarray(graph)
+    rng = np.random.default_rng(seed)
+    groups = [np.flatnonzero(graph == g) for g in pd.unique(graph)]
+    draws = []
+    for _ in range(int(n_permutations)):
+        order = np.arange(len(graph))
+        for rows in groups:
+            order[rows] = rng.permutation(rows)
+        draws.append(_local_statistic(local_moran(values[order], graph, neighbourhoods), form)[0])
+    stacked = np.stack(draws)
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmean(stacked, axis=0), np.nanstd(stacked, axis=0, ddof=1)
+
+
+def select_scale_sets(
+    table: pd.DataFrame, n: int, *, rule: str = "relative", min_local_i: float = 0.05, z: float = 3.0
+) -> pd.DataFrame:
+    """The ranking step of :func:`scale_sets` on its per-gene ``table`` (``i_local``, ``i_global``, ``z_local``).
+
+    *Candidates* are the genes whose local Moran's I lies above the shuffles by more than ``z`` null SDs -- Bonferroni over the
+    genes tested, so a panel of a thousand genes does not hand the sets its noise -- and is at least ``min_local_i``: at
+    hundreds of thousands of cells a Moran's I of 0.01 is significant, and its fall to the slide scale is mostly noise.
+    The candidates are ranked by ``rule`` (:data:`SET_RULES`): the ``n`` with the smallest fall form the global set, the ``n``
+    with the largest the local set. With fewer than ``2 n`` candidates each set takes half of them (a warning says so).
+
+    Returns ``table`` with the columns ``candidate``, ``drop`` (the ranked value, NaN off the candidates), ``rank`` (1 = the
+    smallest fall) and ``scale_set`` (:data:`GLOBAL_SET`, :data:`LOCAL_SET` or :data:`NONE`).
+    """
+    if rule not in SET_RULES:
+        raise ValueError(f"rule must be one of {SET_RULES}, got {rule!r}.")
+    if int(n) < 1:
+        raise ValueError(f"n must be at least 1, got {n}.")
+    out = table.copy()
+    tested = out["z_local"].notna() & out["i_local"].notna() & out["i_global"].notna()
+    corrected = float(norm.isf(norm.sf(z) / max(1, int(tested.sum()))))
+    candidate = tested & (out["z_local"] > corrected) & (out["i_local"] >= float(min_local_i))
+    out["candidate"] = candidate
+    local_i, global_i = out["i_local"], out["i_global"]
+    if rule == "relative":
+        drop = (local_i - global_i) / local_i
+    else:
+        drop = (local_i - global_i).abs()
+    out["drop"] = drop.where(candidate)
+    order = out.loc[candidate, "drop"].sort_values(kind="mergesort")
+    out["rank"] = pd.Series(np.arange(1, len(order) + 1), index=order.index).reindex(out.index)
+    take = int(n)
+    if 2 * take > len(order):
+        take = len(order) // 2
+        warnings.warn(
+            f"only {len(order)} candidate genes for two sets of {int(n)}: {take} in each.", UserWarning, stacklevel=2
+        )
+    out["scale_set"] = NONE
+    if take:
+        out.loc[order.index[:take], "scale_set"] = GLOBAL_SET
+        out.loc[order.index[-take:], "scale_set"] = LOCAL_SET
+    return out
+
+
+@dataclass
+class ScaleSets:
+    """A local and a global gene set from Moran's I at the local component's reach and across the slide.
+
+    Attributes
+    ----------
+    table
+        Per gene (index ``gene``): ``i_local`` (the local statistic), ``hop_local`` (the hop count it was read at),
+        ``i_reach`` (Moran's I over the whole reach), ``i_global`` (across the slide, :func:`global_moran`), ``null_mean``,
+        ``null_sd`` and ``z_local`` (the local statistic against the shuffles), then :func:`select_scale_sets`'s columns.
+    reach_cells
+        The median number of cells within ``hops`` hops: the size of the local neighbourhood, measured on the graph.
+    reach_um
+        The median distance from a cell to the farthest cell within its reach, in µm.
+    settings
+        The arguments the sets were made with, to record next to them.
+    """
+
+    table: pd.DataFrame
+    reach_cells: float
+    reach_um: float
+    settings: dict
+
+    def genes(self, which: str) -> list[str]:
+        """The genes of the set ``which`` (:data:`LOCAL_SET` or :data:`GLOBAL_SET`), most typical first."""
+        found = self.table[self.table["scale_set"] == which]
+        return list(found["drop"].sort_values(ascending=which == GLOBAL_SET).index)
+
+
+def _reach_um(neighbourhood, pos: np.ndarray, unit_um: float) -> float:
+    """The median over cells of the distance to the farthest cell within ``neighbourhood``, in µm."""
+    coo = neighbourhood.tocoo()
+    if not coo.nnz:
+        return float("nan")
+    d = np.sqrt(((pos[coo.row] - pos[coo.col]) ** 2).sum(-1))
+    farthest = pd.Series(d).groupby(coo.row).max()
+    return float(np.median(farthest.to_numpy())) * float(unit_um)
+
+
+def scale_sets(
+    values,
+    graph,
+    pos,
+    adjacency,
+    genes,
+    *,
+    hops: int = 2,
+    n: int = 20,
+    rule: str = "relative",
+    local_form: str = "max",
+    min_local_i: float = 0.05,
+    z: float = 3.0,
+    n_permutations: int = 20,
+    n_centres: int | None = 2000,
+    seed: int = 0,
+    unit_um: float = 1.0,
+) -> ScaleSets:
+    """Split the genes into a local and a global set by how much of their Moran's I within the local reach carries across the slide.
+
+    ``I_local`` is Moran's I within the cells the local component reaches -- ``hops`` hops on ``adjacency``, the graph it reads
+    (:func:`hop_neighbourhoods`, :func:`local_moran`; ``local_form``: :data:`LOCAL_FORMS`) -- and ``I_global`` Moran's I
+    across the slide (:func:`global_moran`). A gene whose autocorrelation stays when the neighbourhood grows to the whole
+    slide varies on the tissue's scale (global); one whose autocorrelation is there within the reach and gone across the slide
+    varies locally. :func:`select_scale_sets` takes the candidates and the two ends of the ranking. Nothing names a dataset:
+    the reach is measured on the graph, the slide scale is each slide's own, and only the training slides should be passed
+    (the sets then decide nothing about the test slides from their own expression).
+
+    Parameters
+    ----------
+    values
+        ``[N, G]`` expression (e.g. ``layers['log1p_norm']``) of the cells used.
+    graph
+        ``[N]`` each cell's graph (slide); neighbourhoods never cross it.
+    pos
+        ``[N, D]`` positions, in units of ``unit_um`` µm.
+    adjacency
+        ``[N, N]`` the local component's graph over the same cells (sparse; e.g. squidpy's ``spatial_connectivities``).
+    genes
+        The ``G`` gene names.
+    hops
+        The local component's reach in hops (a GCN's layer count).
+    n
+        Genes per set.
+    rule, min_local_i, z
+        As for :func:`select_scale_sets`.
+    local_form
+        :data:`LOCAL_FORMS`.
+    n_permutations
+        Shuffles of the local statistic's null.
+    n_centres
+        Centres per graph for :func:`global_moran`.
+    seed
+        Seed of the centres and the shuffles (private generators).
+    unit_um
+        µm per unit of ``pos``.
+    """
+    if local_form not in LOCAL_FORMS:
+        raise ValueError(f"local_form must be one of {LOCAL_FORMS}, got {local_form!r}.")
+    genes = [str(g) for g in genes]
+    values = np.asarray(values, dtype=np.float64)
+    graph = np.asarray(graph)
+    pos = np.asarray(pos, dtype=np.float64)
+    if values.shape != (len(graph), len(genes)):
+        raise ValueError(f"values are {values.shape}, the cells {len(graph)} and the genes {len(genes)}.")
+    neighbourhoods = hop_neighbourhoods(adjacency, graph, hops)
+    curves = local_moran(values, graph, neighbourhoods)
+    i_local, hop = _local_statistic(curves, local_form)
+    null_mean, null_sd = local_moran_null(
+        values, graph, neighbourhoods, form=local_form, n_permutations=n_permutations, seed=seed + 1
+    )
+    with np.errstate(invalid="ignore", divide="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        # As null_z: a gene's SD from a few shuffles is noisy, so it is floored at the median over genes.
+        sd = np.fmax(null_sd, np.nanmedian(null_sd))
+        z_local = np.where(sd > 0, (i_local - null_mean) / np.where(sd > 0, sd, 1.0), np.nan)
+    table = pd.DataFrame(
+        {
+            "i_local": i_local,
+            "hop_local": hop,
+            "i_reach": curves[-1],
+            "i_global": global_moran(values, graph, pos, n_centres=n_centres, seed=seed),
+            "null_mean": null_mean,
+            "null_sd": null_sd,
+            "z_local": z_local,
+        },
+        index=pd.Index(genes, name="gene"),
+    )
+    table = select_scale_sets(table, n, rule=rule, min_local_i=min_local_i, z=z)
+    reach = neighbourhoods[-1]
+    settings = {
+        "hops": int(hops),
+        "n": int(n),
+        "rule": rule,
+        "local_form": local_form,
+        "min_local_i": float(min_local_i),
+        "z": float(z),
+        "n_permutations": int(n_permutations),
+        "n_centres": None if n_centres is None else int(n_centres),
+        "seed": int(seed),
+        "n_cells": len(graph),
+        "n_graphs": int(len(pd.unique(graph))),
+    }
+    return ScaleSets(
+        table=table,
+        reach_cells=float(np.median(np.diff(reach.indptr))),
+        reach_um=_reach_um(reach, pos, unit_um),
+        settings=settings,
+    )
+
+
+def write_scale_sets(var: pd.DataFrame, result: ScaleSets, *, prefix: str = "scale") -> None:
+    """The sets into ``var`` (in place), as columns a ``dataset.mask_genes`` selector can name.
+
+    ``<prefix>_set`` (``local``, ``global``, ``none``: ``mask_genes: ["<prefix>_set=global"]`` hides the global set),
+    ``<prefix>_i_local``, ``<prefix>_i_global``, ``<prefix>_drop``, ``<prefix>_z_local``. Genes of ``var`` the result does
+    not hold get ``none`` and NaN.
+    """
+    table = result.table.reindex([str(g) for g in var.index])
+    var[f"{prefix}_set"] = table["scale_set"].fillna(NONE).to_numpy()
+    for column in ("i_local", "i_global", "drop", "z_local"):
+        var[f"{prefix}_{column}"] = table[column].to_numpy(dtype=np.float64)
+
+
+def plot_scale_sets(result: ScaleSets, *, truth: pd.Series | None = None, truth_label: str = "planted scale (µm)", title: str = ""):
+    """``I_local`` against ``I_global`` for every gene, the two sets coloured (left); with ``truth`` (per gene, e.g. a planted
+    length scale) the ranked fall against it for the candidates, log scale (right).
+    """
+    import matplotlib.pyplot as plt
+
+    table = result.table
+    panels = 2 if truth is not None else 1
+    fig, axes = plt.subplots(1, panels, figsize=(4.6 * panels, 4.2), squeeze=False)
+    colours = {GLOBAL_SET: COLOURS["global"], LOCAL_SET: COLOURS["local"], NONE: COLOURS["axis"]}
+    labels = {GLOBAL_SET: "global set", LOCAL_SET: "local set", NONE: "other genes"}
+    ax = axes[0, 0]
+    _style(ax)
+    for which in (NONE, LOCAL_SET, GLOBAL_SET):
+        rows = table["scale_set"] == which
+        ax.scatter(
+            table.loc[rows, "i_local"], table.loc[rows, "i_global"], s=14 if which != NONE else 8, color=colours[which],
+            label=f"{labels[which]} ({int(rows.sum())})", linewidths=0, alpha=0.9 if which != NONE else 0.6,
+        )
+    top = float(np.nanmax(table[["i_local", "i_global"]].to_numpy())) if len(table) else 1.0
+    ax.plot([0, top], [0, top], color=COLOURS["muted"], linewidth=0.8, linestyle="--")
+    ax.set_xlabel(f"Moran's I within {result.settings['hops']} hops (~{result.reach_cells:.0f} cells, {result.reach_um:.0f} µm)",
+                  color=COLOURS["ink_secondary"], fontsize=8)
+    ax.set_ylabel("Moran's I across the slide (inverse distance)", color=COLOURS["ink_secondary"], fontsize=8)
+    ax.legend(frameon=False, fontsize=7, loc="upper left")
+    if truth is not None:
+        ax = axes[0, 1]
+        _style(ax)
+        known = truth.reindex(table.index)
+        rows = table["candidate"] & known.notna() & (known > 0)
+        for which in (NONE, LOCAL_SET, GLOBAL_SET):
+            here = rows & (table["scale_set"] == which)
+            ax.scatter(known[here], table.loc[here, "drop"], s=14, color=colours[which], linewidths=0, label=labels[which])
+        ax.set_xscale("log")
+        rho, count = _spearman(known[rows], table.loc[rows, "drop"])
+        ax.set_xlabel(truth_label, color=COLOURS["ink_secondary"], fontsize=8)
+        ax.set_ylabel(f"fall of Moran's I ({result.settings['rule']})", color=COLOURS["ink_secondary"], fontsize=8)
+        ax.set_title(f"Spearman {rho:+.2f} over {count} candidates", color=COLOURS["ink"], fontsize=9)
+    if title:
+        fig.suptitle(title, color=COLOURS["ink"], fontsize=10, x=0.01, ha="left")
+    fig.tight_layout()
+    return fig
