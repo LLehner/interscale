@@ -18,9 +18,9 @@ locally. Results go into this file, the verdicts into notes.md (append-only).
 
 | stage | question | state | verified by | date |
 |---|---|---|---|---|
-| M0 — hidden vs visible scores | how much of a reconstruction score is the cell's own input | proposed | | 2026-10-29 |
-| M1 — randomized vs pre-selected gene sets | does a fixed programme matter, or does any rotating set teach communication | proposed (two arms exist: the fixed programme, channel masking) | | 2026-10-29 |
-| M2 — Moran's I gene sets | a local and a global gene set picked without labels, at the GCN's reach | proposed (the curves exist: `evaluation.gene_scales`) | | 2026-10-29 |
+| M0 — hidden vs visible scores | how much of a reconstruction score is the cell's own input | **implemented, unverified on data** (2026-10-29, branch `masking-sets`): `masked_probing.visibility_scores`, `visible_view`, `HeadPredictions.near_hidden_um`, the `cells+blocks` evaluation mask, the slide mean leave-one-out at visible cells; evaluation-only sweep `slurm/new/visibility.py` (synth_spot and legnini cells task, CosMx fold 0), not run | 11 tests, 7 mutations caught (one after a further test), harness IDENTICAL; the hook on toy models | 2026-10-29 |
+| M1 — randomized vs pre-selected gene sets | does a fixed programme matter, or does any rotating set teach communication | **implemented, unverified on data** (2026-10-29, branch `masking-sets`): `dataset.mask_channel_genes` (the pool channels come from), `dataset.mask_gene_sets` + `mask_sets_per_draw` (whole sets drawn from a pool); sweep `slurm/new/masking_sets.py` (7 arms, 13 runs, 300 epochs, own-task scores against `ref_own`), not run | 22 tests, 14 mutations caught (one after a further test), harness IDENTICAL; list mode on a 8-slide stub (every arm validates, names distinct, references fit) | 2026-10-29 |
+| M2 — Moran's I gene sets | a local and a global gene set picked without labels, at the GCN's reach | **implemented; checked on synth_spot without a model** (2026-10-29, notes.md): `gene_scales.scale_sets` (local Moran's I on the graph's own hops, global with inverse-distance weights across the slide, the **relative** fall as the rule), `write_scale_sets`, `plot_scale_sets`; tool `slurm/new/scale_sets.py`; the sets feed M1's `moran_*` arms | 18 tests, 14 mutations caught (one after a further test); synth_spot training slides against the planted scales | 2026-10-29 |
 | M3 — niches as a masking unit | can a hidden niche be filled in from the other niches | proposed; needs niche labels (lung data) | | 2026-10-29 |
 
 ## What exists (do not rebuild)
@@ -91,6 +91,27 @@ every arm of lung_plan.md. Add the untrained twin of one arm: its visible-cell s
 groups with their bars. On synth_spot, one test slide with true / hidden-cell / visible-cell prediction maps for three genes
 (memory: show spatial maps).
 
+**Built 2026-10-29 (implemented, unverified on data).**
+- *Library* (fork, branch `masking-sets`): `masked_probing.visible_view` (the same pass with every entry of the visible cells as
+  the scored set), `visibility_scores` (tables `groups`, `gap`, `per_gene`, `hidden_by_depth`, `visible_by_distance`), the field
+  `HeadPredictions.near_hidden_um` (each visible cell's distance to the nearest hidden cell, filled by `collect_head_predictions`),
+  and the evaluation mask `draw_masks(kind="cells+blocks", rate, radius, block_rate)`: cell masking with discs as a config trains it.
+- *Found while building:* `reference_predictions`' slide mean included the cell itself (weight 1 / n). At a hidden cell that never
+  mattered (its entries are not in the sum); at a visible cell it leaks the answer (on a 64-cell toy slide 0.17 against 0.05 left
+  out). It now leaves the cell's own visible entries out; every hidden-cell number is unchanged (tested).
+- *Sweep* `slurm/new/visibility.py` + `visibility_common.py` + `visibility.sbatch`: evaluation only, one job, four sources in turn
+  (`VIS_SOURCE`): the local_global_split cells task on synth_spot and legnini (6 dual arms, 12 runs + a twin each, 30% of the cells)
+  and CosMx fold 0 (fast part: gcn, hier_soft / fac / fpc; long part if it ran), each loaded with its own sweep's config and arms so
+  the checkpoint names match; missing checkpoints are skipped. CosMx references: k nearest visible cells by a k-d tree, the cell
+  left out, in blocks of queries. Figures per run: `scores.png`, `per_gene.png`, `maps.png` (the genes a clean pass flatters most).
+- *For future runs (2026-10-29, the user's steer):* the evaluation is also a setting of the shared sweep machinery, `VISIBILITY = {}` in
+  `sweep_common.py` (`visibility_tables`): any sweep that trains with cell masking gets the visible-cell tables and figures beside its
+  normal evaluation, for every run and twin, with no extra job; a run trained with gene masking is skipped with a message. The CosMx
+  and lung sweeps set it. `visibility.py` stays for re-reading old checkpoints, but they are weak sources (100-epoch dual models,
+  undertrained CosMx), so read its numbers as a trial of the instrument, not as a result.
+- *Not covered:* models trained with programme masking (no visible cell) and the global-only raw-skip arms of the cells task (the
+  cells task never trained them).
+
 ## M1 — randomized vs pre-selected gene sets (point 3)
 
 **Question.** Programme masking (a fixed, pre-selected gene set hidden in every cell) is the only task that taught the global
@@ -128,6 +149,22 @@ item 3), and M2's sets or co-expression modules are how to get such units withou
 likely, one draw per graph shared by its cells, val/test fixed, refusals (`mask_genes` together with a pool, `Precomputed`), no
 hidden gene reaching a prediction through the real model, a real `train()` whose masks change by epoch. Checkpoint tags
 `chp<fraction>-<pool>` and `sets<k>-<n>`. Defaults off: no RNG drawn.
+
+**Built 2026-10-29 (implemented, unverified on data).**
+- *Library:* `dataset.mask_channel_genes` (selectors; `round(fraction * pool)` of the pool hidden at each draw, every other gene
+  visible; without a pool the draw is the old one, random number for random number) and `dataset.mask_gene_sets` (a list of sets of
+  selectors) with `dataset.mask_sets_per_draw` (`tl.masking.sample_set_columns`, `sample_sets_mask`; the union of `k` distinct sets
+  per graph and draw). Both through `gene_set_mask_kwargs` into the datamodule, redrawn by `NodeMaskResampleCallback` as channels are;
+  `hides_gene_set` is true for both. Validator: a pool needs a fraction, sets exclude `mask_genes` and channels, each set non-empty,
+  `k` in range, a flat list of strings refused (it would be split into characters), gene masking, a warning below 100% of the cells.
+  Tags `ch<f>c<rate>-p<selectors>` and `sets<k>of<n>c<rate>-<sha1 of the sets>`.
+- *Arms as built* (`slurm/new/masking_sets_sweep.yaml`, every one the dense windowed model `full` at 300 epochs): `fixed`, `ch30_all`,
+  `ch30_svg`, `sub50`, `pool_k1` (the 24 planted programmes' response sets; their union is `fixed`), `moran_global`, `moran_local`
+  (20 genes each). `pool_k4` dropped to keep the arms few. Seeds 42 and 43 (`fixed` 42 only), 13 runs, the twin of `fixed`.
+- *Own task* (`masking_sets.own_task`): 3 test-time draws of an arm's own mask (1 for a fixed set), every head and `ref_own` (a
+  `RidgeCV` from the visible to the hidden genes on the training slides, per draw) on the hidden entries.
+- *Data:* the sweep's own preprocessed file (`synth_spot_sets_pp.h5ad`), into whose var `PREPARE_DATA` writes the M2 sets once (locked,
+  atomic, skipped when the recorded settings match); the sbatch prepares under `flock` before each task's run.
 
 ## M2 — Moran's I gene sets: a local and a global programme without labels (point 4)
 
@@ -182,6 +219,31 @@ on quantities the selection did not use.
 a small script that writes the `var` columns into a dataset's h5ad from its training slides. Tests: on constructed fields (a field
 smooth at 2 cells, one smooth at 50, white noise) the sets are what they must be; the threshold equals a hand count on a lattice;
 the test slides are never read.
+
+**Built 2026-10-29, with two changes to the design above (the user's, 2026-10-29: "for the global Moran's I simply calculate it
+across the slide, then rank the genes by the absolute difference of local_I - global I"), both checked on synth_spot first.**
+- *The global statistic.* "Across the slide" read literally -- every other cell of the slide a neighbour, weighted alike -- is
+  degenerate: Moran's I of a z-scored gene is then exactly `-1 / (n - 1)` for every gene. Built instead: inverse-distance weights over
+  every other cell of the slide, `1 / max(d, d0)` with `d0` the slide's median nearest-neighbour distance, row-standardised
+  (`gene_scales.global_moran`). In two dimensions every distance band then carries about the same weight, so it is the correlogram
+  averaged over the slide's own range: no bandwidth, nothing tuned to a dataset. Sampled centres (2,000 per slide) against every cell,
+  a ratio estimator as `moran_by_rank`. Alternatives tried (shell or cumulative at k = 512, Gaussian kernels at a quarter or an eighth of
+  the slide, at the geometric mean of reach and slide) rank the planted scales about as well under the relative rule (0.69-0.83).
+- *The rule.* The absolute difference fails: a weakly patterned gene has a small difference whatever its scale. On synth_spot's 24
+  training slides the four short-range receivers (planted 100 µm, local Moran's I ~0.2) made up 4 of the 10 "global" genes, and the
+  Spearman of the ranking with the planted scale swung between +0.12 and -0.55 with the global statistic and the prefilter. The
+  relative fall `(I_local - I_global) / I_local` divides the size out: -0.75 to -0.83 in every combination. `rule: relative` is the
+  default; `rule: absolute` is kept.
+- *The local statistic* is Moran's I with the graph's own hop neighbourhoods (`hop_neighbourhoods`: the k-NN graph made symmetric,
+  as a GCN reads it), every cell a centre, the largest over 1 .. `hops` (`local_form: max`; `reach` uses all hops at once). On
+  synth_spot's k-NN 8 graph 2 hops are 24 cells / 283 µm, measured. Candidates: above a permutation null by 3 SDs Bonferroni over the
+  genes, and `I_local >= 0.05`. With fewer than `2 n` candidates each set takes half. The overlap rule of the design is gone: one
+  ranking, two ends.
+- *synth_spot (24 training slides, n = 10):* global = the three region markers, SP1, the sources M1 / M3 / M5, the responses MC3 /
+  MC5 / MC23 (median planted scale 1,200 µm); local = R1-R4, SP8-SP10, MC6, MC14, M9 (180 µm). The sparse responses MC16-MC22 are no
+  candidates (local Moran's I 0.00-0.03), as in the 2026-10-23 read. 10 s on 60k spots.
+- *Tool* `slurm/new/scale_sets.py`: any dataset through its training config (data, layer, graph, split, GCN layers), `--residual-of`
+  for the within-type sets, `--write` for the var columns, tables and figures (`*_scatter.png`, `*_maps.png`); `prepare()` for a sweep.
 
 ## M3 — niches as a masking unit (point 1; the lung data)
 

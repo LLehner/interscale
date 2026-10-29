@@ -963,3 +963,26 @@ No `results.md` in the folder; read from `sections/`. The fields (`fields/`, `fi
 
 **Consequence:** on synth_spot carry `hier_none` (or soft from 0, which ends there); priors are not a lever here. The CosMx long run's
 `hier_soft_l0_own` arm is safe (it cannot do worse than none) but will most likely read as hier_none.
+
+## 2026-10-29 — Moran's I gene sets: a local and a global set at the GCN's reach, without labels (masking_plan.md M2; model-free, synth_spot's 24 training slides, k-NN 8, 2 hops)
+
+Per gene, Moran's I within the GCN's reach (2 hops on the training graph: 24 cells, 283 µm, measured) and across the slide; the candidates
+(above the shuffles, Bonferroni over genes, I_local >= 0.05: 53 of 253) ranked by the fall from one to the other; the smallest falls are
+the global set, the largest the local set (n = 10). Read against the planted `length_scale_um`.
+
+**What worked**
+- The relative fall `(I_local - I_global) / I_local` ranks the planted scales (Spearman -0.75 to -0.83 over every global statistic and
+  prefilter tried). Global set: the three region markers, SP1, M1 / M3 / M5, MC3 / MC5 / MC23 (median planted 1,200 µm); local set: R1-R4,
+  SP8-SP10, MC6, MC14, M9 (180 µm). On 4 slides (a stub) the same picture at n = 20 (Spearman -0.76).
+- Inverse-distance weights over every other cell of the slide give a global Moran's I with no bandwidth to choose; Gaussian kernels at a
+  quarter or an eighth of the slide and the k = 512 shell or cumulative read about the same under the relative rule.
+- The reach measured on the graph equals the known 2-hop reach (283 against 290 µm). 10 s for 60k spots.
+
+**What doesn't work**
+- The absolute difference `|I_local - I_global|` (the rule as first stated): small for any weakly patterned gene, whatever its scale. The
+  four short-range receivers (planted 100 µm, I_local ~0.2, I_global ~0.01) were 4 of the 10 "global" genes (median planted 350 µm), and
+  its Spearman with the planted scale swung from +0.12 to -0.55 with the global statistic and the prefilter. Kept as `rule: absolute`.
+- "Across the slide" with every other cell weighted alike is degenerate: Moran's I of a z-scored gene is then -1 / (n - 1) for every gene.
+- The sparse responses MC16-MC22 are no candidates (I_local 0.00-0.03): a Moran's I selection cannot pick rare-receiver programmes. Weak
+  long-range sparse genes that pass the floor (MC23, MC24, I_local 0.06-0.08) land in the global set on a fall measured between two small
+  numbers.

@@ -146,8 +146,8 @@ Give the heads different targets, so they are not competing for one signal:
    every cell, predicted from their drivers), the local head whole-cell reconstruction: two masks per
    step, one loss each.
 4. **Gene-set targets from Moran's I (D2.4; asked 2026-10-29, point 4 of the focus list).** The local
-   and global gene sets of masking_plan.md M2 (Moran's I inside the GCN's reach vs at the largest range,
-   from the training slides, no labels) say which part *should* carry a gene. The question is whether
+   and global gene sets of masking_plan.md M2 (Moran's I inside the GCN's reach vs across the slide, ranked
+   by its relative fall; from the training slides, no labels; built and checked on synth_spot 2026-10-29) say which part *should* carry a gene. The question is whether
    they can push the two embeddings apart. Three forms, cheapest first, all on the additive decoder
    (D3.1) with the context query (D1.2), which already separates by construction, so the read is
    whether the sets add to that:
