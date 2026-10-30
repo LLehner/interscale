@@ -142,12 +142,34 @@ probes, the receptive field -- therefore reads one row per cell, pooled or not. 
 - **A patch token holds visible cells only.** Cells hidden whole (`GlobalModule.wholly_hidden`: the node
   mask, or a fully hidden row under gene masking) weigh 0; a patch with none gets one learned token. The
   grid depends on positions alone, so a hidden value cannot decide a cell's patch; any other assignment
-  (`ASSIGNMENTS`) must read visible entries only.
+  (`ASSIGNMENTS`) must read visible entries only. The one deliberate exception is `kind: label` (niche patches,
+  below): the label is an annotation computed from expression, so it is an annotation arm, never the default.
 - **`max_seq_len` bounds patches, not cells** (`PatchPooling.plan` raises when a slide has more patches).
 - **Not available pooled:** the long-range mask, Laplacian/random-walk node encodings, spectral and expression
   biases, Exphormer, the attention-entropy loss (the validator says so), and every readout that indexes
   attention by cell (`evaluate()`, `attention_by_query`, `attention_diagnostics`, the rollout of `patch_flow`).
   Head scores, probes, `receptive_field`, `response_influence` and the influence flow work.
+
+### Niche patches (`tl/niches.py`; `.claude/lung_plan.md` L2-L3, `.claude/masking_plan.md` M3)
+
+A patch is one connected piece of a categorical label (a niche) on the slide's own graph (`edge_index`): the components left once
+every edge between two labels is cut, so two places of one niche are two patches. `min_cells` merges smaller patches into the
+neighbour they share most edges with (a merged patch can hold two labels), `max_cells` cuts larger ones into kdtree pieces; an
+unlabelled cell (NaN) is a label of its own. Three options read them: the hierarchy's top level (`hierarchy.top_level.mode:
+obs_label`, `obs_key`, `split_by_space` none / components / kdtree), pooled tokens (`pooling.kind: label`, `label_key`,
+`min_cells`, `max_cells`) and the mask unit (`dataset.mask_block_kind: label`, `mask_block_label_key`, `mask_block_max_cells`).
+Invariants:
+
+- **The label reaches the graphs through `dataset.extra_obs_keys`** (one-hot), resolved by `geome_utils.label_attribute` (a named
+  role such as `celltype_key` arrives under the role's name); `niche_codes` reads it back. The validators refuse a column that
+  does not arrive.
+- **It is an annotation arm.** A niche label is computed from expression, hidden cells included, so it breaks "positions alone"
+  (the hierarchy, the grid, discs): a hidden cell's patch says something about it. Read every such arm as an upper bound.
+- **Routed hierarchies need `split_by_space: kdtree`.** Routing gives each parent `cap_per_query // (widest parent's children)`
+  candidate parents: one large niche patch on top starves every query of the slide (the layer warns). `kdtree` cuts patches to the
+  first level's size, `min_cells` keeps level 0 (dense) small.
+- **The disc draw is unchanged.** Niche blocks share the discs' loop (`tl.masking._draw_blocks`); a disc run draws the same random
+  numbers as before, and a niche block takes no radius.
 
 ### Module hierarchy (`interscale.module`)
 
@@ -180,6 +202,7 @@ Two config axes, both under `cfg.dataset`, plus optional spatial blocks. Read th
 | `mask_gene_sets`, `mask_sets_per_draw` | a list of sets (each a list of selectors), int (default 1) | A pool of whole gene sets (M1): at every draw `mask_sets_per_draw` distinct sets are chosen (`sample_set_columns`, `sample_sets_mask`) and their union is hidden in every selected cell of a graph, redrawn as channels are. Not with `mask_genes` or channels; a flat list of strings is refused (it would be read as sets of characters). `hides_gene_set` is true, so the options that need cells hidden whole refuse it, as `Precomputed` does. Tag `sets<k>of<n>c<cell rate>-<sha1 of the sets>`. Empty (default): off, no random number drawn. |
 | `model.global_component.parameters.remask` | `none` (default) / `hidden` | Re-masking before the transformer (`GlobalModule.remask_tokens`, called by `step`): every cell hidden whole hands the transformer one learned token instead of the local component's token, which mixed in its visible neighbours. Combined models only (a `GlobalModel` refuses it), with cell masking or discs; refused with `mask_genes` (no cell is hidden whole), random entries alone, or pooling. Checkpoint tag `rmk-hidden`. |
 | `mask_block_radius_um`, `mask_block_fraction` | float, float | Spatial blocks on top of either strategy (default fraction 0: off, no random draws): whole cells in discs of the radius until the fraction of each graph is covered — masked cells under `node`, whole masked rows under `gene`. A disc wider than the local reach cannot be filled in from neighbours (`.claude/attention_plan.md`, lever 3). |
+| `mask_block_kind`, `mask_block_label_key`, `mask_block_max_cells` | `disc` (default) / `label`, obs column, int (0) | What a block is (`.claude/masking_plan.md`, M3): `label` hides whole niche patches (`tl/niches.py`; the column in `extra_obs_keys`) drawn by the discs' loop (`sample_unit_mask`), no radius; `max_cells` > 0 cuts larger patches into kdtree pieces. The evaluation draws them with `masked_probing.draw_masks(label=, max_cells=)`. Tag `blklab-<key>[-mx<max>]f<fraction>`. |
 
 Masked positions are always filled with `tl.masking.MASK_VALUE`, which is **-1** and is not
 configurable. Two things are easy to get wrong here:
@@ -256,7 +279,8 @@ never an `S x S` tensor), and fuses each cell with its ancestors (`readout`). In
   parameter is zero or drawn from a private generator, CLS stays an open key with bias 0 at every level, and the cell level
   blocks a cell's own key. Keep all three when changing the layer.
 - **Positions alone build the hierarchy; hidden cells weigh 0 in every pooled token** (a cluster with no visible cell is a
-  learned token). Exploration draws only from the module's own generator.
+  learned token). Exploration draws only from the module's own generator. The exception is the `obs_label` top level (niche
+  patches, above): an annotation arm, cached by labels and edges as well as positions.
 - **Readouts.** `recording_hierarchy()` exports each layer's per-level attention (dense, or `SparseRows` when routed);
   `evaluation.hierarchy_readouts` reads hierarchical and dense models alike (sender lift, pair AUPRC, arrow angle, routing
   recall, health, fields). Dense candidates also hand `forward` cell-level maps; routed models hand none. The exported fields

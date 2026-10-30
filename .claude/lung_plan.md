@@ -17,8 +17,8 @@ locally; results here, verdicts appended to notes.md.
 |---|---|---|---|
 | L0 — inputs: the data file, folds, niche columns, checks | proposed; **waits for the data** | | 2026-10-29 |
 | L1 — the arms: SOTA model, baselines, masks | proposed | | 2026-10-29 |
-| L2 — niches as the hierarchy's top level (`top_level.mode: obs_label`) | proposed (in hierarchical_attention_plan.md since 2026-10-26 as P1, not built) | | 2026-10-29 |
-| L3 — niche-pooled tokens (`pooling.assignment: label`) | proposed | | 2026-10-29 |
+| L2 — niches as the hierarchy's top level (`top_level.mode: obs_label`) | **implemented, unverified on data** (2026-10-30, branch `niches`): `hierarchy.top_level.mode: obs_label`, `obs_key`, `split_by_space` none / components / kdtree (below) | tests/test_niches.py (patches, top level, through the model, singleton = dense, config, names), 20 mutations caught, harness IDENTICAL | 2026-10-30 |
+| L3 — niche-pooled tokens (`pooling.kind: label`) | **implemented, unverified on data** (2026-10-30, branch `niches`): `pooling.kind: label`, `label_key`, `min_cells`, `max_cells` (below) | tests/test_niches.py (one token per patch, no leakage, a label per cell = the per-cell model, config, names) | 2026-10-30 |
 | L4 — readouts with niches as labels | proposed | | 2026-10-29 |
 | L5 — the comparison with the other tools (comparison_plan.md C3-C4 on this data) | proposed; the comparison runners are to be written again (below) | | 2026-10-29 |
 
@@ -87,7 +87,30 @@ about what it expresses. The hierarchical plan's line holds: treat `obs_label` a
 prior help?"), never the default. The fair variant, if it matters: niches recomputed from what the model may see (k-means on the
 cell-type composition of each cell's neighbours, fitted on training slides, the cell itself left out).
 
+**Built 2026-10-30 (branch `niches`).** The patches are `tl/niches.py`, shared with L3 and M3: the connected components of the
+label on the slide's own graph (`edge_index`, the edges the GCN reads) after every edge between two labels is cut; patches under
+`min_cells` merge into the neighbour they share the most edges with (then the larger, then the lower id; one without an edge to
+another into the nearest centroid), so a merged patch can hold two labels; patches over `max_cells` are cut by the kdtree. A cell
+with no label (NaN) is a label of its own (-1). The label reaches the graphs through `dataset.extra_obs_keys` (one-hot, read back as
+codes); `geome_utils.label_attribute` resolves the column. Config: `hierarchy.top_level.mode: obs_label`, `obs_key: <niche column>`,
+`split_by_space`: `none` (one cluster per label), `components` (one per patch, `min_cells` merging), `kdtree` (patches cut to the
+size of the first level, `levels[0]` / `cells_per_cluster[0]`, unused otherwise). Finer levels as before, inside each top cluster.
+The hierarchy cache keys by labels and edges too. Checkpoint tag `-ob-<key>-<all|cc|kd>`.
+
+**Routed models need `kdtree` (found 2026-10-30).** Routing gives every parent `cap_per_query // (the widest parent's children)`
+candidate parents (`hierarchical_attention._candidates`): one niche patch of 20,000 cells with clusters of 25 below it makes the widest
+parent 800 children wide, so with the cap at 512 every query of the slide reads its own parent alone. `split_by_space: kdtree` keeps the
+top level balanced (patches cut to ~250 cells), `min_cells` keeps noisy labels from making thousands of one-cell clusters (level 0 is
+dense). The layer now warns when the cap cuts the chosen parents. **The `hier_niche` arm:** `hier_none` with
+`top_level: {mode: obs_label, obs_key: <niche>, split_by_space: kdtree, min_cells: ~50}` and the same `cells_per_cluster`.
+
 ## L3 — niche-pooled tokens
+
+**Built 2026-10-30 (branch `niches`):** `pooling.kind: label`, `label_key`, `min_cells` (1: none), `max_cells` (0: none), on the
+patches of `tl/niches.py` (L2); no `size_um`, `n_patches` or `offset`. The raw own-cell skip is config
+(`model.decoder.own_cell_skip: true`, `own_cell_skip_input: raw`), not forced. The patches are built every step (no cache):
+for the user's coming small-niche algorithm only `label_key` changes; `max_seq_len` bounds the patches per slide, `min_cells` lowers
+them. Checkpoint tag `pool-label-<key>[-mc<min>][-mx<max>]`. The plan as written:
 
 T1b's pooling (`pooling.kind: grid`) with a new assignment: a patch is a connected component of one niche label, split by kdtree
 into pieces of at most `max_cells` (so one large niche does not become one token). Its invariants stay: a patch token holds visible

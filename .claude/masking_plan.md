@@ -21,7 +21,7 @@ locally. Results go into this file, the verdicts into notes.md (append-only).
 | M0 — hidden vs visible scores | how much of a reconstruction score is the cell's own input | **implemented, unverified on data** (2026-10-29, branch `masking-sets`): `masked_probing.visibility_scores`, `visible_view`, `HeadPredictions.near_hidden_um`, the `cells+blocks` evaluation mask, the slide mean leave-one-out at visible cells; evaluation-only sweep `slurm/new/visibility.py` (synth_spot and legnini cells task, CosMx fold 0), not run | 11 tests, 7 mutations caught (one after a further test), harness IDENTICAL; the hook on toy models | 2026-10-29 |
 | M1 — randomized vs pre-selected gene sets | does a fixed programme matter, or does any rotating set teach communication | **implemented, unverified on data** (2026-10-29, branch `masking-sets`): `dataset.mask_channel_genes` (the pool channels come from), `dataset.mask_gene_sets` + `mask_sets_per_draw` (whole sets drawn from a pool); sweep `slurm/new/masking_sets.py` (7 arms, 13 runs, 300 epochs, own-task scores against `ref_own`), not run | 22 tests, 14 mutations caught (one after a further test), harness IDENTICAL; list mode on a 8-slide stub (every arm validates, names distinct, references fit) | 2026-10-29 |
 | M2 — Moran's I gene sets | a local and a global gene set picked without labels, at the GCN's reach | **implemented; checked on synth_spot without a model** (2026-10-29, notes.md): `gene_scales.scale_sets` (local Moran's I on the graph's own hops, global with inverse-distance weights across the slide, the **relative** fall as the rule), `write_scale_sets`, `plot_scale_sets`; tool `slurm/new/scale_sets.py`; the sets feed M1's `moran_*` arms | 18 tests, 14 mutations caught (one after a further test); synth_spot training slides against the planted scales | 2026-10-29 |
-| M3 — niches as a masking unit | can a hidden niche be filled in from the other niches | proposed; needs niche labels (lung data) | | 2026-10-29 |
+| M3 — niches as a masking unit | can a hidden niche be filled in from the other niches | **implemented, unverified on data** (2026-10-30, branch `niches`): `dataset.mask_block_kind: label`, `mask_block_label_key`, `mask_block_max_cells`; `tl.masking.sample_unit_mask`; `masked_probing.draw_masks(label=, max_cells=)` (below); no run, the bar `ref_label+context` not built | tests/test_niches.py (whole patches, the disc draw unchanged draw for draw, redrawn for train and fixed for val, the evaluation draw, config, names), harness IDENTICAL | 2026-10-30 |
 
 ## What exists (do not rebuild)
 
@@ -265,6 +265,16 @@ same model are the comparison.
 
 **Build.** `tl/masking.py` (`label_blocks`, sharing the discs' code), the validator (needs `mask_block_label_key` in `obs`), tests
 as for discs (coverage, components never split, no RNG drawn when off, no hidden value reaching a prediction).
+
+**Built 2026-10-30 (branch `niches`).** `dataset.mask_block_kind: label` with `mask_block_label_key` (the column must be in
+`dataset.extra_obs_keys`) and `mask_block_fraction`; no radius (refused). The units are the patches of `tl/niches.py` (lung_plan.md
+L2), drawn by the discs' own loop (`_draw_blocks`, shared; the disc draw is unchanged random number for random number):
+`sample_unit_mask`. `mask_block_max_cells` > 0 cuts a patch into kdtree pieces of at most that many cells -- added because one large
+niche (one patch covering half a slide) would otherwise be hidden whole by one draw. Everything after the draw is the discs' path
+(cell masking, a gene set's cells, the regime loss: `deep` is accepted with niche blocks, since their depth is the data's). The
+evaluation draws them too: `masked_probing.draw_masks(kind="blocks" | "cells+blocks", label=<attribute>, max_cells=)`; the sweep's
+`sweep_common.py` still draws discs, so an M3 arm is read on discs until it passes `label`. Checkpoint tag
+`blklab-<key>[-mx<max>]f<fraction>`. Not built: the bar `ref_label+context`, the read by niche and by depth into the hole.
 
 ## Order (until Tuesday 2026-11-03)
 
