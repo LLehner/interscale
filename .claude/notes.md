@@ -986,3 +986,33 @@ the global set, the largest the local set (n = 10). Read against the planted `le
 - The sparse responses MC16-MC22 are no candidates (I_local 0.00-0.03): a Moran's I selection cannot pick rare-receiver programmes. Weak
   long-range sparse genes that pass the floor (MC23, MC24, I_local 0.06-0.08) land in the global set on a fall measured between two small
   numbers.
+
+## 2026-10-30 — Randomized against pre-selected gene sets under programme masking, and the cost of whole CosMx sections (masking_plan.md M1: 7 arms, 13 runs, 300 epochs, results in `results/29_10_results/masking_sets`; `cosmx_feasibility`, H100)
+
+The dense windowed global-only model on synth_spot; every arm scored on the planted programme (29 receiver / response genes hidden in
+every spot) and on draws of its own mask against `ref_own`. Centred cosine, whole cell / programme mean / wins-ties-losses against
+`ref_own+context`: fixed 0.947 / 0.786 / 11-12-1; sub50 0.875 / 0.710 / 7-15-2; ch30_svg 0.473 / 0.510 / 1-9-14; ch30_all 0.430 /
+0.399 / 1-3-20; moran_local 0.290 / 0.196; moran_global 0.200 / 0.096; pool_k1 invalid (below). Bars: ref_own 0.405, own+context 0.682.
+
+**What worked**
+- Randomization within the programme is fine: `sub50` (a random half of the 29 genes, redrawn every epoch) reaches 0.875 on the whole
+  programme and 0.89-0.95 on its own task against ref_own 0.56. The hidden unit need not be fixed; it must come from the programme.
+- The Moran's I sets are learnable tasks: on their own masks moran_local 0.74-0.76 (ref_own 0.10), moran_global 0.41-0.45 (ref_own 0.18).
+- 300 epochs lift channel masking over its 100-epoch read on the programme (ch30_all 0.245 -> 0.430; without noise genes 0.473).
+- CosMx whole sections (largest, 3_T1D, 100,230 cells, H100): routed hierarchy 1.2-2.1 s per training step, 6.0 GiB; hier_none 1.15 h per
+  1,000 epochs (upper bound), ~10,400 epochs in 12 h; GCN 0.02 s per step.
+
+**What doesn't work**
+- Random channels learn no communication even on their own task: ch30_all 0.32 against ref_own 0.34 (the cell's own visible genes),
+  ch30_svg 0.57-0.67 against 0.63. Short-range receivers on the programme 0.006 / 0.007 (fixed 0.987).
+- Transfer to the programme is not a fair test of an arm that never hid the programme's genes: under gene-set masking the decoder rows of
+  never-hidden genes get no gradient. moran_local reads R1-R4 (in its set) at 0.908 and the long-range responses (not in it) at 0.055. Read
+  the Moran arms by their own task.
+- The Moran sets hold drivers: global = region markers, SP genes, sources M1 / M2 / M3 / M5 and some responses; local = R1-R4, sources M6 /
+  M9 / M13 / M18 / M19 / M21 and some responses. Hiding a source removes what predicts its responses. moran_global overfits (train 0.06-0.07,
+  val 0.49). MC23 / MC24 (I_local < 0.09) entered the global set on a fall between two small numbers.
+- `pool_k1` is invalid: train loss 0.99-1.05, no evaluation section (crash, cause not in the results folder). 18 of the 24 planted sets are
+  one gene, and the SCE of a single hidden entry per spot is a sign (+-1), with no gradient on the size. Needs several sets per draw (>= ~10
+  genes) or an MSE loss.
+- The exact dense windowed model on fused attention does not train on whole sections: 127 s per training step at 100k cells (41.7 s per
+  evaluation pass, 5.6 GiB), 165 epochs in 12 h; the dual model the same. Memory is not the limit, the quadratic compute is.
