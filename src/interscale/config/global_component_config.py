@@ -160,18 +160,26 @@ def get_global_component_cfg(cfg, global_component_name):
         # cells -- a patch token is the mean of its visible cells' tokens, placed at the patch's centroid --
         # and every cell's global embedding is its patch's. S drops by 10-1000x (whole sections fit dense
         # attention), a patch is a denoised unit, and its embedding cannot carry one cell's own token. The
-        # loss and the evaluation stay per cell. `kind`: `none` (the model from before pooling) or `grid`
-        # (squares by position alone). Give the grid either `size_um` (its side) or `n_patches` (about that
-        # many occupied squares per slide, so slides of different extent get the same S). `offset` shifts
-        # the grid by a fraction of its side. `features`: any of `count` (log number of visible cells) and
+        # loss and the evaluation stay per cell. `kind`: `none` (the model from before pooling), `grid`
+        # (squares by position alone) or `label` (niche patches, below). Give the grid either `size_um` (its
+        # side) or `n_patches` (about that many occupied squares per slide, so slides of different extent get
+        # the same S). `offset` shifts the grid by a fraction of its side. `features`: any of `count` (log number of visible cells) and
         # `std` (spread of their tokens), each learned and starting at zero. Needs dataset.spatial_key; no
         # long-range mask, no Laplacian/random-walk encodings, no spectral/expression bias.
+        # `label` (`.claude/lung_plan.md`, L3): one patch per connected piece of the categorical obs column `label_key` (a
+        # niche; it must reach the graphs, through dataset.extra_obs_keys) on the slide's graph; pieces under `min_cells`
+        # merge into the neighbour they share most edges with, pieces over `max_cells` (> 0) are cut by the kdtree. No size,
+        # n_patches or offset. The label is an annotation computed from expression: an annotation arm. Pair it with the raw
+        # own-cell skip (model.decoder.own_cell_skip_input raw): pooled tokens without it lose the sparse responses.
         pool = cfg.model.global_component.parameters.pooling = CN()
         pool.kind = "none"
         pool.size_um = 0.0
         pool.n_patches = 0
         pool.offset = 0.0
         pool.features = []
+        pool.label_key = ""
+        pool.min_cells = 1
+        pool.max_cells = 0
         # Hierarchical coarse-to-fine attention (`.claude/hierarchical_attention_plan.md`). `kind`: `none` (the transformer as
         # before) or `coarse_to_fine`: every layer pools the cells into a cluster hierarchy of each slide (built from positions
         # alone, cached per slide), attends densely among the coarsest clusters and CLS, then level by level among finer ones,
@@ -188,12 +196,20 @@ def get_global_component_cfg(cfg, global_component_name):
         # How every finer level splits its parents: `kdtree` (balanced splits by cell count across the longer side) or
         # `random` (a balanced random partition, the negative control).
         hier.builder = "kdtree"
-        # The top level: `tree` (the builder over all cells) or `patches` (a square grid of side `patch_size_um`, or about
-        # levels[0] patches when it is 0; patches under `min_cells` cells merge into the nearest larger one).
+        # The top level: `tree` (the builder over all cells), `patches` (a square grid of side `patch_size_um`, or about
+        # levels[0] patches when it is 0; patches under `min_cells` cells merge into the nearest larger one) or `obs_label`
+        # (a categorical obs column `obs_key`, e.g. a niche; it must reach the graphs, through dataset.extra_obs_keys).
+        # `split_by_space` cuts the label: `none` one cluster per label, `components` one per connected patch of a label on
+        # the slide's graph (patches under `min_cells` merge into the neighbour they share most edges with), `kdtree` those
+        # patches cut into pieces of at most the first level's size (levels[0] / cells_per_cluster[0], unused otherwise).
+        # Routed candidates need `kdtree`: one patch with many children leaves every query few candidate parents. The label
+        # is an annotation computed from expression (hidden cells included): an annotation arm, not the default.
         hier.top_level = CN()
         hier.top_level.mode = "tree"
         hier.top_level.patch_size_um = 0.0
         hier.top_level.min_cells = 1
+        hier.top_level.obs_key = ""
+        hier.top_level.split_by_space = "components"
         # A second hierarchy with boundaries elsewhere (kdtree on coordinates turned by 45 degrees, the grid moved by half a
         # patch); the layers alternate between the two (Swin's shifted windows).
         hier.shift = False

@@ -66,13 +66,22 @@ from torch_geometric.loader import DataLoader
 from interscale.evaluation.online_probes import ProbeBatchFeatures, _rng_untouched
 from interscale.evaluation.online_probes import hidden_depth as _hidden_depth
 from interscale.tl.geome_utils import label_codes
-from interscale.tl.masking import sample_block_mask, sample_gene_set_mask
+from interscale.tl.masking import sample_block_mask, sample_gene_set_mask, sample_unit_mask
+from interscale.tl.niches import graph_label_patches
 
 MASK_KINDS = ("entries", "cells", "blocks", "gene_set", "cells+blocks")
 
 
 def draw_masks(
-    data_list, kind: str, rate: float, seed: int, radius: float | None = None, columns=None, block_rate: float | None = None
+    data_list,
+    kind: str,
+    rate: float,
+    seed: int,
+    radius: float | None = None,
+    columns=None,
+    block_rate: float | None = None,
+    label: str | None = None,
+    max_cells: int = 0,
 ) -> None:
     """Hide entries or whole cells of every graph in ``data_list``, in place, from a private generator.
 
@@ -84,23 +93,30 @@ def draw_masks(
     ``columns`` -- and nothing else -- in each cell with probability ``rate`` (1.0: every cell), as
     ``dataset.mask_genes`` does in training; read it with ``mask_strategy="gene"``. ``"cells+blocks"`` is cell masking
     with discs as a config trains it (``mask_percentage`` and ``mask_block_*``): every gene of the cells hidden at
-    ``rate`` (0: none) and of the cells in discs of ``radius`` covering ``block_rate`` of each graph. The global torch
+    ``rate`` (0: none) and of the cells in discs of ``radius`` covering ``block_rate`` of each graph. With ``label`` (the
+    Data attribute of a niche label) ``"blocks"`` and ``"cells+blocks"`` hide niche patches (``tl.niches``, larger ones cut
+    to ``max_cells``) in place of discs, as ``dataset.mask_block_kind: label`` trains, and take no radius. The global torch
     generator is not touched.
     """
     if kind not in MASK_KINDS:
         raise ValueError(f"kind must be one of {MASK_KINDS}, got {kind!r}.")
-    if kind == "blocks" and not (radius is not None and radius > 0 and 0 < rate < 1):
+    has_block = label is not None or (radius is not None and radius > 0)
+    if kind == "blocks" and not (has_block and 0 < rate < 1):
         raise ValueError(f"'blocks' needs a radius > 0 and a rate in (0, 1), got radius {radius} and rate {rate}.")
     if kind == "gene_set" and (columns is None or not len(columns) or not 0 < rate <= 1):
         raise ValueError(f"'gene_set' needs columns and a cell rate in (0, 1], got {columns} and {rate}.")
-    if kind == "cells+blocks" and not (
-        radius is not None and radius > 0 and block_rate is not None and 0 < block_rate < 1 and 0 <= rate < 1
-    ):
+    if kind == "cells+blocks" and not (has_block and block_rate is not None and 0 < block_rate < 1 and 0 <= rate < 1):
         raise ValueError(
             f"'cells+blocks' needs a cell rate in [0, 1), a radius > 0 and a disc share in (0, 1), got {rate}, {radius} and "
             f"{block_rate}."
         )
     gen = torch.Generator().manual_seed(int(seed))
+
+    def blocks(data, share):
+        if label is not None:
+            return sample_unit_mask(graph_label_patches(data, label, max_cells=max_cells), share, generator=gen)
+        return sample_block_mask(data.pos, radius, share, generator=gen)
+
     for data in data_list:
         n, g = data.x.shape
         if kind == "entries":
@@ -110,15 +126,15 @@ def draw_masks(
         elif kind == "gene_set":
             gene_mask = sample_gene_set_mask(n, g, columns, rate, generator=gen)
         elif kind == "cells+blocks":
-            if getattr(data, "pos", None) is None:
+            if label is None and getattr(data, "pos", None) is None:
                 raise ValueError("'cells+blocks' draws discs over cell coordinates, but a graph has no `pos`.")
             cells = torch.rand(n, generator=gen) < rate
-            cells |= sample_block_mask(data.pos, radius, block_rate, generator=gen)
+            cells |= blocks(data, block_rate)
             gene_mask = cells[:, None].expand(n, g).clone()
         else:
-            if getattr(data, "pos", None) is None:
+            if label is None and getattr(data, "pos", None) is None:
                 raise ValueError("'blocks' are drawn over cell coordinates, but a graph has no `pos`.")
-            gene_mask = sample_block_mask(data.pos, radius, rate, generator=gen)[:, None].expand(n, g).clone()
+            gene_mask = blocks(data, rate)[:, None].expand(n, g).clone()
         data.gene_mask = gene_mask
         data.mask = gene_mask.any(dim=1)
 

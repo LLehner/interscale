@@ -405,7 +405,8 @@ class TransformerNodeEncoderHook(GlobalModule):
 
         Per graph, the kept cells (``index_nodes``, so a subsampled graph is built on the cells that are in the sequence) in
         sequence order: their positions in µm, which of them is hidden whole (none on a clean pass), and the hierarchy built
-        from the positions alone (cached per slide), or two under ``shift``.
+        from the positions alone (cached per slide), or two under ``shift``. An ``obs_label`` top level also reads the kept
+        cells' labels and the edges among them (a path through a cell ``pad_batch`` dropped does not connect a patch).
         """
         settings = self.hierarchy
         pos = getattr(batched_data, "pos", None)
@@ -418,14 +419,31 @@ class TransformerNodeEncoderHook(GlobalModule):
         hidden = self.wholly_hidden(batched_data).to(device) if not eval_step else None
         batch = batched_data.batch.to(device=device, dtype=torch.long)
         seq_len = src_padding_mask.shape[1]
+        # A label top level (`obs_label`) also reads each cell's label and, to find its connected patches, the graph's edges.
+        codes = None
+        if settings.top_mode == "obs_label":
+            from interscale.tl.niches import niche_codes
+
+            codes = niche_codes(batched_data, settings.top_label).to(device)
+            edges = batched_data.edge_index.to(device=device, dtype=torch.long)
+            local = torch.full((len(batch),), -1, dtype=torch.long, device=device)
         graphs = []
         for g, kept in enumerate(index_nodes):
             rows = (batch == g).nonzero().squeeze(1)[torch.as_tensor(kept, dtype=torch.long, device=device)]
             where = pos[rows]
             visible = (~hidden[rows]).float() if hidden is not None else torch.ones(len(rows), device=device)
-            hierarchies = [self.hierarchy_cache.get(where, **settings.build_kwargs(False)).to(device)]
+            data = {}
+            if codes is not None:
+                data["labels"] = codes[rows]
+                if settings.split_by_space != "none":
+                    # The edges among the kept cells, in sequence order.
+                    local.fill_(-1)
+                    local[rows] = torch.arange(len(rows), device=device)
+                    ends = local[edges]
+                    data["edge_index"] = ends[:, (ends >= 0).all(0)]
+            hierarchies = [self.hierarchy_cache.get(where, **data, **settings.build_kwargs(False)).to(device)]
             if settings.shift:
-                hierarchies.append(self.hierarchy_cache.get(where, **settings.build_kwargs(True)).to(device))
+                hierarchies.append(self.hierarchy_cache.get(where, **data, **settings.build_kwargs(True)).to(device))
             graphs.append(GraphLayout(seq_len - len(kept), where, visible, hierarchies, list(kept)))
         coarse = None
         if self.attention_bias is not None and settings.coarse_bias == "shared":

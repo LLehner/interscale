@@ -129,7 +129,8 @@ def _attention_tag(cfg) -> str:
 
 
 def _pooling_tag(cfg) -> str:
-    """``pool-grid<side>um`` / ``pool-grid-n<patches>`` (+ ``-o<offset>``, ``-<features>``) for pooled tokens, else ``""``.
+    """``pool-grid<side>um`` / ``pool-grid-n<patches>`` (+ ``-o<offset>``, ``-<features>``) for pooled tokens, else ``""``;
+    niche patches ``pool-label-<label>[-mc<min cells>][-mx<max cells>]`` (+ ``-<features>``).
 
     Pooled runs differ from per-cell runs in every output, so an arm without this tag would overwrite
     the checkpoint of the same model on cells (and of another patch size).
@@ -138,17 +139,22 @@ def _pooling_tag(cfg) -> str:
     pooling = params.get("pooling", None) if params is not None else None
     if pooling is None or pooling.get("kind", "none") == "none":
         return ""
+    features = "".join(f"-{f}" for f in pooling.features)
+    if pooling.kind == "label":
+        label = re.sub(r"[^A-Za-z0-9]+", "-", str(pooling.label_key)).strip("-")
+        least, most = int(pooling.get("min_cells", 1)), int(pooling.get("max_cells", 0))
+        return f"pool-label-{label}{f'-mc{least}' if least != 1 else ''}{f'-mx{most}' if most else ''}{features}_"
     size = f"n{int(pooling.n_patches)}" if pooling.n_patches > 0 else f"{float(pooling.size_um):g}um"
     offset = f"-o{float(pooling.offset):g}" if pooling.offset else ""
-    features = "".join(f"-{f}" for f in pooling.features)
     return f"pool-{pooling.kind}{'-' if size.startswith('n') else ''}{size}{offset}{features}_"
 
 
 def _hierarchy_tag(cfg) -> str:
     """``hier-...`` for the hierarchical attention (every setting away from its default), else ``""``.
 
-    Builder and top level, the coarse levels (``l<counts>`` or ``c<cells per cluster>``), the prior mode, then only what differs
-    from the defaults, so a sweep over any of them never overwrites a checkpoint.
+    Builder and top level (``-pt`` patches, ``-ob-<label>-<all|cc|kd>`` a label cut by ``split_by_space``), the coarse levels
+    (``l<counts>`` or ``c<cells per cluster>``), the prior mode, then only what differs from the defaults, so a sweep over any
+    of them never overwrites a checkpoint.
     """
     params = cfg.model.global_component.get("parameters", None)
     hier = params.get("hierarchy", None) if params is not None else None
@@ -158,6 +164,10 @@ def _hierarchy_tag(cfg) -> str:
     tag = f"hier-{hier.builder}"
     if top.mode == "patches":
         tag += "-pt" + (f"{float(top.patch_size_um):g}um" if top.patch_size_um > 0 else "")
+    elif top.mode == "obs_label":
+        label = re.sub(r"[^A-Za-z0-9]+", "-", str(top.obs_key)).strip("-")
+        split = top.get("split_by_space", "components")
+        tag += f"-ob-{label}-" + {"none": "all", "components": "cc", "kdtree": "kd"}.get(split, split)
     if int(top.min_cells) != 1:
         tag += f"-mc{int(top.min_cells)}"
     if len(hier.levels):
@@ -243,7 +253,7 @@ def _training_tag(cfg) -> str:
     For the same reason as the encoding and attention tags: a sweep over one of these would
     otherwise write every arm to one checkpoint. ``ctr``: ``optim.center_targets``; ``res``:
     ``model.decoder.global_residual``; ``add``: ``model.decoder.additive``; ``blk<radius µm>f<fraction>``: spatial
-    blocks; ``lrm``: the long-range attention mask (``long_range_attention``, off by default). ``lrm`` was added on
+    blocks (``blklab-<label>[-mx<max cells>]f<fraction>``: niche patches); ``lrm``: the long-range attention mask (``long_range_attention``, off by default). ``lrm`` was added on
     2026-10-14: checkpoints trained with the mask on before then carry no tag. ``sch-<schedule>``,
     ``lw<local>-<global>`` and ``frz-<components>``: a staged schedule, loss weights other than
     the default 0.5 / 0.5, and frozen components (``train._schedule``). ``gs<cell rate>-<selectors>``:
@@ -286,7 +296,11 @@ def _training_tag(cfg) -> str:
         parts.append(f"lw{weights['local']:g}-{weights['global']:g}")
     if list(cfg.optim.get("frozen", [])):
         parts.append("frz-" + "-".join(sorted(cfg.optim.frozen)))
-    if cfg.dataset.get("mask_block_fraction", 0.0) > 0:
+    if cfg.dataset.get("mask_block_fraction", 0.0) > 0 and cfg.dataset.get("mask_block_kind", "disc") == "label":
+        label = re.sub(r"[^A-Za-z0-9]+", "-", str(cfg.dataset.mask_block_label_key)).strip("-")
+        most = int(cfg.dataset.get("mask_block_max_cells", 0))
+        parts.append(f"blklab-{label}{f'-mx{most}' if most else ''}f{cfg.dataset.mask_block_fraction:g}")
+    elif cfg.dataset.get("mask_block_fraction", 0.0) > 0:
         parts.append(f"blk{cfg.dataset.mask_block_radius_um:g}f{cfg.dataset.mask_block_fraction:g}")
     gene_set = list(cfg.dataset.get("mask_genes", []) or [])
     if gene_set:

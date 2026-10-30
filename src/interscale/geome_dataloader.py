@@ -15,6 +15,7 @@ VALID_SPLIT = {"node", "graph"}
 import torch
 
 from interscale.tl.masking import (
+    BLOCK_KINDS,
     MASK_STRATEGIES,
     resolve_mask_genes,
     sample_block_mask,
@@ -23,6 +24,7 @@ from interscale.tl.masking import (
     sample_gene_mask,
     sample_gene_set_mask,
     sample_node_mask,
+    sample_unit_mask,
 )
 
 
@@ -31,11 +33,20 @@ def block_mask_kwargs(cfg) -> dict:
 
     The config states the radius in µm and the graphs' ``pos`` are in the units of
     ``obsm[spatial_key]``, so the radius is divided by ``dataset.spatial_unit_um`` here, once for
-    every entrypoint.
+    every entrypoint. Niche patches (``mask_block_kind: label``) take no radius: the label's Data attribute instead.
     """
     fraction = float(cfg.dataset.get("mask_block_fraction", 0.0))
     if fraction == 0:
         return {}
+    if cfg.dataset.get("mask_block_kind", "disc") == "label":
+        from interscale.tl.geome_utils import label_attribute
+
+        return {
+            "mask_block_fraction": fraction,
+            "mask_block_kind": "label",
+            "mask_block_label": label_attribute(cfg, str(cfg.dataset.mask_block_label_key)),
+            "mask_block_max_cells": int(cfg.dataset.get("mask_block_max_cells", 0)),
+        }
     radius = float(cfg.dataset.mask_block_radius_um) / float(cfg.dataset.spatial_unit_um)
     return {"mask_block_radius": radius, "mask_block_fraction": fraction}
 
@@ -85,6 +96,9 @@ class GraphAnnDataModule(pl.LightningDataModule):
         mask_channel_pool: Sequence[int] | None = None,
         mask_gene_sets: Sequence[Sequence[int]] | None = None,
         mask_sets_per_draw: int = 1,
+        mask_block_kind: str = "disc",
+        mask_block_label: str | None = None,
+        mask_block_max_cells: int = 0,
     ):
         """Manages loading and sampling schemes before loading to GPU.
 
@@ -128,6 +142,12 @@ class GraphAnnDataModule(pl.LightningDataModule):
             (`tl.masking.sample_sets_mask`) and their union is hidden in the selected cells, redrawn as channels are.
             Excludes `mask_gene_columns` and `mask_channel_fraction`. Defaults to None.
         mask_sets_per_draw (int, optional): Sets per draw of `mask_gene_sets`, from 1 to their number. Defaults to 1.
+        mask_block_kind (str, optional): What a spatial block is: "disc" (of `mask_block_radius`) or "label", a connected
+            patch of the one-hot annotation `mask_block_label` on the graph's edges (`tl.niches`), drawn as discs are
+            (`tl.masking.sample_unit_mask`). Defaults to "disc".
+        mask_block_label (str, optional): Under "label", the Data attribute of the niche label. Defaults to None.
+        mask_block_max_cells (int, optional): Under "label", patches over this many cells are cut into kdtree pieces;
+            0 keeps them whole. Defaults to 0.
 
         Raises
         ------
@@ -151,13 +171,24 @@ class GraphAnnDataModule(pl.LightningDataModule):
             raise ValueError("mask_strategy must be one of %r." % (MASK_STRATEGIES,))
         self.mask_strategy = mask_strategy
         self.mask_percentage = mask_percentage
-        if mask_block_fraction and not (0 < mask_block_fraction < 1 and mask_block_radius > 0):
+        if mask_block_kind not in BLOCK_KINDS:
+            raise ValueError(f"mask_block_kind must be one of {BLOCK_KINDS}, got {mask_block_kind!r}.")
+        if mask_block_kind == "label":
+            if mask_block_fraction and not (0 < mask_block_fraction < 1 and mask_block_label):
+                raise ValueError(
+                    f"Niche blocks need a fraction in (0, 1) and a label, got fraction {mask_block_fraction} and label "
+                    f"{mask_block_label!r}."
+                )
+        elif mask_block_fraction and not (0 < mask_block_fraction < 1 and mask_block_radius > 0):
             raise ValueError(
                 f"Spatial blocks need a fraction in (0, 1) and a radius > 0, got fraction "
                 f"{mask_block_fraction} and radius {mask_block_radius}."
             )
         self.mask_block_radius = mask_block_radius
         self.mask_block_fraction = mask_block_fraction
+        self.mask_block_kind = mask_block_kind
+        self.mask_block_label = mask_block_label
+        self.mask_block_max_cells = int(mask_block_max_cells)
         if mask_gene_columns is not None and len(mask_gene_columns) and mask_strategy != "gene":
             raise ValueError("mask_gene_columns hides a gene set, which needs mask_strategy 'gene'.")
         self.mask_gene_columns = (
@@ -335,9 +366,14 @@ class GraphAnnDataModule(pl.LightningDataModule):
                 data.mask = blocks
 
     def _sample_blocks(self, data: BaseData) -> torch.Tensor | None:
-        """The cells in this draw's discs, ``[N]``, or None without spatial blocks."""
+        """The cells in this draw's discs (or niche patches), ``[N]``, or None without spatial blocks."""
         if not self.mask_block_fraction:
             return None
+        if self.mask_block_kind == "label":
+            from interscale.tl.niches import graph_label_patches
+
+            units = graph_label_patches(data, self.mask_block_label, max_cells=self.mask_block_max_cells)
+            return sample_unit_mask(units, self.mask_block_fraction)
         if getattr(data, "pos", None) is None:
             raise ValueError("Spatial blocks are drawn over cell coordinates, but a graph has no `pos`.")
         return sample_block_mask(data.pos, self.mask_block_radius, self.mask_block_fraction)

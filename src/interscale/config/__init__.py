@@ -224,18 +224,48 @@ def _validate_masking(cfg):
 
 def _validate_block_mask(cfg):
     """Spatial blocks (``dataset.mask_block_fraction``) need coordinates and a node-level reconstruction."""
+    from interscale.tl.masking import BLOCK_KINDS
+
     fraction = cfg.dataset.get("mask_block_fraction", 0.0)
     radius = cfg.dataset.get("mask_block_radius_um", 0.0)
+    kind = cfg.dataset.get("mask_block_kind", "disc")
+    label = cfg.dataset.get("mask_block_label_key", "")
+    max_cells = cfg.dataset.get("mask_block_max_cells", 0)
+    if kind not in BLOCK_KINDS:
+        raise ValueError(f"dataset.mask_block_kind must be one of {BLOCK_KINDS}, got {kind!r}.")
+    if max_cells < 0:
+        raise ValueError(f"dataset.mask_block_max_cells must not be negative, got {max_cells}.")
+    if kind == "disc" and (label or max_cells):
+        raise ValueError(
+            "dataset.mask_block_label_key and mask_block_max_cells describe niche blocks; set mask_block_kind: label, or "
+            "leave them empty and 0."
+        )
     if fraction == 0:
         if radius != 0:
             raise ValueError(
                 f"dataset.mask_block_radius_um is {radius} but dataset.mask_block_fraction is 0, so no disc "
                 "would be drawn. Set the fraction too, or the radius back to 0."
             )
+        if kind != "disc":
+            raise ValueError(
+                f"dataset.mask_block_kind is {kind!r} but dataset.mask_block_fraction is 0, so no niche patch would be "
+                "drawn. Set the fraction too, or the kind back to disc."
+            )
         return
     if not 0 < fraction < 1:
         raise ValueError(f"dataset.mask_block_fraction must be in (0, 1), got {fraction}.")
-    if not radius > 0:
+    if kind == "label":
+        if radius != 0:
+            raise ValueError(
+                f"dataset.mask_block_radius_um is {radius}, but a niche block (mask_block_kind label) is a patch of a label, "
+                "not a disc: set the radius to 0."
+            )
+        if not label:
+            raise ValueError("dataset.mask_block_kind label hides patches of a label; name it in mask_block_label_key.")
+        from interscale.tl.geome_utils import label_attribute
+
+        label_attribute(cfg, label)
+    elif not radius > 0:
         raise ValueError(f"dataset.mask_block_fraction is {fraction}; it needs mask_block_radius_um > 0, got {radius}.")
     if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":
         raise ValueError(
@@ -594,13 +624,27 @@ def _validate_pooling(cfg):
     where = "model.global_component.parameters.pooling"
     if pooling.kind not in POOLING_KINDS:
         raise ValueError(f"{where}.kind must be one of {POOLING_KINDS}, got {pooling.kind!r}.")
-    if (pooling.size_um > 0) == (pooling.n_patches > 0):
-        raise ValueError(
-            f"{where}: give exactly one of size_um (the grid's side in um) and n_patches (patches per slide); "
-            f"got size_um {pooling.size_um} and n_patches {pooling.n_patches}."
-        )
-    if min(pooling.size_um, pooling.n_patches) < 0 or not 0 <= pooling.offset < 1:
-        raise ValueError(f"{where}: size_um and n_patches must not be negative, and offset must lie in [0, 1).")
+    label, least, most = pooling.get("label_key", ""), pooling.get("min_cells", 1), pooling.get("max_cells", 0)
+    if pooling.kind == "label":
+        if pooling.size_um or pooling.n_patches or pooling.offset:
+            raise ValueError(f"{where}: kind label takes no size_um, n_patches or offset (they describe the grid).")
+        if not label:
+            raise ValueError(f"{where}: kind label pools the patches of a label; name it in label_key.")
+        if least < 1 or most < 0:
+            raise ValueError(f"{where}: min_cells must be >= 1 and max_cells >= 0, got {least} and {most}.")
+        from interscale.tl.geome_utils import label_attribute
+
+        label_attribute(cfg, label)
+    else:
+        if label or least != 1 or most:
+            raise ValueError(f"{where}: label_key, min_cells and max_cells describe niche patches; set kind label.")
+        if (pooling.size_um > 0) == (pooling.n_patches > 0):
+            raise ValueError(
+                f"{where}: give exactly one of size_um (the grid's side in um) and n_patches (patches per slide); "
+                f"got size_um {pooling.size_um} and n_patches {pooling.n_patches}."
+            )
+        if min(pooling.size_um, pooling.n_patches) < 0 or not 0 <= pooling.offset < 1:
+            raise ValueError(f"{where}: size_um and n_patches must not be negative, and offset must lie in [0, 1).")
     unknown = sorted(set(pooling.features) - set(POOL_FEATURES))
     if unknown:
         raise ValueError(f"{where}.features names {unknown}; choose from {list(POOL_FEATURES)}.")
@@ -631,7 +675,7 @@ def _validate_pooling(cfg):
 def _validate_hierarchy(cfg):
     """``hierarchy`` (coarse-to-fine attention): known settings, coarse levels, and nothing it cannot carry."""
     from interscale.module.global_modules import hierarchical_attention as ha
-    from interscale.module.global_modules.hierarchy import HIERARCHY_BUILDERS, TOP_LEVEL_MODES
+    from interscale.module.global_modules.hierarchy import HIERARCHY_BUILDERS, SPLIT_BY_SPACE, TOP_LEVEL_MODES
 
     params = cfg.model.global_component.get("parameters", None)
     hier = params.get("hierarchy", None) if params is not None else None
@@ -643,6 +687,7 @@ def _validate_hierarchy(cfg):
     choices = {
         "builder": (hier.builder, HIERARCHY_BUILDERS),
         "top_level.mode": (hier.top_level.mode, TOP_LEVEL_MODES),
+        "top_level.split_by_space": (hier.top_level.get("split_by_space", "components"), SPLIT_BY_SPACE),
         "pooling": (hier.pooling, ha.HIER_POOLINGS),
         "prior_mode": (hier.prior_mode, ha.PRIOR_MODES),
         "lambda_learnable": (hier.lambda_learnable, ha.LEARNABLE),
@@ -666,6 +711,25 @@ def _validate_hierarchy(cfg):
         raise ValueError(f"{where}: every entry of levels / cells_per_cluster must be positive, got {sizes}.")
     if hier.top_level.mode == "patches" and not sizes and hier.top_level.patch_size_um <= 0:
         raise ValueError(f"{where}.top_level.mode patches needs patch_size_um, or a first entry of levels / cells_per_cluster.")
+    obs_key = hier.top_level.get("obs_key", "")
+    if hier.top_level.mode == "obs_label":
+        if not obs_key:
+            raise ValueError(f"{where}.top_level.mode obs_label builds the top level from a label; name it in obs_key.")
+        from interscale.tl.geome_utils import label_attribute
+
+        label_attribute(cfg, obs_key)
+        if not sizes:
+            raise ValueError(
+                f"{where}.top_level.mode obs_label is a coarse level: give levels / cells_per_cluster (the first entry is the "
+                "top level, the largest piece's size under split_by_space kdtree)."
+            )
+        if hier.direction_prior and hier.top_level.get("split_by_space", "components") == "none":
+            raise ValueError(
+                f"{where}: with split_by_space none a top cluster is a whole label, scattered over the slide, so its arrow "
+                "has no direction to give; set split_by_space components or kdtree, or direction_prior false."
+            )
+    elif obs_key:
+        raise ValueError(f"{where}.top_level.obs_key names a label, which only top_level.mode obs_label reads.")
     if not sizes and hier.prior_mode != "none":
         raise ValueError(f"{where}: no coarse level (levels and cells_per_cluster empty) leaves prior_mode nothing to read.")
     if hier.prior_mode == "none" and hier.readout == "none" and sizes:
@@ -808,8 +872,10 @@ def _validate_regime_loss(cfg):
         raise ValueError(f"{where} measures depth from the cells' coordinates, so it needs dataset.spatial_key.")
     if not cfg.dataset.spatial_unit_um > 0:
         raise ValueError(f"dataset.spatial_unit_um must be > 0, got {cfg.dataset.spatial_unit_um}.")
+    # Niche patches have no radius; how deep their cells lie depends on the patches, which the config does not know.
+    niche_blocks = blocks and cfg.dataset.get("mask_block_kind", "disc") == "label"
     if "deep" in (regime.local_cells, regime.global_cells) and not (
-        blocks and cfg.dataset.mask_block_radius_um > regime.depth_um
+        niche_blocks or (blocks and cfg.dataset.mask_block_radius_um > regime.depth_um)
     ):
         drawn = f"blocks of radius {cfg.dataset.mask_block_radius_um:g} um" if blocks else "no spatial blocks"
         raise ValueError(

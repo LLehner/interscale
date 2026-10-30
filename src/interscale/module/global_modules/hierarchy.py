@@ -4,10 +4,17 @@ Per slide, coarse levels ``0`` (regions, the coarsest) .. ``L - 1`` over the cel
 children. Built from the cells' positions alone -- never from expression -- so no hidden value can decide which cluster a cell
 joins, and the same slide always gets the same hierarchy (cached by a fingerprint of its positions).
 
+Under ``obs_label`` the label decides the top level too. A niche label is an annotation, usually computed from every cell's
+expression, so it breaks "positions alone": a hidden cell's cluster says something about it (``tl.niches``, leakage). It is an
+annotation arm, not the default. The cache keys a hierarchy by the labels and edges as well as the positions.
+
 The top level and the finer ones are built separately:
 
 * the top level (``top_mode``): ``tree`` -- the builder over every cell; ``patches`` -- a square grid by position
-  (``pooling.grid_patches``), patches below ``min_cells`` merged into the nearest larger one;
+  (``pooling.grid_patches``), patches below ``min_cells`` merged into the nearest larger one; ``obs_label`` -- a categorical
+  label (a niche), ``split_by_space``: ``none`` one cluster per label, ``components`` one per connected patch of a label on the
+  slide's graph (``tl.niches``: two places of one niche are two clusters; patches under ``min_cells`` merge into a neighbour),
+  ``kdtree`` those patches cut by the kdtree to the top level's size (the size ``levels[0]`` / ``cells_per_cluster[0]`` gives);
 * every finer level: each parent split by the builder into a number of children proportional to its cells, so the clusters of
   a level hold about the same number of cells. ``kdtree``: recursive splits at the cell-count quantile across the longer
   side -- balanced by cell count, so empty space (an FOV gap, a hole) makes no empty cluster. ``random``: a balanced random
@@ -30,7 +37,9 @@ import numpy as np
 import torch
 
 HIERARCHY_BUILDERS = ("kdtree", "random")
-TOP_LEVEL_MODES = ("tree", "patches")
+TOP_LEVEL_MODES = ("tree", "patches", "obs_label")
+#: How an ``obs_label`` top level cuts a label: one cluster per label, per connected patch, or per kdtree piece of a patch.
+SPLIT_BY_SPACE = ("none", "components", "kdtree")
 
 
 @dataclass
@@ -163,6 +172,23 @@ def patch_labels(pos: np.ndarray, *, size_um: float, n_patches: int, offset: flo
     return labels
 
 
+def _label_top_level(pos, labels, edge_index, split_by_space: str, min_cells: int, max_cells: int) -> np.ndarray:
+    """``[n]`` the top cluster of each cell under ``obs_label``: one per label, per connected patch, or per kdtree piece."""
+    from interscale.tl.niches import label_patches
+
+    if split_by_space == "none":
+        _, top = np.unique(labels, return_inverse=True)
+        return top.reshape(-1)
+    return label_patches(
+        np.asarray(edge_index, dtype=np.int64).reshape(2, -1),
+        labels,
+        len(labels),
+        pos=pos,
+        min_cells=min_cells,
+        max_cells=max_cells if split_by_space == "kdtree" else 0,
+    )
+
+
 def _labels(parts: list[np.ndarray], n: int, start: int = 0) -> tuple[np.ndarray, int]:
     out = np.empty(n, dtype=np.int64)
     for k, p in enumerate(parts):
@@ -182,6 +208,9 @@ def build_hierarchy(
     neighbors: int = 8,
     shift: bool = False,
     seed: int = 0,
+    labels=None,
+    edge_index=None,
+    split_by_space: str = "components",
 ) -> Hierarchy:
     """The hierarchy over cells at ``pos_um`` ``[n, 2]`` (µm), on the CPU.
 
@@ -195,14 +224,19 @@ def build_hierarchy(
         ``kdtree`` or ``random`` (``HIERARCHY_BUILDERS``): how every finer level splits its parents (and the top level under
         ``top_mode`` ``tree``).
     top_mode
-        ``tree`` or ``patches`` (``TOP_LEVEL_MODES``); with ``patches`` the top level is a grid of side ``patch_size_um``, or
-        about ``levels[0]`` patches (``cells_per_cluster[0]`` cells each) when it is 0, and patches under ``min_cells`` merge.
+        ``tree``, ``patches`` or ``obs_label`` (``TOP_LEVEL_MODES``); with ``patches`` the top level is a grid of side
+        ``patch_size_um``, or about ``levels[0]`` patches (``cells_per_cluster[0]`` cells each) when it is 0, and patches under
+        ``min_cells`` merge. With ``obs_label`` it is ``labels`` cut by ``split_by_space`` (module docstring); the first entry
+        of ``levels`` / ``cells_per_cluster`` is then the largest piece's size under ``kdtree`` and unused otherwise.
     neighbors
         Spatial neighbour clusters listed per cluster (nearest centroids), besides the cluster itself.
     shift
         Build the shifted twin (module docstring).
     seed
         For the ``random`` builder.
+    labels, edge_index, split_by_space
+        ``obs_label`` only: ``[n]`` integer label codes, the ``[2, E]`` edges among these cells (for ``components`` and
+        ``kdtree``), and how the label is cut (``SPLIT_BY_SPACE``).
     """
     started = time.perf_counter()
     pos = np.asarray(pos_um, dtype=np.float64)
@@ -213,12 +247,22 @@ def build_hierarchy(
         raise ValueError(f"builder must be one of {HIERARCHY_BUILDERS}, got {builder!r}.")
     if top_mode not in TOP_LEVEL_MODES:
         raise ValueError(f"top_mode must be one of {TOP_LEVEL_MODES}, got {top_mode!r}.")
+    if top_mode == "obs_label":
+        if split_by_space not in SPLIT_BY_SPACE:
+            raise ValueError(f"split_by_space must be one of {SPLIT_BY_SPACE}, got {split_by_space!r}.")
+        if labels is None or len(labels) != n:
+            raise ValueError(f"top_mode obs_label needs a label for each of the {n} cells.")
+        if split_by_space != "none" and edge_index is None:
+            raise ValueError(
+                f"split_by_space {split_by_space!r} finds connected patches on the graph; pass edge_index."
+            )
     if len(levels):
         targets = [int(c) for c in levels]
     else:
         targets = [max(1, int(round(n / float(c)))) for c in cells_per_cluster]
     split_pos = _rotate(pos, 45.0) if shift and builder == "kdtree" else pos
     rng = np.random.default_rng([int(seed), n, 1 if shift else 0])
+    cell_labels = None if labels is None else np.asarray(labels)
 
     assign: list[np.ndarray] = []
     all_cells = np.arange(n)
@@ -232,6 +276,10 @@ def build_hierarchy(
                     n_patches=0 if patch_size_um > 0 else target,
                     offset=0.5 if shift else 0.0,
                     min_cells=min_cells,
+                )
+            elif top_mode == "obs_label":
+                labels = _label_top_level(
+                    split_pos, cell_labels, edge_index, split_by_space, min_cells, math.ceil(n / target)
                 )
             else:
                 parts = (
@@ -341,25 +389,31 @@ def _neighbour_table(centroid: np.ndarray, k: int) -> np.ndarray:
 class HierarchyCache:
     """Hierarchies by slide: a slide's positions (and the settings) map to the one hierarchy built for them.
 
-    The positions never change between steps, so a slide is built once per process; ``max_entries`` bounds the memory.
+    The positions never change between steps, so a slide is built once per process; ``max_entries`` bounds the memory. An
+    ``obs_label`` top level also reads the cells' labels and the graph's edges, so those are part of the key.
     """
 
     def __init__(self, max_entries: int = 256):
         self.max_entries = int(max_entries)
         self._entries: OrderedDict = OrderedDict()
 
-    def get(self, pos_um: torch.Tensor, **settings) -> Hierarchy:
+    def get(self, pos_um: torch.Tensor, labels=None, edge_index=None, **settings) -> Hierarchy:
         array = np.ascontiguousarray(pos_um.detach().double().cpu().numpy())
+        data = {}
+        for name, value in (("labels", labels), ("edge_index", edge_index)):
+            if value is not None:
+                data[name] = np.ascontiguousarray(torch.as_tensor(value).detach().cpu().numpy().astype(np.int64))
         key = (
             hashlib.sha1(array.tobytes()).hexdigest(),
             array.shape,
+            tuple((k, hashlib.sha1(v.tobytes()).hexdigest(), v.shape) for k, v in data.items()),
             tuple(sorted((k, repr(v)) for k, v in settings.items())),
         )
         if key in self._entries:
             self._entries.move_to_end(key)
             return self._entries[key]
         has_levels = len(settings.get("levels", ())) or len(settings.get("cells_per_cluster", ()))
-        built = build_hierarchy(array, **settings) if has_levels else flat_hierarchy(array)
+        built = build_hierarchy(array, **data, **settings) if has_levels else flat_hierarchy(array)
         self._entries[key] = built
         while len(self._entries) > self.max_entries:
             self._entries.popitem(last=False)

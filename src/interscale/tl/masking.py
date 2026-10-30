@@ -56,6 +56,14 @@ Spatial blocks (``dataset.mask_block_fraction`` > 0) -- on top of either strateg
     asks the global component for context from beyond it. Under ``"node"`` the Bernoulli rate may
     then be 0, making the discs the only targets.
 
+Niche patches (``dataset.mask_block_kind: label``) -- in place of discs
+    The unit hidden whole is a connected patch of a niche label (``dataset.mask_block_label_key``; ``tl.niches``) instead of
+    a disc: drawn as discs are (:func:`sample_unit_mask`), until ``mask_block_fraction`` of the cells is covered, the rest as
+    for discs. ``dataset.mask_block_max_cells`` cuts a larger patch into kdtree pieces, so one big niche does not hide half a
+    slide in one draw. The hole is shaped by the tissue: can a hidden niche be filled in from the niches around it
+    (``.claude/masking_plan.md``, M3)? The label was computed from expression, hidden cells included, so the shape of the hole
+    says which cells belong together: read the gain over a bar that knows the niche, not the raw score.
+
 Note on GraphMAE (arXiv:2205.10803): GraphMAE itself masks whole nodes, exactly as ``"node"``
 does here. What it changes to avoid the trivial solution is the *criterion* (scaled cosine
 error, already available as ``interscale.train.losses.SCELoss``), a learnable ``[MASK]`` token
@@ -91,6 +99,8 @@ from torch_geometric.data import Batch
 MASK_VALUE = -1.0
 
 MASK_STRATEGIES = ("node", "gene")
+#: What a spatial block is (``dataset.mask_block_kind``): a disc of a radius, or a niche patch.
+BLOCK_KINDS = ("disc", "label")
 
 
 def block_masking_on(cfg) -> bool:
@@ -371,13 +381,42 @@ def sample_block_mask(
         Boolean tensor of shape ``[N]``.
     """
     pos = pos.double()
-    num_nodes = pos.shape[0]
+    return _draw_blocks(pos.shape[0], fraction, lambda centre: (pos - pos[centre]).norm(dim=1) <= radius, generator)
+
+
+def sample_unit_mask(units: torch.Tensor, fraction: float, generator: torch.Generator | None = None) -> torch.Tensor:
+    """Draw whole units -- niche patches (``tl.niches``) -- until at least ``fraction`` of the cells lie in one.
+
+    The discs' draw (:func:`sample_block_mask`) with a unit in place of a disc: a cell is drawn uniformly among those no unit
+    covers yet and its whole unit is hidden, so a unit is drawn in proportion to its size. Units are whole, so the result
+    overshoots ``fraction`` by at most one unit.
+
+    Parameters
+    ----------
+    units
+        ``[N]`` the unit of each cell (any integer ids).
+    fraction
+        Share of the cells to cover, in (0, 1).
+    generator
+        Optional RNG, for reproducible draws.
+
+    Returns
+    -------
+    torch.Tensor
+        Boolean tensor of shape ``[N]``.
+    """
+    units = torch.as_tensor(units, dtype=torch.long)
+    return _draw_blocks(len(units), fraction, lambda centre: units == units[centre], generator)
+
+
+def _draw_blocks(num_nodes: int, fraction: float, block_of, generator: torch.Generator | None) -> torch.Tensor:
+    """Blocks around centres drawn among the uncovered cells (``block_of(centre)`` ``[N]``) until ``fraction`` is covered."""
     target = max(1, math.ceil(fraction * num_nodes))
     mask = torch.zeros(num_nodes, dtype=torch.bool)
     while int(mask.sum()) < target:
         free = torch.where(~mask)[0]
         centre = free[torch.randint(len(free), (1,), generator=generator)]
-        mask |= (pos - pos[centre]).norm(dim=1) <= radius
+        mask |= block_of(centre)
     return mask
 
 

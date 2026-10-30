@@ -11,7 +11,11 @@ Four pieces, in the order a step meets them:
 
 * :func:`grid_patches` -- which patch each cell belongs to. A grid of squares by position alone
   (``size_um``, or the side that gives about ``n_patches`` patches per slide), so no expression value can
-  decide a cell's patch. More ways to assign cells plug in next to it (``ASSIGNMENTS``).
+  decide a cell's patch. More ways to assign cells plug in next to it (``ASSIGNMENTS``): ``label``, one
+  patch per connected piece of a niche label (``tl.niches.batch_label_patches``; ``.claude/lung_plan.md``,
+  L3), small pieces merged (``min_cells``), large ones cut (``max_cells``). The label is an annotation
+  computed from expression, hidden cells included, so it is the one assignment that does not read
+  positions alone: an annotation arm, not the default.
 * :meth:`PatchPooling.plan` and :meth:`PatchPooling.pool` -- the patch tokens: the mean over the patch's
   *visible* cells (a cell hidden whole contributes nothing), a learned token at the position of a patch
   with no visible cell, and optionally the log cell count and the spread of the cells' tokens
@@ -32,7 +36,7 @@ import torch
 from torch import nn
 
 #: How cells are assigned to patches (``pooling.kind``); ``none`` is no pooling.
-POOLING_KINDS = ("none", "grid")
+POOLING_KINDS = ("none", "grid", "label")
 #: Extra token features beyond the mean (``pooling.features``).
 POOL_FEATURES = ("count", "std")
 
@@ -124,8 +128,18 @@ def grid_patches(
     return patch, int(unique.numel())
 
 
+def label_patches(batched_data, *, label: str, min_cells: int = 1, max_cells: int = 0) -> tuple[torch.Tensor, int]:
+    """``(patch, n_patches)``: one patch per connected piece of the niche label ``label`` (a Data attribute), per graph.
+
+    Batch-global and ordered by graph, as :func:`grid_patches` numbers its squares (``tl.niches.batch_label_patches``).
+    """
+    from interscale.tl.niches import batch_label_patches
+
+    return batch_label_patches(batched_data, label, min_cells=min_cells, max_cells=max_cells)
+
+
 #: How cells are assigned to patches, by ``pooling.kind``.
-ASSIGNMENTS = {"grid": grid_patches}
+ASSIGNMENTS = {"grid": grid_patches, "label": label_patches}
 
 
 class PatchPooling(nn.Module):
@@ -136,11 +150,14 @@ class PatchPooling(nn.Module):
     n_embed
         Width of a token.
     kind
-        How cells are assigned to patches (``POOLING_KINDS``; ``grid``).
+        How cells are assigned to patches (``POOLING_KINDS``; ``grid`` or ``label``).
     size_um, n_patches
-        The grid's side in µm, or the number of patches wanted per slide (exactly one is positive).
+        ``grid``: the grid's side in µm, or the number of patches wanted per slide (exactly one is positive).
     offset
-        Shift of the grid as a fraction of its side, in [0, 1).
+        ``grid``: shift of the grid as a fraction of its side, in [0, 1).
+    label, min_cells, max_cells
+        ``label``: the Data attribute of the niche label, the size under which a patch merges into a neighbour (1: none)
+        and over which it is cut into kdtree pieces (0: none).
     features
         Any of ``count`` (a learned vector times the log number of visible cells) and ``std`` (a learned
         linear map of the per-dimension spread of the visible cells' tokens), each starting at zero.
@@ -158,6 +175,9 @@ class PatchPooling(nn.Module):
         offset: float = 0.0,
         features=(),
         spatial_unit_um: float = 1.0,
+        label: str = "",
+        min_cells: int = 1,
+        max_cells: int = 0,
     ):
         super().__init__()
         if kind not in ASSIGNMENTS:
@@ -165,8 +185,11 @@ class PatchPooling(nn.Module):
         unknown = sorted(set(features) - set(POOL_FEATURES))
         if unknown:
             raise ValueError(f"pooling.features names {unknown}; choose from {list(POOL_FEATURES)}.")
+        if kind == "label" and not label:
+            raise ValueError("pooling.kind label needs the niche label's Data attribute.")
         self.kind, self.size_um, self.n_patches = kind, float(size_um), int(n_patches)
         self.offset, self.features, self.spatial_unit_um = float(offset), tuple(features), float(spatial_unit_um)
+        self.label, self.min_cells, self.max_cells = str(label), int(min_cells), int(max_cells)
         # A patch with no visible cell has no token of its own: one learned vector stands in, drawn from a
         # private generator so that building it moves no other initial weight.
         generator = torch.Generator().manual_seed(0)
@@ -179,11 +202,18 @@ class PatchPooling(nn.Module):
             nn.init.zeros_(self.std_embed.bias)
 
     def extra_repr(self) -> str:
+        if self.kind == "label":
+            return (
+                f"kind=label, label={self.label}, min_cells={self.min_cells}, max_cells={self.max_cells}, "
+                f"features={list(self.features)}"
+            )
         side = f"{self.size_um:g} um" if self.size_um else f"~{self.n_patches} patches"
         return f"kind={self.kind}, {side}, offset={self.offset:g}, features={list(self.features)}"
 
     def plan(self, batched_data, max_patches: int | None = None) -> PoolPlan:
-        """Assign the cells of a batch to patches; positions come from ``batched_data.pos`` alone."""
+        """Assign the cells of a batch to patches: by ``batched_data.pos`` alone (``grid``), or by the niche label on the
+        graph's edges (``label``).
+        """
         pos = getattr(batched_data, "pos", None)
         if pos is None:
             raise ValueError(
@@ -191,9 +221,14 @@ class PatchPooling(nn.Module):
                 "(e.g. 'spatial') so they are attached."
             )
         graph = batched_data.batch.long()
-        patch, n = ASSIGNMENTS[self.kind](
-            pos, graph, size=self.size_um / self.spatial_unit_um, n_patches=self.n_patches, offset=self.offset
-        )
+        if self.kind == "label":
+            patch, n = ASSIGNMENTS["label"](
+                batched_data, label=self.label, min_cells=self.min_cells, max_cells=self.max_cells
+            )
+        else:
+            patch, n = ASSIGNMENTS[self.kind](
+                pos, graph, size=self.size_um / self.spatial_unit_um, n_patches=self.n_patches, offset=self.offset
+            )
         patch_graph = torch.zeros(n, dtype=torch.long, device=pos.device)
         patch_graph[patch] = graph
         n_cells = torch.bincount(patch, minlength=n)
@@ -204,8 +239,8 @@ class PatchPooling(nn.Module):
             if most > max_patches:
                 raise ValueError(
                     f"pooling gives {most} patches on one slide, more than max_seq_len ({max_patches}), so the "
-                    "transformer would drop some. Raise max_seq_len, or use larger patches (pooling.size_um) or "
-                    "fewer (pooling.n_patches)."
+                    "transformer would drop some. Raise max_seq_len, or use larger patches (pooling.size_um, or "
+                    "pooling.min_cells for niche patches) or fewer (pooling.n_patches)."
                 )
         return PoolPlan(patch, n, patch_graph, centroid.to(pos.dtype), n_cells)
 
@@ -261,6 +296,11 @@ def build_pooling(cfg, n_embed: int) -> PatchPooling | None:
     pooling = params.get("pooling", None) if params is not None else None
     if pooling is None or pooling.get("kind", "none") == "none":
         return None
+    label = ""
+    if pooling.kind == "label":
+        from interscale.tl.geome_utils import label_attribute
+
+        label = label_attribute(cfg, str(pooling.label_key))
     return PatchPooling(
         n_embed,
         kind=str(pooling.kind),
@@ -269,4 +309,7 @@ def build_pooling(cfg, n_embed: int) -> PatchPooling | None:
         offset=float(pooling.offset),
         features=list(pooling.features),
         spatial_unit_um=float(cfg.dataset.get("spatial_unit_um", 1.0)),
+        label=label,
+        min_cells=int(pooling.get("min_cells", 1)),
+        max_cells=int(pooling.get("max_cells", 0)),
     )

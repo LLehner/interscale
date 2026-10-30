@@ -28,6 +28,7 @@ layer computes the transformer's dense attention exactly, with the same weights 
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -66,6 +67,8 @@ class HierarchySettings:
     top_mode: str = "tree"
     patch_size_um: float = 0.0
     min_cells: int = 1
+    split_by_space: str = "components"
+    top_label: str = ""  # obs_label: the Data attribute the label arrives under (geome_utils.label_attribute)
     shift: bool = False
     neighbors: int = 8
     pooling: str = "mean"
@@ -103,6 +106,7 @@ class HierarchySettings:
             "top_mode": self.top_mode,
             "patch_size_um": float(self.patch_size_um),
             "min_cells": int(self.min_cells),
+            "split_by_space": self.split_by_space,
             "neighbors": int(self.neighbors),
             "shift": bool(shift),
             "seed": int(self.seed),
@@ -121,6 +125,11 @@ def hierarchy_settings(cfg) -> HierarchySettings | None:
     if hier is None or hier.get("kind", "none") == "none":
         return None
     cand = hier.candidates
+    top_label = ""
+    if hier.top_level.mode == "obs_label":
+        from interscale.tl.geome_utils import label_attribute
+
+        top_label = label_attribute(cfg, str(hier.top_level.obs_key))
     return HierarchySettings(
         levels=tuple(int(c) for c in hier.levels),
         cells_per_cluster=tuple(float(c) for c in hier.cells_per_cluster),
@@ -128,6 +137,8 @@ def hierarchy_settings(cfg) -> HierarchySettings | None:
         top_mode=str(hier.top_level.mode),
         patch_size_um=float(hier.top_level.patch_size_um),
         min_cells=int(hier.top_level.min_cells),
+        split_by_space=str(hier.top_level.get("split_by_space", "components")),
+        top_label=top_label,
         shift=bool(hier.shift),
         neighbors=int(hier.neighbors),
         pooling=str(hier.pooling),
@@ -641,6 +652,17 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         merged = torch.where(drop.gather(-1, order), torch.full_like(merged, -1), merged.gather(-1, order))
         width = hier.children[level - 1].shape[1]
         slots = max(1, min(merged.shape[1], self.settings.cap_per_query // max(width, 1)))
+        chosen = int((~drop).sum(-1).max())
+        if slots < chosen:
+            # The cap is shared out by the widest parent of the level: one parent with many children (a large niche
+            # patch on top, say) leaves every query of the slide only a few of the parents it chose.
+            warnings.warn(
+                f"routed level {level}: a parent with {width} children leaves {slots} of up to {chosen} chosen parents per "
+                f"query under cap_per_query {self.settings.cap_per_query}. Balance the level above (top_level.split_by_space "
+                "kdtree, smaller clusters) or raise cap_per_query.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         parents = merged[:, :slots]
         a = lookup(keys, weights, parents)
         a_cls = lookup(keys, weights, torch.full((n_par, 1), n_par, device=device, dtype=torch.long))[..., 0]

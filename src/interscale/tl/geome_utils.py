@@ -88,6 +88,22 @@ def optional_fields(cfg: CN) -> tuple[dict[str, list[str]], list[str]]:
     return fields, preserve
 
 
+def label_attribute(cfg: CN, obs_key: str) -> str:
+    """The ``Data`` attribute the obs column ``obs_key`` reaches the graphs under, or a ValueError naming the fix.
+
+    A column configured for a named role (``celltype_key`` and the others of ``OPTIONAL_FIELDS``) arrives under the role's
+    name, any column in ``dataset.extra_obs_keys`` under its own.
+    """
+    for name, (cfg_key, source) in OPTIONAL_FIELDS.items():
+        if source == "obs" and getattr(cfg.dataset, cfg_key, None) == obs_key:
+            return name
+    if obs_key in (getattr(cfg.dataset, "extra_obs_keys", []) or []):
+        return obs_key
+    raise ValueError(
+        f"the obs column {obs_key!r} does not reach the graphs; add it to dataset.extra_obs_keys (it arrives one-hot)."
+    )
+
+
 def label_codes(data, name: str) -> torch.Tensor:
     """Integer codes ``[N]`` for a one-hot annotation attached by :func:`optional_fields`.
 

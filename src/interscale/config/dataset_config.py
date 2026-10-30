@@ -52,6 +52,13 @@ def get_dataset_cfg(cfg):
     # 0, leaving the discs as the only targets. Fraction 0 (the default) draws no discs.
     cfg.dataset.mask_block_radius_um = 0.0
     cfg.dataset.mask_block_fraction = 0.0
+    # What a block is (`.claude/masking_plan.md`, M3): `disc` (the radius above) or `label` -- a connected patch of the
+    # categorical obs column `mask_block_label_key` (a niche; it must reach the graphs, through extra_obs_keys) on the
+    # slide's graph, drawn as discs are, no radius. `mask_block_max_cells` > 0 cuts larger patches into kdtree pieces of
+    # at most that many cells (0: whole patches). The label is an annotation computed from expression, hidden cells included.
+    cfg.dataset.mask_block_kind = "disc"
+    cfg.dataset.mask_block_label_key = ""
+    cfg.dataset.mask_block_max_cells = 0
     # Programme masking (mask_strategy "gene" only): hide exactly these genes -- names or
     # "<var column>=<value>" selectors, e.g. ["role=response", "role=receiver"] -- in the selected
     # cells and nothing else. mask_percentage is then the share of cells (1.0: every cell), and
