@@ -153,18 +153,13 @@ def sample_pairs(
     visible, source, receiver, flow, *, receivers: int = 2000, top: int = 5, seed: int = 0
 ) -> dict[str, np.ndarray]:
     """The ``top`` sources of up to ``receivers`` receivers, by net flow: ``pair_receiver`` ``[R]``, ``pair_source`` and
-    ``pair_flow`` ``[R, top]`` (-1 and 0 where a receiver has fewer). Hidden cells with an inflow are drawn first (the cells the
-    model is asked about), else any cell with one; from a private generator, sorted.
+    ``pair_flow`` ``[R, top]`` (-1 and 0 where a receiver has fewer, or none). The receivers are drawn uniformly from all cells,
+    hidden or not, with or without an inflow, so the sample favours no cell; from a private generator, sorted.
     """
     n = len(visible)
     receiver, source = np.asarray(receiver, dtype=np.int64), np.asarray(source, dtype=np.int64)
     flow = np.asarray(flow, dtype=np.float32)
-    has = np.zeros(n, dtype=bool)
-    has[receiver] = True
-    hidden = np.asarray(visible) == 0
-    pool = np.flatnonzero(has & hidden)
-    if not len(pool):
-        pool = np.flatnonzero(has)
+    pool = np.arange(n)
     rng = np.random.default_rng(seed)
     chosen = np.sort(rng.choice(pool, size=min(int(receivers), len(pool)), replace=False)) if len(pool) else pool
     slot = np.full(n, -1, dtype=np.int64)
@@ -442,7 +437,7 @@ def plot_attention_flow(
     title: str = "",
     bandwidth_um: float = 30.0,
     cells: bool = True,
-    shade: bool = True,
+    shade: bool = False,
     link_um: float = 60.0,
     min_cells: int = 100,
     width_in: float = 16.0,
@@ -456,7 +451,7 @@ def plot_attention_flow(
     ``source``: the npz :func:`flow_arrays` wrote (path) or its arrays. All tiles share one scale, so a stream's width and
     colour (the net current per cell, one colour bar) compare across tiles, and nothing but tissue is drawn. ``cells``: draw
     the cells (grey; hidden ones tinted) under the streams, else the streams alone; ``shade``: the smoothed source-sink value
-    (:func:`smoothed_net`) behind them, sources red and sinks blue (needs ``flow_out``; skipped for an older npz); ``min_flow``:
+    (:func:`smoothed_net`) behind them, off by default, so the streams are not read as sources and sinks; red: read more than it reads (needs ``flow_out``; skipped for an older npz); ``min_flow``:
     no stream where the net current is under that share of the colour scale's end (a weak field is noise, drawn as tangle).
     Returns ``{"blocks": B, "cells": drawn, "dropped": cells in dropped blocks}``.
     """
@@ -545,7 +540,7 @@ def plot_attention_flow(
         "Net attention flow, last layer, head mean: A - A^T over cell pairs. Streams point from the cells being read to the cells that read them; "
         "width and colour: net current per cell.\n"
         + (
-            "Behind them the source-sink value (out - in, smoothed): red sources, blue sinks. "
+            "Behind them the source-sink value (out - in, smoothed): red: read more than it reads, blue: reads more. "
             if net is not None
             else ""
         )
@@ -562,16 +557,15 @@ def plot_source_sink(
     *,
     title: str = "",
     bandwidth_um: float = 30.0,
-    hubs: float = 0.01,
     link_um: float = 60.0,
     min_cells: int = 100,
     width_in: float = 16.0,
     tile_in: float = 3.8,
     dpi: int = 120,
 ) -> dict:
-    """The source-sink map of one slide: every cell coloured by its smoothed ``out - in`` (:func:`smoothed_net`), red where it
-    is read more than it reads (a source), blue where it reads more (a sink), on one symmetric scale for the slide; the
-    ``hubs`` share of cells with the largest |value| ringed (sources dark red, sinks dark blue), hidden cells marked by a dot.
+    """The net in- and outflow of one slide: every cell coloured by its smoothed ``out - in`` (:func:`smoothed_net`), on one scale
+    symmetric about 0 for the slide, hidden cells marked by a dot. Nothing is selected or ringed: no share of cells is called a
+    source or a sink by construction; whatever structure there is shows as it is (and noise shows as noise).
     """
     from matplotlib.colors import Normalize
 
@@ -581,11 +575,10 @@ def plot_source_sink(
     drawn = np.any(t.members, axis=0)
     limit = float(np.quantile(np.abs(value[drawn]), 0.99)) if drawn.any() else 0.0
     norm = Normalize(-(limit or 1.0), limit or 1.0)
-    cut = float(np.quantile(np.abs(value[drawn]), 1.0 - float(hubs))) if drawn.any() and hubs > 0 else np.inf
     cmap = _diverging()
     for k, ax in enumerate(t.axes):
         mine = t.members[k]
-        order = np.flatnonzero(mine)[np.argsort(np.abs(value[mine]))]  # strongest last, on top
+        order = np.flatnonzero(mine)
         ax.scatter(
             t.pos[order, 0],
             t.pos[order, 1],
@@ -601,29 +594,18 @@ def plot_source_sink(
         ax.scatter(
             t.pos[hid, 0], t.pos[hid, 1], s=max(0.3, t.dot * 0.08), c="#333333", marker="o", linewidths=0, zorder=2
         )
-        for sign, colour in ((1, "#67001f"), (-1, "#053061")):
-            hub = mine & (np.abs(value) >= cut) & (np.sign(value) == sign)
-            ax.scatter(
-                t.pos[hub, 0],
-                t.pos[hub, 1],
-                s=t.dot * 4,
-                facecolors="none",
-                edgecolors=colour,
-                linewidths=0.7,
-                zorder=3,
-            )
         t.label(k)
     caption = (
-        "Sources and sinks of the net attention flow (last layer, head mean): each cell's out - in (how much it is read minus how much it reads), "
-        f"smoothed over {bandwidth_um:g} µm.\nRed: sources, blue: sinks; ringed: the {hubs:.0%} strongest. Black dots: hidden cells, the receivers by "
-        f"construction, so sinks follow the mask -- compare with the untrained twin. {t.drawn:,} cells in {len(t.axes)} blocks."
+        "Net in- and outflow of the net attention flow (last layer, head mean): each cell's out - in (how much it is read minus how much it reads), "
+        f"smoothed over {bandwidth_um:g} µm, on a scale symmetric about 0.\nNo cell is selected. Black dots: cells hidden in this pass. "
+        f"Read it against the untrained twin's, drawn the same way. {t.drawn:,} cells in {len(t.axes)} blocks."
     )
     return t.finish(
         out_path,
         title,
         caption,
         t.plt.cm.ScalarMappable(norm=norm, cmap=cmap),
-        "out - in per cell (a.u.): sink  <-  ->  source",
+        "out - in per cell (a.u.): reads more  <-  0  ->  is read more",
     )
 
 
@@ -634,12 +616,15 @@ def plot_who_whom(
     title: str = "",
     panels: int = 8,
     view_um: float = 260.0,
-    min_hidden: int = 20,
     columns: int = 4,
     panel_in: float = 3.6,
+    seed: int = 0,
+    min_tissue: float = 0.85,
     dpi: int = 130,
 ) -> dict:
-    """Who influences whom: zoom panels of ``view_um`` on the ``panels`` largest patches of hidden cells, each sampled receiver
+    """Who influences whom: zoom panels of ``view_um`` at ``panels`` places drawn at random over the cells (seeded, never
+    overlapping: a cell at least ``view_um`` from every earlier centre; a view at least ``min_tissue`` tissue, by position alone),
+    so no place is chosen for what it shows; each sampled receiver
     (:func:`sample_pairs`) joined by arrows from its top sources, width and colour by the pair's net flow (one scale for the
     figure). Cells grey, hidden ones tinted. Returns ``{"panels": drawn, "pairs": arrows drawn}``.
     """
@@ -655,15 +640,23 @@ def plot_who_whom(
     pos = np.asarray(data["pos_um"], dtype=np.float64)[:, :2]
     hidden = np.asarray(data["visible"]) == 0
     receivers, sources, flows = data["pair_receiver"], data["pair_source"], data["pair_flow"]
-    patch = np.full(len(pos), -1, dtype=np.int64)
-    if hidden.sum() >= min_hidden:
-        patch[hidden] = tissue_blocks(pos[hidden], link_um=25.0, min_cells=min_hidden)
-    ids, counts = np.unique(patch[patch >= 0], return_counts=True)
-    order = ids[np.argsort(-counts, kind="stable")][: int(panels)]
-    centres = [pos[patch == p].mean(0) for p in order]
-    if not centres:  # nothing hidden: the receivers with the strongest inflow
-        strongest = np.argsort(-flows.sum(1))[: int(panels)]
-        centres = [pos[receivers[i]] for i in strongest]
+    rng = np.random.default_rng(seed)
+    step = float(view_um) / 13.0
+    low = pos.min(0)
+    occupied = set(map(tuple, np.floor((pos - low) / step).astype(np.int64)))
+
+    def tissue_share(centre):
+        corner = np.floor((centre - view_um / 2.0 - low) / step).astype(np.int64)
+        return np.mean([(corner[0] + i, corner[1] + j) in occupied for i in range(1, 13) for j in range(1, 13)])
+
+    centres = []
+    order = rng.permutation(len(pos))
+    for floor in (min_tissue, 0.0):  # a view is mostly tissue; only if too few such places exist, any place
+        for cell in order:
+            if len(centres) == int(panels):
+                break
+            if tissue_share(pos[cell]) >= floor and all(np.abs(pos[cell] - c).max() >= view_um for c in centres):
+                centres.append(pos[cell])
     valid = sources >= 0
     reference = float(np.quantile(flows[valid], 0.99)) if valid.any() else 1.0
     norm = Normalize(0.0, reference or 1.0)
@@ -737,7 +730,7 @@ def plot_who_whom(
     fig.text(
         0.004,
         1 - 0.38 / total_h,
-        f"Who influences whom (net attention flow, last layer, head mean): {view_um:g} µm around the largest patches of hidden cells. Arrows run from each sampled\n"
+        f"Who influences whom (net attention flow, last layer, head mean): {view_um:g} µm at places drawn at random over the tissue. Arrows run from each sampled\n"
         "receiver's top-5 sources (where it reads more than it is read) to the receiver (black dot); colour: the pair's net flow. Hidden cells tinted.",
         fontsize=8,
         va="top",
