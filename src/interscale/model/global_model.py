@@ -4,7 +4,7 @@ import torch
 from anndata import AnnData
 from yacs.config import CfgNode as CN
 
-from interscale.model.base._base_model import BaseModel
+from interscale.model.base._base_model import BaseModel, in_eval_mode
 from interscale.module.base import GlobalModule
 from interscale.module.global_modules.positional_encodings import attach_positional_inputs
 from interscale.tl import prepare_a2d_dataset
@@ -51,6 +51,7 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
         self._attach_aux_losses()
 
     # @torch.inference_mode() Not possible because of pytorch hook for self attention relevance
+    @in_eval_mode
     def get_model_output(self, adata: AnnData | None = None, prefix: str = "", attention: bool = True):
         """Save the embeddings, predictions and attentionsin the adata object.
 

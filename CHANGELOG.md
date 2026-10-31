@@ -352,6 +352,8 @@ and this project adheres to [Semantic Versioning][].
 
 ### Fixed
 
+- `get_model_output` (GlobalModel, LocalModel, CombinedModel) reads the model in eval mode (`in_eval_mode`) and restores the
+  module's mode: a model read after `train()`, left in training mode, used to predict with dropout on, another output every call.
 - `GlobalModel.get_model_output` raised on a slide with more cells than `max_seq_len`: an unused cosine of the whole
   input against the kept cells' predictions had mismatched lengths. Removed.
 - `SelfAttentionRelevance` averaged the heads over every graph of a batch together (now within each graph; one

@@ -4,7 +4,7 @@ import torch
 from anndata import AnnData
 from yacs.config import CfgNode as CN
 
-from interscale.model.base._base_model import BaseModel
+from interscale.model.base._base_model import BaseModel, in_eval_mode
 from interscale.module.base import LocalModule
 from interscale.tl.geome_utils import prepare_a2d_dataset
 from interscale.tl.masking import block_masking_on
@@ -43,6 +43,7 @@ class LocalModel(NodeMaskingTrainingPlan, BaseModel):
         self._attach_aux_losses()
 
     @torch.inference_mode()
+    @in_eval_mode
     def get_model_output(self, adata: AnnData | None = None, prefix: str = ""):
         """Save the embeddings, predictions and attentionsin the adata object.
 

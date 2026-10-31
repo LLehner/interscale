@@ -1,3 +1,4 @@
+import functools
 import logging
 import os
 from abc import ABCMeta, abstractmethod
@@ -70,6 +71,25 @@ class BaseModelMeta(ABCMeta):
             str, dict[str, type[AnnDataManager]]
         ] = {}  # Maps model instance id to AnnDataManager mappings.
         super().__init__(name, bases, dct)
+
+
+def in_eval_mode(method):
+    """Run a model method with its module in eval mode (no dropout), and put the module's mode back afterwards.
+
+    ``get_model_output`` decodes outside the training loop; without this, a model read after ``train()`` -- whose module Lightning
+    leaves in training mode -- predicted with dropout on, a different output on every call.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        was_training = self.module.training
+        self.module.eval()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self.module.train(was_training)
+
+    return wrapper
 
 
 class BaseModel(metaclass=BaseModelMeta):

@@ -4,7 +4,7 @@ import torch
 from anndata import AnnData
 from yacs.config import CfgNode as CN
 
-from interscale.model.base._base_model import BaseModel
+from interscale.model.base._base_model import BaseModel, in_eval_mode
 from interscale.module import CombinedModule, DualDecoderCombinedModule
 from interscale.module.global_modules.positional_encodings import attach_positional_inputs
 from interscale.tl import prepare_a2d_dataset
@@ -76,6 +76,7 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
         state = {k: v for k, v in local_model.module.state_dict().items() if not k.startswith("aux_losses.")}
         self.module.local_module.load_state_dict(state, strict=True)
 
+    @in_eval_mode
     def get_model_output(self, adata: AnnData | None = None, prefix: str = "", attention: bool = True):
         """Save the embeddings, predictions and attentionsin the adata object.
 
