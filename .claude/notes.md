@@ -1207,3 +1207,19 @@ Over all 11 runs the numbers are lower where the prior costs (short 0.88 head me
 summed targets of a disc (it is linear in its target). A source is a cell that is read or drawn from by many (out-strength), a sink one that draws from many (in-strength); the net `out - in` per cell, or the divergence of the smoothed current, maps them. Since hidden cells
 are the receivers by construction, sinks follow the mask layout: read the map against the untrained twin, and for a CosMx claim average over many masks (fold passes) and compare with the expression-permuted slide.
 Plots (not built): a source-sink map (cells coloured by smoothed `out - in`, diverging), zoom panels on discs with the arrows from the top sources to sampled receivers, the streams with the divergence shaded, and the influence against distance for trained, twin and permuted.
+
+## 2026-10-31 — Sources, sinks and who influences whom: three views on the net attention flow (code, tests, a layout check on 3_ND; not run on a model)
+
+The user chose views 1-3 of the plan above. `flow_arrays` now also stores each cell's net flow out and in (`out - in` is the divergence of the net flow, summing to 0 over a slide) and the
+top-5 sources of up to 2,000 sampled receivers (hidden cells first, seeded). Per section the CosMx hook draws `<section>.png` (the streams, with the smoothed `out - in` shaded behind: red sources,
+blue sinks), `<section>_source_sink.png` (cells coloured by it, the strongest 1% ringed, hidden cells dotted) and `<section>_who_whom.png` (260 µm zoom panels on the 8 largest hidden patches,
+arrows from each sampled receiver's top sources, coloured by the pair's net flow).
+
+**What worked**
+- 26 tests (a planted star, where every cell within 50 µm reads the centre, gives the centre `out - in` = 0.4 per reader and each reader -0.4; the smoothed value keeps the signs; bins of
+  several cells average them; the sample takes hidden receivers and their strongest sources first and is seeded; a panel draws only the receivers in its view); all 11 mutations caught.
+- On the real 3_ND geometry (top-5 stand-in, not the result) all three draw, 10 tiles and 8 panels, nothing but tissue.
+
+**What doesn't work (yet)**
+- On the stand-in the hidden discs are the sinks, as the mask makes them; the strongest sources and sinks also sit on tissue edges. Whether anything beyond the mask and the edges shows can only be
+  read on the real rows against the untrained twin. View 4 (influence against distance, with the permuted slide) and IG on discs are not built.

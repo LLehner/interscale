@@ -955,6 +955,9 @@ label heatmaps; the heatmaps need an annotation and the fields mix every program
   short / mid-range receivers (twin 69% / 7%), the net flow points sender -> receiver for 61% / 94% of the pairs (twin 49% / 42%), nothing is found for dense, sparse or
   directional senders, and integrated gradients are stronger (mid 100%). Part of it is geometry (density, edge, the mask's layout): read against the untrained twin. The
   attribution form above is still not built; the permuted-slide check is not run on either form.
+- **Views 1-3 built 2026-10-31** (the user's choice after the readout comparison): the source-sink map, who -> whom zoom panels on hidden patches, and the streams
+  with the source-sink value shaded, from per-cell net strengths and sampled pairs stored in the same npz; one cluster evaluation draws all three per section.
+  Not built: view 4 (influence against distance for trained, twin and permuted), IG on discs for CosMx.
 
 ### T5 — how cell-type driven attention is (W2–W3)
 

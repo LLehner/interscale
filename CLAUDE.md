@@ -479,6 +479,11 @@ cell. Invariants:
   is cut by `rectangles`) gives a tile per block, `tile_layout` packs them at one scale. `hierarchy_readouts(flow_dir=...)` writes `<graph>.npz` and the
   `hier_flow` table (off by default); the CosMx hook (`slurm/new/hier_common.py`) draws `flow/<run>/<section>.png`. The quiver plots (`plot_fields`) are not
   drawn on CosMx.
+- **Sources and sinks** (2026-10-31): the npz also holds each cell's net flow out and in (`cell_strengths`; `out - in` is the exact divergence, summing to 0)
+  and the top-5 sources of up to 2,000 sampled receivers, hidden cells first (`sample_pairs`, a private seeded generator). Three views per section from it:
+  the streams with the smoothed `out - in` shaded behind (`smoothed_net`; red sources, blue sinks), the source-sink map (`plot_source_sink`, the strongest 1%
+  ringed) and zoom panels on the largest hidden patches with arrows from each receiver's sources (`plot_who_whom`). Hidden cells are the receivers by
+  construction, so sinks follow the mask: read against the twin. An npz from before has no strengths: the streams skip the shading, the other two refuse.
 
 #### Online probes (`evaluation/online_probes.py`)
 
