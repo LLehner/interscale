@@ -195,20 +195,21 @@ The report is `results.md`-style (sections per question, a summary on top), with
   logging, label probes on embeddings, the label flow (`patch_flow`), gene scales, attribution shares of decomposable
   models, the orthogonality terms, pooling, fused attention, the oracle and reference machinery.
 - **To build:**
-  - CosMx in the pipeline (roadmap T0): the `PREPROCESS` hook, labels, condition, folds, whole sections as samples.
   - IG attribution by receiver type with sampled receivers and summed targets, resolved by sender type and by input gene,
     with the distance-matched and permuted nulls, at section scale.
   - Attention rows for sampled queries under fused attention; an inference path without dense maps (T6).
   - The table writers in the sweep's evaluation, the runners per baseline, the comparison script and its figures.
 
-## Whole sections, no sliding windows (asked 2026-10-25; to settle in the next chat)
+## Whole sections, no sliding windows (asked 2026-10-25)
 
-The user wants the next CosMx run on whole slides, not sliding windows (roadmap T6 had decided it already).
+The user wants CosMx on whole sections, not sliding windows (roadmap T6). Settled since: the CosMx pipeline runs on whole
+sections (`cosmx_run`, read 2026-10-31, hierarchical_attention_plan.md); still open: the dual arms' route (a / b below) and the
+evaluation without dense maps.
 
 - **The sample is a section, not a physical slide.** Each slide holds two separate pieces of tissue, one ND and one T1D donor,
   5.6-7.9 mm apart (slide 1: 108,711 cells, 2: 126,421, 3: 151,595). One sequence per slide would put two donors in one
   attention sequence (CLS, centring and the widest heads would mix them) and break every per-donor readout. So the unit is
-  `section` (`slide_condition`): 47k-100k cells. Assumed, **to confirm with the user**.
+  `section` (`slide_condition`): 47k-100k cells (used by `cosmx_run`).
 - **What runs at that size today:** the global-only windowed model (fused attention; speed unmeasured) and the GCN models.
   **Not:** the dual arms with the context query (`dual_ctx`, `dual_ctx_orth`): `context_only: query` needs queries different
   from keys, and the transformer refuses every backend but torch's dense attention for it (`transformer_encoder.py`, ~l.153).
@@ -230,7 +231,7 @@ The user wants the next CosMx run on whole slides, not sliding windows (roadmap 
 1. **Pixel size:** 0.18 µm (proposed from the FOV size) -- to confirm from the paper.
 2. **CosMx settings:** k = 8, the hops curve at 1-3, the disc and random-cell rates, the window range (proposed under C1).
 3. **Positive controls:** the user's check of the draft list.
-4. **Whole sections:** the unit is the section (above); the dual arms' route, (a) or (b); epochs after the benchmark.
+4. **Whole sections:** the dual arms' route, (a) or (b); the training length (300 epochs for now, the user 2026-10-30).
 
 ## Order
 
