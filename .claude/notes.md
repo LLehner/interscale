@@ -1223,3 +1223,10 @@ arrows from each sampled receiver's top sources, coloured by the pair's net flow
 **What doesn't work (yet)**
 - On the stand-in the hidden discs are the sinks, as the mask makes them; the strongest sources and sinks also sit on tissue edges. Whether anything beyond the mask and the edges shows can only be
   read on the real rows against the untrained twin. View 4 (influence against distance, with the permuted slide) and IG on discs are not built.
+
+## 2026-10-31 — The in- and outflow views made unbiased (the user: "You don't need to bias the plots to show sources or sinks, I just hope to find any in an unbiased fashion")
+
+What selected by content before, and what replaced it: the source-sink map ringed the 1% strongest cells (a fixed share of "hubs" found even in noise) -> nothing ringed, every cell coloured on a
+scale symmetric about 0, neutral wording ("is read more" / "reads more"); the who -> whom panels sat on the largest hidden patches (sinks by the mask's construction) -> seeded random places, non-overlapping,
+at least 85% tissue by position alone; the receivers were drawn from hidden cells first -> uniformly from all cells; the streams carried the source-sink shading by default -> off unless asked.
+27 tests (uniform receiver draws, no ring or pick in the map, panels placed by the seed and never overlapping, views mostly tissue, no shading by default), all mutations caught. Not run on a model.
