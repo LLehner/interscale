@@ -1230,3 +1230,33 @@ What selected by content before, and what replaced it: the source-sink map ringe
 scale symmetric about 0, neutral wording ("is read more" / "reads more"); the who -> whom panels sat on the largest hidden patches (sinks by the mask's construction) -> seeded random places, non-overlapping,
 at least 85% tissue by position alone; the receivers were drawn from hidden cells first -> uniformly from all cells; the streams carried the source-sink shading by default -> off unless asked.
 27 tests (uniform receiver draws, no ring or pick in the map, panels placed by the seed and never overlapping, views mostly tissue, no shading by default), all mutations caught. Not run on a model.
+
+## 2026-10-31 — Tier 1 for the real-data comparison: visible keys on fused / hierarchy, the context query on fused, the section offset (code and tests; not run on data)
+
+Built on branch `tier1-real-data` (roadmap.md, "Tier 1"): `attention.visible_keys_only` for the fused attention (`StructuredMask.hidden_keys`)
+and every level of the hierarchy; the context query on the fused attention (`FusedAttention.supports_cross`); `model.decoder.section_offset:
+visible_mean` for GlobalModel and LocalModel, and `masked_probing.within_section` for scores within sections. Toy models only, CPU.
+
+**What worked**
+- Fused + visible keys equals dense + visible keys through the real GlobalModel (cell masking, distance window, centred q/k), predictions and every
+  gradient to 1e-5, in one block, in blocks of 4 queries and one query per block on a subsampled slide.
+- The fused context query equals the dense one (node encodings, Fourier, the window, RoPE, centred q/k; one block, blocks, subsampled): embeddings,
+  maps and gradients to 1e-5; a cell stays blind to its own expression bit for bit, also behind a GCN under the long-range mask.
+- Section offset: the part is exactly w x (the leave-one-out visible mean of the cell's section), hidden values never reach a prediction, a visible
+  cell moves every cell of its own section and none of the other; w trains from 1; a gene hidden in every cell gets 0; inference reads the clean batch.
+- Mutation checks: 9 / 9 (visible keys), 6 / 6 (context query), 18 / 18 (section offset; 3 survived first and led to a gene-masking test, a subsampled
+  test and the removal of a redundant `where`). Harness IDENTICAL after each commit.
+
+**What doesn't work / found on the way**
+- **Under cell masking the singleton hierarchy was never the dense model.** The must-pass regression (hierarchical_attention_plan.md, test 2) runs
+  under programme masking only, where no cell is hidden whole. With cells hidden whole the top level hands CLS the learned `pool_fill` of every hidden
+  singleton where the dense model hands it the hidden cell's own token: predictions 2-4e-2 apart (toy model). With visible keys on both, 4e-7. In the
+  CosMx `hier_none` runs (clusters of 25 and 250, 60 µm discs) the same applies only to a coarse cluster whose cells are all hidden, which is rare.
+- **`attention.center_qk` leaks hidden tokens past `visible_keys_only`.** Queries and keys are centred on the mean of every cell token, hidden ones
+  included (weight 1 / S), so moving a hidden token moves the visible cells' predictions even with every hidden key blocked (dense, fused and
+  hierarchy alike). Small at 10^5 cells, but the option is not exactly "no hidden key" with centring on; a centring mean over visible cells only would
+  close it (not built).
+- With centring on, the singleton hierarchy and the dense model still differ by 1.8e-4 under visible keys (the top level centres on a mean holding
+  `pool_fill`).
+- Within sections the slide mean is the centre: its cosine is float32 rounding noise around 0, not exactly 0 or NaN.
+- Nothing run on CosMx yet; `within_section` is not in `sweep_common.py` (cluster scripts) yet.

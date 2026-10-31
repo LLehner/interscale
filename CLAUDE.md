@@ -240,8 +240,13 @@ Performer). With the long-range mask on, `scale_min_um` should be about the loca
 `attention.visible_keys_only` (default off) blocks, in the dense mask of `common_step_local_to_global`, every key that is a cell hidden
 whole (`GlobalModule.wholly_hidden`); a hidden cell still queries, CLS stays open, a clean pass (`eval_step`) is untouched. The key
 vector is laid out with `pad_like` from this call's `index_nodes` -- never a second `pad_batch` -- so it follows left padding and
-subsampling. It must run *before* the bias is merged into the mask. Needs a dense-mask backend (the validator names which) and
-cells hidden whole (not with `mask_genes`, pooling, or gene masking without discs). Checkpoint tag `-vk` in the attention part.
+subsampling. It must run *before* the bias is merged into the mask. The fused attention takes the same key vector as
+`StructuredMask.hidden_keys` and blocks it in every block (`AttentionSpec.hidden_keys`); the hierarchy blocks, at every level, the
+tokens that hold no visible cell (`HierarchicalContext.visible_keys_only`). The Performer, linear and Exphormer backends refuse it
+(the validator names the carriers). Needs cells hidden whole (not with `mask_genes`, pooling, or gene masking without discs).
+**`attention.center_qk` is the one path it leaves open:** queries and keys are centred on the mean of every cell token, the hidden
+ones included (weight 1 / S), so a hidden token still reaches the others through that mean (tested). Checkpoint tag `-vk` in the
+attention part.
 
 ### Exact fused attention (`attention.kind: fused`; `.claude/attention_plan.md`, stage 6)
 
@@ -251,7 +256,11 @@ time, so a sequence of ~10^5 cells (a whole CosMx section) forms no `S x S` tens
 - **It is the dense model.** It takes its mask as a `StructuredMask` of blocked pairs (`mask="pairs"`): without the long-range mask
   that is each cell's own key (`attn_mask_diagonal`'s diagonal), with it the k-hop pairs -- never an open diagonal. Biases come a block
   of rows at a time from `AttentionBias.rows` (`StructuredMask.bias_rows`), rows of exactly the dense bias: every bias with a pair form
-  (distance in every kind, Fourier, spectral); the expression bias, `visible_keys_only` and the entropy loss are refused.
+  (distance in every kind, Fourier, spectral); the expression bias and the entropy loss are refused. `visible_keys_only` arrives as
+  `StructuredMask.hidden_keys` and is blocked like padding in every block.
+- **Read-outs** (`supports_cross`, `AttentionSpec.cross`): queries of their own (the context query's stream) read the tokens as keys
+  and values, each third of the input projection on its own input, with the same blocked pairs and biases: `context_only: query`
+  runs on whole sections, equal to the dense read-out in embeddings, maps and gradients and blind to the cell bit for bit (tested).
 - **No block is kept.** `rows = chunk_pairs // (B * L)` queries per block (`attention.fused.chunk_pairs`, default 2^24); each block's
   additive mask is built when it runs and, in training with more than one block, rebuilt in the backward pass (non-reentrant
   `torch.utils.checkpoint`). Anything a block computes must stay inside the block function; a tensor of all blocks kept outside it is the
@@ -288,8 +297,12 @@ never an `S x S` tensor), and fuses each cell with its ancestors (`readout`). In
   would read over the same keys, scaled to its cell mass: the baseline of a trained head, in place of an untrained twin), the
   planted pairs with their programmes, and with `dependence_genes` each receiver's integrated-gradients dependence
   (`receptive_field.receiver_dependence`: a query over the completeness limit is integrated again with more points).
+- **`visible_keys_only`.** At every level a token with no visible cell (a cell hidden whole, a cluster of only such cells) is
+  no key; CLS stays open. Under cell masking the singleton hierarchy is the dense model only with this on: off, its top level
+  hands CLS the learned `pool_fill` of every hidden singleton where the dense model hands it the hidden cell's token (2-4e-2
+  apart), and with `center_qk` the top level centres on a mean that holds `pool_fill` (1.8e-4 apart; notes.md 2026-10-31).
 - Refused (validator): other backends or head widths, RoPE, spectral / expression biases, the long-range mask, the context
-  query, `visible_keys_only`, `remask`, pooling, losses reading attention maps; prior none without a readout.
+  query, `remask`, pooling, losses reading attention maps; prior none without a readout.
 
 ### Regime losses and the own-cell skip (`tl/depth.py`, `.claude/decoder_plan.md`)
 
@@ -364,10 +377,33 @@ the same memory at every layer, never updated) through that layer's own weights 
   pass `queries=`.
 - **Zero-initialised encodings.** Every node-encoding projection and attention-bias table starts at zero, so a test of anything positional must
   set them to nonzero values first (the context-query tests do), or it checks nothing.
-- **Torch's dense attention only** (the vendored one takes separate queries, keys and values; the backends are self-attention only). The
+- **Torch's dense attention or the fused attention** (the vendored one takes separate queries, keys and values; the fused one reads with
+  them since 2026-10-31, `FusedAttention.supports_cross`; the other backends are self-attention only, the hierarchy refuses it). The
   readouts that compose attention as token mixing (`attention_check`, the rollout flow, relevance) refuse a context-only model; the
   single-layer attention maps (`attention_diagnostics`) and the gradient readouts work. The returned attention maps are the read-out's.
 - The learned token is built from a private generator: the option draws nothing from the global one.
+
+### The section offset (`model.decoder.section_offset`; roadmap Tier 1)
+
+`visible_mean` (default `none`) makes a LocalModel's or GlobalModel's prediction the sum of the decoder and a part `section` =
+`w * m`: `m` each gene's mean over the visible entries of the cell's graph (`tl.masking.section_visible_mean`), `w` one learned
+weight per gene starting at 1 (`section_offset_weight`, no random draw). Why: on CosMx 80-89% of the per-cell centred cosine was
+each section's own offset (notes.md 2026-10-31). Invariants:
+
+- **Visible entries only.** `BaseModule.visible_entries` (the complement of what the loss scores) on the masked batch in training;
+  a cell hidden whole gets its section without itself, a gene hidden in every cell (programme masking) gets 0. At inference
+  (`get_model_output`) the clean batch, every entry. One definition for the model and the evaluation (`within_section`).
+- **A named part.** `StepOutput.parts` carries `section` (GlobalModel: `{"global": {context, [own_cell], section}}`; LocalModel:
+  `{"local": {neighbourhood, section}}`), so `attribution_shares` reads its share. Any caller of `predict` must pass
+  `section=module.section_input(batch, masked=...)` (the module refuses to predict without it).
+- A graph is a section: one graph per section (CosMx) or slide. Reconstruction at node level only; a CombinedModel refuses it in
+  `train()` (`_refuse_unsupported_options`). Checkpoint tag `-sec` in the decoder part (`dec-linear-sec_`).
+
+**Scoring within sections** (`masked_probing.within_section`): `collect_head_predictions` records each row's `section_mean` (the same
+helper); `within_section(pred)` subtracts it from every head and the truth, and `score_heads(..., center=zeros)` then gives the
+within-section centred cosine: how well a head tells a hidden cell from the visible rest of its own section. The slide mean is the
+centre (its cosine is rounding noise around 0). Read it next to the usual centred cosine, which counts the section's offset from the
+training mean as signal.
 
 ### Orthogonality terms (`train/orthogonality.py`, `.claude/decoder_plan.md`, D4)
 

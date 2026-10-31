@@ -215,7 +215,7 @@ evaluation without dense maps.
   from keys, and the transformer refuses every backend but torch's dense attention for it (`transformer_encoder.py`, ~l.153).
   **Not yet:** the evaluation -- `masked_probing.reference_predictions` forms a dense float64 `cdist` per section (~80 GB at
   100k cells), and relevance / attention diagnostics form full maps.
-- **Open choice for the dual arms:** (a) extend the fused attention to the context query (same blocks; queries from the query
+- **Open choice for the dual arms** (route a **built 2026-10-31**, roadmap Tier 1): (a) extend the fused attention to the context query (same blocks; queries from the query
   stream, keys and values from the cells' tokens; recommended: without it the global part mostly copies the local one), or
   (b) run the dual arms without the context query, under the long-range mask the fused attention already supports (quicker;
   weaker local-vs-global readouts).
