@@ -235,7 +235,28 @@ one phase, unchanged), `local_then_global`, `local_then_global_ft`, `alternating
 `-strength * phi(d / l_h)` (`shape` gaussian: `phi = u²/2`, or exponential: `phi = u`) with the scales `l_h` spaced geometrically
 over `[scale_min_um, scale_max_um]`. It is a prior: **not zero at step 0**, unlike every other bias (the "a bias starts at zero"
 convention of the other kinds does not hold). Scales and strength are learned unless `frozen`. Dense and pair forms only (not the
-Performer). With the long-range mask on, `scale_min_um` should be about the local reach.
+Performer). With the long-range mask on, `scale_min_um` should be about the local reach. `pe.distance.scales_um` gives the windows
+per head instead (one per served head; `evaluation.gene_scales.window_scales` reads them off measured length scales: quantiles of
+the variable genes' `ell_um`).
+
+**A bias for a set of heads** (`pe.bias_heads.<kind>`, a list of head indices; empty = every head; `.claude/attention_plan.md`, stage
+10a). Each bias is built for the heads it serves (the scales prior deals its windows over them) and `AttentionBias.place` puts its
+values into the full head axis, zero for the other heads, in every form: dense, `pairs`, `rows` (fused), `factors` (both factors
+zero, so `U W^T` is exactly 0) and the hierarchy's `offset_bias`. A head no bias serves is free: content only (plus RoPE). Each
+encoder carries `served_heads`; a readout of per-head parameters (the window table) must name heads by it, not by position.
+Checkpoint tag `@<heads>` after the bias name, `gl<scales>` for given windows.
+
+**Distances in local units** (`pe.distance.units: local`, `density_k`, `density_ref_um`): every distance a distance bias reads is
+multiplied by the query's density factor `density_ref / r_q` (`positional_encodings.density_factor`), `r_q` the query cell's
+distance to its `density_k`-th nearest cell of its graph. Invariants:
+- **Positions alone.** `density_radius` is precomputed per graph (`attach_positional_inputs`, the distance spec's `precompute`),
+  over every cell of the graph (also those `pad_batch` drops), from `pos`; it is a reserved field. No expression enters.
+- **The query's, not the pair's.** Asymmetric by design: a window spans the same number of neighbours wherever its query sits.
+  Padding (radius 0) gets factor 1; its rows are zeroed anyway. The dense, `pairs` and `rows` forms scale the query rows alike.
+- **The hierarchy** reads a cluster's radius as the mean over all its cells (`level_radii`); every `offset_bias` call passes the
+  query rows' radii and refuses to run without them. The export carries `radius_um`, and `hierarchy_readouts.window_rows` takes it.
+- `density_ref_um` 0 is derived at model build (`resolve_density_reference`: the median radius over the data) and kept as a buffer
+  (`density_ref`), so the checkpoint keeps the density its windows were trained at. Tag `-loc<k>`.
 
 `attention.visible_keys_only` (default off) blocks, in the dense mask of `common_step_local_to_global`, every key that is a cell hidden
 whole (`GlobalModule.wholly_hidden`); a hidden cell still queries, CLS stays open, a clean pass (`eval_step`) is untouched. The key
@@ -521,6 +542,19 @@ cell. Invariants:
   seeded random places, non-overlapping, each at least 85% tissue by position alone) and the streams (`shade`, the `out - in` behind them, is off by default).
   The user wants sources or sinks found, if there are any, not made: nothing in these views selects cells, places or a share of either by what it shows. The
   mask still shapes the flow (hidden cells read their visible neighbours), so read every view against the untrained twin's.
+
+#### Embedding dimensions (`evaluation/dimensions.py`; `.claude/roadmap.md`, task 2, ED0-ED2)
+
+What the decoder reads off each dimension of the embedding a **linear** decoder reads (a GlobalModel's global tokens, hierarchical
+included; a LocalModel's local embedding), read on a masked pass in the hidden cells. `collect_dimensions` (ED0) returns the
+rows the decoder read, in `y_pred` order (decoded, they are the context part of the prediction), the truth, the hidden entries,
+`W`, `b`; with `folds` every cell is hidden once and the graphs' masks are put back; a nonlinear decoder is refused; no global
+generator is touched. ED1 `dimension_importance` (standardised loading, variance share of the centred parts, ablation to the mean
+in centred cosine), `effective_directions` (SVD of `W Σ_z^{1/2}`: the only rotation-free reading -- single dimensions are one basis
+of many); ED2 `dimension_genes` (writes: top `|S|`; tracks: Spearman of `z_k` with each gene's true expression over the cells where
+it was hidden), `track_summary` against the untrained twin. All shift-invariant: a shift of `z` the bias takes back changes nothing
+(tested). `dimension_tables` gives the report tables (`dim_*`); the CosMx hook (`slurm/new/hier_common.py`) writes them unless
+`DIMENSIONS` is False, fold by fold with `DIMENSION_FOLDS`.
 
 #### Online probes (`evaluation/online_probes.py`)
 

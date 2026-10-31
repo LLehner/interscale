@@ -1260,3 +1260,31 @@ visible_mean` for GlobalModel and LocalModel, and `masked_probing.within_section
   `pool_fill`).
 - Within sections the slide mean is the centre: its cosine is float32 rounding noise around 0, not exactly 0 or NaN.
 - Nothing run on CosMx yet; `within_section` is not in `sweep_common.py` (cluster scripts) yet.
+
+## 2026-10-31 — Tier 2: a bias for a set of heads, window scales from the data, distances in local units, the dimension readout (code and tests; not run on data)
+
+Built on branch `tier1-real-data` (roadmap.md, "Tier 2"): `pe.bias_heads.<kind>` (attention_plan.md stage 10a) with `pe.distance.scales_um`
+and `gene_scales.window_scales`; `pe.distance.units: local` (density-scaled distances); `evaluation.dimensions` (task 2, ED0-ED2), wired into
+`slurm/new/hier_common.py` (`dim_*` tables). Toy models only, CPU.
+
+**What worked**
+- A head a bias does not serve gets exactly 0 from it in the dense, pair, row and factor forms and in the hierarchy's `offset_bias`; the served
+  heads get what a bias built for them alone gives; with a free head the fused model equals the dense one (one block and blocks).
+- Local units: the dense bias is the encoder at each query row's scaled distances (asymmetric, as meant); pairs and rows equal dense; at the
+  reference density the bias is the µm one; fused = dense and the singleton hierarchy (dense and routed) = dense under local units.
+- The dimension readout: decoded, the collected rows are the step's prediction (GlobalModel, LocalModel); on a planted readout the dimension
+  that writes the signal tops all three importance readings, writes and tracks its genes, and lifts above an untrained twin; every reading is
+  unchanged by a shift of `z` the bias takes back, and the singular directions by a rotation of the dimensions.
+- Mutation checks: 16 / 16 (bias heads; 2 after stronger tests), 13 / 13 (local units; 4 after: a 0.5 µm unit, jittered lattices, a small
+  readout block, a `level_radii` helper tested on its own), 11 / 11 (dimensions; 4 after: shifted `z`, a negative weight, the twin's mean).
+  Full suite 1,623 passed; harness IDENTICAL after each commit.
+
+**What doesn't work / found on the way**
+- **On a regular lattice local units do almost nothing.** synth_spot's kNN radii are one value for nearly every spot (only edges, corners and
+  holes differ), so `units: local` there is the µm model up to the border. It is meant for CosMx and the lung data; a synth_spot read of it says
+  nothing about uneven tissue -- the same lattice symmetry first hid a misaligned-radius bug in the tests.
+- **`W diag(std z)` is not rotation-free** when the embedding's dimensions are correlated, as task 2's design said it was; the readout uses
+  `W Σ_z^{1/2}` (equal to it for uncorrelated dimensions).
+- The window table of `hier_common.py` numbered heads by position: with `bias_heads` that names the wrong head; it now reads `served_heads`.
+- Not built: ED3 (spatial variability against matched gene sets), ED4 (cell type, planted truth), the PCA control of ED2, an elbow plot,
+  stage 10b; nothing run on data.
