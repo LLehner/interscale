@@ -461,3 +461,159 @@ def test_hierarchy_readouts_writes_the_flow_without_touching_the_rng(tmp_path):
         module, [graph], prediction_task="regression", prediction_level="node", device=torch.device("cpu")
     )
     assert "hier_flow" not in nothing  # off unless asked
+
+
+# --------------------------------------------------------------------------- sources, sinks, who influences whom
+
+
+def _star(n_side=21, radius=50.0):
+    """A lattice whose cells within ``radius`` of the centre read the centre cell (0.5) and are read by it 0.1: a planted source."""
+
+    pos = _sheet(n_side, n_side)
+    centre = int(np.argmin(np.linalg.norm(pos - pos.mean(0), axis=1)))
+    readers = np.flatnonzero((np.linalg.norm(pos - pos[centre], axis=1) <= radius) & (np.arange(len(pos)) != centre))
+    keys = -np.ones((len(pos), len(readers)), dtype=np.int64)
+    weights = np.zeros((1, len(pos), len(readers)), dtype=np.float32)
+    keys[readers, 0], weights[0, readers, 0] = centre, 0.5
+    keys[centre], weights[0, centre] = readers, 0.1
+    return pos, centre, readers, torch.as_tensor(keys), torch.as_tensor(weights)
+
+
+def test_out_and_in_strength_are_the_divergence_of_the_net_flow():
+    from interscale.evaluation.flow_maps import cell_strengths
+
+    source, receiver, flow = np.array([0, 0, 1, 3]), np.array([1, 2, 2, 2]), np.array([0.4, 0.1, 0.2, 0.3])
+    out, into = cell_strengths(4, source, receiver, flow)
+    assert np.allclose(out, [0.5, 0.2, 0, 0.3]) and np.allclose(into, [0, 0.4, 0.6, 0])
+    assert np.isclose((out - into).sum(), 0.0)  # what leaves one cell enters another
+    pos, centre, readers, keys, weights = _star()
+    arrays, _ = flow_arrays(keys, weights, pos, np.ones(len(pos)))
+    net = arrays["flow_out"] - arrays["flow_in"]
+    assert np.isclose(net[centre], 0.4 * len(readers)) and np.allclose(
+        net[readers], -0.4
+    )  # the planted source, its sinks
+    assert np.isclose(net.sum(), 0.0, atol=1e-5)
+
+
+def test_the_smoothed_source_sink_value_has_the_planted_sign():
+    from interscale.evaluation.flow_maps import smoothed_net
+
+    pos, centre, readers, keys, weights = _star(radius=40.0)
+    arrays, _ = flow_arrays(keys, weights, pos, np.ones(len(pos)))
+    grid, value, tissue = smoothed_net(arrays, bandwidth_um=4.0)
+    ring = readers[
+        np.linalg.norm(pos[readers] - pos[centre], axis=1) >= 20
+    ]  # the centre's own bin bleeds into its first ring
+    assert value[centre] > 0 and (value[ring] < 0).all()
+    far = np.linalg.norm(pos - pos[centre], axis=1) > 120
+    assert np.allclose(value[far], 0.0, atol=1e-6)  # nothing happens away from the star
+    old = {k: v for k, v in arrays.items() if k not in ("flow_out", "flow_in")}
+    with pytest.raises(ValueError, match="flow_out"):
+        smoothed_net(old)
+
+
+def test_sampled_pairs_take_hidden_receivers_and_their_strongest_sources_first():
+    from interscale.evaluation.flow_maps import sample_pairs
+
+    visible = np.array([1, 1, 1, 0, 0, 1])
+    source = np.array([0, 1, 2, 0, 2, 0, 1])
+    receiver = np.array([3, 3, 3, 4, 4, 5, 5])
+    flow = np.array([0.1, 0.5, 0.3, 0.2, 0.7, 0.9, 0.4], dtype=np.float32)
+    pairs = sample_pairs(visible, source, receiver, flow, receivers=10, top=2)
+    assert pairs["pair_receiver"].tolist() == [
+        3,
+        4,
+    ]  # the hidden cells; cell 5 (visible) is not drawn while hidden ones exist
+    assert pairs["pair_source"].tolist() == [[1, 2], [2, 0]] and np.allclose(
+        pairs["pair_flow"], [[0.5, 0.3], [0.7, 0.2]]
+    )
+    one = sample_pairs(visible, source, receiver, flow, receivers=1, top=4)
+    assert len(one["pair_receiver"]) == 1 and one["pair_source"].shape == (1, 4) and (one["pair_source"][0, 3] == -1)
+    assert np.array_equal(
+        sample_pairs(visible, source, receiver, flow, receivers=1)["pair_receiver"], one["pair_receiver"]
+    )  # seeded
+    none_hidden = sample_pairs(np.ones(6), source, receiver, flow, receivers=10, top=1)
+    assert none_hidden["pair_receiver"].tolist() == [3, 4, 5]
+
+
+def test_the_source_sink_map_and_the_who_whom_panels_are_drawn(tmp_path, monkeypatch):
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import PathCollection
+
+    from interscale.evaluation.flow_maps import plot_source_sink, plot_who_whom
+
+    pos, centre, readers, keys, weights = _star(n_side=30, radius=40.0)
+    visible = np.ones(len(pos))
+    visible[readers] = 0  # the readers are the hidden cells: one patch
+    arrays, _ = flow_arrays(keys, weights, pos, visible)
+    seen = []
+    monkeypatch.setattr(plt, "close", lambda fig=None: seen.append(fig))
+    out = plot_source_sink(arrays, tmp_path / "ss.png", min_cells=50, bandwidth_um=4.0, hubs=0.01)
+    assert out["blocks"] == 1 and (tmp_path / "ss.png").stat().st_size > 1000
+    tile = max(seen[-1].axes, key=lambda ax: ax.get_xlim()[1] - ax.get_xlim()[0])
+    dots = [c for c in tile.collections if isinstance(c, PathCollection)]
+    assert sum(len(c.get_offsets()) for c in dots[:1]) == len(pos)  # every cell coloured once
+    rings = sum(len(c.get_offsets()) for c in dots[2:])
+    assert (
+        1 <= rings <= int(np.ceil(0.01 * len(pos))) + 2 and np.isclose(dots[2].get_offsets()[0], pos[centre]).all()
+    )  # the source ringed
+    panels = plot_who_whom(arrays, tmp_path / "ww.png", panels=8, min_hidden=5)
+    assert panels == {"panels": 1, "pairs": len(readers)}  # one hidden patch, every reader's one source drawn
+    with pytest.raises(ValueError, match="sampled pairs"):
+        plot_who_whom({k: v for k, v in arrays.items() if not k.startswith("pair_")}, tmp_path / "x.png")
+
+
+def test_the_streams_carry_the_source_sink_shading_unless_switched_off(tmp_path, monkeypatch):
+    import matplotlib.pyplot as plt
+
+    pos = _sheet(40, 25)
+    arrays, _ = flow_arrays(*_left_reads_more(pos), pos, np.ones(len(pos)))
+    images = {}
+    for shade in (True, False):
+        seen = []
+        monkeypatch.setattr(plt, "close", lambda fig=None, seen=seen: seen.append(fig))
+        plot_attention_flow(arrays, tmp_path / f"s{shade}.png", min_cells=50, shade=shade)
+        images[shade] = sum(len(ax.images) for ax in seen[0].axes)
+    assert images == {True: 1, False: 0}
+    old = {k: v for k, v in arrays.items() if k not in ("flow_out", "flow_in")}
+    plot_attention_flow(
+        old, tmp_path / "old.png", min_cells=50
+    )  # an npz from before the strengths: no shading, no error
+
+
+def test_the_sample_is_seeded_and_a_bin_of_several_cells_averages_them(tmp_path):
+    from interscale.evaluation.flow_maps import sample_pairs, smoothed_net
+
+    n = 400
+    visible = np.zeros(n)
+    receiver, source = np.arange(1, n), np.arange(n - 1)
+    flow = np.linspace(0.1, 1.0, n - 1).astype(np.float32)
+    draws = [sample_pairs(visible, source, receiver, flow, receivers=20)["pair_receiver"] for _ in range(2)]
+    assert np.array_equal(*draws) and len(draws[0]) == 20
+    assert not np.array_equal(
+        draws[0], sample_pairs(visible, source, receiver, flow, receivers=20, seed=1)["pair_receiver"]
+    )
+    # cells 5 um apart: four to a 10 um bin; with no smoothing a bin's value is the mean of its cells' out - in
+    pos = _sheet(20, 20, step=5.0)
+    arrays, _ = flow_arrays(*_left_reads_more(pos, step=5.0), pos, np.ones(len(pos)), grid_um=10.0)
+    _, value, _ = smoothed_net(arrays, bandwidth_um=1e-6)
+    net = arrays["flow_out"] - arrays["flow_in"]
+    at = np.floor((pos - arrays["flow_origin"]) / 10.0).astype(int)
+    for b in {tuple(a) for a in at[:40]}:
+        same = (at == b).all(1)
+        assert same.sum() >= 2 and np.allclose(value[same], net[same].mean(), atol=1e-5)
+
+
+def test_a_who_whom_panel_draws_only_the_receivers_in_its_view(tmp_path):
+    from interscale.evaluation.flow_maps import plot_who_whom
+
+    pos = _sheet(80, 30)
+    visible = np.ones(len(pos))
+    big = (pos[:, 0] < 100) & (pos[:, 1] < 100)  # 100 hidden cells in one corner
+    small = (pos[:, 0] > 600) & (pos[:, 0] < 650) & (pos[:, 1] > 100) & (pos[:, 1] < 150)  # 16 hidden cells 500 um away
+    visible[big | small] = 0
+    arrays, _ = flow_arrays(*_left_reads_more(pos), pos, visible)
+    out = plot_who_whom(arrays, tmp_path / "ww.png", panels=1, view_um=260.0, min_hidden=5)
+    hidden_receivers = arrays["pair_receiver"]
+    in_big = big[hidden_receivers] & (arrays["pair_source"][:, 0] >= 0)
+    assert out["panels"] == 1 and out["pairs"] == int(in_big.sum()) and small[hidden_receivers].any()

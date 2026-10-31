@@ -39,6 +39,8 @@ from scipy.sparse import coo_matrix, csr_matrix
 
 #: The arrays :func:`flow_arrays` puts into a slide's npz (besides ``pos_um`` and ``visible``).
 GRID_KEYS = ("flow_ux", "flow_uy", "flow_mass", "flow_cells", "flow_origin", "flow_grid_um")
+#: The per-cell and per-pair arrays it adds: each cell's net flow out and in, and the sampled receivers' top sources.
+CELL_KEYS = ("flow_out", "flow_in", "pair_receiver", "pair_source", "pair_flow")
 
 
 def attention_matrix(keys, weights, n: int) -> csr_matrix:
@@ -137,9 +139,54 @@ def flow_summary(pos, visible, source, receiver, flow, mutual_share: float = flo
     }
 
 
-def flow_arrays(keys, weights, pos_um, visible, *, grid_um: float = 10.0, mutual: bool = True):
-    """``(arrays, summary)`` of one slide from its cell-level rows: the npz arrays (``pos_um``, ``visible``, the grid) and
-    :func:`flow_summary`. ``keys`` ``[n, K]`` and ``weights`` ``[H, n, K]`` as ``hierarchy_readouts.cell_rows`` returns them.
+def cell_strengths(n: int, source, receiver, flow) -> tuple[np.ndarray, np.ndarray]:
+    """``(out, in)`` ``[n]``: each cell's net flow sent (as a source) and received (as a receiver). ``out - in`` is the exact
+    divergence of the net flow at the cell: positive for a source (read more than it reads), negative for a sink.
+    """
+    f = np.asarray(flow, dtype=np.float64)
+    out = np.bincount(np.asarray(source, dtype=np.int64), weights=f, minlength=n)
+    into = np.bincount(np.asarray(receiver, dtype=np.int64), weights=f, minlength=n)
+    return out.astype(np.float32), into.astype(np.float32)
+
+
+def sample_pairs(
+    visible, source, receiver, flow, *, receivers: int = 2000, top: int = 5, seed: int = 0
+) -> dict[str, np.ndarray]:
+    """The ``top`` sources of up to ``receivers`` receivers, by net flow: ``pair_receiver`` ``[R]``, ``pair_source`` and
+    ``pair_flow`` ``[R, top]`` (-1 and 0 where a receiver has fewer). Hidden cells with an inflow are drawn first (the cells the
+    model is asked about), else any cell with one; from a private generator, sorted.
+    """
+    n = len(visible)
+    receiver, source = np.asarray(receiver, dtype=np.int64), np.asarray(source, dtype=np.int64)
+    flow = np.asarray(flow, dtype=np.float32)
+    has = np.zeros(n, dtype=bool)
+    has[receiver] = True
+    hidden = np.asarray(visible) == 0
+    pool = np.flatnonzero(has & hidden)
+    if not len(pool):
+        pool = np.flatnonzero(has)
+    rng = np.random.default_rng(seed)
+    chosen = np.sort(rng.choice(pool, size=min(int(receivers), len(pool)), replace=False)) if len(pool) else pool
+    slot = np.full(n, -1, dtype=np.int64)
+    slot[chosen] = np.arange(len(chosen))
+    keep = slot[receiver] >= 0
+    r, src, f = receiver[keep], source[keep], flow[keep]
+    order = np.lexsort((-f, r))
+    r, src, f = r[order], src[order], f[order]
+    start = np.searchsorted(r, r, side="left")
+    rank = np.arange(len(r)) - start
+    take = rank < top
+    pair_source = np.full((len(chosen), top), -1, dtype=np.int64)
+    pair_flow = np.zeros((len(chosen), top), dtype=np.float32)
+    pair_source[slot[r[take]], rank[take]] = src[take]
+    pair_flow[slot[r[take]], rank[take]] = f[take]
+    return {"pair_receiver": chosen.astype(np.int64), "pair_source": pair_source, "pair_flow": pair_flow}
+
+
+def flow_arrays(keys, weights, pos_um, visible, *, grid_um: float = 10.0, mutual: bool = True, receivers: int = 2000):
+    """``(arrays, summary)`` of one slide from its cell-level rows: the npz arrays (``pos_um``, ``visible``, the grid, each cell's
+    ``flow_out`` / ``flow_in`` (:func:`cell_strengths`) and the sampled pairs (:func:`sample_pairs`)) and :func:`flow_summary`.
+    ``keys`` ``[n, K]`` and ``weights`` ``[H, n, K]`` as ``hierarchy_readouts.cell_rows`` returns them.
     """
     pos = np.asarray(pos_um, dtype=np.float32)
     n = len(pos)
@@ -147,6 +194,8 @@ def flow_arrays(keys, weights, pos_um, visible, *, grid_um: float = 10.0, mutual
     source, receiver, flow, mutual_share = net_flow_pairs(A, mutual=mutual)
     arrays = {"pos_um": pos, "visible": np.asarray(visible, dtype=np.float32)}
     arrays |= flow_grid(pos, source, receiver, flow, grid_um=grid_um)
+    arrays["flow_out"], arrays["flow_in"] = cell_strengths(n, source, receiver, flow)
+    arrays |= sample_pairs(arrays["visible"], source, receiver, flow, receivers=receivers)
     return arrays, flow_summary(pos, visible, source, receiver, flow, mutual_share)
 
 
@@ -271,6 +320,121 @@ def smoothed_field(data, bandwidth_um: float = 30.0, min_density: float = 0.3):
     return np.where(tissue, ux / safe, 0.0), np.where(tissue, uy / safe, 0.0), tissue
 
 
+def smoothed_net(data, bandwidth_um: float = 30.0, min_density: float = 0.3):
+    """``(net_grid [nx, ny], net_cell [n], tissue)``: each cell's ``flow_out - flow_in`` (the divergence of the net flow)
+    Gaussian-smoothed per cell on the slide's grid, and read back at every cell. Positive: a source, negative: a sink.
+    """
+    if "flow_out" not in data:
+        raise ValueError("this npz has no flow_out / flow_in: write it again with flow_maps.flow_arrays.")
+    grid = float(data["flow_grid_um"])
+    origin = np.asarray(data["flow_origin"], dtype=np.float64)
+    pos = np.asarray(data["pos_um"], dtype=np.float64)[:, :2]
+    shape = np.asarray(data["flow_cells"]).shape
+    at = np.clip(np.floor((pos - origin) / grid).astype(np.int64), 0, np.array(shape) - 1)
+    net = np.asarray(data["flow_out"], dtype=np.float64) - np.asarray(data["flow_in"], dtype=np.float64)
+    deposit = np.zeros(shape)
+    np.add.at(deposit, (at[:, 0], at[:, 1]), net)
+    sigma = max(float(bandwidth_um) / grid, 1e-3)
+    smooth, cells = (
+        ndimage.gaussian_filter(deposit, sigma),
+        ndimage.gaussian_filter(np.asarray(data["flow_cells"], dtype=np.float64), sigma),
+    )
+    occupied = np.asarray(data["flow_cells"]) > 0
+    tissue = cells >= float(min_density) * cells[occupied].mean()
+    value = np.where(tissue, smooth / np.where(tissue, cells, 1.0), 0.0)
+    return value, value[at[:, 0], at[:, 1]], tissue
+
+
+class _Tiles:
+    """One slide's figure: a tile per tissue block at one scale (only tissue), a header with a title, a caption, a colour bar
+    and a 100 µm bar. ``axes[k]`` draws block ``k``; ``members[k]`` its cells.
+    """
+
+    def __init__(self, data, *, link_um, min_cells, width_in, tile_in, dpi):
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        self.plt = plt
+        self.pos = np.asarray(data["pos_um"], dtype=np.float64)[:, :2]
+        self.hidden = np.asarray(data["visible"]) == 0
+        block = tissue_blocks(self.pos, link_um=link_um, min_cells=min_cells)
+        ids = np.unique(block[block >= 0])
+        if not len(ids):
+            raise ValueError(f"no tissue block of at least {min_cells} cells to draw.")
+        margin = 0.5 * float(link_um)
+        self.members = [block == b for b in ids]
+        self.boxes_um = [(self.pos[m].min(0) - margin, self.pos[m].max(0) + margin) for m in self.members]
+        boxes, self.scale, height = tile_layout(
+            np.array([h - lo for lo, h in self.boxes_um]), width_in=width_in, tile_in=tile_in
+        )
+        self.header = 0.95
+        self.total = height + self.header + 0.06
+        self.width = max(float((boxes[:, 0] + boxes[:, 2]).max()), 9.0)
+        self.fig = plt.figure(figsize=(self.width, self.total), dpi=dpi, facecolor="white")
+        self.dpi = dpi
+        self.axes = []
+        for k, (low, high) in enumerate(self.boxes_um):
+            left, top, w, h = boxes[k]
+            ax = self.fig.add_axes(
+                [left / self.width, 1 - (self.header + top + h) / self.total, w / self.width, h / self.total]
+            )
+            ax.set_xlim(low[0], high[0])
+            ax.set_ylim(low[1], high[1])
+            ax.set_facecolor("#fbfbfb")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_color("#dddddd")
+                spine.set_linewidth(0.6)
+            self.axes.append(ax)
+        self.drawn = int((block >= 0).sum())
+        self.dot = max(1.5, (8.0 * self.scale * 72.0) ** 2)  # a dot of 8 µm: points^2 at this scale
+
+    def label(self, k, extra=""):
+        ax = self.axes[k]
+        low, high = self.boxes_um[k]
+        ax.set_xlim(low[0], high[0])
+        ax.set_ylim(low[1], high[1])
+        ax.text(
+            0.012,
+            0.985,
+            f"{k + 1} · {int(self.members[k].sum()):,} cells{extra}",
+            transform=ax.transAxes,
+            fontsize=7,
+            color="#444444",
+            va="top",
+            zorder=6,
+            bbox={"facecolor": "white", "alpha": 0.85, "pad": 1.5, "linewidth": 0},
+        )
+
+    def finish(self, out_path, title, caption, mappable, bar_label):
+        from matplotlib.lines import Line2D
+
+        fig, total, width = self.fig, self.total, self.width
+        fig.text(0.004, 1 - 0.12 / total, title, fontsize=11, weight="bold", va="top", ha="left")
+        fig.text(0.004, 1 - 0.38 / total, caption, fontsize=8, va="top", ha="left", color="#444444")
+        right = (width - 3.1) / width
+        cax = fig.add_axes([right, 1 - 0.30 / total, 2.9 / width, 0.08 / total])
+        cb = fig.colorbar(mappable, cax=cax, orientation="horizontal")
+        cb.set_label(bar_label, fontsize=7)
+        cb.ax.tick_params(labelsize=6)
+        bar = 100.0 * self.scale
+        fig.add_artist(Line2D([right, right + bar / width], [1 - 0.80 / total] * 2, color="#333333", lw=2))
+        fig.text(right + bar / width + 0.004, 1 - 0.80 / total, "100 µm", fontsize=7, va="center")
+        fig.savefig(out_path, dpi=self.dpi, facecolor="white")
+        self.plt.close(fig)
+        return {"blocks": len(self.axes), "cells": self.drawn, "dropped": int(len(self.pos) - self.drawn)}
+
+
+#: Sinks blue, sources red, nothing grey: the source-sink colour map.
+def _diverging():
+    from matplotlib.colors import LinearSegmentedColormap
+
+    return LinearSegmentedColormap.from_list("source_sink", ["#2166ac", "#92c5de", "#e3e3e3", "#f4a582", "#b2182b"])
+
+
 def plot_attention_flow(
     source,
     out_path,
@@ -278,6 +442,7 @@ def plot_attention_flow(
     title: str = "",
     bandwidth_um: float = 30.0,
     cells: bool = True,
+    shade: bool = True,
     link_um: float = 60.0,
     min_cells: int = 100,
     width_in: float = 16.0,
@@ -290,82 +455,83 @@ def plot_attention_flow(
 
     ``source``: the npz :func:`flow_arrays` wrote (path) or its arrays. All tiles share one scale, so a stream's width and
     colour (the net current per cell, one colour bar) compare across tiles, and nothing but tissue is drawn. ``cells``: draw
-    the cells (grey; hidden ones tinted) under the streams, else the streams alone; ``min_flow``: no stream where the net
-    current is under that share of the colour scale's end (a weak field is noise, drawn as tangle). Returns ``{"blocks": B, "cells": drawn,
-    "dropped": cells in dropped blocks}``.
+    the cells (grey; hidden ones tinted) under the streams, else the streams alone; ``shade``: the smoothed source-sink value
+    (:func:`smoothed_net`) behind them, sources red and sinks blue (needs ``flow_out``; skipped for an older npz); ``min_flow``:
+    no stream where the net current is under that share of the colour scale's end (a weak field is noise, drawn as tangle).
+    Returns ``{"blocks": B, "cells": drawn, "dropped": cells in dropped blocks}``.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     from matplotlib.colors import Normalize
-    from matplotlib.lines import Line2D
 
     data = np.load(source) if isinstance(source, str | Path) else source
-    pos = np.asarray(data["pos_um"], dtype=np.float64)[:, :2]
-    hidden = np.asarray(data["visible"]) == 0
-    block = tissue_blocks(pos, link_um=link_um, min_cells=min_cells)
-    ids = np.unique(block[block >= 0])
-    if not len(ids):
-        raise ValueError(f"no tissue block of at least {min_cells} cells to draw.")
+    t = _Tiles(data, link_um=link_um, min_cells=min_cells, width_in=width_in, tile_in=tile_in, dpi=dpi)
     U, V, tissue = smoothed_field(data, bandwidth_um)
     grid, origin = float(data["flow_grid_um"]), np.asarray(data["flow_origin"], dtype=np.float64)
     magnitude = np.hypot(U, V)
+    shape = np.array(tissue.shape) - 1
+    windows = []
     inside = np.zeros_like(tissue)
-    margin = 0.5 * float(link_um)
-    boxes_um = []
-    for b in ids:
-        p = pos[block == b]
-        boxes_um.append((p.min(0) - margin, p.max(0) + margin))
-    for low, high in boxes_um:
-        lo = np.clip(np.floor((low - origin) / grid).astype(int), 0, np.array(tissue.shape) - 1)
-        hi = np.clip(np.ceil((high - origin) / grid).astype(int), 0, np.array(tissue.shape) - 1)
+    for low, high in t.boxes_um:
+        lo = np.clip(np.floor((low - origin) / grid).astype(int), 0, shape)
+        hi = np.clip(np.ceil((high - origin) / grid).astype(int), 0, shape)
+        windows.append((lo, hi))
         inside[lo[0] : hi[0] + 1, lo[1] : hi[1] + 1] = True
     reference = float(np.quantile(magnitude[tissue & inside], 0.99)) if (tissue & inside).any() else 0.0
     reference = reference if reference > 0 else 1.0
     norm = Normalize(0.0, reference)
-
-    sizes = np.array([high - low for low, high in boxes_um])
-    boxes, scale, height = tile_layout(sizes, width_in=width_in, tile_in=tile_in)
-    header, foot = 0.95, 0.06
-    total = height + header + foot
-    width_in = max(float((boxes[:, 0] + boxes[:, 2]).max()), 9.0)  # as wide as the packed rows, no margin
-    fig = plt.figure(figsize=(width_in, total), dpi=dpi, facecolor="white")
-    grey, tint, stream_map = "#cfcfcf", "#f0a58a", plt.get_cmap("viridis")
-    for k, (low, high) in enumerate(boxes_um):
-        left, top, w, h = boxes[k]
-        ax = fig.add_axes([left / width_in, 1 - (header + top + h) / total, w / width_in, h / total])
-        ax.set_xlim(low[0], high[0])
-        ax.set_ylim(low[1], high[1])
-        ax.set_facecolor("#fbfbfb")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_color("#dddddd")
-            spine.set_linewidth(0.6)
-        mine = block == ids[k]
-        if cells:
-            dot = max(1.5, (8.0 * scale * 72.0) ** 2)  # a dot of 8 µm: points^2 at this scale
-            ax.scatter(
-                pos[mine & ~hidden, 0], pos[mine & ~hidden, 1], s=dot, c=grey, marker="o", linewidths=0, zorder=1
-            )
-            ax.scatter(pos[mine & hidden, 0], pos[mine & hidden, 1], s=dot, c=tint, marker="o", linewidths=0, zorder=2)
-        lo = np.clip(np.floor((low - origin) / grid).astype(int), 0, np.array(tissue.shape) - 1)
-        hi = np.clip(np.ceil((high - origin) / grid).astype(int), 0, np.array(tissue.shape) - 1)
+    net = None
+    if shade and "flow_out" in data:
+        net, _, _ = smoothed_net(data, bandwidth_um)
+        limit = float(np.quantile(np.abs(net[tissue & inside]), 0.99)) if (tissue & inside).any() else 0.0
+        net_norm = Normalize(-(limit or 1.0), limit or 1.0)
+    grey, tint, stream_map = "#cfcfcf", "#f0a58a", t.plt.get_cmap("viridis")
+    for k, ax in enumerate(t.axes):
+        mine, hidden, pos = t.members[k], t.hidden, t.pos
+        lo, hi = windows[k]
+        sl = (slice(lo[0], hi[0] + 1), slice(lo[1], hi[1] + 1))
         xs = origin[0] + (np.arange(lo[0], hi[0] + 1) + 0.5) * grid
         ys = origin[1] + (np.arange(lo[1], hi[1] + 1) + 0.5) * grid
-        sl = (slice(lo[0], hi[0] + 1), slice(lo[1], hi[1] + 1))
+        if net is not None:
+            ax.imshow(
+                np.ma.array(net[sl].T, mask=~tissue[sl].T),
+                origin="lower",
+                extent=(xs[0] - grid / 2, xs[-1] + grid / 2, ys[0] - grid / 2, ys[-1] + grid / 2),
+                cmap=_diverging(),
+                norm=net_norm,
+                interpolation="bilinear",
+                zorder=0,
+                aspect="auto",
+            )
+        if cells:
+            alpha = 0.45 if net is not None else 1.0
+            ax.scatter(
+                pos[mine & ~hidden, 0],
+                pos[mine & ~hidden, 1],
+                s=t.dot,
+                c=grey,
+                alpha=alpha,
+                marker="o",
+                linewidths=0,
+                zorder=1,
+            )
+            ax.scatter(
+                pos[mine & hidden, 0],
+                pos[mine & hidden, 1],
+                s=t.dot,
+                c=tint,
+                alpha=alpha,
+                marker="o",
+                linewidths=0,
+                zorder=2,
+            )
         mask = ~tissue[sl].T | (magnitude[sl].T < float(min_flow) * reference)
-        u = np.ma.array(U[sl].T, mask=mask)
-        v = np.ma.array(V[sl].T, mask=mask)
         m = np.ma.array(magnitude[sl].T, mask=mask)
         if m.count() and float(m.max()) > 0 and len(xs) > 2 and len(ys) > 2:
             strength = np.ma.filled(m, 0.0)
             ax.streamplot(
                 xs,
                 ys,
-                u,
-                v,
+                np.ma.array(U[sl].T, mask=mask),
+                np.ma.array(V[sl].T, mask=mask),
                 color=strength,
                 cmap=stream_map,
                 norm=norm,
@@ -374,41 +540,214 @@ def plot_attention_flow(
                 arrowsize=0.9,
                 zorder=3,
             )
+        t.label(k)
+    caption = (
+        "Net attention flow, last layer, head mean: A - A^T over cell pairs. Streams point from the cells being read to the cells that read them; "
+        "width and colour: net current per cell.\n"
+        + (
+            "Behind them the source-sink value (out - in, smoothed): red sources, blue sinks. "
+            if net is not None
+            else ""
+        )
+        + f"Hidden cells (tinted) are what the model was asked about; {t.drawn:,} of {len(t.pos):,} cells in {len(t.axes)} blocks."
+    )
+    return t.finish(
+        out_path, title, caption, t.plt.cm.ScalarMappable(norm=norm, cmap=stream_map), "net current per cell (a.u.)"
+    )
+
+
+def plot_source_sink(
+    source,
+    out_path,
+    *,
+    title: str = "",
+    bandwidth_um: float = 30.0,
+    hubs: float = 0.01,
+    link_um: float = 60.0,
+    min_cells: int = 100,
+    width_in: float = 16.0,
+    tile_in: float = 3.8,
+    dpi: int = 120,
+) -> dict:
+    """The source-sink map of one slide: every cell coloured by its smoothed ``out - in`` (:func:`smoothed_net`), red where it
+    is read more than it reads (a source), blue where it reads more (a sink), on one symmetric scale for the slide; the
+    ``hubs`` share of cells with the largest |value| ringed (sources dark red, sinks dark blue), hidden cells marked by a dot.
+    """
+    from matplotlib.colors import Normalize
+
+    data = np.load(source) if isinstance(source, str | Path) else source
+    t = _Tiles(data, link_um=link_um, min_cells=min_cells, width_in=width_in, tile_in=tile_in, dpi=dpi)
+    _, value, _ = smoothed_net(data, bandwidth_um)
+    drawn = np.any(t.members, axis=0)
+    limit = float(np.quantile(np.abs(value[drawn]), 0.99)) if drawn.any() else 0.0
+    norm = Normalize(-(limit or 1.0), limit or 1.0)
+    cut = float(np.quantile(np.abs(value[drawn]), 1.0 - float(hubs))) if drawn.any() and hubs > 0 else np.inf
+    cmap = _diverging()
+    for k, ax in enumerate(t.axes):
+        mine = t.members[k]
+        order = np.flatnonzero(mine)[np.argsort(np.abs(value[mine]))]  # strongest last, on top
+        ax.scatter(
+            t.pos[order, 0],
+            t.pos[order, 1],
+            s=t.dot,
+            c=value[order],
+            cmap=cmap,
+            norm=norm,
+            marker="o",
+            linewidths=0,
+            zorder=1,
+        )
+        hid = mine & t.hidden
+        ax.scatter(
+            t.pos[hid, 0], t.pos[hid, 1], s=max(0.3, t.dot * 0.08), c="#333333", marker="o", linewidths=0, zorder=2
+        )
+        for sign, colour in ((1, "#67001f"), (-1, "#053061")):
+            hub = mine & (np.abs(value) >= cut) & (np.sign(value) == sign)
+            ax.scatter(
+                t.pos[hub, 0],
+                t.pos[hub, 1],
+                s=t.dot * 4,
+                facecolors="none",
+                edgecolors=colour,
+                linewidths=0.7,
+                zorder=3,
+            )
+        t.label(k)
+    caption = (
+        "Sources and sinks of the net attention flow (last layer, head mean): each cell's out - in (how much it is read minus how much it reads), "
+        f"smoothed over {bandwidth_um:g} µm.\nRed: sources, blue: sinks; ringed: the {hubs:.0%} strongest. Black dots: hidden cells, the receivers by "
+        f"construction, so sinks follow the mask -- compare with the untrained twin. {t.drawn:,} cells in {len(t.axes)} blocks."
+    )
+    return t.finish(
+        out_path,
+        title,
+        caption,
+        t.plt.cm.ScalarMappable(norm=norm, cmap=cmap),
+        "out - in per cell (a.u.): sink  <-  ->  source",
+    )
+
+
+def plot_who_whom(
+    source,
+    out_path,
+    *,
+    title: str = "",
+    panels: int = 8,
+    view_um: float = 260.0,
+    min_hidden: int = 20,
+    columns: int = 4,
+    panel_in: float = 3.6,
+    dpi: int = 130,
+) -> dict:
+    """Who influences whom: zoom panels of ``view_um`` on the ``panels`` largest patches of hidden cells, each sampled receiver
+    (:func:`sample_pairs`) joined by arrows from its top sources, width and colour by the pair's net flow (one scale for the
+    figure). Cells grey, hidden ones tinted. Returns ``{"panels": drawn, "pairs": arrows drawn}``.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    data = np.load(source) if isinstance(source, str | Path) else source
+    if "pair_receiver" not in data:
+        raise ValueError("this npz has no sampled pairs: write it again with flow_maps.flow_arrays.")
+    pos = np.asarray(data["pos_um"], dtype=np.float64)[:, :2]
+    hidden = np.asarray(data["visible"]) == 0
+    receivers, sources, flows = data["pair_receiver"], data["pair_source"], data["pair_flow"]
+    patch = np.full(len(pos), -1, dtype=np.int64)
+    if hidden.sum() >= min_hidden:
+        patch[hidden] = tissue_blocks(pos[hidden], link_um=25.0, min_cells=min_hidden)
+    ids, counts = np.unique(patch[patch >= 0], return_counts=True)
+    order = ids[np.argsort(-counts, kind="stable")][: int(panels)]
+    centres = [pos[patch == p].mean(0) for p in order]
+    if not centres:  # nothing hidden: the receivers with the strongest inflow
+        strongest = np.argsort(-flows.sum(1))[: int(panels)]
+        centres = [pos[receivers[i]] for i in strongest]
+    valid = sources >= 0
+    reference = float(np.quantile(flows[valid], 0.99)) if valid.any() else 1.0
+    norm = Normalize(0.0, reference or 1.0)
+    cmap = plt.get_cmap("magma_r")
+    rows = int(np.ceil(len(centres) / columns)) or 1
+    header = 0.85
+    fig = plt.figure(figsize=(columns * panel_in, rows * panel_in + header), dpi=dpi, facecolor="white")
+    total_h = rows * panel_in + header
+    half = float(view_um) / 2.0
+    dot = max(2.0, (8.0 * panel_in / view_um * 72.0) ** 2)
+    drawn = 0
+    for k, centre in enumerate(centres):
+        r, c = divmod(k, columns)
+        ax = fig.add_axes(
+            [
+                c / columns + 0.004,
+                1 - (header + (r + 1) * panel_in) / total_h + 0.004,
+                1 / columns - 0.008,
+                panel_in / total_h - 0.008,
+            ]
+        )
+        low, high = centre - half, centre + half
+        near = np.all((pos >= low) & (pos <= high), axis=1)
+        ax.scatter(pos[near & ~hidden, 0], pos[near & ~hidden, 1], s=dot, c="#d0d0d0", linewidths=0, zorder=1)
+        ax.scatter(pos[near & hidden, 0], pos[near & hidden, 1], s=dot, c="#f0a58a", linewidths=0, zorder=2)
+        here = near[receivers]
+        src, f = sources[here], flows[here]
+        rec = np.repeat(receivers[here][:, None], sources.shape[1], axis=1)
+        ok = src >= 0
+        start, end, f = pos[src[ok]], pos[rec[ok]], f[ok]
+        strongest = np.argsort(f)  # weakest first, strongest on top
+        start, end, f = start[strongest], end[strongest], f[strongest]
+        if len(f):
+            ax.quiver(
+                start[:, 0],
+                start[:, 1],
+                end[:, 0] - start[:, 0],
+                end[:, 1] - start[:, 1],
+                f,
+                cmap=cmap,
+                norm=norm,
+                angles="xy",
+                scale_units="xy",
+                scale=1.0,
+                width=0.004 + 0.008 * np.clip(f / (reference or 1.0), 0, 1).mean(),
+                headwidth=3.5,
+                headlength=4.0,
+                headaxislength=3.5,
+                zorder=3,
+            )
+            ax.scatter(end[:, 0], end[:, 1], s=dot * 0.6, c="#222222", linewidths=0, zorder=4)
+        drawn += len(f)
         ax.set_xlim(low[0], high[0])
         ax.set_ylim(low[1], high[1])
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_facecolor("#fbfbfb")
         ax.text(
-            0.012,
-            0.985,
-            f"{k + 1} · {int(mine.sum()):,} cells",
+            0.02,
+            0.97,
+            f"{k + 1} · {int(here.sum())} receivers",
             transform=ax.transAxes,
             fontsize=7,
-            color="#444444",
             va="top",
-            zorder=5,
+            color="#444444",
             bbox={"facecolor": "white", "alpha": 0.85, "pad": 1.5, "linewidth": 0},
+            zorder=5,
         )
-
-    drawn = int((block >= 0).sum())
-    fig.text(0.004, 1 - 0.12 / total, title, fontsize=11, weight="bold", va="top", ha="left", wrap=False)
+    fig.text(0.004, 1 - 0.12 / total_h, title, fontsize=11, weight="bold", va="top", ha="left")
     fig.text(
         0.004,
-        1 - 0.38 / total,
-        "Net attention flow, last layer, head mean: A - A^T over cell pairs. Streams point from the cells being read to the cells that read them; "
-        "width and colour: net current per cell.\nOnly tissue is drawn, one tile per block at one scale. "
-        f"Hidden cells (tinted) are what the model was asked about; {drawn:,} of {len(pos):,} cells in {len(ids)} blocks.",
+        1 - 0.38 / total_h,
+        f"Who influences whom (net attention flow, last layer, head mean): {view_um:g} µm around the largest patches of hidden cells. Arrows run from each sampled\n"
+        "receiver's top-5 sources (where it reads more than it is read) to the receiver (black dot); colour: the pair's net flow. Hidden cells tinted.",
         fontsize=8,
         va="top",
         ha="left",
         color="#444444",
     )
-    right = (width_in - 3.1) / width_in
-    cax = fig.add_axes([right, 1 - 0.30 / total, 2.9 / width_in, 0.08 / total])
-    cb = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=stream_map), cax=cax, orientation="horizontal")
-    cb.set_label("net current per cell (a.u.)", fontsize=7)
+    cax = fig.add_axes([1 - 3.1 / (columns * panel_in), 1 - 0.30 / total_h, 2.9 / (columns * panel_in), 0.08 / total_h])
+    cb = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=cax, orientation="horizontal")
+    cb.set_label("net flow of a pair (a.u.)", fontsize=7)
     cb.ax.tick_params(labelsize=6)
-    bar_in = 100.0 * scale
-    fig.add_artist(Line2D([right, right + bar_in / width_in], [1 - 0.80 / total] * 2, color="#333333", lw=2))
-    fig.text(right + bar_in / width_in + 0.004, 1 - 0.80 / total, "100 µm", fontsize=7, va="center")
     fig.savefig(out_path, dpi=dpi, facecolor="white")
     plt.close(fig)
-    return {"blocks": int(len(ids)), "cells": drawn, "dropped": int(len(pos) - drawn)}
+    return {"panels": len(centres), "pairs": int(drawn)}
