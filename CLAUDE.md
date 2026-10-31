@@ -213,6 +213,22 @@ configurable. Two things are easy to get wrong here:
 
 The registered ablation pairs are `<dataset>/node_reg` (cell) vs `<dataset>/node_reg_genemask` (gene) — note each carries its own `dataset.name` so the two arms do not share a checkpoint prefix. `config_files/sweeps/mask_granularity_legnini.yaml` runs the granularity/rate grid.
 
+### Training on crops (`dataset.crop`; `tl/crops.py`; roadmap Tier 3, K18)
+
+With `dataset.crop.size_um` > 0 every training graph hands the trainer `per_graph` random crops per epoch (`CropDataset`): a square
+or disc (`shape`) of `size_um` µm around a cell drawn uniformly, cut out with `Data.subgraph` (every per-cell attribute sliced, edges
+among the kept cells renumbered, per-graph ones kept); a window under `min_cells` is drawn again. Validation and test stay whole
+sections (roadmap decision 12). `crop_kwargs(cfg)` converts µm and seeds; every entrypoint passes it. Invariants:
+
+- **The masks are the section's.** A crop slices the training graph's current `mask` / `gene_mask` (discs included), redrawn in place
+  every epoch as before; it draws none of its own. Precomputed encodings (LapPE, RWPE, spectral, `density_radius`) keep the section's values.
+- **Positions alone choose a crop**, and **its own randomness**: a private generator in the main process (seeded from `optim.seed`, never
+  restarted), in a loader worker one seeded from the worker's per-epoch seed and the item -- so crops are new every epoch whatever the
+  order of Lightning's hooks (the epoch's iterator exists before `on_train_epoch_start`). Off: nothing drawn.
+- **Per-sequence quantities differ between training and inference:** `center_qk` centres on the crop's mean token, `pe.center_coords` on its
+  centroid, CLS reads the crop, grid patches start at its corner, a hierarchy is built per crop (the cache is an LRU of 256). The
+  validator warns; compare against a run without crops.
+
 ### Staged training (`train/_schedule.py`)
 
 `optim.schedule` splits a run into phases (`.claude/global_plan.md`, Stage C): `joint` (default,
@@ -458,6 +474,15 @@ their gene-space loadings), and within the global part (`orth_decorrelation`, `o
 ### Evaluation (`interscale.evaluation`)
 
 Post-hoc analysis utilities operating on the `adata` produced by `save_evaluation_results`/`get_model_output`: gene loadings, gene-rank analysis, gene-set covariance, latent-space analysis, graph classification metrics, and network/attention stream visualization (`net_streams.py`).
+
+**Whole sections without dense maps** (roadmap Tier 3). `get_model_output(attention=False)` (GlobalModel, CombinedModel) embeds and
+predicts through `TransformerNodeEncoderHook.encode` -- `evaluate()`'s clean pass without the relevance rollout or a kept map -- and
+writes neither the `[cells, max_seq_len]` table (alone ~40 GB at 10^5 cells) nor the CLS scores. Every `get_model_output` reads the model
+in eval mode (`in_eval_mode`; before 2026-10-31 a model read after `train()` predicted with dropout on). `masked_probing.reference_predictions`
+takes `method="sparse"` (neighbour lists from a k-d tree, never a distance matrix: the same numbers as `"dense"` to rounding, kernels cut at
+`exp(-kernel_truncate)`, 40 by default -- lower values drift where a gene's only visible cells lie far away) or `"auto"` (sparse above
+`max_dense_cells`, 20,000; the default, so the fitted references follow). The CosMx hook uses it (`ref_nearest_<k>`, `ref_slide_mean`
+in place of its own `ref_knn<k>`, `ref_section_mean`).
 
 What each evaluation task answers, which pass it reads, and which ones not to base conclusions on:
 [`.claude/linear_probing_docs.md`](.claude/linear_probing_docs.md). In short, reconstruction from

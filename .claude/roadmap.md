@@ -89,6 +89,21 @@ fused attention; read with the within-section scores first.
 Arms to try with them: `hier_none` with a free head (`bias_heads.distance: [0, 1, 2]`) and windows from CosMx's measured length
 scales; the same in local units; read `dim_importance` / `dim_tracks` of each against its untrained twin.
 
+## Tier 3 (asked 2026-10-31, after Tier 2)
+
+| # | what | why | state | where |
+|---|---|---|---|---|
+| 7 | training on crops (`dataset.crop`: `size_um`, `shape`, `per_graph`, `min_cells`) | a whole section is one step: 2 per epoch on CosMx, and `cosmx_run` stayed undertrained (K18, decision 12) | **built, unverified on data**; validation and test stay whole sections | CLAUDE.md, "Training on crops" |
+| 8 | one evaluation path without dense maps: `reference_predictions(method="sparse" / "auto")`, `encode` / `get_model_output(attention=False)` | the dense `cdist` (~80 GB at 10^5 cells) and the `[cells, max_seq_len]` table; the CosMx hook had its own k-NN references | **built**; the CosMx hook now uses the library's references | CLAUDE.md, "Whole sections without dense maps" |
+| -- | found on the way: `get_model_output` predicted with dropout on | no model switched to eval mode for it | **fixed** (`in_eval_mode`) | notes.md 2026-10-31 |
+
+**For the running script (to write next).** One CosMx run should set, per arm: `dataset.crop.size_um` (e.g. 1000-2000 µm; a section is
+~7 x 10 mm) and `per_graph` (e.g. 16-32, so an epoch is 30-60 steps instead of 2), with a no-crop arm of the same model as the
+control (the validator's warning lists what differs per sequence); `model.decoder.section_offset: visible_mean`;
+`attention.visible_keys_only` (with `center_qk` off, or read its leak); for the readouts the defaults now suffice on whole
+sections (`reference_predictions` switches to neighbour lists above 20,000 cells), `get_model_output(attention=False)` if the AnnData
+outputs are wanted, the `heads_within_*` and `dim_*` tables of `hier_common.py`. Read within sections first, against the untrained twin.
+
 ## Week 1 review (2026-10-26): summary, conclusions, to do
 
 Written on Monday of W2, the day of DP1. The next section ("Where we stand") is the starting point of 2026-10-19. Where this
@@ -255,7 +270,7 @@ read without synth_spot's planted design, so they also work on legnini and CosMx
 | K15 | Programmes judged unsolved at 100 epochs are learned at 300 (M11 0.29 → 0.96, MC23 / MC24 0.65 / 0.55 → 0.94 / 0.90; whole cell 0.904 → 0.952; one seed, `synth_spot_m11`), and smooth genes stay below a 150 µm kernel (0.77 against 0.82) | Too few steps (24 slides x 100 epochs = 2,400), and possibly too little width: the 64-wide token was a rank limit for the own cell, which the raw skip closed. The size has not varied since round 2 | The scale grid of the week 1 review (epochs x width x heads), per-programme validation curves, more training slides; rerun the negative verdicts that rest on 100 epochs | T1; W2 |
 | K16 | Rare interactions are not learned: MC20 / MC21 (20-50 receivers per slide) stay at 0.67 / 0.58 at 300 epochs, while MC23 / MC24, the same rules with 200-500 receivers, reach 0.94 / 0.90 | The per-cell loss gives tens of receivers per slide about 1% of its weight | Loss weighting (per gene, or by a cell's deviation from the gene mean), sampling hidden cells near rare events, more examples per epoch | T1; W2 |
 | K17 | Only programme masking makes the global part learn communication; every label-free task fails (discs K1, cells K14, channel masking 0.245). The CosMx task decided on 2026-10-25 is cell masking with discs | Each label-free task is solved by the neighbourhood or by the cell itself. Under channel masking a hidden response can be read off its visible co-responders, and noise genes (170 of 253) dominate the loss | Module masking (co-expression modules hidden in every cell, structured genes as targets), tested for transfer on synth_spot's programme; an arm that gives a hidden cell its type and trains on the within-type residual; the interferon / MHC-I set as a co-primary CosMx task until one of them passes (decision 11) | T3; W2 |
-| K18 | On whole CosMx sections a fold gives 2 optimiser steps per epoch (one per section, two training sections), against synth_spot's 24 | One step is one section | Random crops of a few mm as training steps and whole sections at inference (not sliding windows; decision 12); sequence-level centring (`center_qk`) and CLS must then behave the same on crops and sections | T0, T6; W2 |
+| K18 | On whole CosMx sections a fold gives 2 optimiser steps per epoch (one per section, two training sections), against synth_spot's 24 | One step is one section | Random crops of a few mm as training steps and whole sections at inference (not sliding windows; decision 12); sequence-level centring (`center_qk`) and CLS must then behave the same on crops and sections **Built 2026-10-31** (`dataset.crop`, roadmap Tier 3); not run | T0, T6; W2 |
 | K19 | The directional programmes (M9's stripe, M10's cone) stay at 0.22-0.25 in every arm, against the oracle's 1.00 / 0.83 | Every bias that worked is isotropic | The anisotropic Fourier bias (built 2026-10-11, never run) on the windowed model, as a per-head role (attention_plan.md, 10a) if needed. On tissue, absolute direction does not carry between sections, so this is mainly synth_spot's | T1; W2 |
 | K20 | Every result we trust comes from a 100 µm lattice (the narrowest window converged to the nearest-neighbour spacing), and on legnini no arm separates from another | synth_spot's geometry is regular and its interactions are exact | Semi-synthetic data: synth_spot-style programmes planted into CosMx's coordinates and cell types, with known senders | T7, T10; W2 |
 

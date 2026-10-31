@@ -1288,3 +1288,37 @@ and `gene_scales.window_scales`; `pe.distance.units: local` (density-scaled dist
 - The window table of `hier_common.py` numbered heads by position: with `bias_heads` that names the wrong head; it now reads `served_heads`.
 - Not built: ED3 (spatial variability against matched gene sets), ED4 (cell type, planted truth), the PCA control of ED2, an elbow plot,
   stage 10b; nothing run on data.
+
+## 2026-10-31 — Tier 3: training on crops, an evaluation path without dense maps, and dropout at inference (code and tests; not run on data)
+
+Built on branch `tier1-real-data` (roadmap.md, "Tier 3"): `dataset.crop` (`tl/crops.py`, `CropDataset`, `crop_kwargs`);
+`reference_predictions(method="sparse" | "auto")`; `TransformerNodeEncoderHook.encode` and `get_model_output(attention=False)`; a fix to
+`get_model_output` (eval mode). `slurm/new/hier_common.py` now takes the library's references. Toy models only, CPU.
+
+**What worked**
+- Crops: a window keeps exactly the cells inside it; every per-cell attribute, the masks of the whole section included, is sliced and the edges
+  among the kept cells kept; new crops every read, from a private generator or the worker's per-epoch seed, repeated by the seed, the global
+  generators untouched; a GlobalModel trains end to end on them (3 steps an epoch from one training section instead of 1).
+- Sparse references equal the dense ones to rounding (1e-14) on random positions with cells hidden whole and in part, a gene hidden everywhere,
+  far-away cells, labels, two graphs, chunks of 7 pairs; no distance matrix is formed.
+- `encode` gives `evaluate`'s clean pass (no hidden key blocked, no map kept); fused = dense through it; a routed hierarchy encodes 400 cells
+  without a tensor over the cells' pairs; `get_model_output(attention=False)` writes the same embeddings and predictions as with the maps.
+- Mutation checks: 12 / 12 (crops; 2 after a test with lone cells and one cluster), 9 / 10 (sparse references; the survivor is an equivalent
+  chunk-size mutation; 1 after counting `cdist` calls), 4 / 4 (encode; 2 after a masked graph under visible keys and a kept-map check).
+  Full suite 1,655 passed; harness IDENTICAL after each commit.
+
+**What doesn't work / found on the way**
+- **`get_model_output` predicted with dropout on.** No model switched its module to eval mode for it, and Lightning leaves it in training mode
+  after `fit`: every read of a trained model gave another output (the test fails on all three models without the fix). Every `.h5ad` written by
+  `get_model_output` before 2026-10-31 -- gene ranks, loadings, `y_pred_*` -- carried dropout noise. The masked-pass evaluations
+  (`collect_head_predictions`, the probes, the sweeps' tables) set eval mode themselves and are not affected.
+- **A kernel cut relative to the query's largest weight is not enough to match the dense form.** The dense path falls back to the slide mean
+  when a gene's denominator is below an *absolute* 1e-12; at a cut of exp(-12) a gene whose only visible cells lay many bandwidths away gave
+  up to 1.2 apart (a 15 µm kernel, far-away cells). exp(-40) keeps every weight that could move that floor: rounding only, at ~3x the pairs.
+- **Lightning creates the epoch's iterator before `on_train_epoch_start`**, so with a worker (or the fetcher's prefetch) the first batch of an
+  epoch can be built before `NodeMaskResampleCallback` redraws the masks. Crops avoid it by drawing in `__getitem__`; the mask redraw itself is
+  unchanged (pre-existing, not measured).
+- Crops change what is taken per sequence (`center_qk`, centred node encodings, grid patches, CLS, the hierarchy): train-on-crops and read-on-
+  sections is a shift the validator warns about, not something tested; a no-crop arm is the control.
+- Not built: IG on sampled receivers for CosMx (the readouts that need it already sample queries); `visibility_common.py` still has its own
+  k-NN references; nothing run on data.
