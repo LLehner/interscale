@@ -453,6 +453,25 @@ def length_scales(curves: MoranCurves, null: MoranNull, genes, *, z: float = 3.0
 # ------------------------------------------------------------------------------- the model's parts
 
 
+
+def window_scales(table: pd.DataFrame, n_heads: int, *, min_um: float = 0.0) -> list[float]:
+    """``n_heads`` distance windows (µm) read off measured length scales: ``pe.distance.scales_um`` from the data.
+
+    ``table`` is :func:`length_scales`'s (or :func:`gene_scales`'s) per-gene table of the training slides. Over the variable
+    genes with a finite ``ell_um`` (a gene that never halves varies beyond the sizes measured and gives no scale), the windows
+    are the quantiles at ``(2h + 1) / (2 n_heads)``: each head stands for an equal share of the genes, by the scale they vary on
+    (attention_plan.md, stage 10a; roadmap decision 13). ``min_um`` floors them, e.g. at the local reach under the long-range
+    mask, where a narrower window only sees blocked keys. Sorted, shortest first.
+    """
+    ell = table.loc[table["pattern"] == VARIABLE, "ell_um"].to_numpy(dtype=float)
+    ell = ell[np.isfinite(ell) & (ell > 0)]
+    if not len(ell):
+        raise ValueError("no variable gene with a finite length scale in the table: nothing to set the windows from.")
+    if int(n_heads) < 1:
+        raise ValueError(f"n_heads must be >= 1, got {n_heads}.")
+    levels = (2 * np.arange(int(n_heads)) + 1) / (2 * int(n_heads))
+    return sorted(max(float(min_um), float(q)) for q in np.quantile(ell, levels))
+
 def part_shares(parts: dict[str, np.ndarray], keep: np.ndarray | None = None) -> pd.DataFrame:
     """Per gene (rows) and part: the part's share of the variance of the summed prediction over the kept entries.
 

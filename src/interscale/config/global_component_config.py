@@ -101,6 +101,10 @@ def get_global_component_cfg(cfg, global_component_name):
         pe.distance.shape = "gaussian"
         pe.distance.strength = 1.0
         pe.distance.frozen = False
+        # `scales` kind: the window of each head it serves, in µm, instead of the geometric spacing over [scale_min_um,
+        # scale_max_um]; one value per head (`pe.bias_heads.distance`, or every head). Empty: the geometric spacing. Set them from
+        # the data's measured length scales with `evaluation.gene_scales.window_scales` (attention_plan.md, stage 10a).
+        pe.distance.scales_um = []
         # A learned bias per head as a function of how alike two cells' expression is: each key's
         # rank among the query's keys by Euclidean distance of their expression (the kNN view of
         # scanpy.pp.neighbors on the expression), piecewise linear in log2(1 + rank) between
@@ -152,6 +156,14 @@ def get_global_component_cfg(cfg, global_component_name):
         # them, so `min_wavelength` is about the shortest distance attended over (the long-range
         # mask's radius). `max_wavelength` 0 derives twice the largest slide diameter when the model
         # is built, so the longest wave never wraps around within a slide.
+        # Which heads each attention bias reaches (attention_plan.md, stage 10a): a list of head indices per bias kind, empty =
+        # every head. A head no bias serves is free (content only, plus RoPE where on); a kind built for fewer heads deals its
+        # settings over those (the scales prior spaces its windows over its own heads). Kinds not in pe.bias are ignored.
+        pe.bias_heads = CN()
+        pe.bias_heads.distance = []
+        pe.bias_heads.expression = []
+        pe.bias_heads.spectral = []
+        pe.bias_heads.fourier = []
         pe.rope = CN()
         pe.rope.kind = "axial"
         pe.rope.min_wavelength = 50.0

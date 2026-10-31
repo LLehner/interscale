@@ -217,11 +217,12 @@ def offset_bias(bias, offsets_um: torch.Tensor) -> torch.Tensor | None:
     for name, encoder in bias.encoders.items():
         need = bias.requires[name]
         if need == "pos":
-            total = total + encoder._lookup(offsets_um.norm(dim=-1))
+            total = total + bias.place(name, encoder._lookup(offsets_um.norm(dim=-1)), -1)
         elif need == "pos_coords":
             phase = offsets_um.double() @ encoder.frequencies.double().T
             a, c = encoder.coefficients()
-            total = total + (phase.cos().to(offsets_um.dtype) @ a.T + phase.sin().to(offsets_um.dtype) @ c.T)
+            values = phase.cos().to(offsets_um.dtype) @ a.T + phase.sin().to(offsets_um.dtype) @ c.T
+            total = total + bias.place(name, values, -1)
         else:
             raise ValueError(
                 f"the attention bias '{name}' reads neither distances nor offsets; the hierarchy cannot place it."

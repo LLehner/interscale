@@ -82,7 +82,8 @@ def _positional_encoding_tag(cfg) -> str:
     names = list(pe.node) + list(pe.get("bias", [])) + list(pe.get("rotary", [])) if pe is not None else []
     if "distance" in names and pe.distance.get("kind", "profile") == "scales":
         d = pe.distance
-        window = f"{d.shape[0]}{float(d.scale_min_um):g}-{float(d.scale_max_um):g}"
+        given = [float(s) for s in d.get("scales_um", []) or []]
+        window = f"{d.shape[0]}l{'.'.join(f'{s:g}' for s in given)}" if given else f"{d.shape[0]}{float(d.scale_min_um):g}-{float(d.scale_max_um):g}"
         strength = f"-s{float(d.strength):g}" if float(d.strength) != 1.0 else ""
         names[names.index("distance")] = f"distance-scales-{window}{strength}{'-fz' if d.frozen else ''}"
     elif "distance" in names and pe.distance.get("kind", "profile") != "profile":
@@ -91,6 +92,13 @@ def _positional_encoding_tag(cfg) -> str:
         names[names.index("rope")] = f"rope-{pe.rope.kind}"
     if "fourier" in names and not pe.fourier.get("isotropic", True):
         names[names.index("fourier")] = "fourier-aniso"
+    # A bias that reaches some heads only (pe.bias_heads, stage 10a): `@<heads>` after its name.
+    chosen = pe.get("bias_heads", None) if pe is not None else None
+    for k, name in enumerate(list(pe.get("bias", [])) if pe is not None else []):
+        heads = [int(h) for h in (chosen.get(name, []) if chosen is not None else [])]
+        if heads:
+            at = len(pe.node) + k
+            names[at] = f"{names[at]}@{'-'.join(str(h) for h in sorted(heads))}"
     return f"pe-{'+'.join(names)}_" if names else ""
 
 

@@ -326,14 +326,26 @@ class ScaledDistanceBias(nn.Module):
     """
 
     def __init__(
-        self, n_heads: int, scale_min_um: float, scale_max_um: float, shape: str, strength: float, frozen: bool
+        self,
+        n_heads: int,
+        scale_min_um: float,
+        scale_max_um: float,
+        shape: str,
+        strength: float,
+        frozen: bool,
+        scales_um: list[float] | None = None,
     ):
         super().__init__()
         if shape not in DISTANCE_SHAPES:
             raise ValueError(f"shape must be one of {DISTANCE_SHAPES}, got {shape!r}.")
         self.shape, self.frozen = shape, bool(frozen)
         n = int(n_heads)
-        if n == 1:
+        if scales_um:
+            # Given per head (e.g. from the data's measured length scales: gene_scales.window_scales).
+            if len(scales_um) != n or not all(float(s) > 0 for s in scales_um):
+                raise ValueError(f"scales_um needs one positive scale per head ({n}), got {list(scales_um)}.")
+            scales = torch.tensor([float(s) for s in scales_um])
+        elif n == 1:
             scales = torch.full((1,), math.sqrt(float(scale_min_um) * float(scale_max_um)))
         else:
             scales = torch.logspace(math.log10(scale_min_um), math.log10(scale_max_um), n)
@@ -905,7 +917,13 @@ def _build_distance(pe, n_heads):
     if pe.distance.kind == "scales":
         d = pe.distance
         return ScaledDistanceBias(
-            n_heads, float(d.scale_min_um), float(d.scale_max_um), d.shape, float(d.strength), bool(d.frozen)
+            n_heads,
+            float(d.scale_min_um),
+            float(d.scale_max_um),
+            d.shape,
+            float(d.strength),
+            bool(d.frozen),
+            scales_um=[float(s) for s in d.get("scales_um", [])],
         )
     if not pe.distance.max_dist > 0:
         raise ValueError(
@@ -1071,9 +1089,17 @@ class AttentionBias(nn.Module):
     CLS stays attendable for every query.
     """
 
-    def __init__(self, encoders: dict[str, nn.Module], *, n_heads: int, spatial_unit_um: float):
+    def __init__(
+        self, encoders: dict[str, nn.Module], *, n_heads: int, spatial_unit_um: float, heads: dict | None = None
+    ):
         super().__init__()
         self.encoders = nn.ModuleDict(encoders)
+        # The heads each bias reaches (`pe.bias_heads`; attention_plan.md, stage 10a): None for every head. An encoder built
+        # for fewer heads gives one value per head it serves; `place` puts them into the full head axis, zero elsewhere. Each
+        # encoder also carries its heads as `served_heads`, so a readout of its per-head parameters names the right head.
+        self.heads = {name: (list(heads[name]) if heads and heads.get(name) else None) for name in encoders}
+        for name, encoder in encoders.items():
+            encoder.served_heads = self.heads[name] if self.heads[name] is not None else list(range(int(n_heads)))
         # The input each bias is handed, by key: the ``Data`` attribute it reads, except that a
         # bias reading coordinates (``reads_coordinates``: Fourier) gets the padded positions
         # ("pos_coords") rather than the pairwise distances the ``distance`` bias takes.
@@ -1083,6 +1109,17 @@ class AttentionBias(nn.Module):
         }
         self.n_heads = int(n_heads)
         self.spatial_unit_um = float(spatial_unit_um)
+
+    def place(self, name: str, values: torch.Tensor, dim: int) -> torch.Tensor:
+        """``values`` of the bias ``name``, one per head it serves along ``dim``, in the full head axis: zero for the other heads."""
+        heads = self.heads.get(name)
+        if heads is None:
+            return values
+        dim = dim % values.dim()
+        shape = list(values.shape)
+        shape[dim] = self.n_heads
+        index = torch.as_tensor(heads, device=values.device)
+        return values.new_zeros(shape).index_copy(dim, index, values)
 
     def factor_dim(self) -> int:
         """Width ``r`` of the low-rank factors of the enabled biases that have them; 0 when none has."""
@@ -1152,7 +1189,7 @@ class AttentionBias(nn.Module):
             key_name = "pos_coords" if self.requires[name] in ("pos", "pos_coords") else self.requires[name]
             if key_name not in inputs:
                 inputs[key_name] = self._inputs(key_name, batched_data, batch, index_nodes, seq_len, dtype, device)
-            total = total + encoder.pairs(*inputs[key_name], graph[rows], query[rows], key[rows])
+            total = total + self.place(name, encoder.pairs(*inputs[key_name], graph[rows], query[rows], key[rows]), -1)
         return out.index_put((rows,), total)
 
     def rows(self, batched_data, index_nodes, src_padding_mask, dtype, device):
@@ -1175,11 +1212,12 @@ class AttentionBias(nn.Module):
             if key not in inputs:
                 inputs[key] = self._inputs(key, batched_data, batch, index_nodes, seq_len, dtype, device)
             if self.requires[name] == "pos":
-                distances.append(encoder)
+                distances.append((name, encoder))
             elif hasattr(encoder, "factors"):
-                factors.append(encoder.factors(*inputs[key]))
+                left, right = encoder.factors(*inputs[key])
+                factors.append((self._place_factor(name, left, n_graphs), self._place_factor(name, right, n_graphs)))
             elif hasattr(encoder, "pairs"):
-                pairwise.append((encoder, key))
+                pairwise.append((name, encoder, key))
             else:
                 raise ValueError(
                     f"the attention bias '{name}' has neither a pair form nor a low-rank form; only a dense attention takes it."
@@ -1194,19 +1232,20 @@ class AttentionBias(nn.Module):
             if distances:
                 pos = inputs["pos_coords"][0]
                 dist = torch.cdist(pos[:, start:cells], pos, compute_mode="donot_use_mm_for_euclid_dist")
-                for encoder in distances:
-                    bias = bias + encoder(dist)  # [B, heads, rows, S]
+                for name, encoder in distances:
+                    bias = bias + self.place(name, encoder(dist), 1)  # [B, heads, rows, S]
             for left, right in factors:
                 bias = bias + left[..., start:cells, :] @ right.transpose(-1, -2)
             if pairwise:
-                graph, query, key = torch.meshgrid(
+                graph, query, key_ids = torch.meshgrid(
                     torch.arange(n_graphs, device=device),
                     torch.arange(start, cells, device=device),
                     torch.arange(seq_len, device=device),
                     indexing="ij",
                 )
-                for encoder, name in pairwise:
-                    values = encoder.pairs(*inputs[name], graph.reshape(-1), query.reshape(-1), key.reshape(-1))
+                for name, encoder, key in pairwise:
+                    values = encoder.pairs(*inputs[key], graph.reshape(-1), query.reshape(-1), key_ids.reshape(-1))
+                    values = self.place(name, values, -1)
                     bias = bias + values.view(n_graphs, cells - start, seq_len, self.n_heads).permute(0, 3, 1, 2)
             bias = bias.masked_fill(pad[:, None, start:cells, None] | pad[:, None, None, :], 0.0)
             out[:, :, : cells - start, :seq_len] = bias
@@ -1233,8 +1272,8 @@ class AttentionBias(nn.Module):
             if key not in inputs:
                 inputs[key] = self._inputs(key, batched_data, batch, index_nodes, seq_len, dtype, device)
             left, right = encoder.factors(*inputs[key])
-            lefts.append(left.expand(n_graphs, self.n_heads, seq_len, -1))
-            rights.append(right.expand(n_graphs, self.n_heads, seq_len, -1))
+            lefts.append(self._place_factor(name, left, n_graphs).expand(n_graphs, self.n_heads, seq_len, -1))
+            rights.append(self._place_factor(name, right, n_graphs).expand(n_graphs, self.n_heads, seq_len, -1))
 
         pad = src_padding_mask.to(device=device, dtype=torch.bool)[:, None, :, None]
 
@@ -1245,6 +1284,15 @@ class AttentionBias(nn.Module):
 
         return lay_out(lefts), lay_out(rights)
 
+    def _place_factor(self, name: str, factor: torch.Tensor, n_graphs: int) -> torch.Tensor:
+        """A low-rank factor ``[B or 1, heads served or 1, S, r]`` in the full head axis: zero for the heads ``name`` does not
+        serve, so ``U W^T`` is exactly 0 there."""
+        if self.heads.get(name) is None:
+            return factor
+        served = len(self.heads[name])
+        factor = factor.expand(factor.shape[0], served, *factor.shape[2:])
+        return self.place(name, factor, 1)
+
     def forward(self, batched_data, index_nodes, src_padding_mask, dtype, device) -> torch.Tensor:
         batch = batched_data.batch.to(device=device, dtype=torch.long)
         n_graphs, seq_len = src_padding_mask.shape
@@ -1254,7 +1302,7 @@ class AttentionBias(nn.Module):
             key = self.requires[name]
             if key not in inputs:
                 inputs[key] = self._inputs(key, batched_data, batch, index_nodes, seq_len, dtype, device)
-            bias = bias + encoder(*inputs[key])  # [B, heads, S, S]
+            bias = bias + self.place(name, encoder(*inputs[key]), 1)  # [B, heads, S, S]
 
         pad = src_padding_mask.to(device=device, dtype=torch.bool)
         bias = bias.masked_fill(pad[:, None, :, None] | pad[:, None, None, :], 0.0)
@@ -1584,6 +1632,16 @@ def build_attention_bias(cfg, n_heads: int) -> AttentionBias | None:
     names, pe = _enabled(cfg, "bias")
     if not names:
         return None
+    heads = {name: bias_heads(pe, name, n_heads) for name in names}
     with torch.random.fork_rng(devices=[]):
-        encoders = {name: PE_REGISTRY[name].build(pe, int(n_heads)) for name in names}
-    return AttentionBias(encoders, n_heads=n_heads, spatial_unit_um=cfg.dataset.spatial_unit_um)
+        # Each built for the heads it serves (stage 10a): the scales prior spaces its windows over its own heads.
+        encoders = {
+            name: PE_REGISTRY[name].build(pe, len(heads[name]) if heads[name] else int(n_heads)) for name in names
+        }
+    return AttentionBias(encoders, n_heads=n_heads, spatial_unit_um=cfg.dataset.spatial_unit_um, heads=heads)
+
+
+def bias_heads(pe, name: str, n_heads: int) -> list[int] | None:
+    """The heads ``pe.bias_heads.<name>`` lets the bias ``name`` reach, or None for every head (an empty list)."""
+    chosen = pe.get("bias_heads", {}).get(name, []) if pe is not None else []
+    return sorted(int(h) for h in chosen) or None

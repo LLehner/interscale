@@ -500,6 +500,7 @@ def _validate_pe(cfg):
 
     for name in names:
         PE_REGISTRY[name].validate(pe)
+    _validate_bias_heads(pe, int(params.n_heads), list(pe.get("bias", [])))
 
     needs_pos = [name for name in names if PE_REGISTRY[name].requires == "pos"]
     if needs_pos and cfg.dataset.spatial_key is None:
@@ -523,6 +524,31 @@ def _validate_pe(cfg):
                 "wavelength, so the attention head width (attention.head_dim, or n_embed / n_heads) must "
                 f"be a multiple of 4; got model.n_embed {n_embed}, n_heads {n_heads}, attention.head_dim "
                 f"{head_dim}."
+            )
+
+
+def _validate_bias_heads(pe, n_heads: int, biases: list[str]):
+    """``pe.bias_heads`` (attention_plan.md, stage 10a): distinct head indices in range, for a bias that is on; and
+    ``pe.distance.scales_um``: one positive window per head the scales prior serves."""
+    chosen = pe.get("bias_heads", None)
+    served = {}
+    for name in chosen or {}:
+        heads = [int(h) for h in chosen[name]]
+        if not heads:
+            continue
+        if name not in biases:
+            raise ValueError(f"pe.bias_heads.{name} lists heads {heads}, but pe.bias {biases} does not switch '{name}' on.")
+        if len(set(heads)) != len(heads) or not all(0 <= h < n_heads for h in heads):
+            raise ValueError(f"pe.bias_heads.{name} must be distinct heads in [0, {n_heads}), got {heads}.")
+        served[name] = len(heads)
+    scales = list(pe.get("distance", {}).get("scales_um", []) or [])
+    if scales:
+        if "distance" not in biases or pe.distance.kind != "scales":
+            raise ValueError("pe.distance.scales_um sets the windows of the scales prior: needs pe.bias [distance] with kind scales.")
+        need = served.get("distance", n_heads)
+        if len(scales) != need or not all(float(s) > 0 for s in scales):
+            raise ValueError(
+                f"pe.distance.scales_um needs one positive window per head the prior serves ({need}), got {scales}."
             )
 
 

@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- A bias for a set of heads (`pe.bias_heads.<kind>`; attention_plan.md, stage 10a): each attention bias is built for the heads it
+  serves and placed into the full head axis, zero elsewhere, in the dense, pair, row and factor forms and in the hierarchy's
+  `offset_bias` (`AttentionBias.place`, `served_heads`), so a head can be free of every bias. `pe.distance.scales_um` gives the
+  scales prior its windows per head; `evaluation.gene_scales.window_scales` reads them off measured length scales. Checkpoint tag
+  `@<heads>` after a bias and `gl<scales>` for given windows.
 - Section offset (`model.decoder.section_offset: visible_mean`; roadmap Tier 1): a LocalModel's or GlobalModel's prediction gets
   the part `section`, each gene's mean over the visible entries of the cell's graph (`tl.masking.section_visible_mean`) times a
   learned per-gene weight starting at 1; `BaseModule.visible_entries`, `section_input`; checkpoint tag `-sec`; a CombinedModel
