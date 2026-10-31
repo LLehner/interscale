@@ -527,14 +527,15 @@ def _validate_pe(cfg):
 
 
 def _validate_visible_keys_only(cfg, params, kind, spec):
-    """``attention.visible_keys_only`` blocks the keys that are cells hidden whole: a dense mask, and cells hidden whole."""
+    """``attention.visible_keys_only`` blocks the keys that are cells hidden whole: a backend that can block a key (a dense
+    mask, or the fused blocks), and cells hidden whole."""
     from interscale.module.global_modules.attention import ATTENTION_REGISTRY
 
     where = "attention.visible_keys_only"
-    if spec.mask != "dense":
-        carriers = sorted(k for k, s in ATTENTION_REGISTRY.items() if s.mask == "dense")
+    if spec.mask != "dense" and not spec.hidden_keys:
+        carriers = sorted(k for k, s in ATTENTION_REGISTRY.items() if s.mask == "dense" or s.hidden_keys)
         raise ValueError(
-            f"{where} edits the dense attention mask; attention.kind {kind!r} has none. Use one of {carriers}."
+            f"{where} blocks keys in the attention mask; attention.kind {kind!r} cannot. Use one of {carriers}."
         )
     pooling = params.get("pooling", None)
     if pooling is not None and pooling.get("kind", "none") != "none":
@@ -756,8 +757,6 @@ def _validate_hierarchy(cfg):
     if attention is not None:
         if attention.get("kind", "dense") != "dense" or int(attention.get("head_dim", 0)) not in (0, cfg.model.n_embed // params.n_heads):
             raise ValueError(f"{where} computes its own attention: use attention.kind dense at the default head width.")
-        if attention.get("visible_keys_only", False):
-            raise ValueError(f"{where}: attention.visible_keys_only is not carried by the hierarchical attention.")
     pe = params.get("pe", None)
     if pe is not None:
         bad = sorted(set(pe.get("bias", [])) & {"spectral", "expression"}) + sorted(pe.get("rotary", []))

@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- `attention.visible_keys_only` for the fused and the hierarchical attention (roadmap Tier 1, K5): the fused blocks take the
+  hidden keys as `StructuredMask.hidden_keys` (`AttentionSpec.hidden_keys`); every level of the hierarchy blocks the tokens that
+  hold no visible cell, CLS open. Under cell masking the singleton hierarchy is the dense model only with the option on.
 - Exact fused attention (`attention.kind: fused`; attention_plan.md, stage 6): dense softmax attention, exactly -- each cell's own
   key blocked without the long-range mask, the k-hop pairs with it, every attention bias with a pair form, RoPE -- computed by
   `F.scaled_dot_product_attention` a block of queries at a time (`attention.fused.chunk_pairs` query-key pairs per block, default

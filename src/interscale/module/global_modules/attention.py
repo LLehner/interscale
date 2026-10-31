@@ -70,6 +70,9 @@ class StructuredMask(NamedTuple):
     For a backend that attends to every pair a block of query rows at a time (fused): ``bias_rows``,
     when attention biases are on, is ``(start, stop) -> [B, heads, stop - start, S + 1]``, the rows
     ``start..stop`` of the dense bias (``AttentionBias.rows``), computed when a block asks for them.
+
+    ``hidden_keys`` (``attention.visible_keys_only``, a backend whose spec says ``hidden_keys``) is ``[B, S + 1]``,
+    True at every key that is a cell hidden whole: blocked for every query, as padding is. The CLS slot is False.
     """
 
     blocked: torch.Tensor
@@ -78,6 +81,7 @@ class StructuredMask(NamedTuple):
     pair_types: torch.Tensor | None = None
     pair_bias: torch.Tensor | None = None
     bias_rows: Callable | None = None
+    hidden_keys: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -95,7 +99,10 @@ class AttentionSpec:
     ``note``, when set, says in a sentence what it cannot carry and why; the validator appends it to
     its rejections. ``pattern``, for ``mask="pattern"``, builds the pairs the backend attends along:
     ``pattern(attention_cfg, *, edge_index, batch, index_nodes, blocked, seed, generator, training,
-    device) -> (pairs [3, E], pair_types [E])``.
+    device) -> (pairs [3, E], pair_types [E])``. ``hidden_keys``: a ``mask="pairs"`` backend that blocks the keys of
+    ``StructuredMask.hidden_keys`` (``attention.visible_keys_only``); a dense-mask backend takes them in its mask.
+    ``cross``: the backend also reads with queries of their own (``query`` and ``key`` different tensors, row ``l`` of
+    each the same cell), which ``context_only`` needs.
     """
 
     build: Callable
@@ -106,6 +113,8 @@ class AttentionSpec:
     training_maps: bool = False
     note: str = ""
     pattern: Callable | None = None
+    hidden_keys: bool = False
+    cross: bool = False
 
 
 ATTENTION_REGISTRY: dict[str, AttentionSpec] = {}
@@ -723,6 +732,8 @@ class FusedAttention(ProjectedAttention):
         closed[graph, query - start, key] = True
         if padding is not None:
             closed |= padding[:, None, :]
+        if context.hidden_keys is not None:
+            closed |= context.hidden_keys[:, None, :]
         if context.bias_rows is None:
             logits = torch.zeros(n_graphs, 1, stop - start, seq_len, dtype=dtype, device=device)
         else:
@@ -981,6 +992,7 @@ def _validate_fused(attention_cfg):
     rotary=True,
     training_maps=False,
     note="The fused attention reads each bias a block of query rows at a time, which takes a bias with a pair form.",
+    hidden_keys=True,
 )
 def _build_fused(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
     return FusedAttention(

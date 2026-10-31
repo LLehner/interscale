@@ -181,11 +181,22 @@ class HierarchicalContext:
 
     The value of ``GlobalInput.attention_mask`` for a hierarchical transformer (no ``S x S`` mask is formed). ``cache`` holds
     the first layer's coarse attention under ``prior_refresh: once``; ``record``, when a list, receives every layer's export
-    (:meth:`HierarchicalEncoderLayer._export`).
+    (:meth:`HierarchicalEncoderLayer._export`). ``visible_keys_only`` (``attention.visible_keys_only``): at every level a
+    token that holds no visible cell -- a cell hidden whole, a cluster of such cells -- is no key; CLS stays open.
     """
 
-    def __init__(self, graphs: list[GraphLayout], *, bias=None, coarse_biases=None, generator=None, training=False):
+    def __init__(
+        self,
+        graphs: list[GraphLayout],
+        *,
+        bias=None,
+        coarse_biases=None,
+        generator=None,
+        training=False,
+        visible_keys_only=False,
+    ):
         self.graphs = graphs
+        self.visible_keys_only = bool(visible_keys_only)
         self.bias = bias
         self.coarse_biases = coarse_biases  # None (no bias above the cells), or one per coarse level
         self.generator = generator
@@ -525,9 +536,12 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
                 level, tokens[level + 1], weights[level + 1], hier.up[level + 1], hier.counts[level], hier
             )
         projected = [self._project(level, L, tokens[level], cls) for level in range(L + 1)]
+        # Under visible_keys_only, per level the tokens that are keys: those holding a visible cell (on a clean pass every
+        # cell is visible, so nothing is blocked). CLS is appended open by each level.
+        open_keys = [w > 0 for w in weights] if ctx.visible_keys_only else [None] * (L + 1)
 
         outputs, attention = [None] * (L + 1), [None] * (L + 1)
-        outputs[0], attention[0] = self._top_level(projected[0], hier, ctx, L)
+        outputs[0], attention[0] = self._top_level(projected[0], hier, ctx, L, open_keys[0])
         for level in range(1, L + 1):
             prior = attention[level - 1]
             if self.settings.prior_refresh == "once":
@@ -536,10 +550,12 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
                     ctx.cache[key] = prior
                 prior = ctx.cache.get(key, prior)
             if self.settings.candidates == "dense":
-                outputs[level], attention[level] = self._dense_level(level, projected, tokens, prior, hier, ctx, L, cls)
+                outputs[level], attention[level] = self._dense_level(
+                    level, projected, tokens, prior, hier, ctx, L, cls, open_keys[level]
+                )
             else:
                 outputs[level], attention[level] = self._routed_level(
-                    level, projected, tokens, prior, hier, ctx, L, cls
+                    level, projected, tokens, prior, hier, ctx, L, cls, open_keys[level]
                 )
 
         if ctx.record is not None:
@@ -557,7 +573,12 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
             cell_map = (attention[L][:, : hier.counts[L]], cls_row)
         return cell_out, cls_out, cell_map
 
-    def _top_level(self, qkv, hier, ctx, L):
+    @staticmethod
+    def _closed_keys(open_keys: torch.Tensor | None) -> torch.Tensor | None:
+        """``[n + 1]``: True at the level's tokens that are no key (``open_keys`` False), CLS (last) open; None for none."""
+        return None if open_keys is None else F.pad(~open_keys, (0, 1))
+
+    def _top_level(self, qkv, hier, ctx, L, open_keys=None):
         """Level 0: dense attention among the level's tokens and CLS: ``(output [n_0 + 1, H, d], A^0 [H, n_0 + 1, n_0 + 1])``."""
         q, k, v = qkv
         n = q.shape[0] - 1
@@ -571,11 +592,13 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
             self_pairs = torch.eye(n + 1, dtype=torch.bool, device=q.device)
             self_pairs[n, n] = False  # CLS reads itself, as in the dense transformer
             scores = scores.masked_fill(self_pairs, float("-inf"))
+        if open_keys is not None:
+            scores = scores.masked_fill(self._closed_keys(open_keys), float("-inf"))
         weights = scores.softmax(-1)
         out = torch.einsum("hqk,khd->qhd", self._dropout(weights), v)
         return out, weights
 
-    def _dense_level(self, level, projected, tokens, prior, hier, ctx, L, cls):
+    def _dense_level(self, level, projected, tokens, prior, hier, ctx, L, cls, open_keys=None):
         """Level ``level`` >= 1 with every token of the level as a key: ``(output [n + 1, H, d], A [H, n, n + 1])``."""
         q, k, v = projected[level]
         n, n_par = hier.counts[level], hier.counts[level - 1]
@@ -589,6 +612,8 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
             scores = scores + F.pad(offset_bias(bias, offsets).permute(2, 0, 1), (0, 1))
         if level == L:
             scores = scores.masked_fill(torch.eye(n, n + 1, dtype=torch.bool, device=q.device), float("-inf"))
+        if open_keys is not None:
+            scores = scores.masked_fill(self._closed_keys(open_keys), float("-inf"))
         pq = hier.up[level]
         pk = torch.cat([pq, pq.new_tensor([n_par])])  # CLS is its own one-member cluster, index n_par
         parent_rows = prior[:, pq]  # [H, n, n_par + 1]
@@ -683,7 +708,7 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         picks = torch.multinomial(mean.float().cpu(), n_draw, replacement=True, generator=gen).to(device)
         return keys.gather(-1, picks)
 
-    def _routed_level(self, level, projected, tokens, prior, hier, ctx, L, cls):
+    def _routed_level(self, level, projected, tokens, prior, hier, ctx, L, cls, open_keys=None):
         """Level ``level`` >= 1, routed: ``(output [n + 1, H, d], SparseRows)``, a block of parents at a time."""
         q_all, k_all, v_all = projected[level]
         n, n_par = hier.counts[level], hier.counts[level - 1]
@@ -722,6 +747,8 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
             if bias is not None:
                 scores = scores + F.pad(offset_bias(bias, offsets).permute(0, 3, 1, 2), (0, 1))
             blocked = (kid < 0)[:, None, :].expand(-1, m, -1)
+            if open_keys is not None:
+                blocked = blocked | ~open_keys[kid.clamp_min(0)][:, None, :]
             if last:
                 blocked = blocked | (kid[:, None, :] == qi[:, :, None])
             blocked = F.pad(blocked, (0, 1))[:, None]  # CLS open

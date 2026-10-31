@@ -685,10 +685,6 @@ def test_the_validator_takes_every_bias_with_a_pair_form_and_rope_for_the_fused_
     with pytest.raises(ValueError, match="reads the attention maps in training"):
         _validate_attention(_cfg(kind="fused", loss="SCE_EntropyATT_Loss"))
     cfg = _cfg(kind="fused")
-    cfg.model.global_component.parameters.attention.visible_keys_only = True
-    with pytest.raises(ValueError, match="visible_keys_only edits the dense attention mask"):
-        _validate_attention(cfg)
-    cfg = _cfg(kind="fused")
     cfg.model.global_component.parameters.attention.fused.chunk_pairs = 0
     with pytest.raises(ValueError, match="chunk_pairs .* must be >= 1"):
         _validate_attention(cfg)

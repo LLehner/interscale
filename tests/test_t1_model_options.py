@@ -318,7 +318,7 @@ def test_it_carries_the_distance_prior_and_the_other_dense_normalisers():
 def test_a_pattern_backend_refuses_it_at_the_forward_pass():
     cfg = _cfg(attention={"visible_keys_only": True, "kind": "performer"})
     batch, _ = _batch()
-    with pytest.raises(ValueError, match="dense attention mask"):
+    with pytest.raises(ValueError, match="cannot block keys"):
         _module(cfg)._common_step(batch, "regression", "node")
 
 

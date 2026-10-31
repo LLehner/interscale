@@ -204,15 +204,9 @@ class TransformerNodeEncoderHook(GlobalModule):
         if hierarchy is not None:
             if hierarchy.coarse_bias not in COARSE_BIAS:
                 raise ValueError(f"hierarchy.coarse_bias must be one of {COARSE_BIAS}, got {hierarchy.coarse_bias!r}.")
-            if (
-                rotary_encoding is not None
-                or self.context_only != "none"
-                or self.visible_keys_only
-                or long_range_attention
-            ):
+            if rotary_encoding is not None or self.context_only != "none" or long_range_attention:
                 raise ValueError(
-                    "the hierarchical attention carries no rotary encoding, context-only queries, visible-keys-only "
-                    "mask or long-range mask."
+                    "the hierarchical attention carries no rotary encoding, context-only queries or long-range mask."
                 )
             # The coarse levels' distance bias between centroids: the cells' own biases (`shared`), a copy per level learned
             # apart (`own`, copied without drawing), or none.
@@ -355,13 +349,18 @@ class TransformerNodeEncoderHook(GlobalModule):
             attention_mask = attention_mask.to(dtype=torch.bool)
 
         if self.visible_keys_only and not eval_step:
+            # Before the bias is merged in: the dense mask is still boolean here. A backend that never forms it takes
+            # the hidden keys as a row of the StructuredMask and blocks them in every block (fused).
+            keys = self._hidden_keys(batched_data, index_nodes, src_padding_mask.shape[1])
             if isinstance(attention_mask, StructuredMask):
-                raise ValueError(
-                    "attention.visible_keys_only needs a dense attention mask; this backend takes a pattern."
-                )
-            attention_mask = self._without_hidden_keys(
-                attention_mask, batched_data, index_nodes, src_padding_mask.shape[1]
-            )
+                if not self.attention_spec.hidden_keys:
+                    raise ValueError(
+                        f"attention.visible_keys_only: attention.kind {self.attention_kind!r} cannot block keys "
+                        "(it takes a pattern or folds its mask into features)."
+                    )
+                attention_mask = attention_mask._replace(hidden_keys=keys)
+            else:
+                attention_mask = self._without_hidden_keys(attention_mask, keys)
 
         if self.attention_bias is not None and not isinstance(attention_mask, StructuredMask):
             # Merged by indexing, never by arithmetic: blocked pairs become -inf, every other pair
@@ -456,6 +455,7 @@ class TransformerNodeEncoderHook(GlobalModule):
             coarse_biases=coarse,
             generator=self.hierarchy_generator,
             training=self.training,
+            visible_keys_only=self.visible_keys_only and not eval_step,
         )
         context.record = self._hierarchy_record
         return context
@@ -488,17 +488,24 @@ class TransformerNodeEncoderHook(GlobalModule):
             return padded_emb.new_zeros(padded_emb.shape)
         return pad_like(node_encoding, batched_data.batch, index_nodes, seq_len).transpose(0, 1).to(padded_emb.dtype)
 
-    def _without_hidden_keys(self, mask: torch.Tensor, batched_data, index_nodes, seq_len: int) -> torch.Tensor:
-        """``mask`` ``[B * heads, S + 1, S + 1]`` (True: blocked) with every key that is a cell hidden whole blocked too.
+    def _hidden_keys(self, batched_data, index_nodes, seq_len: int) -> torch.Tensor:
+        """``[B, S + 1]`` bool: True at every key that is a cell hidden whole; the CLS slot (last) is False.
 
-        A hidden cell stays a query: its row loses only the hidden keys, and CLS (the last slot, never hidden) stays open,
-        so no row is ever empty. The cells are laid out like the tokens (``pad_like`` with this call's ``index_nodes``).
+        Laid out like the tokens (``pad_like`` with this call's ``index_nodes``), so left padding and subsampling stay
+        aligned; padding slots are False (the padding mask blocks them already).
         """
         hidden = self.wholly_hidden(batched_data)
         keys = pad_like(hidden[:, None].float(), batched_data.batch, index_nodes, seq_len)[..., 0] > 0  # [B, S]
-        keys = torch.nn.functional.pad(keys, (0, 1))  # CLS open
-        n_graphs = keys.shape[0]
-        blocked = mask.reshape(n_graphs, self.n_heads, seq_len + 1, seq_len + 1) | keys[:, None, None, :]
+        return torch.nn.functional.pad(keys, (0, 1))  # CLS open
+
+    def _without_hidden_keys(self, mask: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        """``mask`` ``[B * heads, S + 1, S + 1]`` (True: blocked) with the ``keys`` ``[B, S + 1]`` blocked for every query.
+
+        A hidden cell stays a query: its row loses only the hidden keys, and CLS (the last slot, never hidden) stays open,
+        so no row is ever empty.
+        """
+        n_graphs, width = keys.shape
+        blocked = mask.reshape(n_graphs, self.n_heads, width, width) | keys[:, None, None, :]
         return blocked.reshape(mask.shape)
 
     @contextmanager
