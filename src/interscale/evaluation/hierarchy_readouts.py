@@ -29,6 +29,7 @@ import torch
 from torch_geometric.loader import DataLoader
 
 from interscale.evaluation._spatial_weights import graph_edges
+from interscale.evaluation.flow_maps import flow_arrays
 from interscale.evaluation.online_probes import _rng_untouched
 from interscale.module.global_modules.hierarchical_attention import SparseRows
 
@@ -358,6 +359,8 @@ def hierarchy_readouts(
     graph_names: Sequence[str] | None = None,
     dependence_genes=None,
     dependence: dict | None = None,
+    flow_dir: str | Path | None = None,
+    flow_grid_um: float = 10.0,
 ) -> dict[str, pd.DataFrame]:
     """Every readout above, over the graphs of ``data_list`` under the masks they carry (the module corrupts its input as in
     training). ``layers``: which layers' planted metrics and profiles to report (default: all). ``export_dir``: write the
@@ -367,10 +370,14 @@ def hierarchy_readouts(
     exported graph also gets its receivers' dependence field (``receptive_field.receiver_dependence``, ``dep_*`` arrays, cells
     in sequence positions); ``dependence`` passes that function's settings (``baseline``, ``steps``, ``retry_steps``,
     ``gap_limit``, ``receivers_per_program``, ``top``), and ``graphs``: only the first that many exported graphs (0: all; the
-    dependence costs a backward pass per receiver and integration point). Consumes no RNG and leaves the module's mode as it was.
+    dependence costs a backward pass per receiver and integration point). ``flow_dir``: write the net attention flow of the
+    last layer of every graph there (``<name>.npz``, :func:`~interscale.evaluation.flow_maps.flow_arrays` on a grid of
+    ``flow_grid_um``; drawn by :func:`~interscale.evaluation.flow_maps.plot_attention_flow`), independent of ``export_dir``.
+    Consumes no RNG and leaves the module's mode as it was.
 
-    Returns ``hier_planted`` (layer, range_class, head, metric, value, n_receivers), ``hier_health``, ``hier_profile`` and
-    ``hier_stats`` (per graph: the hierarchy's sizes and build time), each only when it has rows.
+    Returns ``hier_planted`` (layer, range_class, head, metric, value, n_receivers), ``hier_health``, ``hier_profile``,
+    ``hier_stats`` (per graph: the hierarchy's sizes and build time) and ``hier_flow`` (per graph: the net flow per cell, the
+    share into hidden cells, its length, the mutual share), each only when it has rows.
     """
     transformer = getattr(module, "global_module", module)
     hierarchical = getattr(transformer, "hierarchy", None) is not None
@@ -381,12 +388,13 @@ def hierarchy_readouts(
     ):
         return {}  # no transformer, or one whose maps are not over cells: nothing to read alike
     graphs = list(data_list)[:max_graphs] if max_graphs else list(data_list)
-    planted, healthy, profile, stats = [], [], [], []
+    planted, healthy, profile, stats, flows = [], [], [], [], []
     was_training = module.training
     module.eval()
     loader = DataLoader(dataset=graphs, shuffle=False, batch_size=1, num_workers=0)
-    if export_dir is not None:
-        Path(export_dir).mkdir(parents=True, exist_ok=True)
+    for folder in (export_dir, flow_dir):
+        if folder is not None:
+            Path(folder).mkdir(parents=True, exist_ok=True)
     try:
         with _rng_untouched(device):
             for g, batch in enumerate(loader):
@@ -424,6 +432,13 @@ def hierarchy_readouts(
                         profile += [
                             {"graph": name, "layer": layer, **row} for row in distance_profile(entry, distance_bins_um)
                         ]
+                if flow_dir is not None and record:
+                    keys, weights = cell_rows(record[-1])
+                    arrays, summary = flow_arrays(
+                        keys, weights, record[-1]["pos_um"], record[-1]["visible"], grid_um=flow_grid_um
+                    )
+                    np.savez_compressed(Path(flow_dir) / f"{name}.npz", **arrays)
+                    flows.append({"graph": name, **summary})
                 if export_dir is not None and record and (not export_graphs or g < export_graphs):
                     arrays = fields(record[-1], bias=getattr(transformer, "attention_bias", None))
                     if pairs is not None:
@@ -470,6 +485,8 @@ def hierarchy_readouts(
         )
     if stats:
         tables["hier_stats"] = pd.DataFrame(stats)
+    if flows:
+        tables["hier_flow"] = pd.DataFrame(flows)
     return tables
 
 
