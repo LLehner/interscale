@@ -42,6 +42,10 @@ exists" is context, so that facts are not re-derived; it is not a template to ex
 - **Fields:** `evaluation.hierarchy_readouts.fields` (per head: cell mass, top-5 targets, `window_vec_heads` = the head's own trained
   window over the same keys) and `notebooks_and_scripts/slurm/hierarchical/scripts/fields_by_class.py` (the per-head figures of
   question 8).
+- **Attention flow maps** (`evaluation/flow_maps.py`, built 2026-10-31 for the CosMx run at the user's request; context, not a template): per slide the net
+  attention `A_ij - A_ji` of the last layer (head mean, cell keys, mutual pairs), deposited on a grid and drawn as streams, one tile per tissue block, no
+  labels, whole sections (a sparse matrix from the routed rows). Checked on synth_spot's Stage B exports against the untrained twin (the later-reads bullet
+  below, notes.md 2026-10-31). The user scrapped the quiver plots on CosMx (empty slide, tiny arrows) and asked for these.
 - **A proposal never built** (roadmap.md T4, "Flow without annotation (task 5)"): per-cell sender vectors from attributions minus the
   permuted-slide expectation and the distance kernel; divergence for sources and sinks; clusters of cells by their vectors. Read it,
   but do not treat it as decided.
@@ -53,6 +57,12 @@ What earlier reads found (notes.md):
   epochs (2026-10-23); `hier_none` mid 1.00, short 0.97 (2026-10-26). It is trustworthy where the completeness gap stays under 0.1,
   and converges slowly where the response barely moves.
 - Head-mean arrows are slide geometry: wide heads pull every arrow to the slide centre, and the untrained twin already scores 31°.
+- **Later reads qualify the first bullet (2026-10-31, Stage B exports of synth_spot, 300 epochs, windowed hierarchical models, 22 slides):** the rank-based
+  readouts at chance were early near-uniform models. Trained, the attention's top 5 (head mean) holds a planted sender for 97% of the short-range receivers
+  (untrained twin 69%: the distance window) and 73% of the mid-range ones (twin 7%; the best head 80%), and the sign of the net flow `A_rs - A_sr` points from
+  sender to receiver for 61% / 94% of the pairs (twin 49% / 42%). IG: 99% / 100%, dense 9% (3x chance); no readout finds the sparse or directional senders
+  (<= chance; the directional programmes are learned by no model). The choice is not "attention or IG" but what each is for: attention is cheap, whole-section,
+  every receiver; IG is the stronger and gene-resolved readout, at a backward pass per receiver and integration point.
 - The directional programmes (stripe, cone) are learned by no model (~0.22-0.25), so a field cannot be validated on direction yet.
 - Gradient magnitude is a sensitivity, not a use (a mean-aggregating GCN ranked its own senders 0.41).
 

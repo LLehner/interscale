@@ -283,7 +283,7 @@ never an `S x S` tensor), and fuses each cell with its ancestors (`readout`). In
   patches, above): an annotation arm, cached by labels and edges as well as positions.
 - **Readouts.** `recording_hierarchy()` exports each layer's per-level attention (dense, or `SparseRows` when routed);
   `evaluation.hierarchy_readouts` reads hierarchical and dense models alike (sender lift, pair AUPRC, arrow angle, routing
-  recall, health, fields). Dense candidates also hand `forward` cell-level maps; routed models hand none. The exported fields
+  recall, health, fields, and the net attention flow of `evaluation.flow_maps`). Dense candidates also hand `forward` cell-level maps; routed models hand none. The exported fields
   carry per head the cell mass, the top-k targets and `window_vec_heads` (where the head's own trained position biases alone
   would read over the same keys, scaled to its cell mass: the baseline of a trained head, in place of an untrained twin), the
   planted pairs with their programmes, and with `dependence_genes` each receiver's integrated-gradients dependence
@@ -460,6 +460,25 @@ cells too -- every entry of each cell with no hidden entry -- with `HeadPredicti
 its entries were never in the sums), so at a visible cell a reference is its context alone. Under programme masking no cell is
 visible as a whole and only the `groups` table comes back. In the cluster sweeps it is the `VISIBILITY` setting of `sweep_common.py`
 (`{}` = defaults; skipped for a run trained without cell masking).
+
+#### Attention flow maps (`evaluation/flow_maps.py`; `.claude/roadmap.md`, task 5)
+
+One figure per slide of the **net attention flow**, annotation-free, for whole sections (routed or dense attention, no `S x S` map). `A` is the last layer's
+head-mean attention over cell keys (`hierarchy_readouts.cell_rows`; CLS, padding and a cell's own key left out); a pair's net flow is `F_ij = A_ij - A_ji`,
+positive when `i` reads `j` more, so information goes `j -> i` (the manuscript's `M - M^T`). Each such pair is an arrow deposited at its midpoint, summed on a
+grid (`flow_grid`; stored in the npz, so a plot is redrawn with another bandwidth), Gaussian-smoothed and divided by the smoothed cell count: the net current per
+cell. Invariants:
+
+- **Mutual pairs only** by default: a routed row holds its parent's candidate keys, so a pair known in one row only would show as a net flow of its full
+  weight. `mutual_share` (table `hier_flow`) is the attention mass on pairs known in both rows; with dense attention it is 1.
+- **It is where the model reads, not signalling.** Checked on synth_spot's trained windowed models (notes.md, 2026-10-31): the head mean's top 5 holds a planted
+  short-range sender for 97% of the receivers (untrained twin 69%: the distance window) and a mid-range one for 73% (twin 7%), and the net flow points from sender to
+  receiver for 61% / 94% of the pairs (twin 49% / 42%); dense, sparse and directional senders are not found, and integrated gradients are stronger (mid range 100%).
+  Part of any net flow is geometry (density, the tissue's edge, the layout of the mask: hidden cells read the visible ones around them). Read it against the untrained twin.
+- **Nothing but tissue is drawn:** `tissue_blocks` (bins joined across gaps under `link_um`; a piece that is not a rectangle, two fields touching at a corner,
+  is cut by `rectangles`) gives a tile per block, `tile_layout` packs them at one scale. `hierarchy_readouts(flow_dir=...)` writes `<graph>.npz` and the
+  `hier_flow` table (off by default); the CosMx hook (`slurm/new/hier_common.py`) draws `flow/<run>/<section>.png`. The quiver plots (`plot_fields`) are not
+  drawn on CosMx.
 
 #### Online probes (`evaluation/online_probes.py`)
 

@@ -1016,3 +1016,194 @@ every spot) and on draws of its own mask against `ref_own`. Centred cosine, whol
   genes) or an MSE loss.
 - The exact dense windowed model on fused attention does not train on whole sections: 127 s per training step at 100k cells (41.7 s per
   evaluation pass, 5.6 GiB), 165 epochs in 12 h; the dual model the same. Memory is not the limit, the quadratic compute is.
+
+## 2026-10-31 — CosMx whole sections at 300 epochs: the GCN against hier_none, folds 0 and 2 (`cosmx_run`: 5 of 6 runs; results in `results/30_10_results/cosmx_run`)
+
+One whole section per forward pass; cell masking, 20% of the cells at random + 60 µm discs over 10% in training, discs alone in the disc evaluation;
+SCELoss on centred targets; 300 epochs (~600 steps); one seed per fold; each fold tests the two sections of one physical slide (f0: 3_ND + 3_T1D,
+f2: 1_ND + 1_T1D). `hier_none` = GlobalModel, routed coarse-to-fine without a prior (clusters of 250 and 25, readout concat, top-k 8 / 8), a distance
+window per head (15-1000 µm), raw own-cell skip. **`hier_none_f1` is missing**: no section, visibility or field file, and no log in the folder. So:
+gcn f0-f2, `hier_none` f0 and f2, and the untrained twin of `hier_none_f0`.
+
+Centred cosine on the hidden spots, discs alone, all depths, **per fold**. The summary table prints fold 0's references and spot count once for every
+arm, so fold 1 and 2 arms stand against the wrong bar there (the per-arm sections are right):
+
+```text
+fold (hidden spots)   gcn     hier_none  twin    knn8   knn32  knn128  section mean
+f0 (15,221)           0.053   0.157     -0.057   0.172  0.220  0.244   0.209
+f1 (12,786)           0.199   missing            0.173  0.225  0.252   0.224
+f2 (10,984)           0.100   0.174              0.153  0.200  0.223   0.177
+beyond 40 um, f0 / f1 / f2:   gcn -0.113 / 0.158 / 0.004;  hier_none 0.134 / - / 0.150;  knn128 0.236 / 0.246 / 0.211
+```
+
+**What worked**
+- The run: 5 of 6 runs trained, evaluated and exported on whole sections. `hier_none` 2.6-3.2 s per epoch (13-16 min for 300 epochs), 6.5-8.2 GiB;
+  the GCN 0.5-0.8 s per epoch, 4.9-7.9 GiB; the whole evaluation (head scores, visibility, fields) 1.5-3.5 min per run. The feasibility bound held
+  (0.7-0.9 h per 1,000 epochs against 1.15 h): the request of 4 h and 192 G was ~10x generous, and 3,000 epochs of `hier_none` would take ~2.6 h.
+- `hier_none` beats the GCN where the GCN is blind, on both folds: +0.104 (f0) / +0.074 (f2) over all hidden spots, +0.247 / +0.146 beyond 40 µm. The
+  GCN falls to -0.113 (f0) and 0.004 (f2) there; `hier_none` is flat with depth (0.171 → 0.134, 0.195 → 0.150). The same on the training-style mask
+  (0.182 vs 0.139, 0.199 vs 0.160), in the validation loss (0.840 vs 0.866, 0.820 vs 0.855) and per gene (better than the GCN on 91% / 94% of the 979 genes).
+- It learned: the untrained twin scores -0.057 (f0), 0.21 below the trained model.
+- Per gene it is a competitive smoother. Mean pooled centred cosine over the 979 genes (training-style pass, the only one with a per-gene table), f0 / f2:
+  hier_none 0.100 / 0.118, gcn 0.062 / 0.097, knn32 0.101 / 0.105, knn128 0.117 / 0.127, section mean 0.082 / 0.098. Where the section mean scores below 0.15
+  (825 / 877 genes, no large section offset) hier_none is 0.069 / 0.103 against knn32 0.062 / 0.083, knn128 0.080 / 0.105, gcn 0.042 / 0.085. Its gain over the
+  section mean falls on the same genes in both folds (correlation 0.62; 49 genes gain > 0.05 in both, 5 lose): the islet / endocrine genes (TTR, GCG, CHGA,
+  SCG5: +0.35 to +0.67) and exocrine ones (PRSS2, SPINK1, REG1A). It reads compact tissue structure from context.
+- M0 (hidden against visible, masking_plan.md): hidden-cell scores are not flattered by the cell's own input. Under cell masking every model scores
+  *lower* on the visible cells (training-style pass, centred cosine hidden / visible: hier_none f0 0.182 / -0.001, f2 0.199 / 0.129; gcn 0.139 / 0.038,
+  0.230 / 0.188, 0.160 / 0.115), while every reference stays within ±0.011. Visible cells are no training targets, so a clean-pass score of these models
+  means nothing; the masked pass is the right one. The genes a clean pass flatters most are section-offset genes (RGS2 +0.57 on f0; MEG3 +0.33, RPS4Y1 +0.26 on f2).
+- The windows moved, unlike in the prior arms of 26-27 Oct (within ~10% of their start): 15 / 60.8 / 246.6 / 1000 µm → 11.2 / 49.4 / 234.8 / 984.1 (f0) and
+  11.1 / 49.8 / 223.1 / 979.8 (f2), strength 1.0 → 1.28 / 1.20 / 1.05 / 1.02 and 1.29 / 1.20 / 1.10 / 1.02. Routing is healthy: never_selected 0 at every level,
+  ~110 keys per query at the cluster level, 265-290 cell keys (0.3-0.6% of a section).
+
+**What doesn't work**
+- `hier_none_f1` is missing (cause unknown: check `cosmx_run_<jobid>_4.err`; `sbatch --array=4 slurm/cosmx_run.sbatch`). The folds are the replicates, so `hier_none`
+  has two. f1 is the fold where the GCN is best (0.199, flat with depth), so the gap to the GCN would be smallest there.
+- Still below the smoothers, as on 26-27 Oct. `hier_none` is below knn32 and knn128 on both folds (knn128 by 0.087 on f0, 0.049 on f2), below the section mean on f0
+  (by 0.052), level with it on f2 (0.174 vs 0.177), and ahead of knn8 on f2 only. On raw SCE it is worse than every reference (0.493 against 0.413-0.465; 0.589
+  against 0.438-0.491). Against the 26 Oct runs on the same f0 test sections (1,000 epochs, with priors: 0.181-0.189, gcn 0.069) the GCN is 0.016 lower at 300 epochs
+  and `hier_none` 0.03 below the prior arms (another arm, so not a clean epoch comparison). The 27 Oct read asked for 10-20x more epochs first; no 10,000-epoch run
+  is in the results folders, and this run went the other way (3x fewer). Undertrained or the model's limit is still open, and the validation curve is not in
+  the folder (final values only), so it cannot be read here.
+- The headline metric is mostly the section's own offset. Cosines are centred on the *training* mean, so whatever sets a test section apart from it (donor, sex, stress
+  state) counts as signal: the section mean alone gives 0.209 / 0.224 / 0.177, 80-89% of knn128, and what neighbours add beyond it is only 0.03-0.05. So every arm
+  sits in a band ~0.06 wide, and the GCN's deep score swings with the fold (-0.113 / 0.158 / 0.004), probably the match between its constant output (the training
+  sections' offset) and the test sections' (not tested), not context. The genes the section mean wins by most are offset genes: MEG3, COL9A2, RGS2, RPS4Y1 (Y-linked),
+  FOS, HSP90AB1. Of the 154 / 102 genes where the section mean scores >= 0.15, hier_none has 0.267 / 0.248 against knn32 0.305 / 0.299, knn128 0.319 / 0.315; on RPS4Y1
+  0.23 / 0.07 against the section mean 0.38 / 0.45. The model does not read the state of the section, and on the islet genes the smoothers are still ahead (nine-gene
+  mean f0 / f2: hier_none 0.417 / 0.467, knn32 0.506 / 0.572, gcn 0.335 / 0.431).
+  Probable cause, not tested: nothing in `hier_none` reaches the whole section. Windows end at ~1 mm, the attention beyond 2 mm is 0.004-0.03 of uniform, a section is ~10
+  tissue blocks of ~1 x 0.5 mm over ~7 x 10 mm (fields figure), and the coarse level reads ~4-5 of 205-246 regions (normalised entropy 0.26-0.34; twin 0.37).
+- The attention is mostly the prior's. The untrained twin already reads locally (lift over uniform 4.6x at 0-15 µm, 0.70 at 60-120 µm, 0.23 at 500-1000 µm); trained 6.2-7.9x,
+  0.72-0.76, 0.32-0.40; coarse entropy 0.37 → 0.26-0.34; keys per query 250 → 265-290. The fields show no readable arrows (two isolated ones on 3_ND; row entropy 4.0-4.9
+  nats, ~55-130 keys). `hier_none` here is a distance-weighted smoother with a learned value path; no content-based choice of senders can be seen.
+- Raw SCE and centred cosine disagree on f2 (SCE: gcn 0.525, hier_none 0.589; cosine 0.100 vs 0.174; val SCE 0.460 vs 0.480). The loss is SCE on centred targets and scale-free, so
+  the size of the predicted deviation is never trained, while the references average and shrink; val_r2 is negative in every run (-0.24 to -0.71). Probably an over-large deviation
+  norm (not tested): read the centred cosine, which the loss trains; a shrinkage fitted on the training sections would show it.
+- The own-cell skip is dead under cell masking: the `own_cell` share is exactly 0 (a hidden cell's raw input is the constant -1 vector), and at visible cells it only adds junk.
+  It came from the programme-masking arms; drop it for cell masking.
+- 60 µm discs cannot separate a global model from a wider smoother: the smoothers lose nothing with depth (knn128 0.245 → 0.236, section mean flat); 128 neighbours cover the hole.
+- Reporting: the summary's references (above); `visibility/*/maps.png` is solid black in every run (each hidden cell, 28% of 50-100k, gets a 0.3 pt ink ring drawn over the values, so
+  truth and prediction cannot be read); no validation curve is written to the results.
+
+**Next, in this order:** (1) rerun `hier_none_f1`; (2) the report: per-fold references in the summary, the maps, a within-section centred cosine (centred on each test section's visible
+mean: the section mean scores 0 by construction and what is left is context), the validation curve as a csv -- before the lung sweep, whose donors will carry the same offsets; (3) one
+fold-0 `hier_none` run at 3,000+ epochs (~2.6 h), to settle training length; (4) only then a way to read the section (a section token, a head without a distance window) and larger discs.
+
+## 2026-10-31 — Correction to the CosMx read above: what the run measured, which part of CosMx each run used, and a first look at the genes (the user's questions)
+
+**What was used.** The file holds 386,727 cells x 979 genes in 6 sections (3 slides x ND / T1D donor, 9-15 FOVs each). A fold column puts each section wholly in one split, one
+slide (ND + T1D) per split; every slide is tested once:
+
+```text
+fold    train (2 sections)         val (2 sections)           test (2 sections)
+split_0 slide 1:  108,711 cells    slide 2:  126,421 cells    slide 3:  151,595 cells
+split_1 slide 3:  151,595 cells    slide 1:  108,711 cells    slide 2:  126,421 cells
+split_2 slide 2:  126,421 cells    slide 3:  151,595 cells    slide 1:  108,711 cells
+```
+
+- Per forward pass it is the whole section: all its cells, all 979 genes, batch size 1, no windows, no cell removed (f0 test: 42,853 hidden + 108,742 visible = 151,595).
+- But **each run trains on two sections (two donors, one ND and one T1D), 28-39% of the cells**: ~2 steps per epoch, ~600 for 300 epochs. The validation slide is not trained on, it
+  picks the checkpoint (`train()` restores the best `val_loss` of the 30 validations, one per 10 epochs); only the test slide is scored: in the disc evaluation the hidden spots are the
+  discs over 10% of its cells (15,221 of 151,595 on f0), in the visibility pass ~28% (20% random + discs). Everything is therefore a transfer to two unseen donors from two seen ones.
+  I had not said this; "the folds are the replicates" holds, but each fold is a different pair of training donors.
+
+**What the run measured and what I wrote.** Only gene-expression reconstruction was scored (head scores, the references, the visibility pass), plus the attention by distance. Statements in
+the entry above that went beyond it, to be read as follows:
+- "The model does not read the state of the section": it reconstructs the section-offset genes (RPS4Y1, MEG3, RGS2, FOS) worse than the section mean. What its embedding encodes was not
+  measured. With two training donors a decoder cannot learn how a donor's state maps onto genes, whatever the embedding holds.
+- "No content-based choice of senders can be seen" and "a distance-weighted smoother with a learned value path": only the attention's profile by distance was read (trained against the
+  untrained twin). That profile cannot show or exclude a choice among cells at one distance. Sender type (the cell-type labels exist), integrated gradients and the decoder's genes were not run
+  on CosMx. Untested.
+- The ranking against the smoothers, and "mostly the section's own offset", are statements about reconstruction scores. They say nothing about what the global embedding represents.
+Not measured, and what is needed (the design is in roadmap.md, task 2, "global-only form"): the decoder's top genes per embedding dimension, the importance of each dimension, and whether
+the genes tied to a dimension vary in space.
+
+**A first look at the genes, local and model-free (no checkpoint).** Moran's I curve and length scale of each gene on the fold's two test sections (`gene_scales`, k 4-512, 2,000 centres,
+10 shuffles), joined with the per-gene hidden-cell centred cosines of the training-style pass:
+- The genes `hier_none` ranks highest are spatially variable, like every method's: all of the top 100 of `hier_none`, the GCN and knn32 have a "variable" pattern, against 78-80% of all
+  genes; Spearman of a method's per-gene score with the gene's first-shell Moran's I: hier_none 0.65 / 0.62 (f0 / f2), gcn 0.68 / 0.64, knn8 0.77 / 0.71, knn32 0.75 / 0.69. Top genes f0: MT2A,
+  SOD2, TTR, MT1X, SERPINA3, CHGA, GCG, CD74, B2M, PRSS2; f2: GCG, TTR, CHGA, CPB1, PRSS2, SPINK1, CUZD1, SERPINA3, INS, RGS2 (islet, exocrine, metallothionein / immune genes). It does not
+  separate the model from a smoother.
+- The edge over an 8-neighbour smoother does not rise with a gene's spatial scale for `hier_none` (Spearman of score minus knn8 with the autocorrelation left at the widest shell: 0.13 / -0.02;
+  with the length scale: -0.01 / -0.05), while it does for wider smoothers (knn32: 0.60 / 0.51 and 0.22 / 0.33; knn128: 0.51 / 0.36). Hint only: a pass where 70% of the hidden cells are
+  isolated, and a reconstruction score, not the embedding.
+- Median length scale of the variable genes 23 / 31 µm; of the top 100 by `hier_none` 31 / 80 µm (TTR, CHGA, GCG, INS 67-126 µm).
+
+## 2026-10-31 — The CosMx field plots (`fields/hier_none_f0`, `_f2`, the twin): what they draw, why they look as they do, what the exported arrays say
+
+`plot_fields` is the synth_spot lattice figure, unchanged. It draws 1,500 random cells (2.4-2.9% of the section) of the last layer's head mean, each an arrow true to scale (1 µm = 1 data unit)
+of `read_vec_i = sum_j A_ij (x_j - x_i)`, the attention-weighted displacement to where the cell reads from, coloured by the entropy of its attention row, on the section's bounding box.
+- **Blank space:** only 11% (f0, 7.5 x 9.4 mm) and 16% (f2, 7.8 x 8.2 mm) of that box holds cells (100 µm squares): a section is ~10 tissue blocks of ~1 x 0.5 mm. The "patches" are those blocks.
+- **Two arrows:** the median `read_vec` is 28 µm (f2: 25), ~2 pixels at ~15 µm per pixel; 90% are under 70 µm and 54 of the 1,500 drawn exceed 100 µm. The two long ones (cells 15 and 25967: 471 and
+  372 µm, entropy 1.85 and 1.75) put about half their attention on CLS and read a few far cells (mean distance ~500 µm); they are the same two outliers in the untrained twin (461 and 372 µm): not learned.
+- **Entropy** is non-negative (nats; e^H keys read evenly): median 4.55 (95 keys; twin 4.84, 126), 90% of the cells within 4.1-4.7. The colour range is stretched by the 35 cells below 3 nats, so all else is one shade.
+- **Few plots:** `EXPORT_GRAPHS = 1` in `cosmx_run.py` (the first test section only: 3_ND, 1_ND; the 100k-cell 3_T1D is not exported), only the hierarchical arms and the twin (the GCN has no attention), fold 1 missing,
+  the PNG is the head mean of the last layer (per-head arrays are in the npz, undrawn), `fields_by_class` needs planted classes (synth_spot only).
+
+What the arrays say (last layer, head mean, top-5 cell keys; attention only, not what the embedding holds):
+- Trained reading is more lopsided than the twin's: median `read_vec` 28 vs 18 µm, 99% 130 vs 71. It is weakly tied to the tissue edge (Spearman with the offset of the 30-neighbour centroid 0.22-0.35) and partly follows the
+  mask: for visible cells within 150 µm of >= 15 hidden cells the arrow leans towards the hidden cells (cosine +0.29 f0, +0.33 f2; twin +0.20; 68-69% of the arrows point towards them).
+- Hidden cells read more sharply than visible ones: entropy 4.08 / 4.11 against 4.55 / 4.49 (f0 / f2); the twin 4.88 against 4.82.
+- The twin's masked tokens attract each other: a hidden cell puts 91% of its top-5 weight on other hidden cells (58% of its 128 nearest are hidden). Training removed it: 51% (f0) / 58% (f2) against 58% / 56% by position,
+  i.e. 49% / 42% of a hidden cell's top-5 weight on visible cells against 42% / 44% expected: at most a few points of preference for the informative keys. Visible cells put 2% of theirs on hidden cells (5% expected).
+- This qualifies "the attention is mostly the prior's" (above): the profile by distance is close to the twin's, but the entropy and the treatment of masked keys changed with training.
+
+**Verdict:** on CosMx there are no planted senders, so the arrows have nothing to be compared with, and what they show is geometry plus the mask layout. Do not read this figure for signalling. The replacement is the readout of
+`interaction_readout_plan.md` (separate session) and the dimension analysis of roadmap.md task 2; a stopgap would crop to one tissue block with the discs outlined and export both test sections.
+
+## 2026-10-31 — Attention flow maps for whole CosMx sections replace the quiver plots (code, tests, a layout check on 3_ND; not run on a model)
+
+The user (2026-10-31): the field plots are "useless" and "don't belong to the cosmx run"; "a plot needs to show a single slide and its observations (or just the vector
+field), not blank space. I want attention flow plots for cosmx."
+- **Removed from the CosMx run:** the per-head fields npz and `plot_fields` (the CosMx hook now calls `hierarchy_tables(export_graphs=0, flow=True)`; `EXPORT_GRAPHS` left
+  `cosmx_run.py`). synth_spot's fields and `fields_by_class` are untouched.
+- **Built:** `evaluation/flow_maps.py`, `hierarchy_readouts(flow_dir=...)` (the `hier_flow` table), the CosMx hook and `cosmx_run.py` in `slurm/new/`. The net flow
+  `F_ij = A_ij - A_ji` of the last layer's head-mean attention over cells (the manuscript's `M - M^T`), from the routed rows as a sparse matrix, mutual pairs only; each
+  positive pair an arrow source -> receiver deposited at its midpoint, smoothed (30 µm) and divided by the cell count; streams per tissue block, one figure per test section
+  (`flow/<run>/<section>.png`, and `.npz` to redraw), one tile per block at one scale, cells grey and the hidden ones tinted, nothing but tissue. No label, no gradient.
+- **Checked:** 19 tests against hand-worked values (a planted "every cell reads its left neighbour more" gives +0.4 along +x; the deposit conserves the flow and sits at the midpoint;
+  dense attention and routing over every parent give one flow; the figure has one axes per block, the tint on the hidden cells only, the packed tiles inside the figure), 24 of 26
+  mutations caught (the two left are equivalent: a safety margin of the grid, and zero-flow pairs); 1,528 tests pass. 100k cells with 290 keys each: flow 5 s, figure 4 s, 4 GB RAM.
+- **Layout on the real geometry** (the old 3_ND export, whose only attention is the top-5 keys per cell, a stand-in: the figure is not the result): 10 tiles for the 10 FOVs, each filled
+  with tissue. The first version found 8 blocks: two pairs of FOVs touch at a corner and form an L, half of whose tile was empty slide; non-rectangular pieces are now cut into rectangles.
+- **Not validated:** raw attention did not find planted senders (2026-10-21); the planted-pair check of the brief was not run on this form. Part of any net flow is geometry
+  (density, the tissue's edge, the mask's layout: a hidden cell reads the visible ones around it, which read it little). The coarse levels and the first layer are not in it; routing
+  truncates rows, which is why only mutual pairs count (`mutual_share` is 0.74 on the top-5 stand-in; read the real one in `hier_flow`).
+- **To read:** the trained figure next to the twin's (`hier_none_f0_untrained`, same code); `hier_flow`: `to_hidden` against `hidden_cells` (its chance value), `visible_to_hidden`, `length_um`.
+- **To get it:** the fork's main with `flow_maps.py` and the `flow_dir` option on the cluster, `hier_common.py` and `cosmx_run.py` from `slurm/new/`, then the runs redone from their
+  checkpoints: `INTERSCALE_MODE=evaluate` with the same sbatch (no retraining).
+
+## 2026-10-31 — Which readout finds the planted senders in trained windowed models: attention per head and head mean, integrated gradients, and the direction of the net flow (Stage B exports of synth_spot, model-free reading of arrays; 22 slides)
+
+The user asked for alternatives to raw attention flow, to see which cell influences which and ideally sinks and sources. Read from `results/27_10_results/hier_synth_spot_B/fields` (windowed hierarchical models at 300 epochs, priors
+from lambda 0; 11 trained runs, 3 untrained twins of seed 42): for the receivers whose integrated gradients were exported (752 per slide, by programme), the share whose top 5 holds one of their planted senders
+(attention: the last layer's top-5 targets, per head and head mean; IG: the first 5 of the 32 cells with the largest |contribution|, `dep_top_cells`); chance is hypergeometric for 5 random cells. The three arms with a twin, seed 42:
+
+```text
+class (receivers)   chance   twin head mean   trained head mean   best head   trained IG
+short (600)         0.002    0.69             0.97                1.00 (h0)   0.99
+mid, M11 (150)      0.002    0.07             0.73                0.80 (h1)   1.00
+dense (450)         0.035    0.01             0.01                0.02        0.09
+sparse (756)        0.034    0.03             0.04                0.04        0.04
+directional (300)   0.007    0.03             0.04                0.04        0.01
+net flow F_rs = A_rs - A_sr (top-5 matrix), share of planted pairs with F > 0:  short 0.61 (twin 0.49), mid 0.94 (twin 0.42); a random cell at the same distance: 0.30 / 0.37
+```
+Over all 11 runs the numbers are lower where the prior costs (short 0.88 head mean, 0.97 IG; mid 0.45 and 0.93; direction short 0.47).
+
+**What worked**
+- Trained attention is a readout of who influences whom for the short and mid range: the head mean's top 5 holds a planted sender for 97% and 73% of the receivers, and the net flow `A - A^T` points from the sender to the receiver (61% and 94%
+  of the pairs, against 49% and 42% for the untrained twin). The head mean costs little against the best head (97% against 100%, 73% against 80%): it does not wash the signal out.
+- Integrated gradients are the stronger readout where the two differ: mid range 100% against 73% (the best head 80%), the dense class 9% (3x chance) against 1%. They need no attention map, are gene-resolved and cover the whole model.
+
+**What doesn't work**
+- The short range is mostly the distance window: the untrained twin's head mean already holds a planted sender for 69% of the receivers (316x chance); training adds 28 points. Only the mid range (twin 7%) shows the model reading something its prior does not.
+- Nothing finds the dense, sparse or directional senders (attention at or below chance, IG 3x chance on dense only). The directional programmes are learned by no model, so that may be the model's blind spot and not the readout's.
+- Net flow at short range is no direction signal by itself in an untrained model (0.49): neighbours read each other.
+- Limits: the matrix is the top 5 per cell (truncated), the chance is over all cells (generous), the arms are priors from lambda 0 and not `hier_none`, one lattice, one seed for the twins; IG is only on the sampled receivers.
+
+**For the goal (which cell influences which, sinks and sources in the tissue).** Both readouts are partial and complementary: attention flow is cheap, covers every cell of a whole section and gives the net direction; IG is the confirmation, on sampled receivers or
+summed targets of a disc (it is linear in its target). A source is a cell that is read or drawn from by many (out-strength), a sink one that draws from many (in-strength); the net `out - in` per cell, or the divergence of the smoothed current, maps them. Since hidden cells
+are the receivers by construction, sinks follow the mask layout: read the map against the untrained twin, and for a CosMx claim average over many masks (fold passes) and compare with the expression-permuted slide.
+Plots (not built): a source-sink map (cells coloured by smoothed `out - in`, diverging), zoom panels on discs with the arrows from the top sources to sampled receivers, the streams with the divergence shaded, and the influence against distance for trained, twin and permuted.
