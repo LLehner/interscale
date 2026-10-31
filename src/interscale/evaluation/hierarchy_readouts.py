@@ -272,7 +272,9 @@ def distance_profile(entry: dict, bins_um: Sequence[float], max_queries: int = 5
     return rows
 
 
-def window_rows(keys: torch.Tensor, pos: torch.Tensor, bias, block: int = 4096) -> torch.Tensor | None:
+def window_rows(
+    keys: torch.Tensor, pos: torch.Tensor, bias, block: int = 4096, radius: torch.Tensor | None = None
+) -> torch.Tensor | None:
     """``[H, n, K]``: each head's position biases alone (its distance window; no content, no prior) as attention over the same
     cell keys, the cell's own key, CLS and padding left out, each row summing to 1 (0 without an open key). None without a bias.
 
@@ -291,7 +293,8 @@ def window_rows(keys: torch.Tensor, pos: torch.Tensor, bias, block: int = 4096) 
             rows = torch.arange(start, start + len(k))[:, None]
             open_cells = (k >= 0) & (k < n) & (k != rows)
             offsets = pos[k.clamp(0, n - 1)] - pos[rows]  # [b, K, 2]
-            logits = offset_bias(bias, offsets.to(device)).float().cpu()  # [b, K, H]
+            query_r = None if radius is None else radius[start : start + len(k)][:, None].to(device)
+            logits = offset_bias(bias, offsets.to(device), query_r).float().cpu()  # [b, K, H]
             logits = logits.masked_fill(~open_cells[..., None], float("-inf"))
             w = torch.softmax(logits, dim=1).nan_to_num(0.0)  # a row with no open key: zeros
             out.append(w.permute(2, 0, 1))
@@ -321,7 +324,7 @@ def fields(entry: dict, top: int = 5, bias=None) -> dict[str, np.ndarray]:
         "entropy": stats["entropy"].mean(0).numpy(),
         "mean_distance_um": stats["mean_distance_um"].mean(0).numpy(),
     }
-    window = window_rows(keys, pos, bias)
+    window = window_rows(keys, pos, bias, radius=entry.get("radius_um"))
     if window is not None:
         window_vec, _ = read_vectors(keys, window * mass[..., None], pos)
         out["window_vec_heads"], out["window_vec"] = window_vec.numpy(), window_vec.mean(0).numpy()

@@ -88,6 +88,10 @@ def _positional_encoding_tag(cfg) -> str:
         names[names.index("distance")] = f"distance-scales-{window}{strength}{'-fz' if d.frozen else ''}"
     elif "distance" in names and pe.distance.get("kind", "profile") != "profile":
         names[names.index("distance")] = f"distance-{pe.distance.kind}"
+    if any(n.startswith("distance") for n in names) and pe.distance.get("units", "um") == "local":
+        # Distances in local units: `-loc<k>` (the density_k-th neighbour sets each query's unit).
+        at = next(i for i, n in enumerate(names) if n.startswith("distance"))
+        names[at] += f"-loc{int(pe.distance.density_k)}"
     if "rope" in names and pe.rope.get("kind", "axial") != "axial":
         names[names.index("rope")] = f"rope-{pe.rope.kind}"
     if "fourier" in names and not pe.fourier.get("isotropic", True):

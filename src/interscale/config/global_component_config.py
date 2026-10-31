@@ -105,6 +105,13 @@ def get_global_component_cfg(cfg, global_component_name):
         # scale_max_um]; one value per head (`pe.bias_heads.distance`, or every head). Empty: the geometric spacing. Set them from
         # the data's measured length scales with `evaluation.gene_scales.window_scales` (attention_plan.md, stage 10a).
         pe.distance.scales_um = []
+        # The unit of the distance a distance bias reads (roadmap Tier 2). "um": as measured. "local": scaled by the query cell's
+        # density, d * density_ref_um / r_q, with r_q the query's distance to its `density_k`-th nearest cell (positions only,
+        # precomputed per graph): a window of 60 µm at the reference density spans fewer µm in dense tissue and more in sparse,
+        # the same number of neighbours. `density_ref_um` 0 derives the median r over the data when the model is built.
+        pe.distance.units = "um"
+        pe.distance.density_k = 8
+        pe.distance.density_ref_um = 0.0
         # A learned bias per head as a function of how alike two cells' expression is: each key's
         # rank among the query's keys by Euclidean distance of their expression (the kNN view of
         # scanpy.pp.neighbors on the expression), piecewise linear in log2(1 + rank) between

@@ -174,6 +174,7 @@ class GraphLayout:
     visible: torch.Tensor  # [n] 1 for a cell with a visible entry, 0 for one hidden whole
     hierarchies: list  # one Hierarchy, or two under shift (layers alternate)
     nodes: list | None = None  # the graph-local node indices pad_batch kept, in sequence order
+    radius_um: torch.Tensor | None = None  # [n] each kept cell's density radius (µm), under pe.distance.units local
 
 
 class HierarchicalContext:
@@ -205,7 +206,7 @@ class HierarchicalContext:
         self.record: list | None = None
 
 
-def offset_bias(bias, offsets_um: torch.Tensor) -> torch.Tensor | None:
+def offset_bias(bias, offsets_um: torch.Tensor, query_radius_um: torch.Tensor | None = None) -> torch.Tensor | None:
     """The enabled attention biases (``positional_encodings.AttentionBias``) at offsets ``key - query`` ``[..., 2]`` (µm): ``[..., heads]``.
 
     Biases of the distance (every ``distance`` kind) and of the offset (``fourier``); none other has a form for an arbitrary
@@ -213,11 +214,19 @@ def offset_bias(bias, offsets_um: torch.Tensor) -> torch.Tensor | None:
     """
     if bias is None:
         return None
+    from interscale.module.global_modules.positional_encodings import density_factor, is_local
+
     total = 0
     for name, encoder in bias.encoders.items():
         need = bias.requires[name]
         if need == "pos":
-            total = total + bias.place(name, encoder._lookup(offsets_um.norm(dim=-1)), -1)
+            dist = offsets_um.norm(dim=-1)
+            if is_local(encoder):
+                # units: local -- each query's distances times its density factor; ``query_radius_um`` broadcasts to them.
+                if query_radius_um is None:
+                    raise ValueError("the distance bias reads local units; offset_bias needs each query's radius.")
+                dist = dist * density_factor(encoder, query_radius_um.to(dist.dtype)).expand_as(dist)
+            total = total + bias.place(name, encoder._lookup(dist), -1)
         elif need == "pos_coords":
             phase = offsets_um.double() @ encoder.frequencies.double().T
             a, c = encoder.coefficients()
@@ -228,6 +237,20 @@ def offset_bias(bias, offsets_um: torch.Tensor) -> torch.Tensor | None:
                 f"the attention bias '{name}' reads neither distances nor offsets; the hierarchy cannot place it."
             )
     return total
+
+
+def level_radii(hier, radius_um: torch.Tensor) -> list[torch.Tensor]:
+    """Per level, each token's density radius (``pe.distance.units: local``): a cell's own (level ``L``), a cluster's the mean
+    over all its cells (positions only, hidden cells included). ``radius_um`` ``[n]`` in the hierarchy's cell order."""
+    L = hier.n_levels
+    radius, counts = [None] * (L + 1), torch.ones_like(radius_um)
+    radius[L] = radius_um
+    for level in range(L - 1, -1, -1):
+        up, n = hier.up[level + 1], hier.counts[level]
+        total = torch.zeros(n, dtype=radius_um.dtype, device=radius_um.device).index_add(0, up, radius[level + 1] * counts)
+        counts = torch.zeros(n, dtype=radius_um.dtype, device=radius_um.device).index_add(0, up, counts)
+        radius[level] = total / counts.clamp_min(1.0)
+    return radius
 
 
 def segment_logsumexp(scores: torch.Tensor, index: torch.Tensor, n_groups: int) -> torch.Tensor:
@@ -532,6 +555,9 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         L, E, H = hier.n_levels, self.d_model, self.n_heads
         tokens, weights = [None] * (L + 1), [None] * (L + 1)
         tokens[L], weights[L] = cells, graph.visible.to(cells.dtype)
+        # Under pe.distance.units local, each level's query radius: a cell's own, a cluster's the mean of its cells' (positions
+        # only, hidden cells included); None otherwise.
+        radius = level_radii(hier, graph.radius_um.to(cells.dtype)) if graph.radius_um is not None else [None] * (L + 1)
         for level in range(L - 1, -1, -1):
             tokens[level], weights[level] = self._pool(
                 level, tokens[level + 1], weights[level + 1], hier.up[level + 1], hier.counts[level], hier
@@ -542,7 +568,7 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         open_keys = [w > 0 for w in weights] if ctx.visible_keys_only else [None] * (L + 1)
 
         outputs, attention = [None] * (L + 1), [None] * (L + 1)
-        outputs[0], attention[0] = self._top_level(projected[0], hier, ctx, L, open_keys[0])
+        outputs[0], attention[0] = self._top_level(projected[0], hier, ctx, L, open_keys[0], radius[0])
         for level in range(1, L + 1):
             prior = attention[level - 1]
             if self.settings.prior_refresh == "once":
@@ -552,11 +578,11 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
                 prior = ctx.cache.get(key, prior)
             if self.settings.candidates == "dense":
                 outputs[level], attention[level] = self._dense_level(
-                    level, projected, tokens, prior, hier, ctx, L, cls, open_keys[level]
+                    level, projected, tokens, prior, hier, ctx, L, cls, open_keys[level], radius[level]
                 )
             else:
                 outputs[level], attention[level] = self._routed_level(
-                    level, projected, tokens, prior, hier, ctx, L, cls, open_keys[level]
+                    level, projected, tokens, prior, hier, ctx, L, cls, open_keys[level], radius[level]
                 )
 
         if ctx.record is not None:
@@ -579,7 +605,7 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         """``[n + 1]``: True at the level's tokens that are no key (``open_keys`` False), CLS (last) open; None for none."""
         return None if open_keys is None else F.pad(~open_keys, (0, 1))
 
-    def _top_level(self, qkv, hier, ctx, L, open_keys=None):
+    def _top_level(self, qkv, hier, ctx, L, open_keys=None, radius=None):
         """Level 0: dense attention among the level's tokens and CLS: ``(output [n_0 + 1, H, d], A^0 [H, n_0 + 1, n_0 + 1])``."""
         q, k, v = qkv
         n = q.shape[0] - 1
@@ -587,7 +613,9 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         bias = self._level_bias(ctx, 0, L)
         if bias is not None:
             pos = hier.centroid[0].to(q.dtype)
-            found = offset_bias(bias, pos[None, :, :] - pos[:, None, :])  # [n, n, H]
+            found = offset_bias(
+                bias, pos[None, :, :] - pos[:, None, :], None if radius is None else radius[:, None]
+            )  # [n, n, H]
             scores = scores + F.pad(found.permute(2, 0, 1), (0, 1, 0, 1))
         if L == 0:
             self_pairs = torch.eye(n + 1, dtype=torch.bool, device=q.device)
@@ -599,7 +627,7 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         out = torch.einsum("hqk,khd->qhd", self._dropout(weights), v)
         return out, weights
 
-    def _dense_level(self, level, projected, tokens, prior, hier, ctx, L, cls, open_keys=None):
+    def _dense_level(self, level, projected, tokens, prior, hier, ctx, L, cls, open_keys=None, radius=None):
         """Level ``level`` >= 1 with every token of the level as a key: ``(output [n + 1, H, d], A [H, n, n + 1])``."""
         q, k, v = projected[level]
         n, n_par = hier.counts[level], hier.counts[level - 1]
@@ -610,7 +638,8 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         offsets = pos[None, :, :] - pos[:, None, :]  # [n, n, 2]: key - query
         bias = self._level_bias(ctx, level, L)
         if bias is not None:
-            scores = scores + F.pad(offset_bias(bias, offsets).permute(2, 0, 1), (0, 1))
+            query_r = None if radius is None else radius[:, None]
+            scores = scores + F.pad(offset_bias(bias, offsets, query_r).permute(2, 0, 1), (0, 1))
         if level == L:
             scores = scores.masked_fill(torch.eye(n, n + 1, dtype=torch.bool, device=q.device), float("-inf"))
         if open_keys is not None:
@@ -645,7 +674,10 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
                 cluster_scores = torch.einsum("qhd,khd->hqk", q * self.head_dim**-0.5, kbar)  # [H, n, n_par + 1]
                 if bias is not None:
                     to_centroid = hier.centroid[level - 1].to(q.dtype)[None, :, :] - pos[:, None, :]
-                    cluster_scores = cluster_scores + F.pad(offset_bias(bias, to_centroid).permute(2, 0, 1), (0, 1))
+                    query_r = None if radius is None else radius[:, None]
+                    cluster_scores = cluster_scores + F.pad(
+                        offset_bias(bias, to_centroid, query_r).permute(2, 0, 1), (0, 1)
+                    )
                 cluster_scores = cluster_scores + self._lam(level)[:, None, None] * (parent_rows + PRIOR_EPS).log()
                 log_w = cluster_scores.log_softmax(-1)
                 logits = within + log_w.gather(-1, pk.expand(log_w.shape[0], n, -1))
@@ -709,7 +741,7 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         picks = torch.multinomial(mean.float().cpu(), n_draw, replacement=True, generator=gen).to(device)
         return keys.gather(-1, picks)
 
-    def _routed_level(self, level, projected, tokens, prior, hier, ctx, L, cls, open_keys=None):
+    def _routed_level(self, level, projected, tokens, prior, hier, ctx, L, cls, open_keys=None, radius=None):
         """Level ``level`` >= 1, routed: ``(output [n + 1, H, d], SparseRows)``, a block of parents at a time."""
         q_all, k_all, v_all = projected[level]
         n, n_par = hier.counts[level], hier.counts[level - 1]
@@ -746,7 +778,8 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
             scores = torch.einsum("gqhd,gkhd->ghqk", q, k)  # [G, H, m, K + 1]
             offsets = pos[kid.clamp_min(0)][:, None, :, :] - pos[qi.clamp_min(0)][:, :, None, :]  # [G, m, K, 2]
             if bias is not None:
-                scores = scores + F.pad(offset_bias(bias, offsets).permute(0, 3, 1, 2), (0, 1))
+                query_r = None if radius is None else radius[qi.clamp_min(0)][:, :, None]
+                scores = scores + F.pad(offset_bias(bias, offsets, query_r).permute(0, 3, 1, 2), (0, 1))
             blocked = (kid < 0)[:, None, :].expand(-1, m, -1)
             if open_keys is not None:
                 blocked = blocked | ~open_keys[kid.clamp_min(0)][:, None, :]
@@ -789,7 +822,8 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
                             hier.centroid[level - 1].to(q.dtype)[cand.clamp_min(0)][:, None]
                             - pos[qi.clamp_min(0)][:, :, None]
                         )
-                        cs = cs + F.pad(offset_bias(bias, to_c).permute(0, 3, 1, 2), (0, 1))
+                        query_r = None if radius is None else radius[qi.clamp_min(0)][:, :, None]
+                        cs = cs + F.pad(offset_bias(bias, to_c, query_r).permute(0, 3, 1, 2), (0, 1))
                     a_c = torch.cat([a[:, groups], a_cls[:, groups, None]], -1).permute(1, 0, 2)[:, :, None]
                     cs = cs + self._lam(level)[None, :, None, None] * (a_c + PRIOR_EPS).log()
                     cs = cs.masked_fill(F.pad(cand < 0, (0, 1))[:, None, None], float("-inf"))
@@ -877,6 +911,7 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
             "hierarchy": hier,
             "pos_um": graph.pos_um.detach().cpu(),
             "visible": graph.visible.detach().cpu(),
+            "radius_um": None if graph.radius_um is None else graph.radius_um.detach().cpu(),
             "nodes": graph.nodes,
             "attention": levels,
             "topk": [self.settings.topk_at(level) for level in range(1, hier.n_levels + 1)],

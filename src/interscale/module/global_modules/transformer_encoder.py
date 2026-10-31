@@ -419,6 +419,15 @@ class TransformerNodeEncoderHook(GlobalModule):
         pos = pos[:, :2].to(device=device, dtype=torch.float32) * float(settings.spatial_unit_um)
         hidden = self.wholly_hidden(batched_data).to(device) if not eval_step else None
         batch = batched_data.batch.to(device=device, dtype=torch.long)
+        # pe.distance.units local: each cell's density radius, for the levels' query radii.
+        from interscale.module.global_modules.positional_encodings import is_local
+
+        density = None
+        if self.attention_bias is not None and any(is_local(e) for e in self.attention_bias.encoders.values()):
+            density = getattr(batched_data, "density_radius", None)
+            if density is None:
+                raise ValueError("pe.distance.units local reads `density_radius` off the graphs; attach_positional_inputs adds it.")
+            density = density.to(device=device, dtype=torch.float32)
         seq_len = src_padding_mask.shape[1]
         # A label top level (`obs_label`) also reads each cell's label and, to find its connected patches, the graph's edges.
         codes = None
@@ -445,7 +454,10 @@ class TransformerNodeEncoderHook(GlobalModule):
             hierarchies = [self.hierarchy_cache.get(where, **data, **settings.build_kwargs(False)).to(device)]
             if settings.shift:
                 hierarchies.append(self.hierarchy_cache.get(where, **data, **settings.build_kwargs(True)).to(device))
-            graphs.append(GraphLayout(seq_len - len(kept), where, visible, hierarchies, list(kept)))
+            radius = None
+            if density is not None:
+                radius = density[rows] * float(settings.spatial_unit_um)
+            graphs.append(GraphLayout(seq_len - len(kept), where, visible, hierarchies, list(kept), radius))
         coarse = None
         if self.attention_bias is not None and settings.coarse_bias == "shared":
             coarse = [self.attention_bias] * settings.n_levels

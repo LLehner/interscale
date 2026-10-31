@@ -25,6 +25,7 @@ RESERVED_FIELD_NAMES = {
     "rw_pe",
     "spectral_pe",
     "spectral_eigval",
+    "density_radius",
 }
 
 #: Optional annotations attached to every PyG ``Data``: attribute name -> (config key, source).

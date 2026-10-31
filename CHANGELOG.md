@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Distances in local units (`pe.distance.units: local`, `density_k`, `density_ref_um`; roadmap Tier 2): a distance bias reads each
+  query's distances times `density_ref / r_q`, `r_q` its distance to its `density_k`-th nearest cell (`knn_radius`, precomputed
+  per graph as `density_radius` from positions alone), so a window spans the same number of neighbours in dense and sparse tissue.
+  Dense, pair and row forms; the hierarchy reads each level's mean radius (`level_radii`), its export carries `radius_um`, and
+  `hierarchy_readouts.window_rows` takes it. `resolve_density_reference` derives the reference (median) at model build; tag `-loc<k>`.
 - A bias for a set of heads (`pe.bias_heads.<kind>`; attention_plan.md, stage 10a): each attention bias is built for the heads it
   serves and placed into the full head axis, zero elsewhere, in the dense, pair, row and factor forms and in the hierarchy's
   `offset_bias` (`AttentionBias.place`, `served_heads`), so a head can be free of every bias. `pe.distance.scales_um` gives the

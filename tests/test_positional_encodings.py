@@ -278,7 +278,7 @@ def test_the_registry_holds_the_encodings_built_so_far():
         "sinusoidal": ("node", "pos", False),
         "lap": ("node", "lap_pe", True),
         "rw": ("node", "rw_pe", True),
-        "distance": ("bias", "pos", False),
+        "distance": ("bias", "pos", True),  # the density radius, under units: local only
         "expression": ("bias", "x", False),
         "spectral": ("bias", "spectral_pe", True),
         "fourier": ("bias", "pos", False),

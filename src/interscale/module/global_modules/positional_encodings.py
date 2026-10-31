@@ -298,9 +298,13 @@ class LinearDistanceBias(nn.Module):
         """``[B, S, S]`` distances in µm to ``[B, heads, S, S]`` biases."""
         return (dist / 1000.0).unsqueeze(1) * self.slope.view(1, -1, 1, 1)
 
+    def _lookup(self, dist: torch.Tensor) -> torch.Tensor:
+        """Distances of any shape (µm) to their biases, ``[*shape, heads]``."""
+        return (dist / 1000.0).unsqueeze(-1) * self.slope
+
     def pairs(self, pos_um: torch.Tensor, graph, query, key) -> torch.Tensor:
         """``[B, S, 2]`` positions (µm) and ``P`` token pairs to their biases, ``[P, heads]``."""
-        return (_pair_distance(pos_um, graph, query, key) / 1000.0).unsqueeze(-1) * self.slope
+        return self._lookup(_pair_distance(pos_um, graph, query, key))
 
     def profile(self, max_dist: float = 1000.0) -> tuple[torch.Tensor, torch.Tensor]:
         """``(knots [2] in µm, values [heads, 2])`` -- the line at 0 and ``max_dist``, as for ``profile``."""
@@ -796,12 +800,40 @@ def _validate_rw(pe):
 DISTANCE_KINDS = ("profile", "linear", "scales")
 #: The window ``pe.distance.shape`` gives a head of the ``scales`` bias.
 DISTANCE_SHAPES = ("gaussian", "exponential")
+#: The unit of the distance a distance bias reads (``pe.distance.units``): as measured, or scaled by the query's density.
+DISTANCE_UNITS = ("um", "local")
+
+
+def density_factor(encoder, radius_um: torch.Tensor) -> torch.Tensor:
+    """``density_ref / r`` of a distance bias with ``units: local``, per query radius ``r`` (µm); 1 where ``r`` is 0 (padding,
+    a cell alone in its graph). Multiplies the query's distances, so its window spans ``r / density_ref`` times its µm."""
+    ref = encoder.density_ref.to(radius_um.dtype)
+    return torch.where(radius_um > 0, ref / radius_um.clamp_min(1e-12), torch.ones_like(radius_um))
+
+
+def is_local(encoder) -> bool:
+    """Whether a distance bias reads distances in local units (``pe.distance.units: local``)."""
+    return hasattr(encoder, "density_ref")
+
+
+def knn_radius(pos: torch.Tensor, k: int) -> torch.Tensor:
+    """``[N]``: each cell's distance to its ``k``-th nearest other cell of the same graph (in ``pos`` units); 0 alone."""
+    from scipy.spatial import cKDTree
+
+    points = pos[:, :2].detach().cpu().double().numpy()
+    n = len(points)
+    if n < 2:
+        return torch.zeros(n)
+    k = min(int(k), n - 1)
+    dist, _ = cKDTree(points).query(points, k=k + 1)  # the first is the cell itself
+    return torch.as_tensor(dist[:, k], dtype=torch.float32)
 
 
 def _validate_distance(pe):
     if pe.distance.kind not in DISTANCE_KINDS:
         raise ValueError(f"pe.distance.kind must be one of {DISTANCE_KINDS}, got {pe.distance.kind!r}.")
     if pe.distance.kind == "linear":
+        _validate_distance_units(pe)
         return  # num_kernels and max_dist only describe the profile
     if pe.distance.kind == "scales":
         d = pe.distance
@@ -813,11 +845,25 @@ def _validate_distance(pe):
             raise ValueError(f"pe.distance.shape must be one of {DISTANCE_SHAPES}, got {d.shape!r}.")
         if not d.strength > 0:
             raise ValueError(f"pe.distance.strength must be > 0, got {d.strength}.")
+        _validate_distance_units(pe)
         return  # num_kernels and max_dist only describe the profile
     if pe.distance.num_kernels < 2:
         raise ValueError(f"pe.distance.num_kernels must be >= 2 (the two ends), got {pe.distance.num_kernels}.")
     if not pe.distance.max_dist >= 0:
         raise ValueError(f"pe.distance.max_dist must be >= 0 (0 derives it from the data), got {pe.distance.max_dist}.")
+    _validate_distance_units(pe)
+
+
+def _validate_distance_units(pe):
+    d = pe.distance
+    units = d.get("units", "um")
+    if units not in DISTANCE_UNITS:
+        raise ValueError(f"pe.distance.units must be one of {DISTANCE_UNITS}, got {units!r}.")
+    if units == "local" and (int(d.get("density_k", 8)) < 1 or not float(d.get("density_ref_um", 0.0)) >= 0):
+        raise ValueError(
+            f"pe.distance.units local needs density_k >= 1 and density_ref_um >= 0 (0: derived), got "
+            f"{d.get('density_k')} and {d.get('density_ref_um')}."
+        )
 
 
 def _validate_expression(pe):
@@ -910,8 +956,37 @@ def _build_rw(pe, n_embed):
     return RWPE(n_embed, int(pe.rw.steps))
 
 
-@register_pe("distance", kind="bias", requires="pos", validate=_validate_distance, forms=frozenset({"dense", "pairs"}))
+def _density_inputs(data, pe) -> dict:
+    """``density_radius`` ``[N]`` (``pos`` units) under ``pe.distance.units: local``: each cell's distance to its ``density_k``-th
+    nearest cell of its graph, from the positions alone, over every cell of the graph (also those ``pad_batch`` may drop)."""
+    if pe.distance.get("units", "um") != "local":
+        return {}
+    return {"density_radius": knn_radius(data.pos, int(pe.distance.density_k))}
+
+
+@register_pe(
+    "distance",
+    kind="bias",
+    requires="pos",
+    validate=_validate_distance,
+    precompute=_density_inputs,
+    forms=frozenset({"dense", "pairs"}),
+)
 def _build_distance(pe, n_heads):
+    encoder = _build_distance_kind(pe, n_heads)
+    if pe.distance.get("units", "um") == "local":
+        ref = float(pe.distance.density_ref_um)
+        if not ref > 0:
+            raise ValueError(
+                "pe.distance.density_ref_um is 0, which means 'derive it from the data', but nothing derived it. A model built "
+                "from AnnData does so in its constructor (resolve_density_reference); a module built from the config needs it set."
+            )
+        # A buffer: the checkpoint keeps the density its windows were trained at.
+        encoder.register_buffer("density_ref", torch.tensor(ref))
+    return encoder
+
+
+def _build_distance_kind(pe, n_heads):
     if pe.distance.kind == "linear":
         return LinearDistanceBias(n_heads)
     if pe.distance.kind == "scales":
@@ -1156,6 +1231,15 @@ class AttentionBias(nn.Module):
                 )
             vecs = pad_like(vecs.to(device=device, dtype=dtype), batch, index_nodes, seq_len)  # [B, S, k]
             return vecs, vals.to(device=device, dtype=dtype).reshape(len(index_nodes), -1)  # [B, k]
+        if key == "density":
+            radius = getattr(batched_data, "density_radius", None)
+            if radius is None:
+                raise ValueError(
+                    "pe.distance.units local reads each cell's `density_radius`, but the graphs carry none. It is precomputed by "
+                    "attach_positional_inputs when the graphs are built (prepare_geome_dataset, get_model_output)."
+                )
+            radius = radius.to(device=device, dtype=dtype)[:, None] * self.spatial_unit_um
+            return (pad_like(radius, batch, index_nodes, seq_len)[..., 0],)  # [B, S], 0 at padding
         raise ValueError(f"no attention bias input is prepared from `{key}`.")
 
     def pairs(self, batched_data, index_nodes, src_padding_mask, pairs, dtype, device) -> torch.Tensor:
@@ -1189,6 +1273,13 @@ class AttentionBias(nn.Module):
             key_name = "pos_coords" if self.requires[name] in ("pos", "pos_coords") else self.requires[name]
             if key_name not in inputs:
                 inputs[key_name] = self._inputs(key_name, batched_data, batch, index_nodes, seq_len, dtype, device)
+            if is_local(encoder):
+                if "density" not in inputs:
+                    inputs["density"] = self._inputs("density", batched_data, batch, index_nodes, seq_len, dtype, device)
+                g, q, k = graph[rows], query[rows], key[rows]
+                dist = _pair_distance(inputs[key_name][0], g, q, k) * density_factor(encoder, inputs["density"][0])[g, q]
+                total = total + self.place(name, encoder._lookup(dist), -1)
+                continue
             total = total + self.place(name, encoder.pairs(*inputs[key_name], graph[rows], query[rows], key[rows]), -1)
         return out.index_put((rows,), total)
 
@@ -1223,6 +1314,11 @@ class AttentionBias(nn.Module):
                     f"the attention bias '{name}' has neither a pair form nor a low-rank form; only a dense attention takes it."
                 )
 
+        # Each cell's density radius under `units: local`: a block scales its query rows' distances by theirs.
+        radius = None
+        if any(is_local(encoder) for _, encoder in distances):
+            radius = self._inputs("density", batched_data, batch, index_nodes, seq_len, dtype, device)[0]
+
         def read(start: int, stop: int) -> torch.Tensor:
             cells = min(stop, seq_len)  # the rows from seq_len on are CLS, whose bias is 0
             out = torch.zeros(n_graphs, self.n_heads, stop - start, seq_len + 1, dtype=dtype, device=device)
@@ -1233,7 +1329,8 @@ class AttentionBias(nn.Module):
                 pos = inputs["pos_coords"][0]
                 dist = torch.cdist(pos[:, start:cells], pos, compute_mode="donot_use_mm_for_euclid_dist")
                 for name, encoder in distances:
-                    bias = bias + self.place(name, encoder(dist), 1)  # [B, heads, rows, S]
+                    scaled = dist * density_factor(encoder, radius[:, start:cells])[..., None] if is_local(encoder) else dist
+                    bias = bias + self.place(name, encoder(scaled), 1)  # [B, heads, rows, S]
             for left, right in factors:
                 bias = bias + left[..., start:cells, :] @ right.transpose(-1, -2)
             if pairwise:
@@ -1302,6 +1399,13 @@ class AttentionBias(nn.Module):
             key = self.requires[name]
             if key not in inputs:
                 inputs[key] = self._inputs(key, batched_data, batch, index_nodes, seq_len, dtype, device)
+            if key == "pos" and is_local(encoder):
+                # units: local -- each query row's distances times its density factor.
+                if "density" not in inputs:
+                    inputs["density"] = self._inputs("density", batched_data, batch, index_nodes, seq_len, dtype, device)
+                scaled = inputs[key][0] * density_factor(encoder, inputs["density"][0])[..., None]
+                bias = bias + self.place(name, encoder(scaled), 1)  # [B, heads, S, S]
+                continue
             bias = bias + self.place(name, encoder(*inputs[key]), 1)  # [B, heads, S, S]
 
         pad = src_padding_mask.to(device=device, dtype=torch.bool)
@@ -1510,6 +1614,33 @@ def resolve_fourier_range(cfg, adata):
     logger.info(
         "pe.fourier.max_wavelength derived from the data: %.1f um (twice the largest slide diameter).", max_wavelength
     )
+    return cfg
+
+
+def resolve_density_reference(cfg, adata):
+    """``cfg`` with a derived ``pe.distance.density_ref_um`` when it is 0 under ``units: local``, else ``cfg`` itself.
+
+    0 means the median over every cell of ``adata`` of its distance to its ``density_k``-th nearest cell of the same
+    ``dataset.sample_key`` group, in µm: the density at which a window's µm are what they say. Returns a clone; called by every
+    model constructor.
+    """
+    names, pe = _enabled(cfg, "bias")
+    if "distance" not in names or pe.distance.get("units", "um") != "local" or pe.distance.density_ref_um > 0:
+        return cfg
+    key = cfg.dataset.spatial_key
+    if key is None or key not in adata.obsm:
+        raise ValueError(f"deriving the reference density needs coordinates, but obsm[{key!r}] does not exist.")
+    coords = torch.as_tensor(np.asarray(adata.obsm[key], dtype=np.float64))
+    groups = adata.obs.groupby(list(cfg.dataset.sample_key), observed=True).indices
+    radii = torch.cat([knn_radius(coords[rows], int(pe.distance.density_k)) for rows in groups.values()])
+    ref = float(radii[radii > 0].median()) * float(cfg.dataset.spatial_unit_um) if (radii > 0).any() else 0.0
+    if not ref > 0:
+        raise ValueError("pe.distance.density_ref_um 0 asks for the median density radius, but every cell lies alone. Set it.")
+    cfg = cfg.clone()
+    cfg.defrost()
+    cfg.model.global_component.parameters.pe.distance.density_ref_um = ref
+    cfg.freeze()
+    logger.info("pe.distance.density_ref_um derived from the data: %.2f um (median %d-th neighbour distance).", ref, pe.distance.density_k)
     return cfg
 
 
