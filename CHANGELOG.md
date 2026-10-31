@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- The decoder-side readout of the embedding dimensions (`evaluation.dimensions`; roadmap task 2, ED0-ED2): `collect_dimensions`
+  reads a GlobalModel's or LocalModel's embedding where its linear decoder reads it, on a masked pass or fold by fold;
+  `dimension_importance` (standardised loading, variance share, ablation), `effective_directions` (the rotation-free SVD of
+  `W Σ_z^{1/2}`), `dimension_genes` (the genes a dimension writes and the genes it tracks, their overlap), `track_summary` (against an
+  untrained twin), `dimension_tables` for the reports.
 - Distances in local units (`pe.distance.units: local`, `density_k`, `density_ref_um`; roadmap Tier 2): a distance bias reads each
   query's distances times `density_ref / r_q`, `r_q` its distance to its `density_k`-th nearest cell (`knn_radius`, precomputed
   per graph as `density_radius` from positions alone), so a window spans the same number of neighbours in dense and sparse tissue.
