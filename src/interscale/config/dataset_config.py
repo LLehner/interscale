@@ -59,6 +59,15 @@ def get_dataset_cfg(cfg):
     cfg.dataset.mask_block_kind = "disc"
     cfg.dataset.mask_block_label_key = ""
     cfg.dataset.mask_block_max_cells = 0
+    # Training on crops (roadmap Tier 3, K18; `tl/crops.py`): with `size_um` > 0 every training graph hands the trainer `per_graph`
+    # random crops per epoch -- squares (or discs, `shape`) of `size_um` µm around a cell drawn uniformly, with every per-cell
+    # attribute and the masks of the whole section -- instead of itself. Validation and test stay whole sections. A window with fewer
+    # than `min_cells` cells is redrawn. 0 (default): off, nothing drawn, the graphs as before.
+    cfg.dataset.crop = CN()
+    cfg.dataset.crop.size_um = 0.0
+    cfg.dataset.crop.shape = "square"
+    cfg.dataset.crop.per_graph = 8
+    cfg.dataset.crop.min_cells = 50
     # Programme masking (mask_strategy "gene" only): hide exactly these genes -- names or
     # "<var column>=<value>" selectors, e.g. ["role=response", "role=receiver"] -- in the selected
     # cells and nothing else. mask_percentage is then the share of cells (1.0: every cell), and

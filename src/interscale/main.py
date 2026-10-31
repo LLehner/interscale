@@ -9,7 +9,7 @@ import interscale as interscale
 from interscale.config import load_config
 from interscale.config.cli import add_config_args, print_registry, resolve_cfg_from_args
 from interscale.evaluation.online_probes import build_probe_obsm
-from interscale.geome_dataloader import GraphAnnDataModule, block_mask_kwargs, gene_set_mask_kwargs
+from interscale.geome_dataloader import GraphAnnDataModule, block_mask_kwargs, crop_kwargs, gene_set_mask_kwargs
 from interscale.pp import apply_segmentation_noise
 from interscale.tl import prepare_geome_dataset, remove_zero_expression_cells, set_full_reproducibility
 
@@ -94,6 +94,7 @@ def main(cfg, model_type):
         learning_type=cfg.dataset.prediction_level,
         **block_mask_kwargs(cfg),
         **gene_set_mask_kwargs(cfg, adata),
+        **crop_kwargs(cfg),
     )
 
     model.train(max_epochs=cfg.optim.n_epochs, datamodule=dm, early_stopping=cfg.optim.early_stopping)

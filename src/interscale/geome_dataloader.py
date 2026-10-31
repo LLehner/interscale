@@ -51,6 +51,26 @@ def block_mask_kwargs(cfg) -> dict:
     return {"mask_block_radius": radius, "mask_block_fraction": fraction}
 
 
+def crop_kwargs(cfg) -> dict:
+    """The crop arguments of :class:`GraphAnnDataModule` from ``cfg.dataset.crop`` (roadmap Tier 3): ``{}`` when off.
+
+    The size is stated in µm and divided by ``dataset.spatial_unit_um`` here, as the disc radius is; the crops' generator is seeded
+    from ``optim.seed``.
+    """
+    crop = cfg.dataset.get("crop", None)
+    if crop is None or not float(crop.get("size_um", 0.0)) > 0:
+        return {}
+    return {
+        "crop": {
+            "size": float(crop.size_um) / float(cfg.dataset.spatial_unit_um),
+            "shape": str(crop.shape),
+            "per_graph": int(crop.per_graph),
+            "min_cells": int(crop.min_cells),
+            "seed": int(cfg.optim.get("seed", 0) or 0),
+        }
+    }
+
+
 def gene_set_mask_kwargs(cfg, adata) -> dict:
     """The gene-set arguments of :class:`GraphAnnDataModule`: ``mask_genes`` resolved on ``adata.var``, the channel
     fraction (and its pool), or the pool of whole sets.
@@ -99,6 +119,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
         mask_block_kind: str = "disc",
         mask_block_label: str | None = None,
         mask_block_max_cells: int = 0,
+        crop: dict | None = None,
     ):
         """Manages loading and sampling schemes before loading to GPU.
 
@@ -148,6 +169,9 @@ class GraphAnnDataModule(pl.LightningDataModule):
         mask_block_label (str, optional): Under "label", the Data attribute of the niche label. Defaults to None.
         mask_block_max_cells (int, optional): Under "label", patches over this many cells are cut into kdtree pieces;
             0 keeps them whole. Defaults to 0.
+        crop (dict, optional): Train on random crops of the training graphs (`tl.crops.CropDataset`: `size` in `pos` units,
+            `shape`, `per_graph`, `min_cells`, `seed`; `crop_kwargs` builds it from the config). The masks stay the whole
+            graphs', redrawn every epoch; validation and test stay whole graphs. None: the training graphs as they are.
 
         Raises
         ------
@@ -229,6 +253,9 @@ class GraphAnnDataModule(pl.LightningDataModule):
         else:
             self.mask_gene_sets = None
         self.mask_sets_per_draw = int(mask_sets_per_draw)
+        if crop is not None and learning_type != "node":
+            raise ValueError("crops cut cells out of a graph: they need node-level learning.")
+        self.crop = dict(crop) if crop else None
         self.first_time = True
 
     def _nodewise_setup(self, stage: str | None) -> None:
@@ -250,7 +277,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
         eval_mask = self.learning_type == "node"
 
         if stage == "fit" or stage is None:
-            self._train_dataloader = self._spatial_node_loader(data_list=self.train_data, shuffle=True)
+            self._train_dataloader = self._spatial_node_loader(data_list=self.train_data, shuffle=True, crop=self.crop)
             self._val_dataloader = self._spatial_node_loader(data_list=self.val_data, shuffle=False, mask=eval_mask)
         if stage == "test" or stage is None:
             self._test_dataloader = self._spatial_node_loader(data_list=self.test_data, shuffle=False, mask=eval_mask)
@@ -396,7 +423,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
             self._assign_random_mask(data)
 
     def _spatial_node_loader(
-        self, data_list: list[BaseData], shuffle: bool = False, mask: bool = True, **kwargs
+        self, data_list: list[BaseData], shuffle: bool = False, mask: bool = True, crop: dict | None = None, **kwargs
     ) -> DataListLoader:
         """Adds a node mask to each Data object.
 
@@ -406,6 +433,8 @@ class GraphAnnDataModule(pl.LightningDataModule):
         shuffle (bool, optional): whether to shuffle the data. Defaults to False.
         mask (bool, optional): whether to mask nodes at all. Graph-level evaluation splits pass
             False so that val/test inputs are not corrupted. Defaults to True.
+        crop (dict, optional): hand the loader random crops of the graphs (`tl.crops.CropDataset`) instead of the graphs;
+            the masks assigned here, and redrawn later in place, are the ones the crops slice. Defaults to None.
         kwargs: arguments passed to the pyg.NeighborLoader
 
         Returns
@@ -418,8 +447,13 @@ class GraphAnnDataModule(pl.LightningDataModule):
             else:
                 data.mask = torch.zeros(data.num_nodes, dtype=torch.bool)
 
+        dataset = data_list
+        if crop:
+            from interscale.tl.crops import CropDataset
+
+            dataset = CropDataset(data_list, **crop)
         return DataLoader(
-            dataset=data_list,
+            dataset=dataset,
             shuffle=shuffle,
             batch_size=self.batch_size,
             num_workers=self.num_workers,

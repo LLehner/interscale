@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 
 from yacs.config import CfgNode as CN
@@ -220,6 +221,49 @@ def _validate_masking(cfg):
             f"dataset.mask_percentage must be in (0, 1] for a regression task, got "
             f"{cfg.dataset.mask_percentage}. With no masking a reconstruction target is its own input."
         )
+
+
+def _validate_crop(cfg):
+    """``dataset.crop`` (training on crops, roadmap Tier 3): a size, coordinates, node level; a warning for what is taken over
+    the crop in training and over the section at inference."""
+    from interscale.tl.crops import CROP_SHAPES
+
+    crop = cfg.dataset.get("crop", None)
+    if crop is None:
+        return
+    size = float(crop.get("size_um", 0.0))
+    if size < 0:
+        raise ValueError(f"dataset.crop.size_um must be >= 0 (0: off), got {size}.")
+    if size == 0:
+        return
+    where = "dataset.crop"
+    if crop.shape not in CROP_SHAPES:
+        raise ValueError(f"{where}.shape must be one of {CROP_SHAPES}, got {crop.shape!r}.")
+    if int(crop.per_graph) < 1 or int(crop.min_cells) < 2:
+        raise ValueError(f"{where} needs per_graph >= 1 and min_cells >= 2, got {crop.per_graph} and {crop.min_cells}.")
+    if cfg.dataset.get("spatial_key", None) is None:
+        raise ValueError(f"{where} cuts windows by position, so it needs dataset.spatial_key.")
+    if cfg.dataset.prediction_level != "node":
+        raise ValueError(f"{where} cuts cells out of a graph: it needs prediction_level node.")
+    params = cfg.model.global_component.get("parameters", None)
+    if params is not None:
+        attention, pe = params.get("attention", None), params.get("pe", None)
+        per_sequence = []
+        if attention is not None and attention.get("center_qk", False):
+            per_sequence.append("attention.center_qk (centres on the crop's mean token)")
+        if pe is not None and list(pe.get("node", [])) and pe.get("center_coords", True):
+            per_sequence.append("node encodings with pe.center_coords (centred on the crop's centroid)")
+        pooling = params.get("pooling", None)
+        if pooling is not None and pooling.get("kind", "none") == "grid":
+            per_sequence.append("grid pooling (the grid starts at the crop's corner)")
+        if per_sequence:
+            warnings.warn(
+                f"{where}: the model trains on crops and is read on whole sections, and these are taken per sequence: "
+                + "; ".join(per_sequence)
+                + ". Compare against a run without crops before trusting the difference.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 def _validate_block_mask(cfg):
@@ -962,6 +1006,7 @@ def _validate(cfg):
     _validate_optim(cfg)
     _validate_val_interval(cfg)
     _validate_block_mask(cfg)
+    _validate_crop(cfg)
     _validate_masking(cfg)
     _validate_objective(cfg)
     _validate_orthogonality(cfg)

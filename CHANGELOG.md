@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Training on crops (`dataset.crop`: `size_um`, `shape`, `per_graph`, `min_cells`; `tl/crops.py`; roadmap Tier 3, K18): every
+  training graph hands the trainer `per_graph` random crops per epoch, square or disc windows around a cell drawn uniformly, with
+  every per-cell attribute and the section's own masks (`Data.subgraph`); validation and test stay whole sections. Crops come from a
+  private generator (main process) or the loader worker's per-epoch seed; `crop_kwargs` for the entrypoints; the validator warns
+  about what is taken per sequence (`center_qk`, centred node encodings, grid pooling).
 - The decoder-side readout of the embedding dimensions (`evaluation.dimensions`; roadmap task 2, ED0-ED2): `collect_dimensions`
   reads a GlobalModel's or LocalModel's embedding where its linear decoder reads it, on a masked pass or fold by fold;
   `dimension_importance` (standardised loading, variance share, ablation), `effective_directions` (the rotation-free SVD of
