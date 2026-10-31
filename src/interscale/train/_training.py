@@ -85,6 +85,12 @@ class NodeMaskingTrainingPlan:
                 "model.decoder.own_cell_skip adds a cell's own token to the prediction of a GlobalModel; this "
                 "model has none to add."
             )
+        wants_section = self._cfg.model.decoder.get("section_offset", "none") != "none"
+        if wants_section and getattr(self.module, "section_offset", "none") == "none":
+            raise ValueError(
+                "model.decoder.section_offset adds each gene's section mean to the prediction of a LocalModel or a "
+                "GlobalModel; a CombinedModel does not carry it yet."
+            )
 
     def train(
         self,

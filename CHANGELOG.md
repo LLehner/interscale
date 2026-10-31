@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- Section offset (`model.decoder.section_offset: visible_mean`; roadmap Tier 1): a LocalModel's or GlobalModel's prediction gets
+  the part `section`, each gene's mean over the visible entries of the cell's graph (`tl.masking.section_visible_mean`) times a
+  learned per-gene weight starting at 1; `BaseModule.visible_entries`, `section_input`; checkpoint tag `-sec`; a CombinedModel
+  refuses it. `masked_probing.within_section` scores heads within their section (truth and heads minus the section's visible
+  mean, recorded as `HeadPredictions.section_mean`).
 - The context query on the fused attention (`context_only: query` with `attention.kind: fused`; roadmap Tier 1, comparison_plan.md
   route a): `FusedAttention.supports_cross` reads with queries of their own, each third of the input projection on its own input,
   the same blocked pairs and biases, so the decomposable dual model (`add_ctx_*`) runs on whole sections. `AttentionSpec.cross`

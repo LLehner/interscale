@@ -37,6 +37,7 @@ class LocalModel(NodeMaskingTrainingPlan, BaseModel):
             mask_percentage=self._cfg.dataset.mask_percentage,
             mask_strategy=self._cfg.dataset.mask_strategy,
             block_masking=block_masking_on(self._cfg),
+            section_offset=self._cfg.model.decoder.get("section_offset", "none"),
         )
 
         self._attach_aux_losses()
@@ -81,7 +82,9 @@ class LocalModel(NodeMaskingTrainingPlan, BaseModel):
             # Fill embeddings directly into the DataFrame
             local_embeddings_df.loc[sample_mask] = local_embedding.detach().cpu().numpy()
 
-            y_pred = self.module.predict(local_embedding, self.prediction_level)
+            y_pred = self.module.predict(
+                local_embedding, self.prediction_level, section=self.module.section_input(batch, masked=False)
+            )
             y_pred_df.loc[sample_mask] = y_pred.detach().cpu().numpy()
 
         # Save embeddings in adata.obsm

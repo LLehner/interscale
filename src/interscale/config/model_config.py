@@ -47,5 +47,10 @@ def get_model_cfg(cfg):
     # What the skip reads: "embedding" (the cell's token, so W_o is limited to rank n_embed) or "raw" (its visible
     # genes themselves, a full-rank linear read: W_o is [n_output, n_input]; a hidden entry is -1 as in the model's input).
     cfg.model.decoder.own_cell_skip_input = "embedding"
+    # LocalModel and GlobalModel: "visible_mean" adds a part `section` to the prediction, each gene's mean over the visible
+    # entries of the cell's graph (a section) times a learned weight per gene starting at 1, so a section's own offset (donor,
+    # condition, batch) need not be carried by the embedding (roadmap Tier 1; notes.md 2026-10-31: on CosMx 80-89% of the
+    # centred cosine was the section's offset). "none": off. Reconstruction at node level only.
+    cfg.model.decoder.section_offset = "none"
 
     return cfg

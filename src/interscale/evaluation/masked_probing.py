@@ -66,7 +66,7 @@ from torch_geometric.loader import DataLoader
 from interscale.evaluation.online_probes import ProbeBatchFeatures, _rng_untouched
 from interscale.evaluation.online_probes import hidden_depth as _hidden_depth
 from interscale.tl.geome_utils import label_codes
-from interscale.tl.masking import sample_block_mask, sample_gene_set_mask, sample_unit_mask
+from interscale.tl.masking import sample_block_mask, sample_gene_set_mask, sample_unit_mask, section_visible_mean
 from interscale.tl.niches import graph_label_patches
 
 MASK_KINDS = ("entries", "cells", "blocks", "gene_set", "cells+blocks")
@@ -703,6 +703,10 @@ class HeadPredictions:
         ``[N]`` distance from each cell with no hidden entry to the nearest cell of its graph that has one, in µm; 0 for
         every other cell and ``inf`` in a graph without a hidden cell. What :func:`visibility_scores` bins the visible
         cells by. None when the graphs carry no ``pos``.
+    section_mean
+        ``[N, G]`` each gene's mean over the visible entries of the cell's graph (``tl.masking.section_visible_mean``, the
+        definition the model's ``section_offset`` uses): what :func:`within_section` centres on. At a cell hidden whole it
+        is the section without the cell.
     """
 
     heads: dict[str, np.ndarray]
@@ -712,6 +716,7 @@ class HeadPredictions:
     cells: np.ndarray | None = None
     parts: dict[str, dict[str, np.ndarray]] | None = None
     near_hidden_um: np.ndarray | None = None
+    section_mean: np.ndarray | None = None
 
 
 def _weighted_mean(w: torch.Tensor, xv: torch.Tensor, vis: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
@@ -1100,7 +1105,7 @@ def collect_head_predictions(
     module.eval()
     heads: dict[str, list[np.ndarray]] = {}
     part_chunks: dict[str, dict[str, list[np.ndarray]]] = {}
-    chunks = {"true": [], "hidden": [], "depth_um": [], "cells": [], "near_hidden_um": []}
+    chunks = {"true": [], "hidden": [], "depth_um": [], "cells": [], "near_hidden_um": [], "section_mean": []}
     loader = DataLoader(dataset=data_list, shuffle=False, batch_size=batch_size, num_workers=0)
     try:
         with _rng_untouched(device), torch.no_grad():
@@ -1124,6 +1129,8 @@ def collect_head_predictions(
 
                 gene_mask = getattr(batch, "gene_mask", None) if mask_strategy == "gene" else None
                 hidden = batch.mask.bool()[:, None].expand_as(batch.x) if gene_mask is None else gene_mask.bool()
+                section = section_visible_mean(batch.x.float(), ~hidden, batch.batch)
+                chunks["section_mean"].append(section[idx].cpu().numpy())
                 pos = getattr(batch, "pos", None)
                 if spatial_unit_um is not None and pos is not None:
                     depth = _hidden_depth(pos, hidden.all(dim=1), batch.batch) * float(spatial_unit_um)
@@ -1166,6 +1173,7 @@ def collect_head_predictions(
         depth_um=cat("depth_um"),
         cells=cat("cells"),
         near_hidden_um=cat("near_hidden_um"),
+        section_mean=cat("section_mean"),
         parts={
             head: {part: np.concatenate(values) for part, values in named.items()}
             for head, named in part_chunks.items()
@@ -1207,6 +1215,33 @@ def blend_heads(pred: HeadPredictions, reference: str, *, weight: float = 0.5) -
         cells=pred.cells,
         parts=pred.parts,
         near_hidden_um=pred.near_hidden_um,
+        section_mean=pred.section_mean,
+    )
+
+
+def within_section(pred: HeadPredictions) -> HeadPredictions:
+    """``pred`` with every head and the truth taken relative to its section: each entry minus ``section_mean``.
+
+    Scored by :func:`score_heads` with ``center`` zero, the centred cosine becomes the **within-section** cosine: how well a
+    head tells a hidden cell from the visible rest of its own section, with the section's offset from the training mean (donor,
+    condition, batch: 80-89% of the CosMx score, notes.md 2026-10-31) taken out of truth and prediction alike. The slide mean
+    (``ref_slide_mean``) is the centre itself at a hidden cell: its vector is zero up to float rounding, so its cosine is
+    noise around 0 (NaN where exactly zero), and a reference or head that only knows the section scores ~0; a model with
+    ``section_offset`` is scored on what its decoder adds. ``parts`` are left as they are (:func:`attribution_shares` centres
+    them per gene itself). Pass a masked pass's predictions; on :func:`visible_view` the mean holds the cell's own entries.
+    """
+    if pred.section_mean is None:
+        raise ValueError("the predictions carry no section means; collect them with collect_head_predictions.")
+    centre = pred.section_mean
+    return HeadPredictions(
+        heads={name: value - centre for name, value in pred.heads.items()},
+        true=pred.true - centre,
+        hidden=pred.hidden,
+        depth_um=pred.depth_um,
+        cells=pred.cells,
+        parts=pred.parts,
+        near_hidden_um=pred.near_hidden_um,
+        section_mean=np.zeros_like(centre),
     )
 
 
@@ -1575,6 +1610,7 @@ def visible_view(pred: HeadPredictions) -> HeadPredictions:
         cells=pred.cells,
         parts=pred.parts,
         near_hidden_um=pred.near_hidden_um,
+        section_mean=pred.section_mean,
     )
 
 

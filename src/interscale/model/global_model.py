@@ -45,6 +45,7 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
             mask_strategy=self._cfg.dataset.mask_strategy,
             block_masking=block_masking_on(self._cfg),
             type_gex_embedding=self._cfg.model.global_component.parameters.type_gex_embedding,
+            section_offset=self._cfg.model.decoder.get("section_offset", "none"),
         )
 
         self._attach_aux_losses()
@@ -106,6 +107,7 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
                 self.prediction_level,
                 own_embedding=self.module.own_cell_input(batch, embedding),
                 node_idx=torch.as_tensor(pad_index_nodes[0], dtype=torch.long, device=embedding.device),
+                section=self.module.section_input(batch, masked=False),
             )
 
             # I = self_attention_relevance.generate_relevance(transformer_in, src_padding_mask)

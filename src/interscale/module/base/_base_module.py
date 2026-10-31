@@ -5,7 +5,7 @@ import pytorch_lightning as L
 import torch
 
 from interscale.nn import LinearDecoder, LinearLSEDecoder, NonLinearDecoder
-from interscale.tl.masking import MASK_STRATEGIES, apply_mask
+from interscale.tl.masking import MASK_STRATEGIES, SECTION_OFFSETS, apply_mask, section_visible_mean
 
 
 class BaseModule(L.LightningModule, ABC):
@@ -24,6 +24,7 @@ class BaseModule(L.LightningModule, ABC):
         mask_strategy: Literal["node", "gene"] = "node",
         type_gex_embedding: Literal["PCA", "NMF", "scvi"] | None = None,
         block_masking: bool = False,
+        section_offset: str = "none",
     ):
         """
         Parameters
@@ -53,6 +54,12 @@ class BaseModule(L.LightningModule, ABC):
         block_masking: bool
             Spatial blocks are hidden as well (``dataset.mask_block_fraction`` > 0). With a
             ``mask_percentage`` of 0 they are the only corruption, and still count as one.
+        section_offset: Literal["none", "visible_mean"]
+            ``"visible_mean"``: the prediction gets a part ``section`` = ``w * m``, ``m`` each gene's mean over the visible
+            entries of the cell's graph (``tl.masking.section_visible_mean``), ``w`` one learned weight per gene starting at 1.
+            The model then predicts each cell as its section's visible mean plus what the decoder adds, so a section's own
+            offset (donor, condition, batch) is not what the embedding has to carry. Reconstruction only (``n_output`` is the
+            genes); a LocalModel or GlobalModel puts it into its prediction, a combined one refuses it.
         """
         super().__init__()
 
@@ -76,6 +83,18 @@ class BaseModule(L.LightningModule, ABC):
         # subsampling branch, which is the correct behaviour.
         self.block_masking = bool(block_masking)
         self.masked_nodes = self.mask_percentage > 0 or self.block_masking
+
+        if section_offset not in SECTION_OFFSETS:
+            raise ValueError(f"section_offset must be one of {SECTION_OFFSETS}, got {section_offset!r}.")
+        self.section_offset = section_offset
+        if section_offset != "none":
+            if n_output != n_input:
+                raise ValueError(
+                    f"section_offset adds each gene's section mean to its prediction: it needs a reconstruction (n_output "
+                    f"{n_output} = n_input {n_input})."
+                )
+            # Ones, not an initialiser: no draw from the global RNG, so every other weight is initialised as without it.
+            self.section_offset_weight = torch.nn.Parameter(torch.ones(n_output))
 
         # Define components
         self.local_component = None
@@ -124,6 +143,34 @@ class BaseModule(L.LightningModule, ABC):
             batch_masked = batch
             entry_mask = None
         return batch_masked, mask_idx, entry_mask
+
+    def visible_entries(self, batch_masked) -> torch.Tensor:
+        """``[N, G]`` bool: the entries of a masked batch the model was given (the complement of what the loss scores).
+
+        ``gene`` strategy: everything but ``gene_mask`` (hidden genes, sets, channels, and the rows of spatial blocks); ``node``:
+        everything but the rows of ``mask`` (random cells and blocks). All of them without masking.
+        """
+        x = batch_masked.x
+        if not self.masked_nodes:
+            return torch.ones(x.shape, dtype=torch.bool, device=x.device)
+        if self.mask_strategy == "gene":
+            gene_mask = getattr(batch_masked, "gene_mask", None)
+            return torch.ones(x.shape, dtype=torch.bool, device=x.device) if gene_mask is None else ~gene_mask.bool()
+        return ~batch_masked.mask.bool()[:, None].expand(x.shape)
+
+    def section_input(self, batch, masked: bool = True) -> torch.Tensor | None:
+        """``[N, G]`` in batch node order: the section part of each cell's prediction (``section_offset``), None when off.
+
+        ``masked``: ``batch`` is the masked batch of a training-style pass, its hidden entries left out of the means; False: a
+        clean batch (inference), every entry counts. The cells' graphs are ``batch.batch`` (one graph when absent).
+        """
+        if self.section_offset == "none":
+            return None
+        x = batch.x.float()
+        visible = self.visible_entries(batch) if masked else torch.ones(x.shape, dtype=torch.bool, device=x.device)
+        graph = getattr(batch, "batch", None)
+        mean = section_visible_mean(x, visible, None if graph is None else graph.long())
+        return mean * self.section_offset_weight.to(mean.dtype)
 
     @abstractmethod
     def _common_step(self, batch):

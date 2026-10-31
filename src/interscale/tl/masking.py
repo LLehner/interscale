@@ -127,6 +127,29 @@ def hides_gene_set(cfg) -> bool:
     return named or pooled or float(cfg.dataset.get("mask_channel_fraction", 0.0)) > 0
 
 
+#: What a section offset is (``model.decoder.section_offset``): none, or the mean of the section's visible entries.
+SECTION_OFFSETS = ("none", "visible_mean")
+
+
+def section_visible_mean(x: torch.Tensor, visible: torch.Tensor, graph: torch.Tensor | None) -> torch.Tensor:
+    """``[N, G]``: per cell, the mean of each gene over the visible entries of its graph (a section, a slide), 0 where none is.
+
+    ``x`` ``[N, G]`` and ``visible`` ``[N, G]`` (True where an entry was given to the model) in batch node order, ``graph``
+    ``[N]`` each cell's graph in the batch (None: one graph). A hidden entry never enters a mean, so the value at a cell
+    hidden whole is a leave-one-out mean of its section: what the section says without the cell. Under programme masking a
+    gene hidden in every cell has no visible entry and gets 0. The one definition the model's section offset
+    (``model.decoder.section_offset``) and the within-section scores (``masked_probing.within_section``) share.
+    """
+    weight = visible.to(x.dtype)
+    if graph is None:
+        graph = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+    graph = graph.to(device=x.device, dtype=torch.long)
+    n_graphs = int(graph.max()) + 1 if graph.numel() else 0
+    total = x.new_zeros(n_graphs, x.shape[1]).index_add_(0, graph, x * weight)
+    count = x.new_zeros(n_graphs, x.shape[1]).index_add_(0, graph, weight)
+    return (total / count.clamp_min(1.0))[graph]  # a gene with no visible entry: 0 / 1
+
+
 def sample_node_mask(num_nodes: int, pct: float, generator: torch.Generator | None = None) -> torch.Tensor:
     """Draw a per-cell mask: each cell is masked independently with probability ``pct``.
 

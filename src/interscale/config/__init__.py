@@ -910,6 +910,22 @@ def _validate_own_cell_skip(cfg):
         )
 
 
+def _validate_section_offset(cfg):
+    """``model.decoder.section_offset`` adds each gene's section mean to a reconstruction: a known kind, regression, node level."""
+    from interscale.tl.masking import SECTION_OFFSETS
+
+    kind = cfg.model.decoder.get("section_offset", "none")
+    if kind not in SECTION_OFFSETS:
+        raise ValueError(f"model.decoder.section_offset must be one of {SECTION_OFFSETS}, got {kind!r}.")
+    if kind == "none":
+        return
+    if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":
+        raise ValueError(
+            "model.decoder.section_offset adds each gene's section mean to a cell's reconstruction: it needs regression at "
+            "prediction_level node."
+        )
+
+
 def _validate(cfg):
     """Run every load-time check.
 
@@ -932,6 +948,7 @@ def _validate(cfg):
     _validate_context_only(cfg)
     _validate_regime_loss(cfg)
     _validate_own_cell_skip(cfg)
+    _validate_section_offset(cfg)
     _validate_sce(cfg)
     _validate_center_targets(cfg)
     _validate_global_residual(cfg)

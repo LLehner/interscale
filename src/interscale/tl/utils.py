@@ -207,20 +207,23 @@ def _hierarchy_tag(cfg) -> str:
 
 
 def _decoder_tag(cfg) -> str:
-    """``dec-<type>[-skip|-skipraw]_`` for a decoder other than the plain linear one or with the own-cell skip, else ``""``.
+    """``dec-<type>[-skip|-skipraw][-sec]_`` for a decoder other than the plain linear one, with the own-cell skip or the
+    section offset, else ``""``.
 
     The decoder type was never part of a checkpoint name, so an arm that varies it would overwrite the arm
-    that does not; the default (``linear``, no skip) adds nothing and every earlier name is unchanged. ``-skipraw``:
-    the skip reads the cell's genes (``model.decoder.own_cell_skip_input: raw``), ``-skip`` its token.
+    that does not; the default (``linear``, no skip, no offset) adds nothing and every earlier name is unchanged.
+    ``-skipraw``: the skip reads the cell's genes (``model.decoder.own_cell_skip_input: raw``), ``-skip`` its token;
+    ``-sec``: ``model.decoder.section_offset: visible_mean``.
     """
     decoder = cfg.model.get("decoder", None)
     if decoder is None:
         return ""
     kind, skip = decoder.get("type", "linear"), bool(decoder.get("own_cell_skip", False))
-    if kind in (None, "linear") and not skip:
+    section = decoder.get("section_offset", "none") != "none"
+    if kind in (None, "linear") and not skip and not section:
         return ""
     raw = skip and decoder.get("own_cell_skip_input", "embedding") == "raw"
-    return f"dec-{kind or 'linear'}{('-skipraw' if raw else '-skip') if skip else ''}_"
+    return f"dec-{kind or 'linear'}{('-skipraw' if raw else '-skip') if skip else ''}{'-sec' if section else ''}_"
 
 
 def _embedding_tag(cfg) -> str:

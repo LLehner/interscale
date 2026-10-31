@@ -31,7 +31,7 @@ class LocalModule(BaseModule):
         """
         return sum(isinstance(m, MessagePassing) for m in self.modules())
 
-    def predict(self, local_embedding, prediction_level: Literal["node", "graph"] | None = None):
+    def predict(self, local_embedding, prediction_level: Literal["node", "graph"] | None = None, section=None):
         """Predict with the decoder.
 
         Parameters
@@ -39,8 +39,15 @@ class LocalModule(BaseModule):
         local_embedding: torch.Tensor
             Size: [N, E]
         prediction_level: Literal["node", "graph"]
+        section: torch.Tensor | None
+            ``[N, G]``: :meth:`section_input` of the same batch, added under ``section_offset`` (required then).
         """
-        return self.decoder.forward(local_embedding)
+        y_pred = self.decoder.forward(local_embedding)
+        if self.section_offset != "none":
+            if section is None:
+                raise ValueError("section_offset needs each cell's section part: pass section=module.section_input(batch, ...).")
+            y_pred = y_pred + section.to(y_pred.dtype)
+        return y_pred
 
     def _common_step(self, batch, prediction_task: str, prediction_level: Literal["node", "graph"]):
         """Shared step between train, val and test.
@@ -59,6 +66,12 @@ class LocalModule(BaseModule):
 
         local_embedding = self.forward(batch_masked.x, batch_masked.edge_index)
         y_pred = self.decoder.forward(local_embedding)
+        # Under `section_offset` the prediction is the section's visible mean (weighted per gene) plus the decoder's output.
+        section = self.section_input(batch_masked, masked=True)
+        parts = None
+        if section is not None:
+            parts = {"local": {"neighbourhood": y_pred, "section": section.to(y_pred.dtype)}}
+            y_pred = y_pred + parts["local"]["section"]
 
         assert y_pred.shape[0] == len(batch.obs_names), (
             f"Mismatch: y_pred.shape: {y_pred.shape[0]}, batch.obs_names: {len(batch.obs_names)}"
@@ -96,6 +109,7 @@ class LocalModule(BaseModule):
                 y_pred=y_pred,
                 y_true=y_true,
                 entry_mask=entry_mask,
+                parts=parts,
                 views=[ViewOutput(local_embedding=local_embedding)],
             )
 
