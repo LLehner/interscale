@@ -169,6 +169,8 @@ class ProjectedAttention(nn.Module):
     is_backend = True
     #: Whether RoPE's rotation of queries and keys keeps its meaning in this backend's similarity.
     supports_rotary = True
+    #: Whether it also reads with queries of their own (``query`` not ``key``): ``context_only``'s read-out.
+    supports_cross = False
 
     def __init__(self, embed_dim: int, num_heads: int, head_dim: int, dropout: float = 0.0, bias: bool = True):
         super().__init__()
@@ -207,16 +209,29 @@ class ProjectedAttention(nn.Module):
         the encoder layer hands it on. ``attn_mask`` is the dense mask, for backends that take one.
         ``context`` carries what a backend needs beyond that (:class:`StructuredMask`). The weights
         are per head, after dropout, laid out like torch's (``average_attn_weights`` is ignored).
+
+        A backend with ``supports_cross`` also reads with queries of their own: ``query`` a tensor other than ``key``
+        (``context_only``'s query stream), row ``l`` of both the same cell, so the mask, the rotation and the padding
+        apply to both alike. Queries, keys and values then come from ``query``, ``key`` and ``value`` through their
+        thirds of the input projection.
         """
         if is_causal:
             raise ValueError("attention backends attend bidirectionally; is_causal is not supported.")
-        if query is not key or value.shape != query.shape:
+        cross = query is not key
+        if (cross and not self.supports_cross) or value.shape != query.shape or key.shape != query.shape:
             raise ValueError(
                 "attention backends are self-attention only: query and key must be one tensor, and the values "
                 "the same tokens (or, under attention.center_qk, the tokens queries and keys were centred from)."
+                if not self.supports_cross
+                else "queries, keys and values must have one shape: row l of each is the same cell."
             )
         seq_len, n_graphs, _ = query.shape
-        if value is key:
+        if cross:
+            # The query stream reads the memory: each third of the projection on its own input.
+            w_q, w_k, w_v = self.in_proj_weight.chunk(3)
+            b_q, b_k, b_v = (None, None, None) if self.in_proj_bias is None else self.in_proj_bias.chunk(3)
+            q, k, v = F.linear(query, w_q, b_q), F.linear(key, w_k, b_k), F.linear(value, w_v, b_v)
+        elif value is key:
             q, k, v = F.linear(query, self.in_proj_weight, self.in_proj_bias).chunk(3, dim=-1)
         else:
             # Queries and keys from one input, values from another (`attention.center_qk`).
@@ -704,7 +719,11 @@ class FusedAttention(ProjectedAttention):
       hook on the map sees the gradient through it.
     * **Dropout** is the fused kernel's own, from its own random stream: in training a fused model and a dense
       one pair by seed but differ in which weights are dropped.
+    * **Read-outs** (``supports_cross``): queries of their own read the tokens as keys and values, with the same mask
+      (``context_only``'s query stream on whole sections).
     """
+
+    supports_cross = True
 
     def __init__(
         self, embed_dim: int, num_heads: int, head_dim: int, *, dropout: float = 0.0, chunk_pairs: int = 2**24
@@ -993,6 +1012,7 @@ def _validate_fused(attention_cfg):
     training_maps=False,
     note="The fused attention reads each bias a block of query rows at a time, which takes a bias with a pair form.",
     hidden_keys=True,
+    cross=True,
 )
 def _build_fused(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
     return FusedAttention(

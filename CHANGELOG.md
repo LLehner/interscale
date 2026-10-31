@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- The context query on the fused attention (`context_only: query` with `attention.kind: fused`; roadmap Tier 1, comparison_plan.md
+  route a): `FusedAttention.supports_cross` reads with queries of their own, each third of the input projection on its own input,
+  the same blocked pairs and biases, so the decomposable dual model (`add_ctx_*`) runs on whole sections. `AttentionSpec.cross`
+  tells the validator which backends take it.
 - `attention.visible_keys_only` for the fused and the hierarchical attention (roadmap Tier 1, K5): the fused blocks take the
   hidden keys as `StructuredMask.hidden_keys` (`AttentionSpec.hidden_keys`); every level of the hierarchy blocks the tokens that
   hold no visible cell, CLS open. Under cell masking the singleton hierarchy is the dense model only with the option on.

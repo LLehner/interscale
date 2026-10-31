@@ -805,9 +805,11 @@ def _validate_remask(cfg):
 
 
 def _validate_context_only(cfg):
-    """``context_only`` (the global embedding from the other cells' tokens and the position only): a known kind, a node-level prediction, torch's dense attention."""
+    """``context_only`` (the global embedding from the other cells' tokens and the position only): a known kind, a node-level
+    prediction, and attention that reads with queries of its own (torch's dense attention, or a backend whose spec says
+    ``cross``: fused)."""
     from interscale.module.base._base_global_module import CONTEXT_ONLY_KINDS
-    from interscale.module.global_modules.attention import attention_head_dim, attention_kind
+    from interscale.module.global_modules.attention import ATTENTION_REGISTRY, attention_head_dim, attention_kind
 
     params = cfg.model.global_component.get("parameters", None)
     context_only = params.get("context_only", "none") if params is not None else "none"
@@ -826,10 +828,11 @@ def _validate_context_only(cfg):
         cfg.model.n_embed % params.n_heads == 0
         and attention_head_dim(attention, cfg.model.n_embed, params.n_heads) * params.n_heads == cfg.model.n_embed
     )
-    if kind != "dense" or not default_width:
+    cross = kind in ATTENTION_REGISTRY and ATTENTION_REGISTRY[kind].cross
+    if not ((kind == "dense" and default_width) or cross):
         raise ValueError(
             f"{where} reads the cells' tokens with queries of their own, which only torch's dense attention at the "
-            f"default head width takes; attention.kind is {kind!r} at a head width of "
+            f"default head width and the fused attention take; attention.kind is {kind!r} at a head width of "
             f"{attention_head_dim(attention, cfg.model.n_embed, params.n_heads)} (n_embed / n_heads would be "
             f"{cfg.model.n_embed // params.n_heads}). The other backends are self-attention only."
         )

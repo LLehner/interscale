@@ -184,12 +184,14 @@ class TransformerNodeEncoderHook(GlobalModule):
                 layer.self_attn.draw_features(generator)
 
         if self.context_only != "none" and any(
-            getattr(layer.self_attn, "is_backend", False) for layer in self.transformer_encoder.layers
+            getattr(layer.self_attn, "is_backend", False) and not getattr(layer.self_attn, "supports_cross", False)
+            for layer in self.transformer_encoder.layers
         ):
             raise ValueError(
                 f"context_only {self.context_only!r} reads the cells' tokens with separate queries, which only torch's "
-                f"vendored dense attention takes; attention.kind {self.attention_kind!r} at head width {self.head_dim} "
-                "is another backend (it is self-attention only). Use attention.kind dense at the default head width."
+                f"vendored dense attention and the fused attention take; attention.kind {self.attention_kind!r} at head "
+                f"width {self.head_dim} is another backend (it is self-attention only). Use attention.kind dense at the "
+                "default head width, or fused."
             )
         # Node positional encodings (`positional_encodings.py`), or None when the config enables
         # none -- in which case nothing is registered and the module is the one from before PEs.
@@ -680,7 +682,9 @@ class TransformerNodeEncoderHook(GlobalModule):
                     mask=None if structured or hierarchical else mask,
                 )  # (S, B, h_d)
             else:
-                transformer_out = self._read_context(queries, padded_h_node, key_padding_mask, mask)  # (S, B, h_d)
+                transformer_out = self._read_context(
+                    queries, padded_h_node, key_padding_mask, None if structured or hierarchical else mask
+                )  # (S, B, h_d)
         finally:
             for encoder in self.transformer_encoder.layers:
                 encoder.rotary = None
