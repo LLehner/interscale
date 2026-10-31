@@ -7,7 +7,7 @@ from yacs.config import CfgNode as CN
 from interscale.model.base._base_model import BaseModel
 from interscale.module.base import GlobalModule
 from interscale.module.global_modules.positional_encodings import attach_positional_inputs
-from interscale.tl import SelfAttentionRelevance, prepare_a2d_dataset
+from interscale.tl import prepare_a2d_dataset
 from interscale.tl.masking import block_masking_on
 from interscale.train._training import NodeMaskingTrainingPlan
 
@@ -51,7 +51,7 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
         self._attach_aux_losses()
 
     # @torch.inference_mode() Not possible because of pytorch hook for self attention relevance
-    def get_model_output(self, adata: AnnData | None = None, prefix: str = ""):
+    def get_model_output(self, adata: AnnData | None = None, prefix: str = "", attention: bool = True):
         """Save the embeddings, predictions and attentionsin the adata object.
 
         Parameters
@@ -60,6 +60,10 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
             AnnData object to run the model on. If `None`, the model's AnnData object is used.
         prefix
             Prefix for the output columns.
+        attention
+            True: also the relevance rollout and the ``[cells, max_seq_len]`` attention table (and the CLS scores), which form
+            ``S x S`` maps -- infeasible on a whole section, and degenerate anyway (CLAUDE.md, Evaluation). False: embeddings and
+            predictions only, from the transformer's clean pass without kept maps (``encode``; roadmap Tier 3).
         """
         if not self.is_trained_:
             raise RuntimeError("Please train the model first.")
@@ -83,23 +87,28 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
 
         # Create empty DataFrame with correct shape
         global_embeddings_df = pd.DataFrame(index=obs_names_str, columns=range(self.n_embed), dtype=np.float32)
-        attention_matrix_df = pd.DataFrame(
-            index=obs_names_str,
-            columns=range(self._cfg.model.global_component.parameters.max_seq_len),
-            dtype=np.float32,
-        )
+        # [cells, max_seq_len]: only when the attention outputs are asked for (at 10^5 cells it alone is ~40 GB).
+        attention_matrix_df = None
+        if attention:
+            attention_matrix_df = pd.DataFrame(
+                index=obs_names_str,
+                columns=range(self._cfg.model.global_component.parameters.max_seq_len),
+                dtype=np.float32,
+            )
 
         y_pred_df = pd.DataFrame(index=obs_names_str, columns=range(self.n_output), dtype=np.float32)
 
-        cls_token_horizontal = np.full(len(adata.obs_names), np.nan)
-        cls_token_vertical = np.full(len(adata.obs_names), np.nan)
-        self_attention_relevance = SelfAttentionRelevance(self.module)
+        cls_token_horizontal = np.full(len(adata.obs_names), np.nan) if attention else None
+        cls_token_vertical = np.full(len(adata.obs_names), np.nan) if attention else None
 
         for batch in pyg:
             embedding = self.module.gex_embedding(batch)
-            transformer_in, global_embedding, src_padding_mask, pad_index_nodes, I = self.module.evaluate(
-                batch, embedding
-            )
+            if attention:
+                transformer_in, global_embedding, src_padding_mask, pad_index_nodes, I = self.module.evaluate(
+                    batch, embedding
+                )
+            else:
+                transformer_in, global_embedding, src_padding_mask, pad_index_nodes = self.module.encode(batch, embedding)
             # no masking during evaluation
             y_pred = self.module.predict(
                 global_embedding,
@@ -114,6 +123,9 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
             batch_obs_names_str = batch.obs_names.numpy().astype(int).astype(str)[pad_index_nodes[0]]
             sample_mask = global_embeddings_df.index.isin(batch_obs_names_str)
             global_embeddings_df.loc[sample_mask] = global_embedding[:-1].squeeze(1).detach().cpu().numpy()
+            y_pred_df.loc[sample_mask] = y_pred.detach().cpu().numpy()
+            if not attention:
+                continue
             cls_token_horizontal[sample_mask] = I[-1, :-1].squeeze().cpu().detach().numpy()
             cls_token_vertical[sample_mask] = I[:-1, -1].squeeze().cpu().detach().numpy()
             attn_matrix = I[:-1, :-1].cpu().detach().numpy()
@@ -124,7 +136,6 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
             )
             padded_attn[:, : attn_matrix.shape[1]] = attn_matrix
             attention_matrix_df.loc[sample_mask] = padded_attn
-            y_pred_df.loc[sample_mask] = y_pred.detach().cpu().numpy()
 
         # Save embeddings in adata.obsm
         adata = self.save_evaluation_results(

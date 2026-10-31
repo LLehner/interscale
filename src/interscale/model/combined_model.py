@@ -76,7 +76,7 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
         state = {k: v for k, v in local_model.module.state_dict().items() if not k.startswith("aux_losses.")}
         self.module.local_module.load_state_dict(state, strict=True)
 
-    def get_model_output(self, adata: AnnData | None = None, prefix: str = ""):
+    def get_model_output(self, adata: AnnData | None = None, prefix: str = "", attention: bool = True):
         """Save the embeddings, predictions and attentionsin the adata object.
 
         Parameters
@@ -85,6 +85,10 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
             AnnData object to run the model on. If `None`, the model's AnnData object is used.
         prefix
             Prefix for the output columns.
+        attention
+            True: also the relevance rollout and the ``[cells, max_seq_len]`` attention table (and the CLS scores), which form
+            ``S x S`` maps -- infeasible on a whole section, and degenerate anyway (CLAUDE.md, Evaluation). False: embeddings and
+            predictions only, from the transformer's clean pass without kept maps (``encode``; roadmap Tier 3).
         """
         if not self.is_trained_:
             raise RuntimeError("Please train the model first.")
@@ -118,11 +122,14 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
         local_embeddings_df = pd.DataFrame(index=obs_names_str, columns=range(self.n_embed), dtype=np.float32)
 
         global_embeddings_df = pd.DataFrame(index=obs_names_str, columns=range(self.n_embed), dtype=np.float32)
-        attention_matrix_df = pd.DataFrame(
-            index=obs_names_str,
-            columns=range(self._cfg.model.global_component.parameters.max_seq_len),
-            dtype=np.float32,
-        )
+        # [cells, max_seq_len]: only when the attention outputs are asked for (at 10^5 cells it alone is ~40 GB).
+        attention_matrix_df = None
+        if attention:
+            attention_matrix_df = pd.DataFrame(
+                index=obs_names_str,
+                columns=range(self._cfg.model.global_component.parameters.max_seq_len),
+                dtype=np.float32,
+            )
 
         if self._cfg.model.decoder.dual_decoder:
             y_pred_local_df = pd.DataFrame(index=obs_names_str, columns=range(self.n_output), dtype=np.float32)
@@ -131,8 +138,8 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
 
         y_pred_global_df = pd.DataFrame(index=obs_names_str, columns=range(self.n_output), dtype=np.float32)
 
-        cls_token_horizontal = np.full(len(adata.obs_names), np.nan)
-        cls_token_vertical = np.full(len(adata.obs_names), np.nan)
+        cls_token_horizontal = np.full(len(adata.obs_names), np.nan) if attention else None
+        cls_token_vertical = np.full(len(adata.obs_names), np.nan) if attention else None
 
         for batch in pyg:
             ## Local model output
@@ -148,9 +155,14 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
                 y_pred_local_df.loc[sample_mask_local] = y_pred_local.detach().cpu().numpy()
 
             ## Global model output
-            transformer_in, global_embedding, src_padding_mask, pad_index_nodes, I = self.module.global_module.evaluate(
-                batch, local_embedding
-            )
+            if attention:
+                transformer_in, global_embedding, src_padding_mask, pad_index_nodes, I = self.module.global_module.evaluate(
+                    batch, local_embedding
+                )
+            else:
+                transformer_in, global_embedding, src_padding_mask, pad_index_nodes = self.module.global_module.encode(
+                    batch, local_embedding
+                )
             # no masking during evaluation
             y_pred_global = self.module.predict_global(global_embedding, src_padding_mask, self.prediction_level)
             if getattr(self.module, "global_is_sum", False):
@@ -163,6 +175,9 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
             batch_obs_names_str = batch.obs_names.numpy().astype(int).astype(str)[pad_index_nodes[0]]
             sample_mask = global_embeddings_df.index.isin(batch_obs_names_str)
             global_embeddings_df.loc[sample_mask] = global_embedding[:-1].squeeze(1).detach().cpu().numpy()
+            y_pred_global_df.loc[sample_mask] = y_pred_global.detach().cpu().numpy()
+            if not attention:
+                continue
             cls_token_horizontal[sample_mask] = I[-1, :-1].squeeze().cpu().detach().numpy()
             cls_token_vertical[sample_mask] = I[:-1, -1].squeeze().cpu().detach().numpy()
             attn_matrix = I[:-1, :-1].cpu().detach().numpy()
@@ -172,8 +187,6 @@ class CombinedModel(NodeMaskingTrainingPlan, BaseModel):
             )
             padded_attn[:, : attn_matrix.shape[1]] = attn_matrix
             attention_matrix_df.loc[sample_mask] = padded_attn
-
-            y_pred_global_df.loc[sample_mask] = y_pred_global.detach().cpu().numpy()
 
         adata = self.save_evaluation_results(
             adata,

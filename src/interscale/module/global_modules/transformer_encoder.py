@@ -747,6 +747,31 @@ class TransformerNodeEncoderHook(GlobalModule):
             state = layer.read_context(state, memory, attn_mask=mask, key_padding_mask=key_padding_mask)
         return self.transformer_encoder.norm(state)
 
+    def encode(self, batched_data, embedding):
+        """:meth:`evaluate`'s clean pass on one graph without the relevance rollout or any kept map.
+
+        ``(transformer_in, transformer_out, src_padding_mask, index_nodes)``, as :meth:`evaluate` returns them minus the relevance:
+        nothing ``S x S`` is formed or kept beyond what the attention backend itself needs (fused and routed attention: nothing), so
+        a whole section can be embedded (roadmap Tier 3). The models' ``get_model_output(attention=False)`` uses it.
+        """
+        if self.pooling is not None:
+            raise NotImplementedError(
+                "encode() reads one token per cell; a pooled model (model.global_component.parameters.pooling) runs on patches. "
+                "Use the masked-pass evaluation (_common_step) instead."
+            )
+        batched_data.batch = torch.zeros(len(batched_data.obs_names), dtype=torch.long, device=embedding.device)
+        given = self.common_step_local_to_global(batched_data, embedding, eval_step=True)
+        transformer_in, src_padding_mask, pad_index_nodes, attn_mask, rotary = given
+        transformer_out, src_padding_mask, _ = self.forward(
+            transformer_in,
+            src_padding_mask,
+            attn_mask,
+            register_hook=False,
+            rotary=rotary,
+            **self._query_kwargs(given),
+        )
+        return transformer_in, transformer_out, src_padding_mask, pad_index_nodes
+
     def evaluate(self, batched_data, embedding):
         """Evaluates transformer encoder on a batch of data without masking and registering hook.
 

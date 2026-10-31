@@ -725,6 +725,11 @@ def _weighted_mean(w: torch.Tensor, xv: torch.Tensor, vis: torch.Tensor, fallbac
     return torch.where(den > 1e-12, num / den.clamp_min(1e-12), fallback)
 
 
+#: How :func:`reference_predictions` forms its neighbours: a dense distance matrix per graph, neighbour lists (a k-d tree), or
+#: neighbour lists for graphs over ``max_dense_cells`` cells.
+REFERENCE_METHODS = ("auto", "dense", "sparse")
+
+
 def reference_predictions(
     x: torch.Tensor,
     hidden: torch.Tensor,
@@ -735,6 +740,10 @@ def reference_predictions(
     kernels_um: tuple[float, ...] = (),
     k_nearest: tuple[int, ...] = (),
     labels: torch.Tensor | None = None,
+    method: str = "auto",
+    max_dense_cells: int = 20000,
+    kernel_truncate: float = 40.0,
+    chunk_pairs: int = 2**24,
 ) -> dict[str, torch.Tensor]:
     """Predictions that use no model: averages of the visible entries of the same graph.
 
@@ -770,17 +779,45 @@ def reference_predictions(
         Bandwidths in µm and neighbour counts, one reference each.
     labels
         ``[N]`` integer labels for ``ref_label_mean``, or None to leave it out.
+    method
+        ``"dense"``: a distance matrix per graph (``N x N``: ~80 GB at 10^5 cells). ``"sparse"``: neighbour lists from a k-d tree,
+        never a matrix over the cells' pairs (roadmap Tier 3) -- the same ``ref_slide_mean``, ``ref_label_mean`` (group sums) and
+        ``ref_nearest_<k>`` (exact; ties at one distance may be broken otherwise), and a kernel cut where its weight falls below
+        ``exp(-kernel_truncate)`` of the query's largest (the dense form's weights, up to that tail). The default 40 keeps every
+        weight that could move the dense form's ``1e-12`` floor on a gene's denominator (``e^-40 x 10^5`` cells < ``1e-12``), so the
+        two agree to rounding (1e-14 on the tests), also for a gene whose only visible cells lie many bandwidths away; 12 already
+        agrees to ~3e-4 at a fraction of the pairs (the ball's radius is ``sqrt(d_min^2 + 2 s^2 kernel_truncate)``). ``"auto"``:
+        sparse for a graph over ``max_dense_cells`` cells.
+    kernel_truncate, chunk_pairs
+        The sparse kernels' cut, and the query-neighbour pairs held at once.
 
     Returns
     -------
     dict
         ``{name: [N, G]}`` float64 tensors, in batch node order.
     """
+    if method not in REFERENCE_METHODS:
+        raise ValueError(f"method must be one of {REFERENCE_METHODS}, got {method!r}.")
     names = ["ref_slide_mean"] + (["ref_label_mean"] if labels is not None else [])
     names += [f"ref_kernel_{s:g}um" for s in kernels_um] + [f"ref_nearest_{k}" for k in k_nearest]
     out = {name: torch.zeros(x.shape, dtype=torch.float64, device=x.device) for name in names}
     for g in torch.unique(graph):
         rows = torch.where(graph == g)[0]
+        if method == "sparse" or (method == "auto" and len(rows) > int(max_dense_cells)):
+            found = _sparse_references(
+                x[rows],
+                hidden[rows],
+                pos[rows],
+                spatial_unit_um=spatial_unit_um,
+                kernels_um=kernels_um,
+                k_nearest=k_nearest,
+                labels=None if labels is None else labels[rows],
+                truncate=kernel_truncate,
+                chunk_pairs=chunk_pairs,
+            )
+            for name, value in found.items():
+                out[name][rows] = torch.as_tensor(value, dtype=torch.float64, device=x.device)
+            continue
         vis = (~hidden[rows]).double()
         xv = x[rows].double() * vis
         total, count = xv.sum(0), vis.sum(0)
@@ -818,6 +855,100 @@ def reference_predictions(
                 w.scatter_(1, nearest, 1.0)
                 w = w * candidate
             out[f"ref_nearest_{k}"][rows] = _weighted_mean(w, xv, vis, fallback)
+    return out
+
+
+def _sparse_references(
+    x, hidden, pos, *, spatial_unit_um, kernels_um, k_nearest, labels, truncate, chunk_pairs
+) -> dict[str, np.ndarray]:
+    """One graph's references from neighbour lists (:func:`reference_predictions`, ``method="sparse"``): ``{name: [n, G]}``.
+
+    Every weighted mean is ``sum_j w_ij v_jg x_jg / sum_j w_ij v_jg`` over other cells, as in the dense form, with the pairs ``(i, j)``
+    from a k-d tree over the cells with any visible entry, a chunk of queries at a time (a sparse matrix per chunk).
+    """
+    from scipy import sparse
+    from scipy.spatial import cKDTree
+
+    vis = (~hidden).cpu().numpy().astype(np.float64)
+    xv = x.detach().cpu().double().numpy() * vis
+    n = len(xv)
+    total, count = xv.sum(0), vis.sum(0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        slide = np.nan_to_num(total / count, nan=0.0)
+        others = count - vis
+        fallback = np.where(others > 0, (total - xv) / np.maximum(others, 1.0), slide)
+    out = {"ref_slide_mean": fallback}
+
+    def weighted(matrix):
+        num, den = matrix @ xv, matrix @ vis
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return np.where(den > 1e-12, num / np.maximum(den, 1e-12), fallback)
+
+    if labels is not None:
+        lab = labels.cpu().numpy()
+        codes, inverse = np.unique(lab, return_inverse=True)
+        group_x = np.zeros((len(codes), xv.shape[1]))
+        group_v = np.zeros_like(group_x)
+        np.add.at(group_x, inverse, xv)
+        np.add.at(group_v, inverse, vis)
+        num, den = group_x[inverse] - xv, group_v[inverse] - vis  # the cell itself left out
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out["ref_label_mean"] = np.where(den > 1e-12, num / np.maximum(den, 1e-12), fallback)
+    if not kernels_um and not k_nearest:
+        return out
+
+    points = pos[:, :2].detach().cpu().double().numpy() * float(spatial_unit_um)
+    open_cells = np.flatnonzero(vis.any(axis=1))
+    if not len(open_cells):
+        for name in [f"ref_kernel_{s:g}um" for s in kernels_um] + [f"ref_nearest_{k}" for k in k_nearest]:
+            out[name] = fallback
+        return out
+    tree = cKDTree(points[open_cells])
+
+    def other_nearest(k):
+        """``(distances, cells)`` ``[n, k']`` of each query's nearest open cells other than itself (``inf`` / -1 padded)."""
+        kk = min(int(k) + 1, len(open_cells))
+        dist, idx = tree.query(points, k=kk)
+        dist, idx = np.atleast_2d(dist.T).T if dist.ndim == 1 else dist, np.atleast_2d(idx.T).T if idx.ndim == 1 else idx
+        cells = open_cells[idx]
+        own = cells == np.arange(n)[:, None]
+        dist = np.where(own, np.inf, dist)
+        order = np.argsort(dist, axis=1, kind="stable")[:, : int(k)]
+        return np.take_along_axis(dist, order, 1), np.where(
+            np.isfinite(np.take_along_axis(dist, order, 1)), np.take_along_axis(cells, order, 1), -1
+        )
+
+    for k in k_nearest:
+        dist, cells = other_nearest(k)
+        rows, cols = np.nonzero(cells >= 0)
+        matrix = sparse.csr_matrix((np.ones(len(rows)), (rows, cells[rows, cols])), shape=(n, n))
+        out[f"ref_nearest_{k}"] = weighted(matrix)
+
+    if kernels_um:
+        d_min = other_nearest(1)[0][:, 0]  # the nearest other open cell: the dense form's reference distance
+        for s in kernels_um:
+            s = float(s)
+            # Every pair whose weight is at least exp(-truncate) of the query's largest: d^2 <= d_min^2 + 2 s^2 truncate.
+            radius = np.sqrt(np.where(np.isfinite(d_min), d_min**2, 0.0) + 2.0 * s * s * float(truncate))
+            result = np.empty_like(xv)
+            start = 0
+            while start < n:
+                # Queries per chunk from the expected neighbours of the first query of the chunk (at least one).
+                expect = max(1.0, float(tree.query_ball_point(points[start], r=radius[start], return_length=True)))
+                stop = min(n, start + max(1, int(chunk_pairs / expect)))
+                lists = tree.query_ball_point(points[start:stop], r=radius[start:stop])
+                q = np.repeat(np.arange(stop - start), [len(one) for one in lists])
+                j = open_cells[np.concatenate([np.asarray(one, dtype=np.int64) for one in lists])] if len(q) else np.zeros(0, int)
+                keep = j != q + start
+                q, j = q[keep], j[keep]
+                d2 = ((points[q + start] - points[j]) ** 2).sum(1)
+                w = np.exp(-(d2 - np.where(np.isfinite(d_min[q + start]), d_min[q + start] ** 2, 0.0)) / (2.0 * s * s))
+                matrix = sparse.csr_matrix((w, (q, j)), shape=(stop - start, n))
+                num, den = matrix @ xv, matrix @ vis
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    result[start:stop] = np.where(den > 1e-12, num / np.maximum(den, 1e-12), fallback[start:stop])
+                start = stop
+            out[f"ref_kernel_{s:g}um"] = result
     return out
 
 

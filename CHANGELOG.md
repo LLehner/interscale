@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning][].
 
 ### Added
 
+- An evaluation path without dense maps (roadmap Tier 3): `reference_predictions(method="sparse" | "auto")` builds the references from
+  neighbour lists (a k-d tree; kernels cut at `exp(-kernel_truncate)`, 40 by default, equal to the dense form to rounding; queries in
+  chunks), `"auto"` above `max_dense_cells`; `TransformerNodeEncoderHook.encode` is the clean pass without relevance or kept maps,
+  and `get_model_output(attention=False)` (GlobalModel, CombinedModel) writes embeddings and predictions without the `[cells,
+  max_seq_len]` table or the CLS scores.
 - Training on crops (`dataset.crop`: `size_um`, `shape`, `per_graph`, `min_cells`; `tl/crops.py`; roadmap Tier 3, K18): every
   training graph hands the trainer `per_graph` random crops per epoch, square or disc windows around a cell drawn uniformly, with
   every per-cell attribute and the section's own masks (`Data.subgraph`); validation and test stay whole sections. Crops come from a
