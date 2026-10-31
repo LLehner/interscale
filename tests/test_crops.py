@@ -230,3 +230,14 @@ def test_a_global_model_trains_end_to_end_on_crops(tmp_path):
     rows = [row for row in net.history_.history if "val_loss" in row]
     assert rows and all(np.isfinite(row["val_loss"]) for row in rows)
     assert len(dm.train_dataloader()) == 3  # one training section x 6 crops / batch 2: three steps an epoch, not one
+
+
+def test_the_checkpoint_name_carries_the_crops_and_is_unchanged_without():
+    from interscale.tl.utils import _training_tag
+
+    plain = _cfg(size=0.0)
+    assert "crop" not in _training_tag(plain)
+    assert "crop60x8" in _training_tag(_cfg())
+    disc = _cfg()
+    disc.dataset.crop.shape, disc.dataset.crop.per_graph = "disc", 16
+    assert "crop60dx16" in _training_tag(disc)

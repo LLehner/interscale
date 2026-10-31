@@ -269,7 +269,8 @@ def _training_tag(cfg) -> str:
     otherwise write every arm to one checkpoint. ``ctr``: ``optim.center_targets``; ``res``:
     ``model.decoder.global_residual``; ``add``: ``model.decoder.additive``; ``blk<radius µm>f<fraction>``: spatial
     blocks (``blklab-<label>[-mx<max cells>]f<fraction>``: niche patches); ``lrm``: the long-range attention mask (``long_range_attention``, off by default). ``lrm`` was added on
-    2026-10-14: checkpoints trained with the mask on before then carry no tag. ``sch-<schedule>``,
+    2026-10-14: checkpoints trained with the mask on before then carry no tag. ``crop<size µm>[d]x<per graph>``: training on crops
+    (``dataset.crop``; ``d`` for discs). ``sch-<schedule>``,
     ``lw<local>-<global>`` and ``frz-<components>``: a staged schedule, loss weights other than
     the default 0.5 / 0.5, and frozen components (``train._schedule``). ``gs<cell rate>-<selectors>``:
     a hidden gene set (``dataset.mask_genes``). ``ch<fraction>c<cell rate>``: channel masking, a random share of the
@@ -317,6 +318,10 @@ def _training_tag(cfg) -> str:
         parts.append(f"blklab-{label}{f'-mx{most}' if most else ''}f{cfg.dataset.mask_block_fraction:g}")
     elif cfg.dataset.get("mask_block_fraction", 0.0) > 0:
         parts.append(f"blk{cfg.dataset.mask_block_radius_um:g}f{cfg.dataset.mask_block_fraction:g}")
+    crop = cfg.dataset.get("crop", None)
+    if crop is not None and float(crop.get("size_um", 0.0)) > 0:
+        disc = "d" if crop.get("shape", "square") == "disc" else ""
+        parts.append(f"crop{float(crop.size_um):g}{disc}x{int(crop.per_graph)}")
     gene_set = list(cfg.dataset.get("mask_genes", []) or [])
     if gene_set:
         # Letters, digits and dashes only: "role=response" -> "role-response".
