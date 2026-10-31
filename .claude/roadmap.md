@@ -97,7 +97,8 @@ scales; the same in local units; read `dim_importance` / `dim_tracks` of each ag
 | 8 | one evaluation path without dense maps: `reference_predictions(method="sparse" / "auto")`, `encode` / `get_model_output(attention=False)` | the dense `cdist` (~80 GB at 10^5 cells) and the `[cells, max_seq_len]` table; the CosMx hook had its own k-NN references | **built**; the CosMx hook now uses the library's references | CLAUDE.md, "Whole sections without dense maps" |
 | -- | found on the way: `get_model_output` predicted with dropout on | no model switched to eval mode for it | **fixed** (`in_eval_mode`) | notes.md 2026-10-31 |
 
-**For the running script (to write next).** One CosMx run should set, per arm: `dataset.crop.size_um` (e.g. 1000-2000 µm; a section is
+**For the running script (written 2026-10-31: notebooks_and_scripts/slurm/new/cosmx_tiers.py + .sbatch, arms from
+make_cosmx_tiers_yaml.py; 7 arms x 3 folds, 300 epochs, crops 1 mm x 8 per section, center_qk kept on; not run yet).** One CosMx run should set, per arm: `dataset.crop.size_um` (e.g. 1000-2000 µm; a section is
 ~7 x 10 mm) and `per_graph` (e.g. 16-32, so an epoch is 30-60 steps instead of 2), with a no-crop arm of the same model as the
 control (the validator's warning lists what differs per sequence); `model.decoder.section_offset: visible_mean`;
 `attention.visible_keys_only` (with `center_qk` off, or read its leak); for the readouts the defaults now suffice on whole
