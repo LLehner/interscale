@@ -1322,3 +1322,33 @@ Built on branch `tier1-real-data` (roadmap.md, "Tier 3"): `dataset.crop` (`tl/cr
   sections is a shift the validator warns about, not something tested; a no-crop arm is the control.
 - Not built: IG on sampled receivers for CosMx (the readouts that need it already sample queries); `visibility_common.py` still has its own
   k-NN references; nothing run on data.
+
+## 2026-11-01 — CosMx `cosmx_run`, the missing fold: `hier_none_f1` (results in `results/30_10_results/cosmx_run`; first CosMx flow plots)
+
+- **Scores (centred cosine on hidden cells, test slide of fold 1):** hier_none_f1 0.233, flat over depth (0.242 at 0-12 µm, 0.224 beyond 40 µm);
+  GCN_f1 0.199, falling with depth (0.240 to 0.158); ref_section_mean 0.224, ref_knn32 0.225, ref_knn128 0.252. Fold 1 is the best fold for
+  both models, and the only one where hier_none beats the section mean (+0.009) and knn32 (+0.008). It stays below knn128 (-0.019).
+- **All three folds, hier_none minus the section mean:** -0.052 (f0), +0.009 (f1), -0.003 (f2). Minus knn128: -0.087, -0.019, -0.049. Beyond
+  40 µm (the GCN goes blind) hier_none beats the GCN on every fold: 0.134 / 0.224 / 0.150 against -0.113 / 0.158 / 0.004. The
+  conclusion from folds 0 and 2 holds: it beats the GCN at depth but sits at about the section mean, below the k-NN smoothers. The
+  spread over folds (0.157 to 0.233) is larger than any difference between the arms.
+- **Raw SCE is worse than every reference on every fold.** hier_none_f1 0.672 against 0.46 for the references (f0 0.493 against 0.41;
+  f2 0.589 against 0.44). The GCN shows the same. The centred score is close to the references while the raw score is far off, so the
+  models' mean profile (or scale) per section is off. This is what `section_offset: visible_mean` addresses (cosmx_tiers: gcn ->
+  gcn_sec, hier_crop -> hier_tier).
+- **Training:** 4.8 s an epoch, 0.49 steps/s, so about 2 steps an epoch and about 600 steps in total. val_loss 0.733 (the lowest of the three).
+  The model is still undertrained, as on folds 0 and 2.
+- **Attention (hier_profile):** strongly local. 0-15 µm gets 16% of the weight (7.8x uniform), 15-30 µm 2.2x, and beyond 30 µm less
+  than uniform. The windows sit at 11 / 49 / 231 / 953 µm with strengths 1.3 to 1.05: the short heads are the strongest, and the windows
+  barely moved from their initial spread. Coarse routing is sharp (coarse entropy 0.29 / 0.33) and never leaves a cluster unselected;
+  110 / 280 keys per query at levels 1 / 2.
+- **Flow plots (2_ND, 2_T1D; the first from `flow_maps.py`):** the net flow is organised by the masking discs, not the tissue. The
+  strongest streams and the deepest sources and sinks sit on the hidden discs. Many discs are sinks (they read from their rim), as
+  expected, but **several hidden discs are net sources**: the rest of the tissue reads hidden cells more than they read it, although a
+  hidden cell's token holds only the mask fill and its position. Hidden cells are keys here (no `visible_keys_only`), so this is the leak
+  that hier_tier closes. Away from the discs the flow is weak and has no visible tissue structure. Who-whom: the top-5 sources sit mostly
+  within ~20-50 µm, plus a few long, faint links of ~200 µm. No untrained twin exists for fold 1, so these plots cannot be read against
+  one yet (cosmx_tiers draws them for every run and for hier_none_f0's twin).
+- **For cosmx_tiers:** (1) read per fold, because fold 1 alone would look like a win; (2) read raw SCE next to the within-section score,
+  because the offset fix should show in raw SCE first; (3) compare the flow plots of hier_tier against hier_crop: hidden discs should stop
+  being sources.
