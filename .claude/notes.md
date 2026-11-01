@@ -1352,3 +1352,67 @@ Built on branch `tier1-real-data` (roadmap.md, "Tier 3"): `dataset.crop` (`tl/cr
 - **For cosmx_tiers:** (1) read per fold, because fold 1 alone would look like a win; (2) read raw SCE next to the within-section score,
   because the offset fix should show in raw SCE first; (3) compare the flow plots of hier_tier against hier_crop: hidden discs should stop
   being sources.
+
+## 2026-11-01 — CosMx `cosmx_tiers`: Tier 1-3 on three folds (results in `results/31_10_results/cosmx_tiers`)
+
+18 of 21 runs came back: gcn, gcn_sec, hier_none, hier_crop, hier_tier, hier_tier2 on folds 0-2, plus the twins of hier_none_f0 and
+hier_tier2_f0. **dual_ctx (all three folds) is missing**: no checkpoint, no section, no twin (cluster logs not read).
+
+- **Within sections (the score that counts on CosMx), centred cosine on hidden cells, f0 / f1 / f2:** gcn 0.052 / 0.060 / 0.072;
+  gcn_sec 0.055 / 0.060 / 0.071; hier_none 0.089 / 0.103 / 0.122; hier_crop 0.085 / 0.097 / 0.120; hier_tier 0.087 / 0.096 / 0.117;
+  hier_tier2 0.089 / 0.096 / 0.118. References: knn8 0.084 / 0.076 / 0.089, knn32 0.111 / 0.104 / 0.118, knn128 0.130 / 0.124 / 0.136,
+  section mean ~0.005. Every hierarchical arm beats knn8 on every fold and is at about knn32 (below on f0, level on f1 / f2); none reaches
+  knn128 at any depth (closest: f2 at 0-12 µm, 0.145 against 0.148). The GCN is below knn8 at every depth and falls to 0.02 beyond 40 µm.
+  **The Tier 1-3 options do not move the within-section score** (all arms within ±0.006 of hier_none per fold).
+- **The section offset does what it was built for and nothing else.** On the training-mean centred score gcn -> gcn_sec jumps 0.053 ->
+  0.218 (f0), 0.100 -> 0.196 (f2), and is flat over depth; hier_none -> hier_tier 0.156 -> 0.213 (f0), 0.174 -> 0.200 (f2); hier_tier_f1
+  0.257 is above knn128 (0.252), the only arm and fold that is. Within sections nothing changes. The twin of hier_tier2 scores 0.0000
+  within sections (the offset alone is zero there, as it should be).
+- **Raw SCE stays worse than every reference with the offset on** (hier_tier f0 / f1 / f2 0.481 / 0.800 / 0.644 against the section mean
+  0.422; gcn_sec is the exception at 0.42-0.47). The 2026-11-01 entry above expected the offset to fix raw SCE: it does not, so the raw gap is
+  not (only) the section offset. Centred cosine high and raw cosine low with negative val R² (-0.5 to -3.4; crops worst) points to the
+  prediction's scale along the mean profile, not its direction. Not measured: the ratio of the prediction's norm to the target's. hier_crop
+  has the worst raw SCE and val SCE (f1 0.944 / 0.821) but a better centred test score than hier_none, so val SCE and the centred test score
+  disagree: check which metric picks the checkpoint.
+- **Visible cells: Tier 1 makes the model usable on them.** Visible minus hidden centred cosine (f0): hier_none -0.183 (visible cells at
+  -0.0002, i.e. useless; raw SCE 1.13), hier_crop -0.039, hier_tier -0.019, hier_tier2 -0.008 (f2 -0.002); gcn -0.094, gcn_sec -0.015.
+  Matters for any readout on all cells (CCC maps, comparisons).
+- **Crops: 8x the steps, 6x less memory, no gain.** hier_crop runs ~4,800 steps (16 an epoch) against ~600 on whole sections at the same
+  epoch time, with peak memory 1.1-1.7 GiB against 6.5-10.5 GiB; the within-section score is the same or 0.005 lower. So "undertrained"
+  (cosmx_run read) is unlikely to be the main reason for the gap to knn128: more steps did not buy it. Crops are the route for the lung
+  (memory), not for accuracy.
+- **Tier 2 (window on heads 0-2, local units) adds nothing over Tier 1** (within ±0.002 per fold). Windows after training (hier_tier2_f0):
+  7.7 / 45 / 689 with strengths 1.6 / 1.9 / 1.4; Tier 1 moved the windows further than hier_none (hier_tier 7.4 / 34 / 193 / 629 against
+  hier_none 11 / 50 / 235 / 959) and sharpened the profile a little (0-15 µm lift 7.8 against 6.2; twin 4.9).
+- **Negative probes:** the 19 `NegPrb*` channels are in the 979 reconstructed features. hier_tier2 reconstructs them within sections at
+  0.041-0.049 (knn128 0.030-0.040; twin 0.002), about 70% of its mean over real genes (0.062-0.066); hier_none 0.027, gcn 0.012. Ten
+  NegPrb channels are among the genes where hier_tier2 beats knn128 on all three folds. So a large part of the per-gene gain is technical
+  (FOV background, counts per cell), and per-gene "wins over knn128" are not evidence of cell-cell signal without a NegPrb floor. Real
+  genes with the clearest gains over knn128 (f2): REG1A, PRSS2, ANXA4, TTR, MGP (acinar / islet markers, i.e. cell type composition).
+- **Flow plots:** with visible keys the hidden discs are no longer sources (to_hidden 0 by construction); trained hier_tier2_f0 shows
+  compact sinks ~50-100 µm across with flow about twice the twin's scale (±0.075 against ±0.04); whether they are islets is not checked
+  (no cell labels in the plot). Who-whom arrows run 50-150 µm. Hidden-disc sources in hier_none: to_hidden 0.17 against the twin's 0.05.
+- **Dimension readout (hier_tier2_f0):** importance spread over many dims (top dim 5.7% of the variance, single-dim ablations < 0.003),
+  tracks stronger than the twin's; no dim with a clear role.
+- **Next, proposed:** (1) drop the NegPrb channels from inputs and targets, or keep them only as a technical control score next to every
+  per-gene table; (2) measure the prediction / target norm ratio to explain raw SCE, and check the checkpoint metric; (3) find out why
+  dual_ctx did not run; (4) the gap to knn128 within sections is now the question: larger discs (60 µm do not separate a global model from
+  a wider smoother) and a model-plus-knn128 blend to see whether the model holds anything knn128 lacks.
+
+## 2026-11-01 — CosMx `cosmx_tiers`: the decoder readout (dim_directions / dim_direction_genes / dim_tracks)
+
+- **The decoder writes into few directions, the same on every fold and arm.** SVD of `W Σ_z^{1/2}` on hidden cells: 5-9 directions carry 99%
+  for every trained hier arm (gcn 10, gcn_sec 19; untrained twins 24-30 with random genes on top, NegPrb among them). The recurring axes:
+  (A) acinar against endocrine: CPB1 / SPINK1 / REG1A / PRSS2 / CUZD1 against INS / GCG / TTR / CHGA (IAPP, SST, SCG5 in the GCN);
+  (B) a one-signed axis of abundant genes: RPL21, RPL34, AZU1, NEAT1, MZT2A, MT1X, HSP90AB1, B2M, HLA-A / -C (every loading the same sign, so
+  a size / quality factor, probably technical); (C) stress / ductal: SERPINA3, HSPB1, SOD2, OLFM4, CXCL2, HSPA1A; ANXA4, SOX9, KRT8, FGFR3,
+  CLU; stromal (IGFBP7, VIM, COL6A2, DCN, TAGLN) further down. Tier 1 (section offset) makes A the first direction (0.40) instead of B.
+- **Gene priority (hier_tier2, squared direction loadings over the listed top-10 genes, mean over folds):** CPB1, INS, TTR, GCG, SPINK1,
+  CUZD1, AZU1, SERPINA3, PRSS2, REG1A, RPL21, RPL34, HLA-A, XBP1, TYK2 -- the first 10 on all three folds. The top-10 lists cover only
+  35-43% of the squared total, and loadings are in expression units, so abundant markers dominate; a full per-gene ranking (absolute and
+  per-gene standardised `||(W Σ_z^{1/2})[g]||`) is computed inside `effective_directions` but not exported.
+- **Tracks:** trained dimensions track true expression of hidden cells about twice as well as the twin's (mean top-5 |rho| 0.31 against 0.16;
+  hier_none 0.32 against 0.15); the tracked genes are the same markers (CPB1 / PRSS2 / REG1A -0.54 / -0.54 / -0.40 on dim 8).
+- **Reading:** the prediction varies along tissue composition (acinar / islet / duct / stroma) plus one abundance axis. This is what a
+  neighbourhood smoother would also produce; not checked: the same SVD on the knn128 prediction. Without that, the readout does not show
+  anything only the model holds.
