@@ -581,6 +581,22 @@ it was hidden), `track_summary` against the untrained twin. All shift-invariant:
 (tested). `dimension_tables` gives the report tables (`dim_*`); the CosMx hook (`slurm/new/hier_common.py`) writes them unless
 `DIMENSIONS` is False, fold by fold with `DIMENSION_FOLDS`.
 
+**Every gene's priority and the same readout on any prediction** (2026-11-01). `gene_priority` (table `dim_gene_priority`, a default of
+`dimension_tables`): every gene's squared row of `W Σ_z^{1/2}` = the variance of `W z` over the hidden cells, its share, and
+`std_ratio` (its prediction spread over the truth's: the per-gene-scale ranking; the share is in expression units, so abundant genes
+lead). `prediction_readout` / `prediction_tables` read a prediction matrix the same way -- a model head whatever its decoder, a reference
+(`ref_nearest_<k>`), the truth -- centred within `groups` (the section); on a linear decoder's `W z + b` without groups they equal
+`effective_directions` and `gene_priority` exactly, signs included (`_signed`: each direction's largest gene positive, also in
+`effective_directions` since then). Tables `pred_directions`, `pred_direction_genes`, `pred_gene_priority` (wide, every gene),
+`pred_overlap` (principal-angle overlap of the first k directions between heads: does the model move along the axes knn128 or the data
+does?). The CosMx hook writes them for every head and reference but `ref_slide_mean`, within sections, unless `PREDICTION_DIRECTIONS` is False.
+
+**Varimax** (option `rotation="varimax"`, `rotate_k`, `kaiser` of `dimension_tables` and `prediction_tables`; default off; hook settings
+`ROTATION`, `ROTATE_K`, on in `cosmx_tiers.py`): the first `rotate_k` directions (loadings `u * s`) rotated into sparse gene programs
+(`dim_rotated*`, `pred_rotated*`; each head rotated on its own). A rotation keeps the subspace (`pred_overlap` unchanged) and each gene's
+summed squares; only the split into components changes, and it depends on `rotate_k`. `kaiser` (R's default) is off: it would give a gene
+the prediction hardly moves (a negative probe) the weight of a marker.
+
 #### Online probes (`evaluation/online_probes.py`)
 
 `linear_probing.py` probes a finished run's `.h5ad`. `online_probes.py` probes *during* training,
