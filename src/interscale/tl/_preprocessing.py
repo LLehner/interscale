@@ -13,6 +13,36 @@ def remove_zero_expression_cells(adata):
     return adata
 
 
+def drop_genes(adata, cfg):
+    """``adata`` without the genes of ``dataset.drop_genes`` (remove and retrain, ``.claude/ranking_plan.md`` R3).
+
+    Selectors as for ``dataset.mask_genes`` (gene names or ``"<var column>=<value>"``; one that matches nothing raises). The genes
+    leave the data as it is read, so neither the input nor the target holds them; ``uns['dropped_genes']`` records them. A gene
+    the configuration hides as a target (``mask_genes``, ``mask_gene_sets``) is refused: dropping a target changes the task, not
+    the input. Empty (the default): ``adata`` unchanged.
+    """
+    selectors = list(cfg.dataset.get("drop_genes", []) or [])
+    if not selectors:
+        return adata
+    from interscale.tl.masking import resolve_mask_genes
+
+    columns = resolve_mask_genes(selectors, adata.var)
+    targets = set(resolve_mask_genes(list(cfg.dataset.get("mask_genes", []) or []), adata.var))
+    for one in cfg.dataset.get("mask_gene_sets", []) or []:
+        targets |= set(resolve_mask_genes(list(one), adata.var))
+    clash = sorted(set(columns) & targets)
+    if clash:
+        names = [str(adata.var_names[c]) for c in clash]
+        raise ValueError(f"dataset.drop_genes would drop target genes of the masking ({names}); drop inputs only.")
+    keep = np.ones(adata.n_vars, dtype=bool)
+    keep[columns] = False
+    dropped = [str(g) for g in adata.var_names[~keep]]
+    adata = adata[:, keep].copy()
+    adata.uns["dropped_genes"] = dropped
+    print(f"dataset.drop_genes: dropped {len(dropped)} genes")
+    return adata
+
+
 PIXEL_TO_UM = 0.138  # Resolve MC1 default; override via cfg if instrument differs
 
 

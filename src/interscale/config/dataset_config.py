@@ -73,6 +73,10 @@ def get_dataset_cfg(cfg):
     # cells and nothing else. mask_percentage is then the share of cells (1.0: every cell), and
     # discs, if on, select cells for it too. Empty: random entries, as before.
     cfg.dataset.mask_genes = []
+    # Remove and retrain (.claude/ranking_plan.md, R3): genes removed from the data as it is read (tl.drop_genes) -- neither
+    # input nor target -- by name or "<var column>=<value>" selector. A gene of mask_genes / mask_gene_sets is refused (a
+    # target). Empty: every gene kept. Checkpoint tag drop<n>-<sha1>.
+    cfg.dataset.drop_genes = []
     # Channel masking (mask_strategy "gene" only): the label-free form of programme masking. A random share of
     # the genes -- round(fraction * G), the same set in every selected cell -- is hidden, and drawn again each time
     # the graphs' masks are redrawn (every epoch for the training graphs; validation and test graphs keep the set

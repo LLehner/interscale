@@ -1,4 +1,4 @@
-from ._preprocessing import get_average_local_and_global_size, remove_zero_expression_cells
+from ._preprocessing import drop_genes, get_average_local_and_global_size, remove_zero_expression_cells
 from .anchors import (
     ZONE_ORDER,
     anchor_enrichment,
@@ -63,6 +63,7 @@ __all__ = [
     "attn_mask_diagonal",
     "blocked_pairs",
     "remove_zero_expression_cells",
+    "drop_genes",
     "get_average_local_and_global_size",
     "find_anchor_cells",
     "anchor_signed_distance",

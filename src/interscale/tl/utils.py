@@ -341,6 +341,12 @@ def _training_tag(cfg) -> str:
         digest = hashlib.sha1(repr(sets).encode()).hexdigest()[:8]
         per_draw = int(cfg.dataset.get("mask_sets_per_draw", 1))
         parts.append(f"sets{per_draw}of{len(sets)}c{float(cfg.dataset.mask_percentage):g}-{digest}")
+    dropped = [str(g) for g in (cfg.dataset.get("drop_genes", []) or [])]
+    if dropped:
+        import hashlib
+
+        digest = hashlib.sha1(repr(sorted(dropped)).encode()).hexdigest()[:8]
+        parts.append(f"drop{len(dropped)}-{digest}")
     weights = {name: float(w) for name, w in dict(cfg.optim.get("aux_loss_weights", {})).items() if float(w) != 0.0}
     if weights:
         parts.append("aux-" + "-".join(f"{name}{w:g}" for name, w in sorted(weights.items())))

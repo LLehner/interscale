@@ -17,7 +17,7 @@ from interscale.config.sweep import ARM_PARAM, apply_sweep_config, build_sweep_c
 from interscale.evaluation.online_probes import build_probe_obsm
 from interscale.geome_dataloader import GraphAnnDataModule, block_mask_kwargs, crop_kwargs, gene_set_mask_kwargs
 from interscale.pp.segmentation_noise import apply_segmentation_noise
-from interscale.tl import prepare_geome_dataset, remove_zero_expression_cells
+from interscale.tl import drop_genes, prepare_geome_dataset, remove_zero_expression_cells
 from interscale.tl.utils import get_model_filename_prefix, set_full_reproducibility
 
 # geome calls the deprecated `sq.gr.spatial_neighbors` entrypoint; silence its
@@ -167,6 +167,7 @@ def main_sweep(cfg_factory, model_type, sweep_goal, sweep_params=None, arms=None
     adata = sc.read_h5ad(cfg.dataset.h5ad_data)
     print_memory_usage("After loading h5ad")
     adata = remove_zero_expression_cells(adata)
+    adata = drop_genes(adata, cfg)
     print(adata)
     if cfg.dataset.segmentation_robustness is not None:
         print("Applying segmentation noise...")
