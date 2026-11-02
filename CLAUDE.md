@@ -536,6 +536,43 @@ shuffles (Bonferroni over genes) with `I_local >= min_local_i`; they are ranked 
 are the global set, the largest the local set. Pass the training slides only. `write_scale_sets` puts `<prefix>_set` into `var`, so
 `mask_genes: ["scale_set=global"]` hides the global set. The cluster tool is `notebooks_and_scripts/slurm/new/scale_sets.py`.
 
+**Label residuals** (`evaluation/residuals.py`, `.claude/yardsticks_plan.md` Y0): the scale sets drawn again after a label is
+taken out of the expression, so a cell-type or region marker is not called "global". A `Block` is a design over the cells
+(`label_block` one-hot, `composition_block` = a label's shares among any neighbourhood's cells, e.g. the GCN's 2-hop reach or
+`knn_neighbourhood`); `residualise` adds blocks cumulatively after one intercept per graph (`fit: graph` = coefficients per slide,
+`pooled` = shared), R² against the within-graph variance; `shapley_r2` splits the full R² among the blocks without an order (2^B
+fits); `residual_scale_sets` / `label_summary` run `scale_sets` per stage and line a gene up before and after. Invariants: graphs
+never mix (neighbourhoods refuse crossing edges, `fit: graph` fits per graph); a gene a stage explains exactly within a graph is set
+to 0 there (`EXACT`), so it reads as constant, not as rounding noise; **composition explains interaction too** -- rebuild the sets on
+the residual of the cell's own label (or a region label) only, and read composition as a variance share. Cluster / local tool:
+`notebooks_and_scripts/slurm/new/label_residuals.py` (synth_spot, CosMx, vannan25).
+
+**Per-gene scale readouts** (`.claude/yardsticks_plan.md` V1-V3; cluster hook `notebooks_and_scripts/slurm/new/readout_common.py`):
+- `evaluation/partition.py` (V1): `collect_feature_blocks` (blocks `own` = visible input, 0 where hidden; `near` = the visible
+  entries' mean over the hop reach of the batch's edges; `local`; `global` tokens; with `folds` every cell hidden once, masks given
+  back) and `partition_r2` (ridge per gene, out of fold by graph or `spatial_folds` blocks, target and features centred within graphs;
+  unique / shared for two groups, Shapley shares via `residuals.shapley_from_subsets`). Scores only genes hidden in every kept row.
+- `evaluation/context_test.py` (V2): a conditional randomisation test with the model as a black box. Invariants: whole rows move
+  (`fields`: x, masks, labels, embeddings), positions / edges / names stay (`POSITIONAL`), any other per-cell attribute refuses; the
+  shift wraps on a torus; `near` takes **one receiver per graph and pass** (several would let a far-only gene show a near effect);
+  `p`/`q` from the Gaussian z of the surrogate losses (the rank p, `p_rank`, cannot pass BH over many genes); ties are `p = 1`.
+- `evaluation/component_scales.py` (V3): `collect_fold_predictions` (every head, any decoder, every cell once) and `component_scales`
+  (SVD of the within-graph-centred prediction; each component map's `ell_um` from `gene_scales`; global if wider than the reach, local
+  within, unstructured otherwise; per gene shares and the loading-weighted median scale, `inf` allowed).
+
+**Gene rankings** (`.claude/ranking_plan.md` R1-R4; cluster hook `notebooks_and_scripts/slurm/new/ranking_common.py`):
+- `evaluation/deletion.py` (R2): `sender_deletion` replaces a sender gene (or a group) by a draw from its conditional given the cell's
+  other visible genes (`conditional_parts`: one regularised precision matrix per graph gives every block's conditional mean; a draw
+  adds another visible cell's residual row) and reads every target's ΔR² at the receivers. Regions: `all` (receivers' own rows too),
+  `context` (own rows kept: what the model reads from other cells), `far` (beyond a radius). Invariants: one true pass, then one per
+  sender and draw; only `x` changes (graphs with precomputed `embeddings` are refused); a hidden gene is no sender; rank by `delta_r2`
+  (z treats neighbouring receivers as independent).
+- `evaluation/ranking.py` (R1, R4): `rank_by_effect` (expression-matched robust z, control floor), `rbo`, `rank_stability`,
+  `robust_rank_aggregation`.
+- `dataset.drop_genes` (R3, remove and retrain): `tl.drop_genes(adata, cfg)` right after `remove_zero_expression_cells` in main.py,
+  main_sweep.py and the sweeps' `load_adata` -- every new entry point that reads the data must call it too; a target gene of the
+  masking is refused; checkpoint tag `drop<n>-<sha1>`; default empty (names unchanged).
+
 **Hidden against visible cells** (`masked_probing.visibility_scores`, `visible_view`; M0): the same masked pass scored on the visible
 cells too -- every entry of each cell with no hidden entry -- with `HeadPredictions.near_hidden_um` for the bins. Every reference of
 `reference_predictions` leaves the query cell out, the slide mean included since 2026-10-29 (a hidden cell's numbers are unchanged:

@@ -1416,3 +1416,32 @@ hier_tier2_f0. **dual_ctx (all three folds) is missing**: no checkpoint, no sect
 - **Reading:** the prediction varies along tissue composition (acinar / islet / duct / stroma) plus one abundance axis. This is what a
   neighbourhood smoother would also produce; not checked: the same SVD on the knn128 prediction. Without that, the readout does not show
   anything only the model holds.
+
+## 2026-11-02 — Label residuals before the Moran's I scale sets (yardsticks_plan.md Y0; results in `results/02_11_results/label_residuals`)
+
+Run locally by mistake (whole datasets belong on the cluster; `slurm/new/label_residuals.sbatch` written for the full run). synth_spot (24
+training slides) and CosMx fold 0 (training slide, 2 sections, 108,711 cells x 979 genes) complete; vannan25 only 8 samples balanced over
+`sample_type` (430,261 cells) and only the `final_CT` stage (the run was stopped). k-NN 8, 2 hops, `fit: graph`, n = 20 per set.
+
+**What worked**
+- synth_spot, label `region` (positive control): the region markers CM1-CM3 lose their pattern (I_local 0.95 -> 0.001, label R² 0.98) and
+  leave the global set; every planted programme keeps 95-100% of its local Moran's I; the Spearman of the fall with the planted scale is
+  unchanged (-0.79 -> -0.78). M4, M7, M8 enter the freed global slots.
+- vannan25, `final_CT` (8 samples): the global set before is airway identity (C20orf85, FOXJ1, MUC5B, SCGB1A1, WFDC2, SOX2); 16 of 20
+  leave it once the cell type is out (kept I_global ~0.02-0.2). The global set after is ECM / fibrosis (COL1A2, COL3A1, POSTN, FN1, SFRP2),
+  inflammation (CCL2, CCL18, CXCL13, ICAM1, SOD2, ATF3) and alveolar (SFTPC, NAPSA): tissue-scale variation within cell types. Local set
+  before = markers of scattered types (mast TPSAB1 / CPA3, endothelial ACKR1 / PLVAP), 15 of 20 leave.
+- CosMx, `slide_fov` as a region label: the global set (HSPA1A/B, HSP90s, HSPB1, BAG3, FOS, JUN, DUSP1/5, RPLs) loses 85% of its I_global
+  (median kept 0.15), 15 of 20 leave; the cell type hardly touches them (kept I_global 0.99). A stress / immediate-early + ribosomal
+  signature constant within ~1 x 0.66 mm fields: most likely handling or per-FOV technical, not tissue biology (the statistic alone cannot
+  tell; an FOV residual also removes real mm-scale gradients).
+
+**What doesn't work / caveats**
+- CosMx, `cell_type_coarse`: the genes that enter the local set after the cell type is out (GCG, TTR, CHGA, CPB1, SST; R² 0.4-0.7) are
+  **segmentation spillover**: non-endocrine cells with 0 / 1 / 2 / 3 / 4+ endocrine cells among their 8 nearest carry GCG at 0.02 / 0.05 /
+  0.10 / 0.20 / 0.56 (alpha cells 2.77) and INS at 0.21 / 0.50 / 0.76 / 0.97 / 1.41 (log-normalised X, fold 0 training slide). A GCN
+  predicts them from its neighbours trivially; they are not communication. The Shapley split shows it too (GCG own 0.38, near composition 0.32).
+- CosMx label R² is small for most genes (median 0.004); the 110 significant candidates shrink to 65 after the cell type. 19 NegPrb: none in a
+  set before or after.
+- Composition explains interaction too, so the sets are rebuilt on own-label (or region) residuals only; composition stays a variance share.
+- vannan25 TNiche / CNiche stages and the Shapley split are missing (run stopped); CosMx folds 1-2 not run.
