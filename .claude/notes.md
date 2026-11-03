@@ -1445,3 +1445,22 @@ training slides) and CosMx fold 0 (training slide, 2 sections, 108,711 cells x 9
   set before or after.
 - Composition explains interaction too, so the sets are rebuilt on own-label (or region) residuals only; composition stays a variance share.
 - vannan25 TNiche / CNiche stages and the Shapley split are missing (run stopped); CosMx folds 1-2 not run.
+
+## 2026-11-03 — Gene rankings on synth_spot: sender deletion, seed stability, remove and retrain (results in `results/03_11_results`)
+
+`full` x seeds 42-44 + twin, 300 epochs, programme masking; ROAR arms at seed 42 only.
+
+**What worked**
+- Consensus context top 10 is 10/10 planted (S1-S4, M7, M8, M11, M19-M21). Removing them: centred cosine 0.946 -> 0.289; all 25 planted removed 0.280; bottom10 0.953; rand10 0.946 / 0.928; twin -0.006.
+- Context edges above ΔR² 0.05: 14 of 14 planted. Precision@1 vs twin: `all` 0.62 vs 0.10, `context` 0.49 vs 0.07.
+- Seeds: nine genes in every seed's context top 10 (Jaccard@10 0.82-1.0; twin RBO 0.02). Stage 1 per-gene cosine SD mostly <= 0.01.
+- Removals agree with `all` ΔR² per target: MR22 -> MC22 0.84 -> 0.03, MR25 -> MC25 0.98 -> 0.10, M1 -> MC1 0.83 -> 0.37, M3 -> MC3 0.74 -> 0.31, M10 -> MC13 no change.
+
+**What doesn't work**
+- Conditional deletion understates smooth senders: the other genes rebuild them within a slide (corr with M7 0.63-0.81 on 3 test slides; S1, M11, noise 0.26-0.40). M7 ΔR² <= 0.25, yet cosine ~0.96 -> ~0.2 on removal. Importance is not comparable across sender classes. Cause inferred; `METHOD: permute` on the checkpoints is the test.
+- `context` misses own-row reading: M1-M6 ΔR² ~0 there, 0.01-0.48 in `all`. Only 14 of 31 planted edges pass 0.05.
+- Top 10 removal leaves MC1-MC6 at 0.52-0.65 (planted arm 0.12-0.28); the headline 0.289 vs 0.280 hides it.
+- Collateral loss: top10 kept M12-M18 yet MC16-MC22 fell 0.04-0.14, MC1 0.31; train / val loss 0.20 / 0.60 vs 0.04 / 0.05. ROAR drops are not all lost information.
+- rand arms are not neutral: they hit M1, M3 and receptors.
+- MC16-MC22 cosine is mostly receptor on/off (sources removed 0.52-0.92), so it cannot show source reading. MC12, MC13 stay ~0.25 in every arm.
+- V2 skipped (no ctx_ tables). V1 unique_global vs planted length: Spearman 0.12.

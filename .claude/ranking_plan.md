@@ -111,3 +111,7 @@ every run in turn (`ARRAY_TASK = False`, sweep_common's default), sized to stay 
   100 epochs, deletion with 1 conditional draw on 3 test samples, + twin, then the stability step. ~9-10 h, unmeasured.
 `submit_*.sh` and `ranking_stability.sbatch` are gone; the earlier lines of this plan that name them, `rand<k>` x 3 draws, two folds,
 seeds 42-43 in stage 2 or 2 draws describe the first version.
+
+## Follow-ups of the synth read (2026-11-03; verdicts in notes.md)
+
+`sbatch slurm/synth_followup.sbatch`, written, not run: stage `permute` (stage 1's checkpoints, `METHOD: permute`, `receiver_scores`: Pearson within each slide's receivers) and stage `followup` (one class removed per arm: sparse_sources, receptors, rings, own_row; seeds 42-43). Read: did M7, M8, M1-M6 rise under `permute`, and does `sparse_sources` lower `receiver_corr` for MC16-MC22 against `full`? A pooled-over-slides conditional is built only if `permute` confirms the diagnosis.
