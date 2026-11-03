@@ -99,3 +99,15 @@ per patient; 5 patient groups dealt by condition, so every test fold holds both.
 **Read first.** Synth: `del_recovery_summary` (precision@1 and MRR of the planted senders, `context`) against the twin; stability.md
 (seed pairs' RBO and Jaccard@20); then synth_roar: programme scores of `top<k>` against `rand<k>` and `none`, `planted` as the bar.
 Lung: heads_within_* first (did the model learn), then the seed pairs' agreement of `sender_all`, then the consensus senders.
+
+## Runs as single jobs (2026-11-02, the user: "Why can't we do single runs with multiple arms as initially?")
+
+The first version spread the runs over job arrays (one task per run, chained submit scripts). Replaced by one job per experiment,
+every run in turn (`ARRAY_TASK = False`, sweep_common's default), sized to stay under 12 h:
+- **synth** (`sbatch slurm/synth_ranking.sbatch`): stage 1 `full` x seeds 42-44 + twin -> `ranking_stability.py --roar-yaml` -> stage 2
+  at seed 42 only: `top10`, `bottom10`, `rand10_d0`, `rand10_d1`, `planted` (5 runs; k = 20 and the `none` arm dropped: stage 1's
+  `full_s42` is the baseline). ~5-9 h.
+- **lung** (`sbatch slurm/lung_ranking.sbatch`): fold 0 only (the seeds are the replicates; no fold stability in this run), seeds 42-44,
+  100 epochs, deletion with 1 conditional draw on 3 test samples, + twin, then the stability step. ~9-10 h, unmeasured.
+`submit_*.sh` and `ranking_stability.sbatch` are gone; the earlier lines of this plan that name them, `rand<k>` x 3 draws, two folds,
+seeds 42-43 in stage 2 or 2 draws describe the first version.

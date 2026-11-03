@@ -15,7 +15,7 @@ locally; results here, verdicts appended to notes.md.
 
 | stage | state | verified by | date |
 |---|---|---|---|
-| L0 — inputs: the data file, folds, niche columns, checks | proposed; **waits for the data** | | 2026-10-29 |
+| L0 — inputs: the data file, folds, niche columns, checks | **built 2026-11-03, not yet run on the real file**: `make_lung_inputs.py` -> `MA/vannan25_pp.h5ad` (counts as `vannan_pre_process.ipynb`, no filtering; 5 balanced patient groups; per-sample 40th-neighbour distance recorded); `lung_hier.yaml`: 40-NN graph, discs 200 µm | `patient_groups` on the real `obs` (7 patients per group, control 2/2/2/2/1, cells 290k-338k, deterministic); the whole script on a stand-in (real `obs`, 500 µm crops, random counts): layers equal an independent recomputation, one `obsm`, no patient across splits, both conditions in every test, file reads back; the real matrix was not read locally | 2026-11-03 |
 | L1 — the arms: SOTA model, baselines, masks | proposed | | 2026-10-29 |
 | L2 — niches as the hierarchy's top level (`top_level.mode: obs_label`) | **implemented, unverified on data** (2026-10-30, branch `niches`): `hierarchy.top_level.mode: obs_label`, `obs_key`, `split_by_space` none / components / kdtree (below) | tests/test_niches.py (patches, top level, through the model, singleton = dense, config, names), 20 mutations caught, harness IDENTICAL | 2026-10-30 |
 | L3 — niche-pooled tokens (`pooling.kind: label`) | **implemented, unverified on data** (2026-10-30, branch `niches`): `pooling.kind: label`, `label_key`, `min_cells`, `max_cells` (below) | tests/test_niches.py (one token per patch, no leakage, a label per cell = the per-cell model, config, names) | 2026-10-30 |
@@ -26,16 +26,17 @@ locally; results here, verdicts appended to notes.md.
 
 | field | value |
 |---|---|
-| dataset, platform, paper | TBD |
-| cluster path | TBD (`MA/...`) |
-| samples (the attention sequence) and their key | TBD; one tissue section = one sequence, never two donors in one (the CosMx rule) |
-| cells per sample (min / median / max) | TBD: decides dense-fused vs routed (L1) |
-| coordinates: `obsm` key, unit, pixel size | TBD; µm in the input file. Check that no two FOVs overlap (the CosMx trap: FOV-local pixels stacked) |
-| genes on the panel | TBD |
-| cell types: key, coarse and fine | TBD |
-| niches: key(s), how they were computed | TBD: from cell-type composition of a neighbourhood, from transcripts, or from a model? This decides the leakage (below) |
-| condition (IPF / other ILD / control), donor, region | TBD |
-| folds | TBD; proposed: by donor, each test fold holds both conditions (as CosMx) |
+| dataset, platform, paper | Vannan et al. 2025, Xenium, lung fibrosis; 1,630,319 cells |
+| cluster path | `MA/vannan25.h5ad` (source, local `Arbeit/data/vannan25.h5ad`) -> `MA/vannan25_pp.h5ad` (`make_lung_inputs.py`) |
+| samples (the attention sequence) and their key | `obs['sample']`: 45 cores of 35 patients (`obs['patient']`: 9 control, 26 disease, never both; 9 patients have 2-3 samples, 19 samples = 36% of the cells) |
+| cells per sample (min / mean / max) | 5,941 / 36,229 / 124,717 (four TMA3 cores of 69k-125k cells, 5-7 mm wide; the rest ~3.5 mm): decides dense-fused vs routed (L1) |
+| coordinates: `obsm` key, unit, pixel size | `obsm['spatial']` = `x_centroid`, `y_centroid`, µm. One frame per TMA: 405 of 990 sample pairs overlap in bounding box, so graphs are per sample. Cell spacing ~9 µm; nearest neighbours 7-12 µm in every sample |
+| genes on the panel | 343 |
+| cell types: key, coarse and fine | `final_lineage` (coarse) and `final_CT` (fine); written as `cell_type_coarse`, `cell_type_fine` |
+| niches: key(s), how they were computed | `TNiche`, `CNiche` (given by the source; how they were computed is not recorded in the file: the leakage question below stays open); written as `niche`, `niche_c` |
+| condition (IPF / other ILD / control), donor, region | `disease_status` (Control 225,137 cells = 14%, Disease 1,405,182), `patient`, `sample_affect` (more / less affected), `sample_type` (INT / MF / LF / Unaffected), `tma`, `run` |
+| graph | a fixed 40-nearest-neighbour graph per sample (user, 2026-11-03). The 40th neighbour: median 47 µm (samples 41-95 µm); two hops: median 102 µm directed, 127 µm symmetrised; 90% of cells within 152 / 205 µm. The CosMx values (k = 8, discs of 60 µm) do not carry over: discs are 200 µm |
+| folds | 5 patient groups of 7 (control 2/2/2/2/1), balanced in cells (290k-338k), samples and cells per condition and region by a seeded search (`patient_groups`); fold k tests group k, validates on k + 1, trains on the 21 other patients (~27 samples). Run, TMA and site (T* vs VU* patient ids: Run1 is VU only, 2 T controls) are confounded and not stratified |
 
 ## L0 — inputs
 

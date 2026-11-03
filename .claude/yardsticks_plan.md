@@ -155,3 +155,7 @@ full and hier_none), `cosmx_tiers.py` (`SCALE_READOUTS`, near test off; re-evalu
 **Read first (synth_spot):** Spearman of `v1_unique_global` and `v2far_delta_r2` with the planted `length_scale_um` over the programme
 genes; long-range responses high, short-range receivers low, the twins as the floor; `v2_label` against the planted role;
 `v3_global_share_global` against `v3_truth_share_global`.
+
+**2026-11-02, later:** `synth_spot_readouts.sbatch` and `label_residuals.sbatch` are single jobs now (every run / dataset in turn, no
+arrays; the user asked for single runs with multiple arms). The CosMx re-evaluation with the readouts: one job,
+`INTERSCALE_MODE=evaluate INTERSCALE_RUNS=gcn_f0,hier_none_f0,hier_tier2_f0 python scripts/cosmx_tiers.py`.
