@@ -953,22 +953,32 @@ def _sparse_references(
 
 
 def _reference_parts(
-    batch, hidden: torch.Tensor, *, spatial_unit_um: float, kernels_um, position, drivers=None
+    batch, hidden: torch.Tensor, *, spatial_unit_um: float, kernels_um, position, drivers=None, k_nearest=()
 ) -> dict:
     """Per cell, model-free inputs of the fitted references, in batch node order (float64).
 
     ``own``: the cell's visible values (a hidden entry reads 0); ``context``: Gaussian-kernel means
-    of the visible values of the other cells of its graph, one block of genes per bandwidth;
+    of the visible values of the other cells of its graph, one block of genes per bandwidth, and / or means over the
+    ``k_nearest`` cells (neighbour lists: no distance matrix, for whole sections);
     ``position``: :func:`position_features` (or absent); ``driver``: :func:`oracle_features` (or absent). No
     hidden value enters any of them.
     """
     x = batch.x.double()
     parts = {"own": torch.where(hidden, torch.zeros_like(x), x)}
-    if kernels_um:
+    if kernels_um or k_nearest:
         refs = reference_predictions(
-            batch.x, hidden, batch.pos, batch.batch, spatial_unit_um=spatial_unit_um, kernels_um=tuple(kernels_um)
+            batch.x,
+            hidden,
+            batch.pos,
+            batch.batch,
+            spatial_unit_um=spatial_unit_um,
+            kernels_um=tuple(kernels_um),
+            k_nearest=tuple(k_nearest),
+            method="sparse" if k_nearest and not kernels_um else "auto",
         )
-        parts["context"] = torch.cat([refs[f"ref_kernel_{s:g}um"] for s in kernels_um], dim=1)
+        parts["context"] = torch.cat(
+            [refs[f"ref_kernel_{s:g}um"] for s in kernels_um] + [refs[f"ref_nearest_{k}"] for k in k_nearest], dim=1
+        )
     if position is not None:
         parts["position"] = position(batch, hidden)[POSITION].double()
     if drivers is not None:
@@ -1019,6 +1029,8 @@ class FittedReferences:
         µm per unit of ``pos``.
     kernels_um
         Bandwidths of the context, µm.
+    k_nearest
+        The context's means over the k nearest cells, on neighbour lists: the form for whole sections.
     position
         A :func:`position_features` function, or None to leave the position reference out.
     drivers
@@ -1040,6 +1052,7 @@ class FittedReferences:
         *,
         spatial_unit_um: float,
         kernels_um=(),
+        k_nearest=(),
         position=None,
         drivers=None,
         alphas=(0.1, 1.0, 10.0, 100.0, 1e3, 1e4),
@@ -1048,8 +1061,9 @@ class FittedReferences:
     ):
         self.spatial_unit_um, self.kernels_um, self.position = float(spatial_unit_um), tuple(kernels_um), position
         self.drivers = drivers
+        self.k_nearest = tuple(k_nearest)
         names = [n for n, parts in FITTED_REFERENCES.items() if position is not None or "position" not in parts]
-        names = [n for n in names if kernels_um or "context" not in FITTED_REFERENCES[n]]
+        names = [n for n in names if kernels_um or k_nearest or "context" not in FITTED_REFERENCES[n]]
         names = [n for n in names if drivers is not None or "driver" not in FITTED_REFERENCES[n]]
         chunks, targets, hidden_rows, graph_of = {}, [], [], []
         graphs = list(train_data)
@@ -1089,6 +1103,7 @@ class FittedReferences:
             kernels_um=self.kernels_um,
             position=self.position,
             drivers=self.drivers,
+            k_nearest=getattr(self, "k_nearest", ()),
         )
 
     def _choose_alpha(self, x, y, rows, fold, alphas) -> float:
@@ -1124,7 +1139,7 @@ class FittedReferences:
         return fitted
 
     #: What a fitted instance holds besides the ``position`` function (a closure, which a file cannot keep).
-    STATE = ("spatial_unit_um", "kernels_um", "fill", "target_columns", "models", "alpha_")
+    STATE = ("spatial_unit_um", "kernels_um", "k_nearest", "fill", "target_columns", "models", "alpha_")
 
     def state(self) -> dict:
         """The fit as a plain dict of arrays and sklearn objects, for :func:`pickle` (see :meth:`from_state`)."""
@@ -1137,6 +1152,7 @@ class FittedReferences:
         Lets jobs that evaluate different models on the same training slides share one fit: the ridge
         regressions depend on the graphs, their masks and the settings only, never on a model.
         """
+        state = {"k_nearest": (), **state}  # a fit saved before k_nearest existed
         missing = [name for name in cls.STATE if name not in state]
         if missing:
             raise ValueError(f"the saved fit lacks {missing}")
@@ -1373,6 +1389,41 @@ def within_section(pred: HeadPredictions) -> HeadPredictions:
         parts=pred.parts,
         near_hidden_um=pred.near_hidden_um,
         section_mean=np.zeros_like(centre),
+    )
+
+
+def within_groups(pred: HeadPredictions, groups) -> HeadPredictions:
+    """``pred`` with every head and the truth each centred on its **own** mean per group and gene, over the hidden entries.
+
+    ``groups`` ``[n]``: a label per row (a section, or a section and cell type). Scored by :func:`score_heads` with ``center``
+    zero, the centred cosine then asks how well a head follows the variation among the hidden entries inside each group; the
+    level of a group counts for nothing, so a head that only knows the group (a section's offset, a cell type's mean) scores
+    ~0. Unlike :func:`within_section` it needs no visible entry, so it also works for a gene hidden in every cell. It uses the
+    truth's own means, which no model has: a score, never an input.
+    """
+    groups = np.asarray(groups)
+    hidden = np.asarray(pred.hidden, dtype=bool)
+    if len(groups) != len(hidden):
+        raise ValueError(f"groups has {len(groups)} rows, the predictions {len(hidden)}.")
+
+    def centred(value):
+        out = np.array(value, dtype=np.float64)
+        for group in np.unique(groups):
+            rows = groups == group
+            keep = hidden[rows]
+            mean = (out[rows] * keep).sum(0) / np.maximum(keep.sum(0), 1)
+            out[rows] -= mean
+        return out
+
+    return HeadPredictions(
+        heads={name: centred(value) for name, value in pred.heads.items()},
+        true=centred(pred.true),
+        hidden=pred.hidden,
+        depth_um=pred.depth_um,
+        cells=pred.cells,
+        parts=pred.parts,
+        near_hidden_um=pred.near_hidden_um,
+        section_mean=None if pred.section_mean is None else np.zeros_like(pred.section_mean),
     )
 
 

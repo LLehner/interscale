@@ -127,8 +127,9 @@ def hides_gene_set(cfg) -> bool:
     return named or pooled or float(cfg.dataset.get("mask_channel_fraction", 0.0)) > 0
 
 
-#: What a section offset is (``model.decoder.section_offset``): none, or the mean of the section's visible entries.
-SECTION_OFFSETS = ("none", "visible_mean")
+#: What a section offset is (``model.decoder.section_offset``): none, the mean of the section's visible entries, or the
+#: training mean of the cell's label (``label_mean``, ``model.decoder.label_offset_key``: the loss then reads what the label leaves).
+SECTION_OFFSETS = ("none", "visible_mean", "label_mean")
 
 
 def section_visible_mean(x: torch.Tensor, visible: torch.Tensor, graph: torch.Tensor | None) -> torch.Tensor:

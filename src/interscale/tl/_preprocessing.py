@@ -1,6 +1,7 @@
 from typing import Literal
 
 import numpy as np
+import pandas as pd
 import squidpy as sq
 
 
@@ -93,3 +94,27 @@ def get_average_local_and_global_size(
         "global_cells": global_cells,
         "global_dist_um": global_dist_um,
     }
+
+
+def imitation_labels(adata, key: str, *, train, layer: str | None = None, n_clusters: int = 15, n_pcs: int = 30, seed: int = 0):
+    """``obs[key]``: clusters that imitate cell types, for a dataset without annotation (``model.decoder.label_offset_key``).
+
+    k-means on the first ``n_pcs`` principal components of ``layer`` (default ``X``), both fitted on the cells of ``train``
+    (``[cells]`` bool: the training split, so no held-out cell shapes a cluster), every cell then assigned to its nearest centre.
+    An existing column is left alone: real annotation always comes first.
+    """
+    if key in adata.obs:
+        return adata
+    import scipy.sparse as sp
+    from sklearn.cluster import MiniBatchKMeans
+    from sklearn.decomposition import TruncatedSVD
+
+    values = adata.layers[layer] if layer else adata.X
+    values = values.toarray() if sp.issparse(values) else np.asarray(values)
+    train = np.asarray(train, dtype=bool)
+    mean = values[train].mean(0)
+    svd = TruncatedSVD(n_components=min(int(n_pcs), values.shape[1] - 1), random_state=seed).fit(values[train] - mean)
+    scores = svd.transform(values - mean)
+    kmeans = MiniBatchKMeans(n_clusters=int(n_clusters), random_state=seed, n_init=3).fit(scores[train])
+    adata.obs[key] = pd.Categorical([f"c{k}" for k in kmeans.predict(scores)])
+    return adata

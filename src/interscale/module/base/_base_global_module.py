@@ -657,6 +657,7 @@ class GlobalModule(BaseModule):
             y_true=y_true,
             entry_mask=entry_mask,
             parts={"global": parts} if len(parts) > 1 else None,
+            target_center=parts["section"].detach() if self.section_offset == "label_mean" else None,
             views=[
                 ViewOutput(
                     global_embedding=global_embedding,

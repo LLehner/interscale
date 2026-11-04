@@ -225,7 +225,7 @@ def _decoder_tag(cfg) -> str:
     The decoder type was never part of a checkpoint name, so an arm that varies it would overwrite the arm
     that does not; the default (``linear``, no skip, no offset) adds nothing and every earlier name is unchanged.
     ``-skipraw``: the skip reads the cell's genes (``model.decoder.own_cell_skip_input: raw``), ``-skip`` its token;
-    ``-sec``: ``model.decoder.section_offset: visible_mean``.
+    ``-sec``: ``model.decoder.section_offset: visible_mean``; ``-lab-<key>``: ``label_mean`` on that obs column.
     """
     decoder = cfg.model.get("decoder", None)
     if decoder is None:
@@ -235,7 +235,11 @@ def _decoder_tag(cfg) -> str:
     if kind in (None, "linear") and not skip and not section:
         return ""
     raw = skip and decoder.get("own_cell_skip_input", "embedding") == "raw"
-    return f"dec-{kind or 'linear'}{('-skipraw' if raw else '-skip') if skip else ''}{'-sec' if section else ''}_"
+    offset = ""
+    if section:
+        label = re.sub(r"[^A-Za-z0-9]+", "-", str(decoder.get("label_offset_key", ""))).strip("-")
+        offset = f"-lab-{label}" if decoder.get("section_offset") == "label_mean" else "-sec"
+    return f"dec-{kind or 'linear'}{('-skipraw' if raw else '-skip') if skip else ''}{offset}_"
 
 
 def _embedding_tag(cfg) -> str:
@@ -326,6 +330,10 @@ def _training_tag(cfg) -> str:
     if gene_set:
         # Letters, digits and dashes only: "role=response" -> "role-response".
         names = "-".join(re.sub(r"[^A-Za-z0-9]+", "-", str(s)).strip("-") for s in gene_set)
+        if len(names) > 80:  # a long list of genes: a file name cannot hold it
+            import hashlib
+
+            names = f"{len(gene_set)}genes-{hashlib.sha1(repr(sorted(map(str, gene_set))).encode()).hexdigest()[:8]}"
         parts.append(f"gs{float(cfg.dataset.mask_percentage):g}-{names}")
     channels = float(cfg.dataset.get("mask_channel_fraction", 0.0))
     if channels:

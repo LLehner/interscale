@@ -5,6 +5,7 @@ import pytorch_lightning as L
 import torch
 
 from interscale.nn import LinearDecoder, LinearLSEDecoder, NonLinearDecoder
+from interscale.tl.geome_utils import label_codes
 from interscale.tl.masking import MASK_STRATEGIES, SECTION_OFFSETS, apply_mask, section_visible_mean
 
 
@@ -25,6 +26,7 @@ class BaseModule(L.LightningModule, ABC):
         type_gex_embedding: Literal["PCA", "NMF", "scvi"] | None = None,
         block_masking: bool = False,
         section_offset: str = "none",
+        label_offset_attr: str | None = None,
     ):
         """
         Parameters
@@ -93,8 +95,15 @@ class BaseModule(L.LightningModule, ABC):
                     f"section_offset adds each gene's section mean to its prediction: it needs a reconstruction (n_output "
                     f"{n_output} = n_input {n_input})."
                 )
-            # Ones, not an initialiser: no draw from the global RNG, so every other weight is initialised as without it.
-            self.section_offset_weight = torch.nn.Parameter(torch.ones(n_output))
+            if section_offset == "visible_mean":
+                # Ones, not an initialiser: no draw from the global RNG, so every other weight is initialised as without it.
+                self.section_offset_weight = torch.nn.Parameter(torch.ones(n_output))
+            else:
+                if not label_offset_attr:
+                    raise ValueError("section_offset label_mean is built for a GlobalModel (it passes label_offset_attr, the graphs' label attribute).")
+                self.label_offset_attr = label_offset_attr
+                # [labels, G], sized by set_label_means (or by the checkpoint it is loaded from). A buffer: saved with the model.
+                self.register_buffer("label_means", torch.zeros(0, n_output))
 
         # Define components
         self.local_component = None
@@ -158,6 +167,30 @@ class BaseModule(L.LightningModule, ABC):
             return torch.ones(x.shape, dtype=torch.bool, device=x.device) if gene_mask is None else ~gene_mask.bool()
         return ~batch_masked.mask.bool()[:, None].expand(x.shape)
 
+    def set_label_means(self, graphs) -> None:
+        """``label_means`` ``[labels, G]`` from ``graphs`` (the training graphs, never val or test): each gene's mean over the
+        cells of each label, read from ``data.x``, which masking never touches. A label without a training cell gets the
+        training mean over all cells."""
+        total, count = None, None
+        for data in graphs:
+            x, codes = data.x.double().cpu(), label_codes(data, self.label_offset_attr).cpu()
+            n_labels = getattr(data, self.label_offset_attr).shape[1]
+            if total is None:
+                total, count = torch.zeros(n_labels, x.shape[1], dtype=torch.float64), torch.zeros(n_labels, dtype=torch.float64)
+            total.index_add_(0, codes, x)
+            count.index_add_(0, codes, torch.ones_like(codes, dtype=torch.float64))
+        overall = total.sum(0) / count.sum()
+        means = total / count.clamp_min(1.0)[:, None]
+        means[count == 0] = overall
+        self.label_means = means.to(self.label_means.dtype).to(self.label_means.device)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # label_means is sized by the data: take the checkpoint's size before the copy.
+        saved = state_dict.get(f"{prefix}label_means")
+        if saved is not None and hasattr(self, "label_means"):
+            self.label_means = torch.zeros_like(saved).to(self.label_means.device)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def section_input(self, batch, masked: bool = True) -> torch.Tensor | None:
         """``[N, G]`` in batch node order: the section part of each cell's prediction (``section_offset``), None when off.
 
@@ -166,6 +199,11 @@ class BaseModule(L.LightningModule, ABC):
         """
         if self.section_offset == "none":
             return None
+        if self.section_offset == "label_mean":
+            if not self.label_means.numel():
+                raise ValueError("section_offset label_mean: no label means yet; train the model or load a trained one.")
+            codes = label_codes(batch, self.label_offset_attr).to(self.label_means.device)
+            return self.label_means[codes].to(batch.x.dtype)
         x = batch.x.float()
         visible = self.visible_entries(batch) if masked else torch.ones(x.shape, dtype=torch.bool, device=x.device)
         graph = getattr(batch, "batch", None)

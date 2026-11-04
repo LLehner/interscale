@@ -51,6 +51,10 @@ def get_model_cfg(cfg):
     # entries of the cell's graph (a section) times a learned weight per gene starting at 1, so a section's own offset (donor,
     # condition, batch) need not be carried by the embedding (roadmap Tier 1; notes.md 2026-10-31: on CosMx 80-89% of the
     # centred cosine was the section's offset). "none": off. Reconstruction at node level only.
+    # "label_mean" (GlobalModel): the part is the training mean of the cell's label instead (`label_offset_key`, an obs column
+    # that reaches the graphs through dataset.extra_obs_keys; cell types, or clusters that imitate them), fixed, and the loss
+    # reads prediction and target minus it: the decoder predicts only what the label does not explain.
     cfg.model.decoder.section_offset = "none"
+    cfg.model.decoder.label_offset_key = ""
 
     return cfg

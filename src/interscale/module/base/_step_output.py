@@ -84,6 +84,9 @@ class StepOutput:
         ``y_pred`` (the half of a stacked dual output): a global-only model with the own-cell skip (``context`` and
         ``own_cell``), the global head of a residual dual decoder (``local``, detached, and ``global``). ``None``
         where no head has more than one part. What ``masked_probing.attribution_shares`` reads.
+    target_center
+        ``[N, F]`` in the rows of ``y_pred``: what the loss subtracts from prediction and target, per cell, in place of
+        ``optim.center_targets``' training mean (the label's mean under ``section_offset: label_mean``). ``None``: that mean.
     views
         One :class:`ViewOutput` per forward pass. Length 1 until the two-view stage.
     """
@@ -93,6 +96,7 @@ class StepOutput:
     entry_mask: torch.Tensor | None = None
     loss_mask: torch.Tensor | None = None
     parts: dict[str, dict[str, torch.Tensor]] | None = None
+    target_center: torch.Tensor | None = None
     views: list[ViewOutput] = field(default_factory=list)
 
     @property

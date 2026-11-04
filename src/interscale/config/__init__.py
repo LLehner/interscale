@@ -987,6 +987,17 @@ def _validate_section_offset(cfg):
     kind = cfg.model.decoder.get("section_offset", "none")
     if kind not in SECTION_OFFSETS:
         raise ValueError(f"model.decoder.section_offset must be one of {SECTION_OFFSETS}, got {kind!r}.")
+    key = cfg.model.decoder.get("label_offset_key", "")
+    if key and kind != "label_mean":
+        raise ValueError(f"model.decoder.label_offset_key {key!r} is read under section_offset label_mean, not {kind!r}.")
+    if kind == "label_mean":
+        from interscale.tl.geome_utils import label_attribute
+
+        if not key:
+            raise ValueError("model.decoder.section_offset label_mean needs model.decoder.label_offset_key, an obs column.")
+        label_attribute(cfg, key)  # raises, naming the fix, when the column does not reach the graphs
+        if not cfg.optim.get("center_targets", False):
+            raise ValueError("model.decoder.section_offset label_mean centres the loss on the label's mean: set optim.center_targets.")
     if kind == "none":
         return
     if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":

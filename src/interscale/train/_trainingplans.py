@@ -405,6 +405,7 @@ class TrainingPlan(pl.LightningModule):
         mask_idx: torch.Tensor | None = None,
         attn: torch.Tensor | None = None,
         entry_mask: torch.Tensor | None = None,
+        target_center: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Calculate regression metrics.
 
@@ -435,7 +436,7 @@ class TrainingPlan(pl.LightningModule):
         """
         # What the loss sees: the values minus each gene's training mean under optim.center_targets.
         y_pred_raw, y_true_raw = y_pred, y_true
-        y_pred, y_true = self.centred(y_pred, y_true)
+        y_pred, y_true = self.centred(y_pred, y_true, target_center)
         if self.loss is None:
             # No reconstruction criterion: the objective comes entirely from the auxiliary terms.
             # Metrics are still computed and logged -- they say what the representation can do,
@@ -498,6 +499,7 @@ class TrainingPlan(pl.LightningModule):
         entry_mask: torch.Tensor | None = None,
         extra_loss: torch.Tensor | None = None,
         loss_override: torch.Tensor | None = None,
+        target_center: torch.Tensor | None = None,
     ):
         """Helper method to log metrics for training, validation, or test steps.
 
@@ -520,7 +522,9 @@ class TrainingPlan(pl.LightningModule):
             metrics.pop(f"{mode}_f1_per_class")
 
         elif "regression" in self.prediction_task:
-            loss, metrics = self._regression_metrics(y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask)
+            loss, metrics = self._regression_metrics(
+                y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask, target_center=target_center
+            )
 
         if loss_override is not None:
             # The weighted sum of the two heads' losses (`loss_weights`): what this run optimises,
@@ -589,7 +593,8 @@ class TrainingPlan(pl.LightningModule):
         # but there are no halves to report when no reconstruction criterion is configured.
         if self.loss is None or not hasattr(self.module, "compute_separate_losses"):
             return self._compute_and_log_metrics(
-                y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask, extra_loss=aux_total
+                y_pred, y_true, mode, metrics, attn=attn, entry_mask=entry_mask, extra_loss=aux_total,
+                target_center=out.target_center,
             )
 
         # `optim.regime_loss`: each head's loss on the hidden cells of its regime (`tl.depth`). The metrics keep
@@ -741,11 +746,13 @@ class TrainingPlan(pl.LightningModule):
         """Test step for the model."""
         return self._step(batch, "test")
 
-    def centred(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(y_pred, y_true)`` minus each gene's training mean under ``optim.center_targets``, else as given."""
-        if self.target_center is None:
+    def centred(self, y_pred: torch.Tensor, y_true: torch.Tensor, center: torch.Tensor | None = None):
+        """``(y_pred, y_true)`` minus ``center`` (per cell: ``StepOutput.target_center``), else minus each gene's training mean
+        under ``optim.center_targets``, else as given."""
+        center = self.target_center if center is None else center
+        if center is None:
             return y_pred, y_true
-        return y_pred - self.target_center, y_true - self.target_center
+        return y_pred - center, y_true - center
 
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""

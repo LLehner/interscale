@@ -291,6 +291,9 @@ class NodeMaskingTrainingPlan:
         if self._cfg.optim.get("center_targets", False):
             target_center = train_gene_means(datamodule.train_data)
             print(f"Loss on gene-centred values: means of {len(target_center)} genes over the training graphs")
+        if getattr(self.module, "section_offset", "none") == "label_mean":
+            self.module.set_label_means(datamodule.train_data)
+            print(f"Loss on what the label leaves: means of {self.module.label_means.shape[0]} labels over the training graphs")
 
         training_plan = self._training_plan_cls(
             self.module,

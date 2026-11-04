@@ -4,6 +4,7 @@ import torch
 from anndata import AnnData
 from yacs.config import CfgNode as CN
 
+from interscale.tl.geome_utils import label_attribute
 from interscale.model.base._base_model import BaseModel, in_eval_mode
 from interscale.module.base import GlobalModule
 from interscale.module.global_modules.positional_encodings import attach_positional_inputs
@@ -46,6 +47,11 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
             block_masking=block_masking_on(self._cfg),
             type_gex_embedding=self._cfg.model.global_component.parameters.type_gex_embedding,
             section_offset=self._cfg.model.decoder.get("section_offset", "none"),
+            label_offset_attr=(
+                label_attribute(self._cfg, self._cfg.model.decoder.label_offset_key)
+                if self._cfg.model.decoder.get("section_offset", "none") == "label_mean"
+                else None
+            ),
         )
 
         self._attach_aux_losses()
