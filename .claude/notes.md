@@ -1464,3 +1464,46 @@ training slides) and CosMx fold 0 (training slide, 2 sections, 108,711 cells x 9
 - rand arms are not neutral: they hit M1, M3 and receptors.
 - MC16-MC22 cosine is mostly receptor on/off (sources removed 0.52-0.92), so it cannot show source reading. MC12, MC13 stay ~0.25 in every arm.
 - V2 skipped (no ctx_ tables). V1 unique_global vs planted length: Spearman 0.12.
+
+## 2026-11-04 — Gene rankings on synth_spot, follow-up: deletion by permutation, one class removed per arm, scores within receivers (results in `results/03_11_results/synth_ranking_permute`, `synth_followup`)
+
+Stage 1's checkpoints re-evaluated (seeds 42-44 + twin); four retraining arms x seeds 42-43, 300 epochs. Check: `full_s42` reproduces 0.945.
+
+**What worked**
+- The diagnosis of 2026-11-03 holds: the conditional replacement hid smooth senders. Context ΔR², conditional -> permute: M7 on MC8 / MC9 0.10 / 0.21 -> 1.12 / 1.33; M8 on MC10 / MC11 0.03 / 0.14 -> 1.43 / 1.65; M19-M21 0.07-0.13 -> 0.27-0.57. Spot-like senders hardly move (S, M11).
+- `context` + permute is the usable ranking: the same 11 genes lead in all three seeds, all planted (S1-S4, M7, M8, M11, M19-M21, M3); next gene <= 0.05, noise max 0.006. 17 of 31 planted edges above ΔR² 0.05. Seven off-target edges, all from M7 / M8 (largest M7 -> MC24 0.16).
+- Own-row reading confirmed: M1, M2, M4, M5, M6 context ΔR² <= 0.003, `all` 0.45-1.51. `own_row` arm: MC1-MC6 0.67-0.83 -> -0.05-0.39, everything else unchanged.
+- The sparse sources M12-M18 are not read: ΔR² <= 0.002 under both methods in both regions; `sparse_sources` arm leaves MC16-MC22 within 0.001 of `full`; receiver_corr -0.25 to 0.18 (full -0.23 to 0.21, twin -0.15 to 0.09). Their high cosine is receptor on/off: `receptors` arm takes MC16-MC25 to 0.02-0.23.
+- Readings follow scores between seeds (3 seeds only): M3 context 0.05 / 0.47 / 0.13 with MC3 0.66 / 0.81 / 0.75; M20 0.42 / 0.31 / 0.10 with MC24 receiver_corr 0.60 / 0.60 / 0.37.
+- `receiver_scores`: MC23-MC25 0.37-0.91 in full against twin ~0, so the dense programmes' level is followed.
+
+**What doesn't work**
+- Permutation in `all` gives false positives on collinear genes: CM1 ranks first (5.03; MC4 1.88, MC2 1.05, MC6 0.98), though bottom10 removed CM1 and CM2 with no loss and CM1's context sum is 0.015. Off-manifold: CM1 changed while CM2, CM3 stay. `all` precision@1 falls 0.62 -> 0.52. Neither method is right for `all`; a conditional pooled over slides is the proposed fix (not built).
+- Headline cosine misses whole classes: `own_row` 0.946 vs full 0.947, though six programmes collapse. Read per programme.
+- Removing rings damages programmes whose senders stayed: MC14 / MC15 ~0.90 -> 0.07-0.34 (M11 kept), MC23-MC25 receiver_corr -> 0.24-0.39; train / val loss 0.055 / 0.387. No other arm does this, so the top10 collateral of 2026-11-03 probably comes from here. Cause open: overfitting on targets that became unpredictable, or the rings teaching long-range reading.
+- Tried and refuted: the hidden response leaking through library-size normalisation (raw counts, 8 test slides: within receivers its correlation with receptor, background mean and log library is ~0, |r| <= 0.11).
+- Open: `receptors` arm raises receiver_corr of MC18, MC19, MC21, MC22 to 0.33-0.47. Level depends on distance to the source, so this hints the source is read once the receptor is gone; not tested. M19-M21 still have no retraining arm of their own. V2 reason still unknown.
+
+## 2026-11-04 — Plan for the improved global model, a type-residual target, CosMx gene masking and a capacity sweep (code, tests, stub data; no run)
+
+Review of the plan files with the user (roadmap.md, "Focus until Tuesday 10 November"): the hard date moved to 10 November; first a somewhat well working improved global-only model, then T7, T8 and T10, for which the user will
+give details. What the user wants downstream: spatially variable genes among the most influential ones, better still a separation of local and global genes; expression itself matters less.
+
+Built on branch `cosmx-programme`:
+- `model.decoder.section_offset: label_mean` + `label_offset_key` (GlobalModel): the prediction gets a fixed part, the training mean of the cell's label; the loss reads prediction and target minus it. Inputs unchanged, so a sender's type stays readable. `tl._preprocessing.imitation_labels` gives clusters where no annotation exists.
+- `masked_probing.within_groups`: every head and the truth on their own mean per group. It needs no visible entry, so it works for a gene hidden in every cell, where `within_section` does not. `within_type_*` tables centre per section and label.
+- `FittedReferences(k_nearest=...)`: the ridge bars on neighbour lists for whole sections; `dataset.eval_mask_genes`: an arm's own evaluation set; a long `mask_genes` list is hashed in the checkpoint name.
+- Sweeps in `slurm/new/`: `cosmx_masking` (8 arms, 21 runs + 2 twins) and `synth_capacity` (7 arms x 2 seeds).
+
+**What worked**
+- 14 new tests pass, the whole suite passes (1738), all 16 mutations are caught (4 only after stronger tests, among them that the label means come from the training graphs alone), the harness is IDENTICAL against `main` (5 cases / 15 epochs). On stub data: the gene-set step, a smoke training for 5 arms that cover every kind of mask and target, and the evaluation hook; the stub's `ref_own+context` lies above `ref_own` (0.27 against 0.19).
+
+**What the existing tables already say (fold 0, label_residuals of 2026-11-02; no model)**
+- Only 65 genes pass the default candidate threshold (I_local >= 0.05), 50 once the genes whose neighbours' label composition explains >= 5% are out; so the run lowers the threshold to 0.03 (107 clean genes on fold 0) and takes 30 per set.
+- Removed as spillover: PRSS2, CPB1, REG1A, GCG, IAPP, CHGA, TTR. The most local clean genes: IGF2, CD74, CCL2, COL1A1, OLFM4, APOD, CXCL2, IL32, COL3A1, SOD2: cytokines, matrix, stress response.
+- The most global: HSPA1A/B, BAG3, HSP90AA1, FOS, JUN, RPL22, HSPB1, DUSP5: stress, immediate-early and ribosomal, with the largest FOV shares (HSPA1A 0.22, against a median of 0.003). Possibly handling, not biology. Read `moran_global` with that in mind; it could still pass a score.
+
+**Choices to read the run with**
+- The main arms train on 1 mm crops (4,800 steps), since synth_spot's programmes needed ~7,200 steps; cosmx_tiers' "crops bring nothing" was read under discs. The space arms cannot use crops (a crop re-centres the coordinates), hence the whole-section control `rand50_whole`.
+- `space_only` is scored on sections of donors never trained on, with coordinates centred per section: expect about 0 within sections; a score above that says how much of the target is place, or a bug.
+- The bars use the k nearest cells' visible genes, not kernels: not the bar of the synth_spot runs.

@@ -19,7 +19,7 @@ The terms used below:
 
 ## Status
 
-Last updated 2026-10-29 (the focus until Tuesday 3 November, below the table).
+Last updated 2026-10-29 (the focus until Tuesday 3 November, below the table); the table has not been brought up to date since. **The current priorities are in "Focus until Tuesday 10 November" below it (2026-11-04).**
 
 | track | question | state | verified by | date |
 |---|---|---|---|---|
@@ -36,6 +36,42 @@ Last updated 2026-10-29 (the focus until Tuesday 3 November, below the table).
 | T8 | prior knowledge (NicheNet), downstream | proposed | | |
 | T9 | literature review and write-up | proposed | | |
 | T10 | comparison with other methods: classification (manuscript Fig. 2), communication methods, spatially variable genes, spatial domains | **workflow planned and started** ([comparison_plan.md](comparison_plan.md), 2026-10-25; CosMx first, synth_spot as the calibration): shared inputs (the section layout from the global pixels), the LIANA+ consensus resource cut to the panel, the output tables, and 4 of 7 baselines (LIANA+, `ligrec`, Moran's I, logistic regression) run locally on a 2-FOV copy; AMICI, Steamboat, NicheCompass, the InterScale arms and readouts, Visium and IMC not started. **2026-10-29: the lung fibrosis data added as the second dataset, with niches** ([lung_plan.md](lung_plan.md); data not ready); the comparison runner scripts were removed by the user, to be written again | local runs on a 2-FOV-per-section copy | 2026-10-29 |
+
+## Focus until Tuesday 10 November (decided with the user on 2026-11-04)
+
+The hard date moved from 8 to 10 November. **First a somewhat well working improved global model, then T7, T8 and T10.** Those three stay important;
+the user will give additional details for them, so they are not designed or scheduled here yet. This section takes precedence over the W3 schedule below.
+
+Decisions (2026-11-04):
+- **Decision 11:** programme masking on CosMx. The user expects a different reconstruction soon, based on mean-subtracted counts: predicting the effect that cell type / structure
+  alone does not explain. Details open.
+- **Decision 13:** global-only, already raised with the supervisors. It looks easier to improve than the dual model, and one model that captures local and global effects would be a big
+  improvement on it. The dual model stays as the comparison.
+
+**What "well working" means (the user, 2026-11-04):** the downstream analysis shows spatially variable genes among the most influential ones; better still, it separates local from global genes.
+Reconstructing expression itself matters less. So the decision is read from influence rankings against each gene's spatial pattern (with an expression-matched floor: abundant genes are both), not from a cosine.
+
+**The target (the user, 2026-11-04):** subtract the mean of the cell's type where annotation exists, else of clusters that imitate cell types. Built as `model.decoder.section_offset: label_mean` (`label_offset_key`) and
+`tl._preprocessing.imitation_labels`. Inputs stay as they are, so a sender's type stays readable.
+
+**CosMx masking (the user, 2026-11-04):** no particular programme. Moran's I sets, or random genes, then at 50% since the panel has few noisy genes. Also space alone and expression + space, "I want to see what it does".
+
+| # | what | why | state | effort |
+|---|---|---|---|---|
+| 1 | capacity sweep on `full`: width, heads, layers, epochs | width 64, 4 heads, 2 layers unchanged since round 2; below a 150 µm kernel it could represent (0.77 vs 0.82, K15) | **written 2026-11-04, not run**: `synth_capacity.{py,sbatch}`, 7 arms x 2 seeds | one job under 12 h |
+| 2 | CosMx under gene masking: `hier_none`; a random half of the genes, Moran's I local / global sets; the type-residual target; space alone and expression + space; bars `ref_own`, `ref_own+context`; `NegPrb` out; spillover genes out of the Moran sets (the interferon / MHC-I set dropped: the user has no particular programme) | the only kind of task under which a global model learned communication (K17); no wholly hidden cells, so discs should stop shaping the flow | **written 2026-11-04, not run**: `cosmx_masking.{py,sbatch}`, 8 arms, 21 runs + 2 twins; branch `cosmx-programme`, checked on stub data | one job, ~9 h |
+| 3 | test the flow: intervention (hide a receiver's most-attended cells against random cells at the same distance; synth_spot, then CosMx), reproducibility over masks and seeds, the permuted slide, T5's same-type share against a distance-matched null with labels only as a later overlay; IG only to confirm on sampled receivers, after checking its completeness gap | the CosMx plots are one seed per fold and one mask, their sinks unchecked; nothing so far could fail them | proposed | about 1 day to build, mostly evaluation only |
+| 4 | additive global-only decoder: one part per distance band plus the own-cell skip (decision 13, stage H-γ) | each gene an exact sum of parts at known scales, without the GCN (short range 0.56-0.68 against the window's 0.95-0.97) | proposed | about 1 day to build; synth_spot, then CosMx |
+| 5 | programmes planted into CosMx coordinates (K20) | separates "the model cannot read this" from "the tissue does not have it" | proposed, if time remains | about 1 day |
+
+**Not this week:** hierarchy priors, entmax / top-k, null key, registers; H-α, H-β, Performer / Exphormer at section scale, fused training; local units, free heads, crops for accuracy, the 10,000-epoch run; channel masking;
+gated and FiLM decoders, D2.4, regime loss, re-masking, contrastive losses; `dual_ctx` on CosMx unless item 4 fails; the pooled conditional and the rings collateral (rank by `context` + permute as it stands).
+
+**If a slot is free:** a small orthogonality sweep (the description names it, already built); one window + Fourier arm (confirm first that `fourier` is K19's "anisotropic" bias); deletion of M12-M18 on the `receptors` checkpoints.
+
+**Next after job 2's read:** on the best arm, influence by deletion (`context` + permute) against each gene's Moran's I and local / global class, with an expression-matched floor: the user's criterion above. Evaluation only, not built yet.
+
+**Not started and not covered above:** T7 (conditioning), T8 (NicheNet), T10's runners and remaining baselines, the AMICI-style same-type block.
 
 ## Focus until Tuesday 3 November (set by the user on 2026-10-29)
 

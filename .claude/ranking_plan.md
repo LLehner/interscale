@@ -115,3 +115,5 @@ seeds 42-43 in stage 2 or 2 draws describe the first version.
 ## Follow-ups of the synth read (2026-11-03; verdicts in notes.md)
 
 `sbatch slurm/synth_followup.sbatch`, written, not run: stage `permute` (stage 1's checkpoints, `METHOD: permute`, `receiver_scores`: Pearson within each slide's receivers) and stage `followup` (one class removed per arm: sparse_sources, receptors, rings, own_row; seeds 42-43). Read: did M7, M8, M1-M6 rise under `permute`, and does `sparse_sources` lower `receiver_corr` for MC16-MC22 against `full`? A pooled-over-slides conditional is built only if `permute` confirms the diagnosis.
+
+Follow-ups read 2026-11-04 (notes.md): `permute` confirms the diagnosis; rank communication by `context` + permute. `all` needs the pooled conditional (not built): permutation flags collinear genes (CM1). Next candidates: deletion of M12-M18 on the `receptors` checkpoints; the rings arm's collateral.

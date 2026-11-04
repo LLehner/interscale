@@ -702,3 +702,8 @@ across epochs and the curve is comparable.
 - Code style is enforced by `pre-commit` (ruff-check/format, biome-format, pyproject-fmt, whitespace/merge-conflict hooks) — run `pre-commit install` once locally.
 - Tests live under `tests/`, use `pytest` with `--import-mode=importlib`; shared fixtures (e.g. a small synthetic `AnnData`) are defined in `conftest.py` at the repo root.
 - Coverage is measured over the `interscale` package only (`[tool.coverage] run.source = ["interscale"]`), excluding `test_*.py` files.
+
+**The target a label leaves** (`model.decoder.section_offset: label_mean`, `label_offset_key`; GlobalModel; `.claude/roadmap.md`, focus until 10 November): the prediction gets a fixed part, the training
+mean of the cell's label (`label_means`, a buffer sized by the data, set in `train` from the training graphs only, saved with the model), and the loss reads prediction and target minus it, cell by cell (`StepOutput.target_center`).
+Inputs are unchanged, so a sender's type stays readable. The column must reach the graphs (`dataset.extra_obs_keys`). `tl._preprocessing.imitation_labels` gives clusters where no annotation exists, fitted on training cells.
+Score with `masked_probing.within_groups` (every head and the truth on its own mean per group; it also works for a gene hidden in every cell, where `within_section` has no visible mean). `FittedReferences(k_nearest=...)` are the ridge bars on neighbour lists, for whole sections.
