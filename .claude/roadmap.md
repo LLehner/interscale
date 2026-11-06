@@ -19,7 +19,7 @@ The terms used below:
 
 ## Status
 
-Last updated 2026-10-29 (the focus until Tuesday 3 November, below the table); the table has not been brought up to date since. **The current priorities are in "Focus until Tuesday 10 November" below it (2026-11-04).**
+Last updated 2026-10-29 (the focus until Tuesday 3 November, below the table); the table has not been brought up to date since. **The current priorities are in "Focus until Tuesday 10 November" below it (2026-11-04).** **On 2026-11-05 the user added nine high-priority tasks: "Added 2026-11-05", right above that section, take precedence.**
 
 | track | question | state | verified by | date |
 |---|---|---|---|---|
@@ -36,6 +36,109 @@ Last updated 2026-10-29 (the focus until Tuesday 3 November, below the table); t
 | T8 | prior knowledge (NicheNet), downstream | proposed | | |
 | T9 | literature review and write-up | proposed | | |
 | T10 | comparison with other methods: classification (manuscript Fig. 2), communication methods, spatially variable genes, spatial domains | **workflow planned and started** ([comparison_plan.md](comparison_plan.md), 2026-10-25; CosMx first, synth_spot as the calibration): shared inputs (the section layout from the global pixels), the LIANA+ consensus resource cut to the panel, the output tables, and 4 of 7 baselines (LIANA+, `ligrec`, Moran's I, logistic regression) run locally on a 2-FOV copy; AMICI, Steamboat, NicheCompass, the InterScale arms and readouts, Visium and IMC not started. **2026-10-29: the lung fibrosis data added as the second dataset, with niches** ([lung_plan.md](lung_plan.md); data not ready); the comparison runner scripts were removed by the user, to be written again | local runs on a 2-FOV-per-section copy | 2026-10-29 |
+
+## Added 2026-11-05: nine high-priority tasks until Tuesday 10 November (the user)
+
+Asked while the net-flow permutation job runs. Where they compete, these take precedence over "Focus until Tuesday 10 November" below. That table's item 2 continues in tasks 1-2, its item 3 in tasks 3, 4 and 7, and its "T7, T8, T10 after details" is now partly specified by tasks 5 and 6. Its "not this week" list no longer rules out the attention and PE arms task 3 needs. The rule "older model, no new variants" (the user, 2026-11-05) is for the PR notebook; tasks 3 and 8 compare fork variants on purpose.
+
+**Order.** Proposed first with task 7 at the top, because tasks 3, 4 and 5 all read a net flow and today two different ones are in use. **Update, same day (the user): no need to do task 7 now; the notebook as it runs is fine for now.** So task 7 is parked, and until it is picked up tasks 3, 4 and 5 read the notebook's flow, with K10's caveat (below). The table shows the new order. The numbers are the user's; the order and the days are a proposal.
+
+| order | task | first step | runs on | state | days (proposal) |
+|---|---|---|---|---|---|
+| parked | 7, which net flow | decide the readout; compare both on the permutation job's checkpoints | evaluation only | answered below; improvement proposed; parked by the user 2026-11-05 | - |
+| 1 | 2, mean-subtracted reconstruction | evaluate `rand50_type` and the Moran arms, train `moran_local_type` | evaluation only, plus one training job | **script faults fixed 2026-11-05, unverified on data**; not run | Thu 5 - Fri 6 |
+| 2 | 1, Moran's I after mean subtraction | run `label_residuals.sbatch`, read folds 0-2 | no model | **combined stage built 2026-11-05**; not run on the cluster | Thu 5 - Fri 6 |
+| 3 | 4, stability over seeds | `cosmx_stability.sbatch`, `net_flow_seeds.sbatch` | two jobs | **built 2026-11-05, nothing trained**; not run | Fri 6 - Sat 7 |
+| 5 | 3, attention and PEs under shuffling | a few arms, per cell-type pair; other methods | one job per set of arms; baselines | proposed | Sat 7 - Sun 8 |
+| 6 | 5, condition differences | per-slide T1D minus ND of the chosen flow | evaluation only | proposed | Sun 8 |
+| 7 | 6, CellAgentChat global results | find the August outputs, check its coordinates | its own env | script from August, no read | Sun 8 |
+| 8 | 8, global-only with an embedding as input | scVI and CellCharter tokens on CosMx | one job | `Precomputed` built; CellCharter not computed | Sun 8 - Mon 9 |
+| alongside | 9, thesis outline | `.claude/thesis_outline.md` with chapters and a page budget | none | not started | by Mon 9 |
+
+**CosMx splits (the user, 2026-11-05):** the predefined `split_0-2` (one slide per split) are not needed for regression; splits can be shuffled independently of donor. First used in task 4: FOVs shuffled within each section, 70 / 15 / 15 by cells, every donor in every split, six sections training instead of two. Scores on such splits say nothing about new donors and are not comparable with the donor-held-out ones. The running permutation notebook and the follow-up of `cosmx_masking` keep the predefined splits, so they stay comparable with their first runs.
+
+**If time runs short (proposal):** task 8 without CellCharter (scVI only), task 6 as a comparison on one fold, task 3 with two arms. Task 7 and task 4 are what make the others readable, so they stay.
+
+### Task 1: check Moran's I by normalized slide again
+
+- **What it means (the user, 2026-11-05):** mean subtraction, not only per slide: also per region or cell type, where annotations exist.
+- **Exists:** `evaluation.gene_scales` z-scores each gene within its slide before pooling and keeps neighbours within a slide; `scale_sets` on type residuals; `evaluation.residuals` and `label_residuals.py` (any label's mean per slide taken out, then the scale sets; yardsticks Y0); the per-fold sets in `make_cosmx_masking_yaml.py` (cell type only).
+- **Already read, fold 0 only (notes.md, 2026-11-02):** the FOV as a region stand-in takes out the global set's stress, immediate-early and ribosomal genes (85% of I_global lost, 15 of 20 leave); the cell type hardly touches them (kept 0.99) but moves the local set (11 of 20 leave), and segmentation spillover enters it. So neither alone is enough. This run was local; folds 1 and 2 have not been read.
+- **Built 2026-11-05:** a label can be a list of columns, whose means come out together: `cell_type_coarse+fov` on CosMx. CosMx has no region annotation, so the FOV stands in, and its residual also removes real mm-scale gradients; synth_spot has `region`; legnini has neither a type nor a region annotation (clusters via `imitation_labels` would have to be added).
+- **Step:** `sbatch slurm/label_residuals.sbatch` (no GPU, ~10 min per fold; partition names in the script to check). Read: for each of slide, type, FOV, type + FOV, how the local and global sets change, on all three folds. Then decide whether the Moran arms should use type + FOV sets; that changes their masks, so those arms would need retraining.
+
+### Task 2: reconstruct with mean subtracted
+
+- **Exists:** `model.decoder.section_offset: label_mean` with `label_offset_key`, `tl._preprocessing.imitation_labels`, `masked_probing.within_groups` (built 2026-11-04). `rand50_type` is trained on three folds.
+- **Was blocked by (notes.md, 2026-11-05):** `sweep_common.eval_cfg` overwrote `extra_obs_keys` with `CONTEXT_LABELS`, so `rand50_type` was never evaluated; the Moran arms were scored under `rand_eval` (480 genes hidden, not their 30); `moran_local_type` has no result.
+- **Fixed 2026-11-05, unverified on data:** `eval_cfg` keeps the arm's columns; Moran arms set `eval_mask_genes` to their own set (not part of the checkpoint name, so old checkpoints still load); `moran_local_type` gets a shorter dataset name (its checkpoint name came to exactly 255 characters, the file name limit, the longest of all arms and the only arm without a result; the cause is likely but not proven, the job log would settle it); a `spillover` gene group in the tables, kept in `cosmx_masking_genes.json` (an older file only gains the lists, its masks stay). Checked without a model: only that arm's name changes, the evaluation sets are right, the label reaches the model's config.
+- **Limit:** `label_mean` takes the mean from the training graphs, and a label without a training cell gets the overall mean. So it works for a cell type or a recurring region, not for FOVs of held-out donors. `within_groups` in the evaluation has no such limit.
+- **Step:** the two jobs in the header of `cosmx_masking.sbatch`, one after the other (training `moran_local_type`; evaluation only for `rand50`, `rand50_type` and the Moran arms, if the checkpoints in `MA/04_11_results/cosmx_masking` are kept). Read: within type against `ref_own` and `ref_own+context`, `rand50_type` against `rand50`, with `spillover=no`.
+
+### Task 3: how do attention and PEs affect the shuffling results, cell type by cell type; how are other methods affected
+
+- **Exists:** the permutation notebook (`docs/notebooks/net_flow_permutation_cosmx.ipynb`, branch `net-flow-permutation-notebook`: one model per level, cell-type flow); `attention_flow.patch_flow` (influence and rollout against an expression-permuted slide without retraining, per label pair; read once, on legnini); the attention kinds and PE arms; `comparison_plan.md` (LIANA+ and `ligrec` were written, the runners were removed by the user on 2026-10-29).
+- **Design point:** the current permutation swaps profiles among all cells, so it also breaks the link between a cell's label and its expression. A label-based method (LIANA+, `ligrec`) collapses for that reason alone, whatever it does with space, so the comparison would say little. Add a **within-type** permutation (identity kept, spatial arrangement gone) next to the any-cell one, so an effect can be attributed to space.
+- **Step:** at most four arms (no PE, distance window, one more PE, possibly fused or hierarchical on whole sections), the same levels, one job under 12 h. The readout comes from task 7. Baselines on the same permuted inputs.
+- **Read:** per sender-receiver pair, the flow against the level per arm; per method, the rank correlation of its pair scores with its own reference. Differences count only beyond task 4's seed spread.
+
+### Task 4: stability, how results are affected by different seeds
+
+- **Exists:** the seed axis (T0), `ranking_stability.py`, 3-seed reads on synth_spot. On CosMx there is no second seed on one fold: the flow agreement of 0.23-0.74 (notes.md, 2026-11-05) cannot separate noise from task.
+- **Gap:** the notebook's `SEED` draws both the permutations and the model; these should be separate parameters, so the two sources of variance can be told apart. On gene masking the mask draw is a third source.
+- **Step:** three seeds of one arm on fold 0, plus repeated mask draws on one checkpoint (evaluation only). Read: Spearman between seeds of the cell-level and the pair-level flow, overlap of top genes in the rankings, SD of the within-type score.
+- **Output:** a seed spread per readout. It is the bar for tasks 3 and 5.
+- **Built 2026-11-05, unverified on data** (`slurm/new/`): `cosmx_stability.py` with `make_cosmx_stability_yaml.py`: `rand50` on FOV-shuffled splits, 100 epochs (48 steps per epoch, so the same 4,800 steps as before); split draw 0 at seeds 42-44, draws 1 and 2 at seed 42, one twin; each checkpoint's flow is read again with the other random half hidden. `cosmx_stability_read.py` writes `stability.md`: pairs differing only in seed, split or hidden half, for scores, per-gene scores, gene priority, the smoothed net flow per cell, the mean net flow per cell type, and T1D minus ND (the bar for task 5). `net_flow_seeds.sbatch`: the notebook's flow at seeds 43 and 44, levels 0 and 100, older InterScale and predefined split, parameters injected by papermill so the notebook is not edited. This replaces the "separate parameters" gap above for level 0, where only the model seed differs; at level 100 the permutation differs too.
+- **Checked without training:** split draws on the real metadata (70 / 15 / 15 by cells, every section in every split, no FOV cut, repeatable); the sweep's list mode (5 runs); the data path on a 3-FOV stub (6 graphs per split; the two halves hidden without overlap, the masks restored); the read on relabelled outputs of 2026-11-04; the seeds job with a fake model.
+
+### Task 5: more condition differences, e.g. mast and immune in CosMx T1D; how to get more disease signature
+
+- **Exists:** per-condition heatmaps in the notebook; T7's design (below, not started); the manuscript's claims (mast stronger in T1D by the CLS score, Alpha / Beta with Immune / Mast in the flow map), both from relevance scores (K10, task 7).
+- **The data's limit:** 3 slides x one ND and one T1D donor, so 3 donors per condition; FOVs are not independent replicates. Mast 3,092 and Immune 14,578 of 386,727 cells. Conclusions per slide, by consistent sign, not by FOV-level tests.
+- **Step, reading only:** T1D minus ND of the chosen flow per slide, for the mast and immune rows and columns, against task 4's spread; then within-type expression differences of the same cells' genes.
+- **Step, to get more signature (after that read):** in increasing cost: one model per condition and how well each transfers; rare types weighted in the loss or sampled; the condition as a model input (T7's conditioning of the latent space).
+
+### Task 6: CellAgentChat global results (comparison)
+
+- **Exists:** `github/CellAgentChat/tutorial/cell_agent_cosmx.py` and `cosmx.ipynb` (2026-08-17, untracked in that repo). It trains on `MA/cosmx_pancreas.h5ad`, runs its own `permutation_test`, fits the distance distribution and calls `CCI(..., dist=True, threshold=0.05)`, which is its distance-dependent (short and long range) mode. No results on this machine: the notebook only recorded the data load.
+- **To check first:** it reads `coordinates_key="spatial"`, which in this file holds FOV-local pixels, so the FOVs of a section overlap (`obsm['spatial']`; memory `cosmx-coordinates`). Distances across FOVs are then wrong, whatever the batch label does; check before reading any long-range result. Also check whether it expects counts: `X` here is log-normalised.
+- **Step:** look for the August outputs on the cluster; if they used stacked FOVs, rerun on global coordinates. Read: cell-type pair scores per condition against InterScale's flow (rank correlation), and how it behaves under task 3's permutations.
+
+### Task 7: which net flow is used for the current plots; how to make it work for any slide the model was trained on, not just masked data
+
+**Parked (the user, 2026-11-05): no need to do this now; the notebook as it runs is fine for now.** The answer and the proposal stay here for when it is picked up.
+
+**Answer: two different ones.**
+
+| | CosMx flow plots (`cosmx_run`, `cosmx_tiers`, `cosmx_masking`; `evaluation.flow_maps`) | manuscript and permutation notebook (`evaluation.net_streams.compute_hierarchical_net_flow`) |
+|---|---|---|
+| matrix | last layer, head mean of the raw attention | `_attn_matrix`: `generate_relevance` of the unmasked pass |
+| net flow | `F_ij = A_ij - A_ji` per cell pair | the same difference, per cell-type pair |
+| normalised | no; smoothed per cell count on a grid | by the window's largest entry |
+| labels | none | needed |
+| pass | the evaluation's masked pass (`module._common_step`) on the test sections | clean pass over the windows of the first sample key, all splits |
+| checked | yes: synth_spot, short and mid-range senders found, not dense, sparse or directional (notes.md, 2026-10-31) | no: K10 |
+
+- **The problem with the right column (K10):** the relevance backpropagates a summed LayerNorm output, an arbitrary direction (memory `interscale-gcn-gradient-probe`: two random final-norm scales on the same weights gave maps correlating 0.14). Each permutation level is a separately trained model, so differences between levels are especially exposed. This also covers the job running now and the manuscript's Fig. 4 flow and CLS scores.
+- **The problem with the left column:** it only exists for what the evaluation masks and on test sections, and part of it is geometry of the mask (a hidden cell reads the visible ones around it). `cosmx_masking` removed the discs, but a flow from one mask draw is still one draw.
+- **Proposed improvement:** one flow function that takes any list of graphs (train, val or test) and any hiding policy:
+  1. **Mask average:** the flow averaged over several mask draws, in the distribution the model was trained on. This is the default for a model trained under masking.
+  2. **Nothing hidden:** for comparison. On a model trained with half the genes hidden, this is an input it never saw.
+  3. **Cell-type aggregation of the same flow,** so the tissue map and the sender-receiver heatmap come from one matrix, optionally with influence (IG) on sampled receivers as the check (memory `influence-readouts-compared`).
+- **First step (evaluation only):** the permutation job keeps `checkpoints/level_<pct>/`. Load them and compute raw attention and relevance on the same windows, with the same aggregation. Read: do the heatmaps and the curves agree between the two? If they don't, the notebook for the PR should use raw attention or carry that caveat.
+- **Then:** intervention and permuted-slide tests from the focus table's item 3, on the chosen readout.
+
+### Task 8: focus on global-only with an embedding as input, or another embedding (e.g. CellCharter)
+
+- **Exists:** `type_gex_embedding: Precomputed` with `model.global_component.latent_obsm_key`, `precomputed_mask_fill`, `check_embedding_genes`; `global_pca`, `global_scvi` sweeps. On synth_spot PCA and scVI tokens lost to the linear embedding and dropped drivers (programme mean 0.61 / 0.57; notes.md, 2026-10-25), though scVI + Fourier beat the smoother on response genes at depth (2026-10-18). CellCharter is not computed anywhere.
+- **Constraints:** an embedding cannot hide single genes, so under gene masking it must be fitted without the hidden genes, which rules out random sets redrawn at each step (a fixed set per arm, or cell masking). CellCharter aggregates neighbours' embeddings, so a hidden cell's expression leaks into its neighbours' tokens under cell masking; the aggregate must be built without hidden cells or the scores read on the task that allows it. It also brings local context into the tokens, which is the appeal for decision 13 (one model for both scales, no GCN).
+- **Step:** scVI and CellCharter (its own env) fitted on the training sections, on CosMx; `Precomputed` arms against `Linear`, 300 epochs, one job. Read: the user's criterion (spatially variable genes among the most influential, by deletion), not the cosine alone.
+
+### Task 9: thesis outline (about 50 pages without references)
+
+- **Deliverable:** `.claude/thesis_outline.md`: chapters and sections with a page budget that adds up to about 50, and per section the plan file or `notes.md` entries it draws on and which figures exist.
+- **Sources:** `description.pdf` (the questions), the manuscript, `notes/summary.txt`, `notes.md`, the plan files, `gene_ranking_literature.md`, T9 below.
+- **State:** not started. No results needed for a first version; a section whose result is missing is marked so.
 
 ## Focus until Tuesday 10 November (decided with the user on 2026-11-04)
 
@@ -58,8 +161,8 @@ Reconstructing expression itself matters less. So the decision is read from infl
 
 | # | what | why | state | effort |
 |---|---|---|---|---|
-| 1 | capacity sweep on `full`: width, heads, layers, epochs | width 64, 4 heads, 2 layers unchanged since round 2; below a 150 µm kernel it could represent (0.77 vs 0.82, K15) | **written 2026-11-04, not run**: `synth_capacity.{py,sbatch}`, 7 arms x 2 seeds | one job under 12 h |
-| 2 | CosMx under gene masking: `hier_none`; a random half of the genes, Moran's I local / global sets; the type-residual target; space alone and expression + space; bars `ref_own`, `ref_own+context`; `NegPrb` out; spillover genes out of the Moran sets (the interferon / MHC-I set dropped: the user has no particular programme) | the only kind of task under which a global model learned communication (K17); no wholly hidden cells, so discs should stop shaping the flow | **written 2026-11-04, not run**: `cosmx_masking.{py,sbatch}`, 8 arms, 21 runs + 2 twins; branch `cosmx-programme`, checked on stub data | one job, ~9 h |
+| 1 | capacity sweep on `full`: width, heads, layers, epochs | width 64, 4 heads, 2 layers unchanged since round 2; below a 150 µm kernel it could represent (0.77 vs 0.82, K15) | **run and read 2026-11-05** (notes.md): 8 heads, 4 layers or 900 epochs lift the headline 0.949 -> ~0.96 (dense, M11); width alone costs that but is the first to move the sparse levels within receivers (MC18, MC22 ~0.8 at w256); w256_h8_l4 keeps both; directional and own-row untouched. `synth_capacity.{py,sbatch}`, 7 arms x 2 seeds | one job under 12 h |
+| 2 | CosMx under gene masking: `hier_none`; a random half of the genes, Moran's I local / global sets; the type-residual target; space alone and expression + space; bars `ref_own`, `ref_own+context`; `NegPrb` out; spillover genes out of the Moran sets (the interferon / MHC-I set dropped: the user has no particular programme) | the only kind of task under which a global model learned communication (K17); no wholly hidden cells, so discs should stop shaping the flow | **run 2026-11-04, partly read 2026-11-05** (notes.md): rand50 ties the own-cell ridge within type (0.166 vs 0.167). **Not valid yet:** the Moran arms were evaluated under `rand_eval` (480 genes hidden, not their 30); `rand50_type` has no evaluation (`eval_cfg` drops `extra_obs_keys`); `moran_local_type` missing, cause unknown. `cosmx_masking.{py,sbatch}`, 8 arms, 21 runs + 2 twins; branch `cosmx-programme`, checked on stub data | one job, ~9 h |
 | 3 | test the flow: intervention (hide a receiver's most-attended cells against random cells at the same distance; synth_spot, then CosMx), reproducibility over masks and seeds, the permuted slide, T5's same-type share against a distance-matched null with labels only as a later overlay; IG only to confirm on sampled receivers, after checking its completeness gap | the CosMx plots are one seed per fold and one mask, their sinks unchecked; nothing so far could fail them | proposed | about 1 day to build, mostly evaluation only |
 | 4 | additive global-only decoder: one part per distance band plus the own-cell skip (decision 13, stage H-γ) | each gene an exact sum of parts at known scales, without the GCN (short range 0.56-0.68 against the window's 0.95-0.97) | proposed | about 1 day to build; synth_spot, then CosMx |
 | 5 | programmes planted into CosMx coordinates (K20) | separates "the model cannot read this" from "the tissue does not have it" | proposed, if time remains | about 1 day |

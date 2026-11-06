@@ -1507,3 +1507,125 @@ Built on branch `cosmx-programme`:
 - The main arms train on 1 mm crops (4,800 steps), since synth_spot's programmes needed ~7,200 steps; cosmx_tiers' "crops bring nothing" was read under discs. The space arms cannot use crops (a crop re-centres the coordinates), hence the whole-section control `rand50_whole`.
 - `space_only` is scored on sections of donors never trained on, with coordinates centred per section: expect about 0 within sections; a score above that says how much of the target is place, or a bug.
 - The bars use the k nearest cells' visible genes, not kernels: not the bar of the synth_spot runs.
+
+## 2026-11-05 — Capacity sweep on synth_spot and CosMx gene masking (results of 04_11_results)
+
+Run: `synth_capacity` (7 arms x 2 seeds, 14 of 14 done) and `cosmx_masking` (20 of 23 runs have results.md sections; see the two faults below). The checks marked "from the npz" are not in results.md: the arms' saved flow files, one T1D section per fold, 25,000 sampled cells, net flow smoothed over 30 µm, Spearman.
+
+**Faults in the run, both in the sweep scripts of 2026-11-04 (not fixed yet)**
+- **The Moran arms were evaluated on the wrong mask.** `make_cosmx_masking_yaml.py` leaves `dataset.eval_mask_genes` empty for them, and `sweep_common.eval_gene_selectors` then falls back on the script's `EVAL_MASK_GENES` (`rand_eval`) before `mask_genes`. So each Moran model, trained with 30 genes hidden, was scored with 480 hidden. Visible in the counts: moran_set=local on fold 0 has 2,728,710 hidden entries = 18 x 151,595 cells, of 30 genes. Its numbers are not the planned test: raw SCE above 1, pooled cosine -0.25 to 0.26, attribution shares and flow all under that shifted input. Only a re-evaluation can read them (`eval_mask_genes` = the arm's `mask_genes`; the ridge bars refit for it).
+- **The type-residual target was not evaluated.** `rand50_type_f0-2` have a training section only. `sweep_common.eval_cfg` sets `extra_obs_keys = list(CONTEXT_LABELS)`, and this script has `CONTEXT_LABELS = []`, which removes `cell_type_coarse`; `GlobalModel` then needs it for `label_offset_attr` (`label_attribute` raises), and `one_trial` catches the error. Read from the code; the job log should show it. Evaluation only, if the checkpoints are kept.
+- **`moran_local_type` is missing altogether** (no section for any fold, not even training). Cause unknown, the job log is not in the results folder. So decision 11's target has no result yet.
+- Also: the CosMx summary's reference rows are fold 0's only (raw SCE own: 0.502 on f0, 0.577 on f1, 0.591 on f2), and it omits the arms without an evaluation without saying so. Read per fold from the sections.
+
+**What worked**
+- Capacity has room: centred cosine on the programme, mean of 2 seeds: w64_h4_l2 0.949 (reproduces `full`), w64_h8_l2 0.961, w64_h4_l4 0.962, e900 0.959, w256_h8_l4 0.960, at 0.91-1.29 s/epoch (e900 3x the epochs). The gain is in the dense and mid-range programmes: M20 0.70 -> 0.86 (h8, e900), M19 0.89 -> 0.93-0.95, M11 0.88 -> 0.93-0.96. Within receivers MC24 0.62 -> 0.81-0.83, MC23 0.81 -> 0.89-0.92.
+- Width is the first thing that moved the sparse levels within receivers (the class `full` misses, notes of 2026-11-04), in both seeds: w64 -> w128 -> w256: MC18 0.06 / 0.47 / 0.80, MC22 0.06 / 0.34 / 0.81, MC16 0.05 / 0.16 / 0.46, MC17 0.09 / 0.27 / 0.42. Heads, layers and epochs do not (MC18 and MC22 stay <= 0.14). w256_h8_l4 keeps both: MC18 0.68, MC22 0.67, MC24 0.80, MC23 0.81. Not yet known whether that reads the source: a score, no deletion. Next: deletion of M12-M18 on it.
+- CosMx rand50 is trained and clearly above its twin: within type 0.15-0.19 against -0.001, and ties the ridge from the own cell's visible genes over 3 folds (mean within type on rand_eval: model 0.166, ref_own 0.167, ref_own+context 0.168; within section 0.225, 0.230, 0.233).
+- More steps help: crops (4,800 steps) over whole sections (600): within type +0.012 / +0.015, within section +0.017 / +0.028 (f0, f1).
+- `space_only` behaves as predicted on held-out donors: within section 0.018 / 0.005, within type 0.011 / 0.006. The pooled 0.13 on f1 is level, not place (f0: -0.02).
+- Flow: no cell is wholly hidden now, so the discs' sinks are gone by construction (`hidden_cells` 0). Against the twin the net flow is 2x larger per cell (0.29-0.37 vs 0.15), less mutual (0.72-0.77 vs 0.90), and no longer follows local density (from the npz: rho with cells within 30 µm 0.42 in the twin, -0.03 to 0.05 in rand50); the twin's tissue-edge band is much weaker.
+
+**What doesn't work**
+- Width alone costs the dense class and overfits: w256_h4_l2 0.927 (train 0.011, val 0.068), M20 0.46, M11 0.74, MC24 0.28. Raw SCE worsens with width and epochs although val_loss does not: 0.009 (base), 0.045 (e900), 0.087 (w256), 0.078 (w256_h8_l4).
+- No arm moves the directional programmes (M9 0.17-0.23, M10 0.18-0.25) or the own-row ones (M2, M4, M5, M6 ~0.67-0.70), nor M16 / M17 (0.67 / 0.58); within receivers MC19 and MC21 stay <= 0.19. Directional is not a capacity problem: the distance windows carry no direction.
+- 4 layers is seed-unstable on M20 (0.89 / 0.61, MC24 0.85 / 0.45). 2 seeds in all, read small gaps with that in mind.
+- CosMx rand50 finds no context effect beyond own-cell genes: per gene within type (480 genes, 3 folds), the model beats ref_own by > 0.02 in every fold on 2 genes: TTR, GCG, both segmentation spillover (excluded from the Moran sets for that reason, but not from rand_eval). ref_own+context beats ref_own by > 0.02 in every fold on 5: GCG, TTR, CHGA (spillover), SERPINA3, HSPB1. Pooled, the ridge's own context gain is ~0 (-0.002 to +0.004), so the bar itself says little context is linearly readable from the 8-128 nearest cells' means. What the model reads cannot be said from these scores.
+- Attribution says context supplies 50-60% of rand50's prediction, while the score equals an own-cell ridge. Shares say nothing about whether the part helps; a within-type score of the parts is missing.
+- Coordinates add nothing: rand50_space against rand50_whole within type ±0.001, within section ±0.003. Expected on donors never trained on, so this does not test place within a donor.
+- Pooled against the bar rand50 is below, by more than within section (0.246 vs own 0.275, context 0.284), and raw SCE well above (0.566 / 0.895 / 0.736 vs 0.502 / 0.577 / 0.591). Crop-trained models have much worse val R² on whole sections (-2.1 to -3.4 vs -0.5 to -0.6): a level or scale shift from crops to sections, unconfirmed.
+- The flow hot spots are not yet stable (from the npz, smoothed net flow on the same section): rand50_whole vs rand50_space 0.57 / 0.74 (same training, same seed), rand50 vs rand50_whole 0.35 / 0.41, rand50 vs Moran arms -0.08 to 0.32 (those under the wrong mask), rand50 vs twin 0.04. No second seed on one fold, so noise and task are not separated. Not readable as biology before roadmap item 3's tests.
+- The user's criterion (SVGs among the most influential genes, local / global separated) was not tested: this run has no influence ranking.
+
+## 2026-11-05 — Net flow under expression permutation (attention_test.py, 2026-09-04) re-read while turning it into a notebook
+
+Read against the code of three versions (the Aug-19 upstream checkout `MA/interscale`, upstream/main of 2026-10-28, the fork's main) and the CosMx file's metadata. Nothing was trained; the setup path of the new notebook was run up to `model.train` on a 12-FOV stub.
+
+**What worked**
+- The pipeline itself is sound: one model per level, `get_model_output`, `compute_hierarchical_net_flow`, heatmaps of reference / level / difference, the partial permutation curve. The permutation draws are nested over levels (one pool order, `SHUFFLE_LEVELS` 0, 0.1, 0.2, 0.5, 0.8, 1.0, seed 42).
+- The same `CombinedModel` is built by all three versions for the notebook's config: 43 tensors, 323,814 parameters, identical names and shapes; no config value differs among shared keys. The fork's 184 extra config keys are switched off or inert at their defaults.
+- `get_model_output` fills `_attn_matrix` identically in the older and the upstream code (the only difference is an identity gather in the local decoder).
+
+**What doesn't work (in the Sep-4 scripts; the notebook corrects all of them)**
+- `FOV_KEY = "fov"` is not unique: 24 of its 25 ids occur in several sections and 5 occur in both conditions, so `compute_hierarchical_net_flow` pooled FOVs of different slides and gave 5 ids a single condition by `first()`. `slide_fov` (71 values) is unique.
+- The attention sequences follow the **first** sample key, not the last: `prepare_a2d_dataset` returns inside its loop (older checkout, upstream, fork alike; checked by counting the graphs it builds on a stub: 47 = `sliding_window_square`, not 64 = `sliding_window_v`). The script's `resolve_window_key` took the last key, so with a config listing (square, v) the flow was aggregated over windows other than those the attention is indexed by. Flows of that run are probably not the cell-type pairs they claim.
+- `X` of `cosmx_pancreas.h5ad` is log-normalised (max 4.5, non-integer), `layers['counts']` holds the integer counts. `create_permuted_data.py` permuted `X` as if it were counts and normalised it a second time (`target_sum=1e4`), so the model trained on a log of a log. The manuscript's "normalised and log-transformed with scanpy, maximum normalised values of 4" matches `X`, not that layer.
+- `long_range_attention: True` raises `NotImplementedError` in the older code and in upstream/main (only the fork implements the mask, with `local_mask_hops`), so the Sep-4 run must have used the default (off), although the manuscript describes the mask `1 - A`.
+- With the package defaults (`lr_warmup` 20, `n_epochs` 100) and `MAX_EPOCHS = 20` the run never leaves the learning-rate warm-up, if cosmx.yaml kept them. The older loop also restores no best checkpoint (last epoch is used); newer versions restore the best epoch after the warm-up.
+- `create_permuted_data.py` permutes only train and val by default: slide 3 (39% of the cells, the test split) stays intact at every level, and the flow is averaged over all cells.
+- Not settled: the content of `MA/interscale/config_files/cosmx.yaml` (it uses `pct_mask_nodes`, which the current package no longer reads). The notebook's config is the package default plus radius 110 (manuscript's CosMx radii: 0, 60, 110, 150), dual decoder, batch size 8, warm-up of a tenth of the epochs.
+
+## 2026-11-05 — Correction: the net flow of the permutation notebook reads the relevance (K10)
+
+Corrects the entry above, whose "the pipeline itself is sound" did not consider which matrix the flow reads. No new run; read from the code.
+
+**What doesn't work**
+- `compute_hierarchical_net_flow` reads `_attn_matrix`, which `get_model_output` fills from `generate_relevance` of a summed transformer output, in the older code and in the fork (K10). That target is an arbitrary direction, so the flow heatmaps and the partial permutation curves of `attention_test.py`, of the notebook and of the manuscript's Fig. 4 rest on it. Each permutation level is a separately trained model, which makes differences between levels especially exposed.
+- The notebook's text says only "relevance-weighted attention" and carries no caveat yet.
+
+**What worked**
+- The notebook keeps `checkpoints/level_<pct>/`, so raw attention can be compared on the same models without retraining (roadmap, "Added 2026-11-05", task 7).
+- The CosMx flow plots (`flow_maps`) read the last layer's head-mean raw attention, not the relevance, and were checked on synth_spot (2026-10-31).
+
+## 2026-11-05 — Script fixes for the mean-subtracted target and Moran's I after mean subtraction (code and stub only; no run)
+
+The user: "normalized slide" means mean subtraction, per slide, region or cell type where annotations exist. Task 7 (which net flow) is parked; the notebook as it runs is fine for now.
+
+**What worked**
+- Checked without a model on stand-in gene lists: after the fixes only `moran_local_type` changes its checkpoint name, the Moran arms evaluate their own 30 genes, `rand50_type` keeps `cell_type_coarse` through `eval_cfg`.
+- `label_residuals.py` takes a list of columns as one label; `cell_type_coarse+fov` runs on a 12-FOV stub (stub numbers mean nothing). An existing `cosmx_masking_genes.json` gains the spillover lists and keeps its masks.
+
+**What doesn't work**
+- `moran_local_type` is the only arm whose checkpoint name reaches 255 characters (242 the next), and the only one with no result in any fold. Likely the cause, not proven: 255 is still legal, and the job log has not been seen.
+- `label_mean` cannot subtract a label unseen in training: FOVs of held-out donors get the overall mean, so it suits cell types and recurring regions, not FOVs.
+
+## 2026-11-05 — Stability sweep and donor-independent CosMx splits (code and stubs only; no run)
+
+The user: for regression the predefined donor split is not needed, CosMx splits can be shuffled independently of donor. Roadmap "Added 2026-11-05", task 4.
+
+**What worked**
+- FOVs shuffled within each section: 70 / 15 / 15 by cells on the real metadata, every section in every split, no FOV cut, repeatable. The sweep's list mode, the data path on a stub, the read script on relabelled outputs and the seeds job with a fake model all run.
+
+**What doesn't work**
+- Not yet known whether anything holds on data: nothing was trained. Runtimes are estimates.
+- Scores on these splits cannot be compared with the donor-held-out ones, and say nothing about new donors, since test FOVs share a donor and tissue with training.
+- Split pairs compare flows only on cells that are test cells in both draws: few FOVs, so that row may be thin or empty.
+
+## 2026-11-05 — Net-flow permutation notebook: the out-of-memory crash, and first read of levels 0-50
+
+Full run (seed 42, older checkout 662e864, 192 GB) finished levels 0, 10, 20, 50 and died in `get_model_output` at level 80. No traceback in the executed notebook: the kernel was killed. Plot cells come after training, so no figures. The Slurm .err was not read here.
+
+**What worked**
+- Cause found on toy data (360 cells, CPU), not measured on CosMx. Three things outlive a level: (1) `generate_relevance` does `I += matmul(I, attn_map)` with `attn_map` requiring grad, a C++ reference cycle that gc cannot see and that pins each window's whole graph; (2) `_setup_adata_manager_store` / `_per_instance_manager_store` keep every level's AnnData, with its attention and predictions; (3) a layer <-> hook cycle keeps the last window and the layer. Estimate for CosMx: ~45 GB per level, which reaches 192 GB in the fifth level, where it died.
+- Fix in the notebook only (`relevance_without_graph`, `release_level`). Toy: 11.6 MB per level before, 0 after, on 662e864 and upstream. Attention bytes identical before/after on 662e864, so levels 0-50 stay valid next to new ones. Resume from a crash state tested on toy. The log now prints peak RAM per level: that is the check on real data.
+- Also fixed: summary `last_*` were NaN and `epochs` 21 (the final validate/test passes add history rows); levels 0-50 keep the old values in the CSV. The sbatch restarts up to 3 times from finished levels.
+
+**What doesn't work**
+- Dropping `retain_graph=True` alone is not enough (88% on the toy, but the N² attention tensors stay, and they dominate at N ~ 650).
+- Upstream still has the cycle; the fork's `generate_relevance` is no longer in place (not tested for the leak). Library fix not made.
+
+**First read, levels 0-50 only, one seed, relevance not raw attention (K10)**
+- Total absolute flow ND 4.99 / 5.11 / 4.71 / 2.40, T1D 4.34 / 4.13 / 3.68 / 2.47. Holds to 20%, about half at 50%.
+- Correlation with level 0 stays high (ND 0.86 / 0.80 / 0.71, T1D 0.93 / 0.81 / 0.83). Level 0 is further from 10 (0.86) than 10 from 20 (0.99) in ND: separate-model noise may be as large as the small-level effect. Needs net_flow_seeds.
+- Reconstruction does not drop with permutation: val_loss -0.5303 at level 0, -0.5328 at level 50; test cosine 0.668 to 0.678 at level 80. The model does not need the spatial arrangement to reach its loss after 20 epochs.
+
+## 2026-11-06 — Net-flow permutation notebook: full run read (all six levels)
+
+Results: local `results/net_flow_permutation/` (levels 0-50 from the 5 Nov job, 80 and 100 resumed 6 Nov; 0-50 unchanged to the digit against the partial folder). One seed per level, relevance not raw attention (K10), 20 epochs, 466 training windows.
+
+**What worked**
+- The memory fix holds on CosMx: peak RAM 15 GB after level 80, 16 GB after level 100 (only these two levels ran in the resumed process). About 4-5 min per level, so a full series costs under 30 min.
+
+**Read**
+- Total absolute flow: ND 4.99 / 5.11 / 4.71 / 2.40 / 0.97 / 0.60; T1D 4.34 / 4.13 / 3.68 / 2.47 / 1.20 / 0.67 (levels 0, 10, 20, 50, 80, 100).
+- Cosine with level 0: ND 0.86 / 0.80 / 0.71 / 0.53 / -0.22; T1D 0.93 / 0.81 / 0.83 / 0.25 / -0.34. Slope on level 0 through the origin: ND 0.87 / 0.75 / 0.34 / 0.11 / -0.03; T1D 0.84 / 0.63 / 0.49 / 0.07 / -0.05.
+- Reconstruction does not see the permutation: test loss -0.5297 at level 0, -0.5347 at level 100 (slightly better); test cosine 0.668 / 0.678 (80) / 0.662 (100). One seed, so these small differences are not read further.
+- One score per cell type explains 93-98% of the squared flow at levels 0-50 (additive potential p_s - p_r), 85-89% at 80-100. The heatmaps carry about nine numbers (source/sink rank: Acinar and Endothelial sources, Endocrine and Immune sinks), not pair-specific flows.
+- Mean across-FOV spread hardly moves (0.14 at level 0, 0.12-0.13 at level 100) while RMS mean flow drops from 0.16 to 0.02. What disappears is agreement between FOVs, not per-FOV flow size. Per-window max normalisation rescales noise to the same size as signal, so this spread is partly built in.
+
+**What doesn't work (the inference, not the run)**
+- The notebook keeps cell-type labels fixed while it moves the expression profiles, so permuting also breaks label <-> expression. Flow averaged by label must decay even if attention depended only on each cell's own expression and not on position at all. For additive potentials that predicts slope 1 - p (0.9, 0.8, 0.5, 0.2, 0); observed values are close. This is compatible with the confound, not proof of it; a spatial effect could look similar. The notebook text ("a flat line means the flow does not depend on where expression sits") claims more than the design can show.
+- Decisive test, not run: from the saved checkpoints, recompute the attention at levels 80 and 100 and aggregate by transported labels (`labels[order]`, the type of the profile now at that position). Pattern returns: flow follows expression identity, the decay is label mixing. Pattern stays gone: it depends on arrangement.
+- Stars are not a significance test (difference over across-FOV spread of one model, 72 x 5 entries uncorrected); no stars at 10-20%. Adjacent-level cosine in ND is 0.86 between levels 0 and 10 but 0.99 between 10 and 20, so model-to-model noise needs net_flow_seeds.
+
+**Still open before the PR:** K10 raw attention comparison on the checkpoints, transported-label test, notebook wording, NaN `last_*` columns and `epochs` 21 vs 20 in the 0-50 rows of the summary table.
