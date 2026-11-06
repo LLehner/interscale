@@ -29,6 +29,7 @@ from .masking import (
     sample_gene_mask,
     sample_node_mask,
 )
+from .moran import DEFAULT_KS, auc_from_profile, delta_from_profile, moran_profile, moran_scale, radii_from_knn
 from .padding import pad_batch, pad_like
 from .positional import laplacian_pe, random_walk_pe
 from .self_attn_relevance import SelfAttentionRelevance
@@ -72,4 +73,10 @@ __all__ = [
     "anchor_enrichment",
     "local_reach_um",
     "ZONE_ORDER",
+    "DEFAULT_KS",
+    "moran_scale",
+    "moran_profile",
+    "auc_from_profile",
+    "delta_from_profile",
+    "radii_from_knn",
 ]

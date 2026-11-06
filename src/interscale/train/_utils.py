@@ -3,7 +3,7 @@ import time
 import matplotlib.pyplot as plt
 import pandas as pd
 import torch
-from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 
 from interscale.tl.masking import block_masking_on
@@ -19,6 +19,56 @@ def redraws_masks(cfg) -> bool:
     set of discs for the whole run.
     """
     return cfg.dataset.mask_percentage > 0 or block_masking_on(cfg)
+
+
+class PostWarmupModelCheckpoint(ModelCheckpoint):
+    """``ModelCheckpoint`` that ignores every epoch before ``start_epoch``.
+
+    With ``CosineWarmupScheduler`` the LR ramps linearly over the first ``lr_warmup`` epochs, so
+    a checkpoint from inside the ramp is a near-initialisation model. On small, noisy validation
+    sets such an epoch can still hit the best monitored score by chance -- in chen22 sweep
+    qbmsh55r 77 of 90 runs had their best val_f1_macro during warm-up, the top one at epoch 0 --
+    and train() then restores it and reports it as the run's result.
+
+    Parameters
+    ----------
+    start_epoch
+        First (0-indexed) epoch that may be saved. Epochs before it are never candidates.
+    **kwargs
+        Passed to :class:`~lightning.pytorch.callbacks.ModelCheckpoint`.
+    """
+
+    def __init__(self, start_epoch: int = 0, **kwargs):
+        super().__init__(**kwargs)
+        self.start_epoch = int(start_epoch)
+
+    # Private Lightning hook (2.x); tests/test_warmup_selection.py fails if it disappears.
+    def _should_skip_saving_checkpoint(self, trainer) -> bool:
+        return trainer.current_epoch < self.start_epoch or super()._should_skip_saving_checkpoint(trainer)
+
+
+class PostWarmupEarlyStopping(EarlyStopping):
+    """``EarlyStopping`` that neither tracks a best score nor counts patience before ``start_epoch``.
+
+    Must be used together with :class:`PostWarmupModelCheckpoint`. If only the checkpoint ignored
+    warm-up, a warm-up peak would still set EarlyStopping's best score: patience would run out
+    ``patience`` epochs after that peak, possibly before any post-warm-up epoch beat it.
+
+    Parameters
+    ----------
+    start_epoch
+        First (0-indexed) epoch whose monitored value is considered.
+    **kwargs
+        Passed to :class:`~lightning.pytorch.callbacks.EarlyStopping`.
+    """
+
+    def __init__(self, start_epoch: int = 0, **kwargs):
+        super().__init__(**kwargs)
+        self.start_epoch = int(start_epoch)
+
+    # Private Lightning hook (2.x); tests/test_warmup_selection.py fails if it disappears.
+    def _should_skip_check(self, trainer) -> bool:
+        return trainer.current_epoch < self.start_epoch or super()._should_skip_check(trainer)
 
 
 class NodeMaskResampleCallback(Callback):

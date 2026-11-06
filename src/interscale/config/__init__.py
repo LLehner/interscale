@@ -116,12 +116,15 @@ def _coerce_override_values(cfg, overrides):
 
 def _validate_gene_set_pool(cfg, gene_set: list, channels: float) -> None:
     """``dataset.mask_gene_sets`` and ``mask_sets_per_draw`` (``.claude/masking_plan.md``, M1): a list of non-empty sets of
-    selectors, gene masking, no other hidden gene set beside it, and a draw size the pool can give."""
+    selectors, gene masking, no other hidden gene set beside it, and a draw size the pool can give.
+    """
     raw = list(cfg.dataset.get("mask_gene_sets", []) or [])
     per_draw = int(cfg.dataset.get("mask_sets_per_draw", 1))
     if not raw:
         if per_draw != 1:
-            raise ValueError(f"dataset.mask_sets_per_draw {per_draw} draws from dataset.mask_gene_sets, which is empty.")
+            raise ValueError(
+                f"dataset.mask_sets_per_draw {per_draw} draws from dataset.mask_gene_sets, which is empty."
+            )
         return
     where = f"dataset.mask_gene_sets ({len(raw)} sets)"
     if any(isinstance(one, str) or not isinstance(one, list | tuple) for one in raw):
@@ -133,7 +136,9 @@ def _validate_gene_set_pool(cfg, gene_set: list, channels: float) -> None:
     if not 1 <= per_draw <= len(raw):
         raise ValueError(f"dataset.mask_sets_per_draw must be between 1 and the {len(raw)} sets, got {per_draw}.")
     if cfg.dataset.mask_strategy != "gene":
-        raise ValueError(f"{where} hides gene sets, which needs mask_strategy 'gene' (got {cfg.dataset.mask_strategy!r}).")
+        raise ValueError(
+            f"{where} hides gene sets, which needs mask_strategy 'gene' (got {cfg.dataset.mask_strategy!r})."
+        )
     if gene_set or channels:
         raise ValueError(
             f"{where}, dataset.mask_genes and dataset.mask_channel_fraction each name the hidden genes: give one."
@@ -155,17 +160,26 @@ def _validate_masking(cfg):
     A reconstruction task with ``mask_percentage`` at 0 has the identity map as its solution, and
     every metric looks excellent, so it fails loudly instead.
 
+    A graph-level task is the opposite case: the label is per graph, so masking is not needed and
+    is switched off (tasks/graph_clas.yaml); a rate > 0 there is rejected rather than silently
+    turning augmentation back on.
+
     Raises
     ------
     ValueError
-        If ``mask_strategy`` is unknown, or ``mask_percentage`` is not a rate in (0, 1] for a
-        regression task.
+        If ``mask_strategy`` is unknown, ``mask_percentage`` is not a rate in (0, 1] for a
+        regression task, or is not 0 for a graph-level task.
     """
     from interscale.tl.masking import MASK_STRATEGIES, hides_gene_set
 
     if cfg.dataset.mask_strategy not in MASK_STRATEGIES:
         raise ValueError(f"dataset.mask_strategy must be one of {MASK_STRATEGIES}, got {cfg.dataset.mask_strategy!r}.")
 
+    if cfg.dataset.prediction_level == "graph" and cfg.dataset.mask_percentage != 0:
+        raise ValueError(
+            f"dataset.mask_percentage must be 0 for a graph-level task, got {cfg.dataset.mask_percentage}. "
+            "Graph labels do not need input masking; see config_files/tasks/graph_clas.yaml."
+        )
     gene_set = list(cfg.dataset.get("mask_genes", []) or [])
     if gene_set and cfg.dataset.mask_strategy != "gene":
         raise ValueError(
@@ -225,7 +239,8 @@ def _validate_masking(cfg):
 
 def _validate_crop(cfg):
     """``dataset.crop`` (training on crops, roadmap Tier 3): a size, coordinates, node level; a warning for what is taken over
-    the crop in training and over the section at inference."""
+    the crop in training and over the section at inference.
+    """
     from interscale.tl.crops import CROP_SHAPES
 
     crop = cfg.dataset.get("crop", None)
@@ -573,7 +588,8 @@ def _validate_pe(cfg):
 
 def _validate_bias_heads(pe, n_heads: int, biases: list[str]):
     """``pe.bias_heads`` (attention_plan.md, stage 10a): distinct head indices in range, for a bias that is on; and
-    ``pe.distance.scales_um``: one positive window per head the scales prior serves."""
+    ``pe.distance.scales_um``: one positive window per head the scales prior serves.
+    """
     chosen = pe.get("bias_heads", None)
     served = {}
     for name in chosen or {}:
@@ -581,14 +597,18 @@ def _validate_bias_heads(pe, n_heads: int, biases: list[str]):
         if not heads:
             continue
         if name not in biases:
-            raise ValueError(f"pe.bias_heads.{name} lists heads {heads}, but pe.bias {biases} does not switch '{name}' on.")
+            raise ValueError(
+                f"pe.bias_heads.{name} lists heads {heads}, but pe.bias {biases} does not switch '{name}' on."
+            )
         if len(set(heads)) != len(heads) or not all(0 <= h < n_heads for h in heads):
             raise ValueError(f"pe.bias_heads.{name} must be distinct heads in [0, {n_heads}), got {heads}.")
         served[name] = len(heads)
     scales = list(pe.get("distance", {}).get("scales_um", []) or [])
     if scales:
         if "distance" not in biases or pe.distance.kind != "scales":
-            raise ValueError("pe.distance.scales_um sets the windows of the scales prior: needs pe.bias [distance] with kind scales.")
+            raise ValueError(
+                "pe.distance.scales_um sets the windows of the scales prior: needs pe.bias [distance] with kind scales."
+            )
         need = served.get("distance", n_heads)
         if len(scales) != need or not all(float(s) > 0 for s in scales):
             raise ValueError(
@@ -598,7 +618,8 @@ def _validate_bias_heads(pe, n_heads: int, biases: list[str]):
 
 def _validate_visible_keys_only(cfg, params, kind, spec):
     """``attention.visible_keys_only`` blocks the keys that are cells hidden whole: a backend that can block a key (a dense
-    mask, or the fused blocks), and cells hidden whole."""
+    mask, or the fused blocks), and cells hidden whole.
+    """
     from interscale.module.global_modules.attention import ATTENTION_REGISTRY
 
     where = "attention.visible_keys_only"
@@ -728,7 +749,9 @@ def _validate_pooling(cfg):
         )
     pe = params.get("pe", None)
     if pe is not None:
-        bad = sorted(set(pe.get("node", [])) & {"lap", "rw"}) + sorted(set(pe.get("bias", [])) & {"spectral", "expression"})
+        bad = sorted(set(pe.get("node", [])) & {"lap", "rw"}) + sorted(
+            set(pe.get("bias", [])) & {"spectral", "expression"}
+        )
         if bad:
             raise ValueError(
                 f"{where} cannot carry the encodings {bad}: they read the cell graph or each cell's expression, "
@@ -740,7 +763,9 @@ def _validate_pooling(cfg):
     from interscale.train.losses import LOSSES_READING_ATTENTION
 
     if cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION:
-        raise ValueError(f"{where}: optim.loss {cfg.optim.loss!r} reads cell-by-cell attention maps, which patches do not give.")
+        raise ValueError(
+            f"{where}: optim.loss {cfg.optim.loss!r} reads cell-by-cell attention maps, which patches do not give."
+        )
 
 
 def _validate_hierarchy(cfg):
@@ -781,7 +806,9 @@ def _validate_hierarchy(cfg):
     if any(float(v) <= 0 for v in sizes):
         raise ValueError(f"{where}: every entry of levels / cells_per_cluster must be positive, got {sizes}.")
     if hier.top_level.mode == "patches" and not sizes and hier.top_level.patch_size_um <= 0:
-        raise ValueError(f"{where}.top_level.mode patches needs patch_size_um, or a first entry of levels / cells_per_cluster.")
+        raise ValueError(
+            f"{where}.top_level.mode patches needs patch_size_um, or a first entry of levels / cells_per_cluster."
+        )
     obs_key = hier.top_level.get("obs_key", "")
     if hier.top_level.mode == "obs_label":
         if not obs_key:
@@ -802,7 +829,9 @@ def _validate_hierarchy(cfg):
     elif obs_key:
         raise ValueError(f"{where}.top_level.obs_key names a label, which only top_level.mode obs_label reads.")
     if not sizes and hier.prior_mode != "none":
-        raise ValueError(f"{where}: no coarse level (levels and cells_per_cluster empty) leaves prior_mode nothing to read.")
+        raise ValueError(
+            f"{where}: no coarse level (levels and cells_per_cluster empty) leaves prior_mode nothing to read."
+        )
     if hier.prior_mode == "none" and hier.readout == "none" and sizes:
         raise ValueError(
             f"{where}: with prior_mode none and readout none the coarse levels reach no cell; set a readout (concat or "
@@ -825,7 +854,10 @@ def _validate_hierarchy(cfg):
         raise ValueError(f"{where} pools cells itself; set pooling.kind none.")
     attention = params.get("attention", None)
     if attention is not None:
-        if attention.get("kind", "dense") != "dense" or int(attention.get("head_dim", 0)) not in (0, cfg.model.n_embed // params.n_heads):
+        if attention.get("kind", "dense") != "dense" or int(attention.get("head_dim", 0)) not in (
+            0,
+            cfg.model.n_embed // params.n_heads,
+        ):
             raise ValueError(f"{where} computes its own attention: use attention.kind dense at the default head width.")
     pe = params.get("pe", None)
     if pe is not None:
@@ -838,7 +870,9 @@ def _validate_hierarchy(cfg):
     from interscale.train.losses import LOSSES_READING_ATTENTION
 
     if cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION:
-        raise ValueError(f"{where}: optim.loss {cfg.optim.loss!r} reads attention maps in training, which the hierarchy does not form.")
+        raise ValueError(
+            f"{where}: optim.loss {cfg.optim.loss!r} reads attention maps in training, which the hierarchy does not form."
+        )
 
 
 def _validate_remask(cfg):
@@ -877,7 +911,8 @@ def _validate_remask(cfg):
 def _validate_context_only(cfg):
     """``context_only`` (the global embedding from the other cells' tokens and the position only): a known kind, a node-level
     prediction, and attention that reads with queries of its own (torch's dense attention, or a backend whose spec says
-    ``cross``: fused)."""
+    ``cross``: fused).
+    """
     from interscale.module.base._base_global_module import CONTEXT_ONLY_KINDS
     from interscale.module.global_modules.attention import ATTENTION_REGISTRY, attention_head_dim, attention_kind
 
@@ -891,7 +926,9 @@ def _validate_context_only(cfg):
         return
     where = f"model.global_component.parameters.context_only {context_only!r}"
     if cfg.dataset.prediction_level != "node":
-        raise ValueError(f"{where} is a per-cell notion (a cell's embedding without the cell); it needs prediction_level node.")
+        raise ValueError(
+            f"{where} is a per-cell notion (a cell's embedding without the cell); it needs prediction_level node."
+        )
     attention = params.get("attention", None)
     kind = attention_kind(attention)
     default_width = (
@@ -989,15 +1026,21 @@ def _validate_section_offset(cfg):
         raise ValueError(f"model.decoder.section_offset must be one of {SECTION_OFFSETS}, got {kind!r}.")
     key = cfg.model.decoder.get("label_offset_key", "")
     if key and kind != "label_mean":
-        raise ValueError(f"model.decoder.label_offset_key {key!r} is read under section_offset label_mean, not {kind!r}.")
+        raise ValueError(
+            f"model.decoder.label_offset_key {key!r} is read under section_offset label_mean, not {kind!r}."
+        )
     if kind == "label_mean":
         from interscale.tl.geome_utils import label_attribute
 
         if not key:
-            raise ValueError("model.decoder.section_offset label_mean needs model.decoder.label_offset_key, an obs column.")
+            raise ValueError(
+                "model.decoder.section_offset label_mean needs model.decoder.label_offset_key, an obs column."
+            )
         label_attribute(cfg, key)  # raises, naming the fix, when the column does not reach the graphs
         if not cfg.optim.get("center_targets", False):
-            raise ValueError("model.decoder.section_offset label_mean centres the loss on the label's mean: set optim.center_targets.")
+            raise ValueError(
+                "model.decoder.section_offset label_mean centres the loss on the label's mean: set optim.center_targets."
+            )
     if kind == "none":
         return
     if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":
