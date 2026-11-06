@@ -46,9 +46,9 @@ Asked while the net-flow permutation job runs. Where they compete, these take pr
 | order | task | first step | runs on | state | days (proposal) |
 |---|---|---|---|---|---|
 | parked | 7, which net flow | decide the readout; compare both on the permutation job's checkpoints | evaluation only | answered below; improvement proposed; parked by the user 2026-11-05 | - |
-| 1 | 2, mean-subtracted reconstruction | evaluate `rand50_type` and the Moran arms, train `moran_local_type` | evaluation only, plus one training job | **script faults fixed 2026-11-05, unverified on data**; not run | Thu 5 - Fri 6 |
-| 2 | 1, Moran's I after mean subtraction | run `label_residuals.sbatch`, read folds 0-2 | no model | **combined stage built 2026-11-05**; not run on the cluster | Thu 5 - Fri 6 |
-| 3 | 4, stability over seeds | `cosmx_stability.sbatch`, `net_flow_seeds.sbatch` | two jobs | **built 2026-11-05, nothing trained**; not run | Fri 6 - Sat 7 |
+| 1 | 2, mean-subtracted reconstruction | evaluate `rand50_type` and the Moran arms, train `moran_local_type` | evaluation only, plus one training job | **script faults fixed 2026-11-05, unverified on data**; job written 2026-11-06 (`tasks_1_2_4.sbatch`, on the upstream sync), not run | Thu 5 - Fri 6 |
+| 2 | 1, Moran's I after mean subtraction | run `label_residuals.sbatch`, read folds 0-2 | no model | **combined stage built 2026-11-05**; job written 2026-11-06 (`tasks_1_2_4.sbatch`), not run on the cluster | Thu 5 - Fri 6 |
+| 3 | 4, stability over seeds | `cosmx_stability.sbatch`, `net_flow_seeds.sbatch`, since 2026-11-06 steps of `tasks_1_2_4.sbatch` | one job with tasks 1 and 2 | **built 2026-11-05, nothing trained**; not run; results now `06_11_results/cosmx_stability` | Fri 6 - Sat 7 |
 | 5 | 3, attention and PEs under shuffling | a few arms, per cell-type pair; other methods | one job per set of arms; baselines | proposed | Sat 7 - Sun 8 |
 | 6 | 5, condition differences | per-slide T1D minus ND of the chosen flow | evaluation only | proposed | Sun 8 |
 | 7 | 6, CellAgentChat global results | find the August outputs, check its coordinates | its own env | script from August, no read | Sun 8 |

@@ -1629,3 +1629,18 @@ Results: local `results/net_flow_permutation/` (levels 0-50 from the 5 Nov job, 
 - Stars are not a significance test (difference over across-FOV spread of one model, 72 x 5 entries uncorrected); no stars at 10-20%. Adjacent-level cosine in ND is 0.86 between levels 0 and 10 but 0.99 between 10 and 20, so model-to-model noise needs net_flow_seeds.
 
 **Still open before the PR:** K10 raw attention comparison on the checkpoints, transported-label test, notebook wording, NaN `last_*` columns and `epochs` 21 vs 20 in the 0-50 rows of the summary table.
+
+## 2026-11-06 — Fork synced with upstream; tasks 1, 2 and 4 as one job (code and stubs only; no run)
+
+**What worked**
+- `main` now contains upstream/main 4363aea (14 commits). 1748 tests pass. Every line upstream added is in the merge except the deliberate ones: `pp/__init__.py`, the masked metric signatures that gained `sce_gamma`, the seeding comment in `main_sweep.py`, the `CLAUDE.md` table reformatting.
+- Metrics follow upstream: torchmetrics objects updated per batch and computed once per epoch, so R2, correlations and the masked metrics are exact epoch values, not means of batches. Fork additions moved onto them: SCE metric, loss-free runs, target centring, the masked cosine and SCE averaged over cells that have a masked gene. Pinned: `test_the_masked_metric_over_an_epoch_is_the_metric_of_all_its_batches`, `test_the_masked_metrics_skip_cells_without_a_masked_gene`.
+- `slurm/new/tasks_1_2_4.sbatch`: one job, steps task1, task2_eval, task2_train, task4_flow, task4_runs, task4_read; estimate 8-10 h, unmeasured. A step that fails does not stop the next; `STEPS` runs a subset, so the same file can run tasks 1-2 and task 4 side by side. A preflight stops the job if the cluster's checkout is not the synced one. Checked: the order, environment and failure handling with a stub `python`; the stability yaml, split draws and the seed read on toy files. Nothing trained, no real data read.
+
+**What doesn't work / what to watch**
+- Upstream's `pp/__init__.py` imports `pp.background` and `pp.donor_scale`, which are not in its tree, so `interscale.main_sweep` does not import on upstream's main. The merge keeps the old `__init__`; nothing here uses those functions. Expect one small conflict when upstream adds the files.
+- Upstream's best-epoch selection read `optim.lr_warmup`, wrong for a staged phase (scaled warm-up, epochs from 0). Fixed to the phase's value; mutation-checked. Upstream's classes refer to `tests/test_warmup_selection.py`, which it never committed; written here with a real `Trainer`, because a renamed private Lightning hook would otherwise fail silently.
+- `moran_local_type` and the stability runs train on the synced code, the other Moran arms before it: the best checkpoint can no longer come from the warm-up. Expected not to matter at warm-up 10 of 100-300 epochs, not measured.
+- Stability results moved to `06_11_results/cosmx_stability`, so runs on the synced code cannot mix with anything started on 2026-11-05.
+- Task 1 still has no legnini arm: no type or region annotation there, clusters via `imitation_labels` would have to be added.
+
