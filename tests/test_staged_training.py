@@ -563,3 +563,29 @@ def test_a_trained_local_model_can_be_copied_in_as_phase_one(tmp_path):
     source = {k: v for k, v in local.module.state_dict().items() if not k.startswith("aux_losses.")}
     target = combined.module.local_module.state_dict()
     assert set(source) == set(target) and all(torch.equal(source[k], target[k]) for k in source)
+
+
+def test_the_best_checkpoint_skips_the_warm_up_of_its_own_phase(tmp_path, monkeypatch):
+    """A staged phase has a scaled warm-up and counts epochs from 0: 4 of 8 epochs at warm-up 4 start selecting at 2, not 3."""
+    import interscale.train._training as training
+    from interscale.geome_dataloader import GraphAnnDataModule
+    from interscale.tl import prepare_geome_dataset
+    from interscale.train._utils import MetricsHistory
+
+    starts = []
+
+    class Recorder(MetricsHistory):
+        def on_train_start(self, trainer, pl_module):
+            starts.append([c.start_epoch for c in trainer.callbacks if hasattr(c, "start_epoch")])
+
+    monkeypatch.setattr(training, "MetricsHistory", Recorder)
+    save = tmp_path / "out"
+    model, adata, cfg = _setup_model(
+        tmp_path, schedule="local_then_global", n_epochs=8, save=f"{save}/", lr_warmup=4, min_epochs=5
+    )
+    pyg, _ = prepare_geome_dataset(adata, cfg)
+    dm = GraphAnnDataModule(
+        datas=pyg, num_workers=0, batch_size=2, mask_percentage=0.3, mask_strategy="node", learning_type="node"
+    )
+    model.train(max_epochs=cfg.optim.n_epochs, datamodule=dm, early_stopping=False, wandb_use=False)
+    assert starts == [[], [2]]  # only the last phase checkpoints

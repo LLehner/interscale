@@ -333,7 +333,8 @@ class NodeMaskingTrainingPlan:
         # Capped at the last epoch so a run shorter than the warm-up still selects something.
         selection_start_epoch = 0
         if self._cfg.optim.lr_scheduler == "CosineWarmupScheduler":
-            selection_start_epoch = max(0, min(int(self._cfg.optim.lr_warmup), int(max_epochs) - 1))
+            # This phase's warm-up: a staged run scales it (phase_warmup), and its epochs count from 0 again.
+            selection_start_epoch = max(0, min(int(lr_warmup), int(max_epochs) - 1))
         print(f"Best-epoch selection starts at epoch {selection_start_epoch} (after LR warm-up)")
 
         if early_stopping:

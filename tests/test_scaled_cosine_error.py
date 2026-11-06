@@ -15,7 +15,12 @@ from torch import nn
 
 from interscale.config import load_config
 from interscale.tl.masking import masked_loss, sample_gene_mask
-from interscale.train._trainingplans import RunningScaledCosineError, TrainingPlan, masked_regression_metrics
+from interscale.train._trainingplans import (
+    MaskedRegressionMetric,
+    RunningScaledCosineError,
+    TrainingPlan,
+    masked_regression_metrics,
+)
 from interscale.train.losses import SCELoss, scaled_cosine_error
 
 
@@ -207,3 +212,28 @@ def test_early_stopping_minimises_errors(monitor, mode):
     owner = SimpleNamespace(_cfg=SimpleNamespace(optim=SimpleNamespace(monitor=monitor)), prediction_task="regression")
 
     assert NodeMaskingTrainingPlan._resolve_monitor(owner) == (monitor, mode)
+
+
+@pytest.mark.parametrize("name", ["cosine_similarity", "scaled_cosine_error", "mse", "r2"])
+def test_the_masked_metric_over_an_epoch_is_the_metric_of_all_its_batches(name):
+    """Accumulated, not a mean of batches: two batches of different size and share of masked cells give the single-batch value."""
+    y_pred, y_true = _pair()
+    _, entry_mask = _cell_mask(*y_pred.shape)
+    entry_mask = entry_mask.clone()
+    entry_mask[:10] = False  # a first batch with few masked cells
+    entry_mask[:2] = True
+    metric = MaskedRegressionMetric(name, y_pred.shape[1], sce_gamma=2.0)
+    metric.update(y_pred[:10], y_true[:10], entry_mask[:10])
+    metric.update(y_pred[10:], y_true[10:], entry_mask[10:])
+    whole = masked_regression_metrics(y_pred, y_true, entry_mask, sce_gamma=2.0)[name]
+    assert metric.compute().item() == pytest.approx(whole.item(), abs=1e-5)
+
+
+def test_the_masked_metrics_skip_cells_without_a_masked_gene():
+    """A cell with no masked entry has no masked coordinates: it must not enter the mean as a cosine of 0."""
+    y_pred, y_true = _pair()
+    cells, entry_mask = _cell_mask(*y_pred.shape)
+    got = masked_regression_metrics(y_pred, y_true, entry_mask, sce_gamma=2.0)
+    cos = nn.functional.cosine_similarity(y_pred[cells], y_true[cells], dim=1)
+    assert got["cosine_similarity"].item() == pytest.approx(cos.mean().item(), abs=1e-5)
+    assert got["scaled_cosine_error"].item() == pytest.approx(((1 - cos) ** 2).mean().item(), abs=1e-5)
