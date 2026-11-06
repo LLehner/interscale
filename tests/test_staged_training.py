@@ -271,7 +271,7 @@ def test_each_head_logs_its_own_masked_sce_beside_the_combined_one():
         expected = scaled_cosine_error((out.y_pred[rows] * m)[scored], (out.y_true[rows] * m)[scored], 1.0).mean()
         assert plan.logged[f"val_masked_scaled_cosine_error_{name}"].item() == pytest.approx(expected.item(), abs=1e-6)
     heads = [plan.logged[f"val_masked_scaled_cosine_error_{h}"].item() for h in ("local", "global")]
-    assert plan.logged["val_masked_scaled_cosine_error"].item() == pytest.approx(sum(heads) / 2, abs=1e-5)
+    assert plan.logged["val_masked_scaled_cosine_error"].compute().item() == pytest.approx(sum(heads) / 2, abs=1e-5)
     assert heads[0] != heads[1]
 
 
@@ -500,7 +500,9 @@ def test_a_staged_run_trains_each_component_only_in_its_phases_and_saves_once(tm
         assert record.eval_ok and all(record.eval_ok)  # frozen parts in eval at every step
         assert record.frozen_grad and not any(record.frozen_grad)
         assert "NodeMaskResampleCallback" in record.callbacks  # masks redrawn in every phase
-    assert "ModelCheckpoint" not in records[0].callbacks and "ModelCheckpoint" in records[1].callbacks
+    # The checkpoint ignores the LR warm-up (PostWarmupModelCheckpoint), so match on the base name.
+    assert not any("ModelCheckpoint" in c for c in records[0].callbacks)
+    assert any("ModelCheckpoint" in c for c in records[1].callbacks)
     assert all(p.requires_grad for p in model.module.parameters())  # flags back after the run
     assert len(model.phase_histories_) == 2 and model.history_ is model.phase_histories_[-1]
     assert model.is_trained_

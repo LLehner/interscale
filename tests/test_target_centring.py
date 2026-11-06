@@ -47,7 +47,8 @@ def test_the_loss_is_the_sce_of_the_centred_values_over_the_masked_entries():
     y_pred = y_true + 0.2 * torch.randn(y_true.shape, generator=torch.Generator().manual_seed(5))
     plan = _plan(mean)
 
-    loss, metrics = plan._regression_metrics(y_pred, y_true, "val", plan.valid_metrics, entry_mask=entry_mask)
+    loss = plan._regression_metrics(y_pred, y_true, "val", plan.valid_metrics, entry_mask=entry_mask)
+    metrics = plan.valid_metrics.compute()
 
     expected = masked_loss(SCELoss(1.0), "SCELoss", y_pred - mean, y_true - mean, entry_mask)
     assert loss.item() == pytest.approx(expected.item(), abs=1e-6)
@@ -62,14 +63,12 @@ def test_predicting_the_mean_profile_scores_worst_instead_of_best():
     constant = mean.expand_as(y_true).clone()
     raw_plan, centred_plan = _plan(None), _plan(mean)
 
-    raw, _ = raw_plan._regression_metrics(constant, y_true, "val", raw_plan.valid_metrics, entry_mask=entry_mask)
-    centred, _ = centred_plan._regression_metrics(
+    raw = raw_plan._regression_metrics(constant, y_true, "val", raw_plan.valid_metrics, entry_mask=entry_mask)
+    centred = centred_plan._regression_metrics(
         constant, y_true, "val", centred_plan.valid_metrics, entry_mask=entry_mask
     )
     halfway = mean + 0.5 * (y_true - mean)  # the right deviations at half their size
-    better, _ = centred_plan._regression_metrics(
-        halfway, y_true, "val", centred_plan.valid_metrics, entry_mask=entry_mask
-    )
+    better = centred_plan._regression_metrics(halfway, y_true, "val", centred_plan.valid_metrics, entry_mask=entry_mask)
 
     assert raw.item() < 0.05  # raw: the mean profile alone is nearly a perfect cosine
     assert centred.item() == pytest.approx(1.0)  # centred: it carries no direction at all
@@ -108,7 +107,7 @@ def test_without_centring_the_plan_is_unchanged():
     mean, y_true, entry_mask = _data()
     y_pred = y_true * 1.1
     plan = _plan(None)
-    loss, _ = plan._regression_metrics(y_pred, y_true, "val", plan.valid_metrics, entry_mask=entry_mask)
+    loss = plan._regression_metrics(y_pred, y_true, "val", plan.valid_metrics, entry_mask=entry_mask)
     assert loss.item() == pytest.approx(
         masked_loss(SCELoss(1.0), "SCELoss", y_pred, y_true, entry_mask).item(), abs=1e-7
     )

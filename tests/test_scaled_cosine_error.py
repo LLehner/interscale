@@ -160,7 +160,9 @@ def test_the_plan_logs_sce_for_all_and_for_masked_cells_and_the_masked_one_is_th
     y_pred, y_true = _pair()
     cells, entry_mask = _cell_mask(*y_pred.shape)
 
-    loss, metrics = plan._regression_metrics(y_pred, y_true, "val", plan.valid_metrics, entry_mask=entry_mask)
+    loss = plan._regression_metrics(y_pred, y_true, "val", plan.valid_metrics, entry_mask=entry_mask)
+    # The metrics are accumulated objects, read once over everything they have seen.
+    metrics = {**plan.valid_metrics.compute(), **plan.masked_metrics["val_masked"].compute()}
 
     assert metrics["val_masked_scaled_cosine_error"].item() == pytest.approx(loss.item(), abs=1e-6)
     every_cell = scaled_cosine_error(y_pred, y_true, 2.0).mean()
@@ -171,7 +173,8 @@ def test_sce_is_tracked_whatever_the_loss():
     plan = _plan("MSELoss", gamma=1.0)
     y_pred, y_true = _pair()
 
-    _, metrics = plan._regression_metrics(y_pred, y_true, "val", plan.valid_metrics)
+    plan._regression_metrics(y_pred, y_true, "val", plan.valid_metrics)
+    metrics = plan.valid_metrics.compute()
 
     cos = nn.functional.cosine_similarity(y_pred, y_true, dim=1).mean()
     assert metrics["val_scaled_cosine_error"].item() == pytest.approx(1 - cos.item(), abs=1e-6)

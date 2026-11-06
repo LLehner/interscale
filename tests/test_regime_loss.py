@@ -23,6 +23,7 @@ import types
 import numpy as np
 import pandas as pd
 import pytest
+import torchmetrics
 
 torch = pytest.importorskip("torch")
 
@@ -241,6 +242,12 @@ def _plan(module, weights=None):
     return plan
 
 
+def _logged(plan, name):
+    """A logged value; metric objects are logged uncomputed, so they are read here."""
+    value = plan.logged[name]
+    return value.compute() if isinstance(value, torchmetrics.Metric) else value
+
+
 def test_each_heads_loss_is_the_mean_over_its_own_cells_and_the_heads_are_weighed_alike():
     module = _module()
     plan = _plan(module)
@@ -274,7 +281,7 @@ def test_the_metrics_do_not_change_with_the_regimes():
         "val_masked_scaled_cosine_error",
         "val_scaled_cosine_error",
     ):
-        assert on_plan.logged[key].item() == pytest.approx(off_plan.logged[key].item(), abs=1e-6), key
+        assert _logged(on_plan, key).item() == pytest.approx(_logged(off_plan, key).item(), abs=1e-6), key
     assert "val_regime_cells_local" not in off_plan.logged
 
 
