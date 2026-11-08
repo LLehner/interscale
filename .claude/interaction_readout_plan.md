@@ -82,3 +82,38 @@ What earlier reads found (notes.md):
 > principles and the literature, how to read sender-receiver relationships without cell types from a trained InterScale model,
 > using integrated gradients where they are valid, and how to show them in a few uncluttered figures. Check every proposal on
 > synth_spot's planted pairs against the untrained twin and the permuted slide. Write the design into the plan file before code.
+
+## Design 2026-11-06: from a trained model to biology (the user: "a good way to interpret downstream results ... flows of information, not purely attention, correlated with actual biology, same with the embedding dimensions; I need useful output")
+
+| stage | state | verified by | date |
+|---|---|---|---|
+| `evaluation.interpretation` (the readouts), `evaluation.interpretation_report` (report per run, summary over runs, from the tables alone) | **implemented**; committed 2026-11-08 | 19 tests, 14 mutations caught (4 after stronger tests), the hook dry-run on a toy graph with the real resource | 2026-11-06 |
+| `slurm/new/downstream_read.py`, `downstream.sbatch`, `biology_resource.json` | **written, not run** | settings accepted by the real `sweep_common`; `bash -n` | 2026-11-06 |
+| The check on synth_spot's planted senders (`DOWNSTREAM=synth`) | **run and read**: context use 0.51 (twin -0.002); planted sender first for 12 of 15 targets, the twin 5 of 15 (planted senders have large effects at random weights): read against the twin | `07_11_results/downstream_synth` | 2026-11-08 |
+| CosMx run (`downstream.sbatch`, step cosmx; 04_11 checkpoints) | **run and read**: identity, spillover, handling only; ΔR² scoring and the known-pair null found faulty (notes.md) | `results/downstream_cosmx` | 2026-11-07 |
+| Scoring by centred cosine within the receiver type (flows, targets, gene flows; fixed section-wide type centres, sums pooled over draws and sections); known pairs ranked within each receiver type (`lr_support_by_type`, matched on detection there); the label-mean twin gets the training means (`sweep_common.give_label_means`); the readers load the shipped copies first; results to `07_11_results` | **run and read** on CosMx and synth (`07_11_results`, notes.md 2026-11-08); committed 2026-11-08 | 25 tests, 10 of 10 mutations caught (4 after stronger tests); the new pair test 6.5% / 1.0% at p < 0.05 / 0.01 over 200 null seeds, the old one AUC ~0.23 against a null of 0.50 on type-specific receptors; a miscalibrated model (x5, shifted) gives identical flows; the twin fix on a real label-mean GlobalModel | 2026-11-07 |
+| Known-pair p over shared genes (`lr_cluster_p`: bootstrap over ligand and receptor genes; the twin's sub-null AUC was the per-pair null's too narrow spread); the planted check against the twin (`twin_of`, `planted_against_twin`); conditions with sections as replicates (`condition_by_section`); gene flows over runs; `DOWNSTREAM=stability` (the task 4 checkpoints) | **implemented**; the 07_11 summaries rebuilt from their tables (scratch copy); stability not run; committed 2026-11-08 | 30 tests; shared-gene nulls: per-pair p < 0.05 in 42% of 12 seeds, the clustered p in 0% | 2026-11-08 |
+| Gene influence against spatial pattern (report section 7: `gene_flows(far_radius=)`, `gene_influence`, `moran_genes`, `gene_spatial`, `influence_read`; `DOWNSTREAM_READOUTS=influence`, steps `synth_influence`, `stability_influence`); summary figures `flows_over_runs.png`, `condition_over_runs.png` | **implemented, unverified on data**; committed 2026-11-08 | 34 tests (near sender exactly unchanged in the far region, `moran_genes` = `moran` to 1e-12, a toy with known local / global senders); figures drawn from the 07_11 tables | 2026-11-08 |
+
+**Why not integrated gradients first.** IG costs a backward pass per receiver and integration point. An intervention needs one forward pass per perturbation, works on whole sections, is directional by construction and states what the prediction uses. `sender_deletion` with `context` + permute already found 10 of 10 planted senders on synth_spot (notes.md, 2026-11-03/04). IG stays the gene-resolved check for single receivers (questions 7 and 9 above stay open for the annotation-free part).
+
+**The objects and their nulls.**
+
+| question | object | null |
+|---|---|---|
+| does the prediction use other cells | (since 2026-11-07: the drop in centred cosine within the receiver type; was ΔR²) on the receivers' hidden genes when all other cells swap profiles within type (`all_state`) or among all (`all_arrangement`) | untrained twin; spread of the draws |
+| which type affects which | `identity` (sender cells take another type's profile) and `state` (they swap among themselves), per receiver type, in the `context` (only the receivers kept) and `far` (their neighbourhood kept too) | `identity_null`: the same change on the nearest cells of other types, for co-location; twin |
+| through which genes | one gene permuted within type in the context; per receiver type and target | known pairs against the same ligand's other targets of similar expression (`lr_support`); twin; planted pairs on synth_spot (`edge_recovery`) |
+| what the attention's sources and sinks are | smoothed `flow_out - flow_in` against type, against each gene within section and type, against neighbourhood composition; top sources by type | labels shuffled within 100 µm squares; twin |
+| what the programmes are | varimax of the prediction's first 12 directions: genes, gene sets (the panel as background: K11), type (eta²), Moran's I of what the type leaves at 8 and 128 neighbours, neighbourhood R², condition | twin; a class by stated thresholds |
+| disease | per flow and programme, later minus earlier condition, per run: one donor pair each, so read over folds by sign | three pairs keep one sign by chance a quarter of the time |
+
+**Design points.**
+- `state` is the flow that does not suffer from the permutation notebook's label mixing (notes.md 2026-11-06): the type at each position stays.
+- Receivers are chosen per type, rare types first, with a share kept back so a type also has senders; fresh per draw.
+- Labels come from config. On data without annotation they are clusters (`imitation_labels`), so this is a summary by label; the annotation-free question above stays open.
+- Every table fills whatever the model is (a random stub in the dry run gets pathways and top pairs as well), so the summary puts the twin beside each run.
+- The report is rebuilt from `runs/<run>/tables/`, so wording and figures can change without a GPU.
+
+**Not in this stage:** sender gene restricted to one sender type (a flow's own ligands), NicheNet targets instead of receptors (T8), LIANA+ comparison (T10).
+

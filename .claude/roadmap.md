@@ -47,11 +47,11 @@ Asked while the net-flow permutation job runs. Where they compete, these take pr
 |---|---|---|---|---|---|
 | parked | 7, which net flow | decide the readout; compare both on the permutation job's checkpoints | evaluation only | answered below; improvement proposed; parked by the user 2026-11-05 | - |
 | 1 | 2, mean-subtracted reconstruction | evaluate `rand50_type` and the Moran arms, train `moran_local_type` | evaluation only, plus one training job | **script faults fixed 2026-11-05, unverified on data**; job written 2026-11-06 (`tasks_1_2_4.sbatch`, on the upstream sync), not run | Thu 5 - Fri 6 |
-| 2 | 1, Moran's I after mean subtraction | run `label_residuals.sbatch`, read folds 0-2 | no model | **combined stage built 2026-11-05**; job written 2026-11-06 (`tasks_1_2_4.sbatch`), not run on the cluster | Thu 5 - Fri 6 |
-| 3 | 4, stability over seeds | `cosmx_stability.sbatch`, `net_flow_seeds.sbatch`, since 2026-11-06 steps of `tasks_1_2_4.sbatch` | one job with tasks 1 and 2 | **built 2026-11-05, nothing trained**; not run; results now `06_11_results/cosmx_stability` | Fri 6 - Sat 7 |
+| 2 | 1, Moran's I after mean subtraction | run `label_residuals.sbatch`, read folds 0-2 | no model | **combined stage built 2026-11-05**; job written 2026-11-06 (`tasks_1_2_4.sbatch`); **run and read 2026-11-07** (folds 0-2 + synth_spot, no vannan25; notes.md) | Thu 5 - Fri 6 |
+| 3 | 4, stability over seeds | `cosmx_stability.sbatch`, `net_flow_seeds.sbatch`, since 2026-11-06 steps of `tasks_1_2_4.sbatch` | one job with tasks 1 and 2 | **built 2026-11-05**; results now `06_11_results/cosmx_stability`; **2026-11-07: 1 of 5 runs + twin came back** (no seed/split spread yet; hidden-half flow agreement 0.13-0.41; notes.md) | Fri 6 - Sat 7 |
 | 5 | 3, attention and PEs under shuffling | a few arms, per cell-type pair; other methods | one job per set of arms; baselines | proposed | Sat 7 - Sun 8 |
 | 6 | 5, condition differences | per-slide T1D minus ND of the chosen flow | evaluation only | proposed | Sun 8 |
-| 7 | 6, CellAgentChat global results | find the August outputs, check its coordinates | its own env | script from August, no read | Sun 8 |
+| 7 | 6, CellAgentChat global results | `cellagent.sbatch`: run on global coordinates, read by gene | job | **written 2026-11-06, checked on synthetic data, not run**; script from August read `obsm['spatial']` (overlapping FOVs) | Sun 8 |
 | 8 | 8, global-only with an embedding as input | scVI and CellCharter tokens on CosMx | one job | `Precomputed` built; CellCharter not computed | Sun 8 - Mon 9 |
 | alongside | 9, thesis outline | `.claude/thesis_outline.md` with chapters and a page budget | none | not started | by Mon 9 |
 

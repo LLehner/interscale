@@ -1644,3 +1644,254 @@ Results: local `results/net_flow_permutation/` (levels 0-50 from the 5 Nov job, 
 - Stability results moved to `06_11_results/cosmx_stability`, so runs on the synced code cannot mix with anything started on 2026-11-05.
 - Task 1 still has no legnini arm: no type or region annotation there, clusters via `imitation_labels` would have to be added.
 
+## 2026-11-06 — From a trained model to biology: interventions, gene sets, programme cards (code and toy only; no run)
+
+The user needs readable downstream output by Tuesday: flows of information, not only attention, and embedding dimensions, tied to biology. Design: `.claude/interaction_readout_plan.md`, "Design 2026-11-06".
+
+**What worked**
+- `evaluation.interpretation`: cell-type flows by intervention (`identity` with a location-matched null, `state`, near / far), gene flows, known-pair support against expression-matched targets, attention sources and sinks within type, programme cards with a class. `evaluation.interpretation_report` builds a report per run and a summary over runs from the tables alone. 19 tests on a module of known dependence, 14 mutations caught, four of them only after the toy data was made harder (types in patches, a target detected in few cells).
+- Biology resource, panel-filtered: 960 genes, 1,007 known pairs (OmniPath), Hallmark 46, KEGG 187, Reactome 647, GO BP 1,445 sets. The control sets are proposed by Claude from general knowledge and are for the user to check.
+
+**What doesn't work / what to watch**
+- Nothing has run on data. The synth_spot check of the readouts (`DOWNSTREAM=synth`) is the first thing to read.
+- Every table fills whatever the model is: in the dry run a random stub got a pathway at q 0.04 and a full top-pairs table. Read against the twin.
+- rand50 ties the own-cell ridge within type (notes.md 2026-11-05), so the context-use line may well be near 0. That would be the result, not a fault of the readout.
+- The LIANA consensus URL is gone; the pairs are OmniPath's instead, which is not the resource `comparison_plan.md` names.
+
+## 2026-11-06 — CellAgentChat: what its code allows on CosMx (task 6; code and synthetic data only, no run)
+
+**What worked**
+- `slurm/new/cellagent_run.py`, `cellagent_read.py`, `cellagent.sbatch` run the unmodified package: a fixed sample per section on global µm, log1p_norm in X, modes `none`, `far` (delta 0.25), `near` (delta 1), each distance mode again with coordinates shuffled among the same cells. On synthetic data with all 728 panel pairs, one planted co-located pair ranks first of 241 ligands and of 205 receptors by space gain, about 8x above the next gene.
+- Measured on synthetic data (~58 active receptors per cell): 0.2 min at 400 cells, 0.8 min at 800: quadratic, ~11 min a distance run at 3,000 cells.
+
+**What doesn't work**
+- Whole sections in distance mode: an N x N table, then a Python loop per cell, active receptor, ligand and sender, ~10^12 operations at 10^5 cells; all cells at once also ~600 GB for the distances. So a sample, which loses a cell's real nearest neighbours (`near` is not contact range), or `--unit fov`, which has real density but reaches ~1 mm only.
+- The August script reads `obsm['spatial']` with `batch_label=slide_condition`: FOV-local pixels, FOVs on top of each other, so its distances across FOVs are wrong. Its permutation test at threshold 10,000 on all cells would also build the model about 125 times.
+- The package's significance test is not comparable between deltas: its null ignores delta. On random synthetic data 100% of the scores pass at delta 0.25, 3-9% at delta 1. Hence every score is saved and read against shuffled coordinates.
+- A raw far-minus-near gain calls everything near: the planted pair gains 2.79 under the near kernel and 0.43 under the far one, as any clustered gene would. Compare ranks within a kernel.
+- A far gain can come from tissue structure alone. It says a pair is co-located at that scale.
+
+
+## 2026-11-07 — Tasks 1 and 4 from `tasks_1_2_4.sbatch`: label residuals on CosMx folds 0-2, and the first stability run (results in `results/cosmx_stability`, `results/label_residuals`)
+
+What came back: `label_residuals` for synth_spot and CosMx folds 0-2 (no vannan25; labels `cell_type_coarse`, `CellTypes_max`, `fov`,
+`cell_type_coarse+fov`); `cosmx_stability` with **one run of five** (`rand50_split0_s42`) and its twin, each flow read under both hidden
+halves. No `stability.md`, no task 2 outputs, no `net_flow_seeds` folders in what was copied; the job log was not read here. The hidden-half
+agreement below was computed locally from the saved flow npz files (test cells only, ~9k per section) with `cosmx_stability_read.py`'s own
+`smooth` / `rho` (30 µm, 5,000 centres per section), not by the script's `main`.
+
+**Task 1: what worked**
+- synth_spot positive control holds again: `region` takes CM1-CM3 out (R² 0.96-1.00, I_local 0.93-0.97 -> 0.01-0.03), every planted programme
+  keeps its I_local (local set 20/20 stays), M4 / M7 / M8 fill the freed global slots, Spearman(fall, planted scale) -0.72 -> -0.69.
+- CosMx, the fold-0 read of 2026-11-02 reproduces on all three folds: the FOV takes out most of the global set (median kept I_global 0.15 /
+  0.23 / 0.20) and hardly touches the local one (I_local kept 0.91 / 0.92 / 0.94); the cell type does the reverse (global I_global kept
+  0.99 / 0.89 / 0.96, local I_local kept 0.55 / 0.75 / 0.41). `CellTypes_max` (14 levels) says the same as `cell_type_coarse`.
+- Type + FOV together leave few candidates: 110 -> 31, 144 -> 64, 71 -> 19 (f0 / f1 / f2). Clean local genes in all three folds after it:
+  IGF2, OLFM4 (REG1A, SST also, but spillover); CCL2, PRSS2, SERPINA1, MEG3, CPB1, SPINK1 in two.
+- The Shapley split agrees across folds: the global set's largest block is the FOV (0.036 / 0.021 / 0.026), the local set's the own cell type
+  (0.089 / 0.064 / 0.185). NegPrb in no set before or after, in any fold or label.
+
+**Task 1: what doesn't work / caveats**
+- **The sets depend on the fold (= which two donors)**, before any residual: only 3 of 20 global genes (HSP90AA1, HSP90AB1, RPL34) and 4 of
+  20 local genes (ANXA4, COL18A1, FGFR3, IGF2) are in the set on all three training slides. Per-fold sets are not a property of the tissue.
+- **The stress / immediate-early signature is fold 0's alone**: HSPA1A I_local 0.23 on f0, 0.05 on f1 and f2; HSPA1B 0.14 vs 0.03; FOS 0.13
+  vs 0.02-0.03. The 2026-11-02 headline "global set = HSPA1A/B, FOS, JUN" describes one slide. Fits handling of that slide, not biology.
+- **Type + FOV pushes spillover into the global set**: INS enters the global set on all three folds (R² 0.43 on f0), with CHGA, TTR, GCG,
+  CUZD1 on some. FOV alone does it more (f2: 8 endocrine / acinar products global after). Islet-sized halos of spillover outlast the 2-hop
+  reach. INS, CUZD1, SST, SPINK1, SCG5 are not in the spillover list of 2026-11-04 (PRSS2, CPB1, REG1A, GCG, IAPP, CHGA, TTR); a Moran arm
+  built on type + FOV sets would mask them as "global" unless the list grows.
+- The reach on CosMx is 37 µm (k-NN 8, 2 hops), so "global" here means beyond about two cell layers, not the ~290 µm of synth_spot.
+- The map figures keep the blank space between FOVs and colour each panel on its own scale.
+- vannan25 missing.
+
+**Task 4 (stability), one run only: what worked**
+- Training is cheap: 9.5 s / epoch, 1.5 GB GPU; evaluation ~8 min (ridge references ~5 min). So the four missing runs did not fail for time
+  per run; the cause is in the job log.
+- rand50 on FOV-shuffled splits (every donor in training, six sections) is trained: within type 0.156 vs twin 0.000; within section 0.217.
+- Attention moves outwards with training: share beyond 250 µm 0.09 (twin 0.004), still lift 6.6-8.0 at 0-15 µm. The distance windows
+  hardly move from init (15 / 61 / 247 / 1000 -> 12.5 / 61 / 231 / 1101 µm), as in the distance-window sweep.
+
+**Task 4: what doesn't work**
+- **The flow map of one checkpoint depends on the mask draw**: the same model, the same cells, the other random half of genes hidden: per-cell
+  net flow Spearman 0.20-0.34, smoothed 0.13-0.41 over the six test sections. The twin agrees with itself more (smoothed 0.32-0.53),
+  because its flow follows geometry. Trained vs twin 0.0-0.2. So a flow map from one mask draw is mostly that draw; this backs task 7's
+  "mask average" before any seed or condition comparison of flow maps.
+- Seeing the donors does not close the gap to the ridges: within type 0.156 vs ref_own 0.150 / ref_own+context 0.160; on spillover=no
+  0.157 vs 0.161 / 0.164 (below both). Pooled raw SCE 0.715 vs 0.561 / 0.552, val R² -1.26. The raw SCE gap of 2026-11-05 was therefore not
+  (only) unseen donors; the crop-to-section level shift stays the candidate.
+- Per gene within type, the model beats ref_own by > 0.02 on 8 of 480 genes: GCG, TTR, CHGA, SST, CUZD1 (spillover), MEG3, SERPINA3,
+  OLFM4, MT2A; ref_own+context matches all but MEG3. One seed, so not read further.
+- Attribution again says context supplies 61% of the prediction's variance (56% on spillover=no) while the score ties an own-cell ridge.
+- No seed or split spread exists yet: the task's output (a spread per readout as the bar for tasks 3 and 5) is still missing.
+- Addendum, same day (the user): the job hit its 12 h limit inside `task4_runs`, after the first run. Tasks 1, 2 and `task4_flow` came
+  before it in the job; their outputs (`MA/04_11_results/cosmx_masking`, `MA/net_flow_seeds`) were not copied here. Measured per stability
+  run: ~16 min training, ~8 min evaluation (ridge fit ~5 min, cached per split draw), so the four missing runs need ~2-2.5 h on their own.
+
+## 2026-11-07 — Downstream interpretation on CosMx (`downstream.sbatch`, step `cosmx`; results in `results/downstream_cosmx`)
+
+Evaluation only, on the checkpoints of `04_11_results/cosmx_masking`: rand50_f0-2, rand50_type_f0-2, twins of both fold-0 arms. Predefined donor
+folds, so each run is read on one test slide (one ND + one T1D donor). The synth check (`downstream_synth`) was not copied, so it is not yet
+known whether the readouts find planted senders; everything below is read without that check.
+
+**What worked**
+- The job runs end to end on all 6 trained models and the rand50 twin. The twin's numbers are tiny (context ΔR² ~0.001, top gene flow 0.07),
+  so the trained values are not readout noise.
+- Programmes recur over folds: programmes 0-4 of rand50_f0 match rand50_f1 / f2 at loading cosine 0.79-0.94. Programme 1 (ANXA4, CLU, CCND1,
+  COL18A1, FGFR3, SOX9, KRT8; "spatial state", 22% of the prediction's variance) holds the genes that were in the local Moran's I set on all three
+  folds in task 1 (ANXA4, COL18A1, FGFR3). The most reproducible spatial signal of the day, in both analyses.
+- The identity controls are found where they should be (identity_acinar, _ductal, _alpha, _beta at q 1e-7 to 5e-3 in programmes), and the
+  handling sets flag the handling programmes (ribosomal, stress).
+- Attention reads cell identity: sources are the endocrine types (Beta, Endocrine, Alpha; 25-30% in the top decile against 10% by chance) and
+  ductal genes (identity_ductal q 1.5e-6, MHC-I q 1.2e-3); sinks are acinar genes (identity_acinar q 4e-5) and ribosomal genes.
+
+**What doesn't work**
+- **Nothing repeats over folds as a flow**: 0 of 81 type pairs keep one sign with a positive mean in every run, for state flows and for
+  identity flows alike.
+- **The large flows are segmentation spillover and handling, not communication**: Acinar -> every type (targets RGS2, CUZD1, RPL21, RPL34,
+  SERPINA3: acinar products and ribosomal), Ductal -> Mast 0.47 (ANXA4, KRT8 in mast cells: ductal transcripts). Programme 1's top type is Mast
+  too, so its ductal genes in mast cells may be spillover as well. Programmes are mostly `handling` (4-5 of 12) or `weak` (5-7).
+- **Context ΔR² has both signs and is large**: mean over types -0.018 to -0.159; Mast -0.18 on f0 (shuffling other cells within their type
+  *improves* the prediction). These models' R² is far off (val R² -1.3 to -3.4, raw SCE well above the ridges), so a change in R² mixes scale
+  and level with context use. Gene-level ΔR² above 1 (LEFTY1 -> REG1A 1.34, top 7.16 on rand50_type_f2) says the same. **Readout fault, mine:**
+  the interventions score by R², but these models need centred cosine within type (memory `metrics-cosine-not-r2`). Not fixed yet.
+- **The known-pair test is biased**: AUC 0.449 / 0.487 / 0.503 against a null of ~0.48-0.49, but the untrained twin also gets 0.434 (p = 1).
+  A random model sitting below the null means the expression matching or the null is off, not that known pairs are depleted. Unreadable until
+  fixed.
+- Attention does not follow use: Spearman of the type-by-type tables 0.00 over 81 pairs.
+- Condition differences: 2 (state) and 4 (identity) of 81 pairs keep their sign over all six runs, fewer than chance with three donor pairs.
+  The two arms share their donor pairs, so six runs are three independent comparisons. Programme condition effects flip sign between folds.
+- `rand50_type_f0_untrained` wrote nothing ("no receiver was scored"; every step < 4 s). Silent failure; cause not read (job log).
+
+## 2026-11-07 — Downstream readouts rescored by centred cosine within type; known-pair test within types; twin fix (code and toy data only; no run)
+
+Fixes the readout faults found in the CosMx read above. Results of the next run go to `07_11_results/downstream_{cosmx,synth}`.
+
+**What worked**
+- Every intervention is now scored by the centred cosine within the receiver type: per receiver cell over its hidden genes (the flows, context use),
+  per target across the type's receivers (flow targets, gene flows). Truth and the unchanged model's prediction are centred on the receiver type's
+  means over the whole section, the changed prediction on the same point, and the per-gene sums are pooled over draws and sections. A flow is the
+  drop, at most 2. A model 5x too large and shifted per gene gives identical flows (tested); under ΔR² it would have moved them ~25-fold.
+- Known pairs are ranked within each receiver type, against targets matched on detection in that type, and pooled (`lr_support_by_type`). On random
+  scores with type-specific receptors the old test (score maximised over types, matched on overall expression) gave AUC ~0.23 against a null of
+  0.50; the new one 0.503 ± 0.060 with p < 0.05 for 6.5% and p < 0.01 for 1.0% of 200 null seeds; a planted pair is found (AUC > 0.8). This is
+  the likely cause of the CosMx twin's 0.434 against 0.485: a receptor is often detected in few types, so its maximum is over fewer types.
+- The untrained twin of a label-mean model now gets the training label means (`sweep_common.give_label_means`): checked on a real GlobalModel (it
+  refused to predict before, the means equal the training means after, a model with means and an offset-free model are untouched).
+- The readers load the copies shipped next to them before an installed `interscale.evaluation.interpretation` (checked with the editable fork
+  installed), so an older copy on the cluster cannot win silently.
+- 25 tests pass; 10 of 10 mutations caught, 4 of them only after stronger tests (the readable floor, the detection match, the 2-gene minimum per
+  cell, the context-use ratio).
+
+**What doesn't work / what to watch**
+- Not run on data. Numbers from the 2026-11-07 CosMx read are not comparable with the next run's (another score, another pair test).
+- A target's within-type score needs at least 3 receivers with it hidden; with few far receivers some far targets stay unscored (NaN, not 0).
+- The cosine flow counts a level shift the perturbation causes at the receivers (the changed prediction is centred on the unchanged model's mean).
+  That is intended (context moved the prediction), but it is not the same as `within_groups`, which centres every head on its own mean.
+- Spillover genes are still scored as targets; `spillover` is not yet excluded from the flows.
+
+## 2026-11-08 — Downstream readouts rerun with centred cosine within type: synth check and CosMx (`07_11_results/downstream_{synth,cosmx}`)
+
+Evaluation only. Synth: `full_s42` of `03_11_results/synth_ranking` and its twin (2 region labels CM1/CM2, 224 senders, 15 planted targets).
+CosMx: rand50_f0-2, rand50_type_f0-2 (checkpoints of `04_11_results/cosmx_masking`, predefined donor folds) and the two fold-0 twins. All 8
+CosMx runs and both synth runs wrote complete reports; the summaries were rebuilt at the end of each step (synth 16:54, cosmx 18:17).
+The two fold-0 twins are identical in every number (same init; the type target only changes the loss), so there is one twin.
+
+**What worked**
+- Synth: context use is large and learned: shuffling other cells' profiles within their type lowers the centred cosine within type by 0.51
+  (among all cells 0.64); twin -0.002. Beyond 300 um still 0.18-0.20 (far CM2 has 14 receivers only).
+- Synth: gene flows find the planted senders: best planted sender ranked first for 11 of 15 targets (MC1 rank 7, MC3 3, MC6 12), deltas up to
+  0.88 (M8 -> MC11, M7 -> MC9, S1-S4 -> R1-R4); twin's top gene flow 0.010.
+- CosMx: the cosine scoring removed the both-signed, oversized context numbers: context use is positive in every trained run, 0.0011-0.0043
+  (state) and 0.0024-0.0052 (arrangement), against the twin's 0.00015 / 0.00035, so 10-30x the twin. In absolute terms it is ~1% of synth's:
+  the CosMx models barely rest on other cells. `far` (beyond 60 um) is ~0 and both-signed.
+- CosMx: flows now repeat over folds (last read: none). State: Acinar->Acinar 0.0018, Ductal->Endothelial 0.0017, Ductal->Ductal 0.0015,
+  Acinar->Endothelial 0.0013, Acinar->Ductal 0.0013, all above the twin's largest (0.00032); Ductal->Alpha, Alpha->Fibroblasts, Beta->Beta,
+  Endocrine->Alpha repeat too but sit at the twin's level. Identity: Acinar -> Acinar/Endothelial/Immune/Ductal/Fibroblasts 0.005-0.013
+  (twin max 0.00043), Alpha->Alpha 0.0008. Six runs are three folds (the arms share test slides).
+- Programmes 0-4 of rand50_f0 again match rand50_f1/f2 at loading cosine 0.67-0.94; the twin's programmes classify as "other", the trained ones
+  as handling / spatial state / weak.
+
+**What doesn't work / what to watch**
+- Synth planted check: the twin also ranks a planted sender first for 5 of 15 targets (33%), against "chance about 1%" in the report. Its ranks
+  are bimodal (1 or 200-224), so planted senders have extreme |effect| even at random weights: likely input scale (planted senders are the
+  high-variance genes). The right bar is the twin's 5/15, not 1/224. Fix: rank against the twin's score per (sender, target), or standardise
+  senders, and print the twin's rate next to the trained one.
+- Synth: every programme classifies as `spatial state` in the trained model and the twin (12/12); the class thresholds do not separate on
+  synth_spot. Attention biology and known biology are empty (no hierarchy readout in this model, no resource for synth genes). The over-runs
+  tables are empty with one trained run.
+- CosMx: the repeating flows are the ones the last read called spillover / identity: Acinar identity flows move CUZD1, SERPINA3, OLFM4, RGS2,
+  RPL21 (acinar products, ribosomal) in every receiver type. State flows Acinar/Ductal -> Endothelial/Ductal are the only candidates that are not
+  plainly identity, and their targets (XBP1, MT2A, CUZD1, RPL21) are still acinar/handling genes.
+- CosMx known pairs: AUC 0.49-0.52 against null ~0.50; p = 0.37, 0.91, 0.52 (rand50) and 0.08, 0.23, 0.0145 (type). One of six below 0.05,
+  not after correction. The twin is still below its null (0.470 vs 0.501, p = 1), less than before (0.434) but ~3 null SDs: the test is still
+  not calibrated for a model with near-zero effects (ties at zero are the first suspect).
+- CosMx gene flows: the top-15 table of rand50_type_f2 is INS in Alpha from 15 unrelated senders (ETV5, IL18, WIF1, IL6, GCG, ...) all at
+  ~0.009: a spillover target that moves with any input, not 15 pathways. Trained top gene flow 0.006-0.013 vs twin 0.0057, so gene-level flows
+  are at most twice the twin's.
+- Condition: 2 (state) and 4 (identity) of 81 pairs keep their sign over all runs; with three donor pairs ~1/4 would by chance. Ductal ->
+  Endothelial / Immune identity higher in T1D in all three folds is the only lead and is still one comparison per fold.
+- Attention: Spearman with the intervention table -0.29 to 0.23 over runs (twin -0.22); Alpha / Beta are the top sources on f0 and the top
+  sinks on f1 and type_f2, so the "endocrine sources" of the last read do not hold over folds. The twin's sources are also enriched for
+  identity_acinar (q 4e-5): the enrichment reads identity, not training.
+
+## 2026-11-08 — Downstream readout: known-pair p over shared genes, planted check against the twin, conditions over sections, stability config (code and saved tables only; no GPU run)
+
+**Correction to the entry above:** the synth planted check is 12 of 15 targets first (80%), not 11; first here and not in the twin: 9 of 15 (60%).
+
+**What worked**
+- **The "twin below its null" was the null's spread, not a bias.** The 1,245 CosMx (pair, type) reads come from 124 receptors and 165 ligands
+  (ITGB1 alone 144, FZD4/FZD5/ITGAV 56 each); the per-pair null draws every pair's target independently and gave SD 0.008. A bootstrap over
+  ligand and receptor genes gives the observed mean SD 0.022, so the twin's 0.470 against 0.501 is z = -1.4. New `interpretation.lr_cluster_p`:
+  `p` one-sided from z = (auc - null_mean) / sqrt(cluster_sd² + null_sd²); the old p kept as `p_independent`. Rebuilt from the 07_11 tables:
+  rand50 f0/f1/f2 p = 0.44 / 0.74 / 0.51, rand50_type 0.24 / 0.38 / 0.15 (was 0.0145), twin 0.90. No known-pair support in any run.
+  Test: random gene effects shared by a receptor's pairs, 12 seeds: per-pair p < 0.05 in 42%, the clustered p in 0%; cluster_sd 3-10x null_sd;
+  distinct receptors keep cluster_sd ≈ null_sd and a planted effect is still found (p < 0.01).
+- **Planted check against the twin** (`interpretation_report.twin_of`, `planted_against_twin`): the twin is `<run>_untrained`, else the twin of
+  another seed of the same arm. Reports and the summary now give `planted_twin` and `planted_beyond_twin`. synth: 80% / twin 33% / beyond 60%.
+- **Conditions over sections** (`condition_by_section`): when a run has ≥ 2 test sections per condition (the FOV-shuffled stability splits:
+  3 ND + 3 T1D), per pair the difference of condition means, `separated` (every section of one condition beyond the other's) and an exact
+  Mann-Whitney p (3 vs 3: 0.1 at best). Runs with one section per condition keep the over-runs table; its chance line now follows the run count.
+- **Gene flows over runs** (`gene_flows_over_runs`): triples in the top 1000 of trained runs, with the twins' values. On the 07_11 folds no
+  triple is in all six tops; the most repeated (HLA-A -> SERPINA3 in Mast, 5 of 6) is in the twin's top too (0.0023): an input property.
+- **`DOWNSTREAM=stability`** in `downstream_read.py` and step `stability` in `downstream.sbatch`: the 5 cosmx_stability checkpoints + the twin
+  of split0_s42, `cosmx_stability.prepare` for the FOV split columns, the training job's flow reused from `06_11_results/cosmx_stability/flow`,
+  results `08_11_results/downstream_stability`. Checked without data: config import, run expansion (5 runs, 1 twin), selections.
+- `--summary` rebuilds old results with all three fixes from their tables: no GPU rerun of cosmx or synth needed. Rebuilt in a scratch copy only.
+- 30 tests pass (5 new); ruff clean.
+
+**What doesn't work / what to watch**
+- The bootstrap over genes is an approximation of the right null (a null that substitutes each receptor gene consistently would be exact); it is
+  conservative where few genes carry many pairs.
+- The stability step is unmeasured on data; it needs the four missing task 4 checkpoints (`tasks_1_2_4.sbatch`, `STEPS=task4_runs`).
+- The stability runs share their test sections and donors: agreement over them is the model's stability, not a donor replicate.
+- Programme classes still do not separate on synth_spot (all `spatial state`, the twin too); not touched.
+
+## 2026-11-08 — Gene influence against spatial pattern (report section 7) and summary figures (code and toy data only; no run)
+
+The user's success criterion (spatially variable genes among the most influential, local and global separated) as a readout. The user,
+2026-11-08: important, but "just one way to measure relevance of results"; it sits next to the other readouts, not above them.
+
+**What worked**
+- `interpretation.gene_flows(far_radius=)`: the cells within the radius of a receiver keep their values, so only distant cells change.
+  `gene_influence`: per sender gene the mean drop in centred cosine over every (receiver type, target) read (unbiased where nothing moves,
+  so it can be set against the twin) and the largest. `moran_genes` (every gene at once, equal to `moran` per gene to 1e-12) and
+  `gene_spatial`: per gene Moran's I within type (every (section, type) mean out) at 8 neighbours and across the section
+  (`gene_scales.global_moran`), plus the raw local I (the usual SVG statistic).
+- The read (`interpretation_report.influence_read`, from tables only): learned influence = influence minus the twin's; Spearman with each
+  Moran's I, raw and inside expression deciles; the 20 most influential genes' share of spatially variable genes (top quarter by local or
+  global I) against genes of the same expression (`expected`, permutation `p`); among spatially variable genes, whether global ones lean
+  more to far influence than local ones (percentile far minus near, one-sided Mann-Whitney). Summary: the same per run, and the ranking's
+  stability over runs (RBO, Spearman, top-20 Jaccard, genes in every top 20). Figure `influence_vs_moran.png` per run.
+- `DOWNSTREAM_READOUTS` (default the four old readouts, so the queued stability job is unchanged); `influence` writes `gene_influence` into
+  the same run folders. sbatch steps `synth_influence` (full_s42 + twin) and `stability_influence` (split0 s42-44 + twin).
+- Summary figures `flows_over_runs.png` (state and identity, mean over runs; outlined: one sign in every run and beyond the largest twin
+  flow) and `condition_over_runs.png` (outlined: one sign in every donor pair, or separated in every run with sections as replicates).
+- 34 tests pass (9 new today); far region: a sender read within 150 is exactly unchanged beyond 160, a partner at 400 still lost.
+
+**What doesn't work / what to watch**
+- **Far receivers:** `pick_receivers` serves the rarest type first, and with zones the first types fill the 40% cover, leaving common types
+  about one receiver per section. The far pass therefore uses the far per-type count (60, as `type_flows`); still few receivers, so far
+  influence is noisier than near. Found while testing, on toy data.
+- "Spatially variable" is relative (top quarter of the panel), so about a third to a half of the genes qualify; `expected` is the bar, not 0.
+- Cost unmeasured: one pass per visible gene, section and region (~480 x 6 x 2 per CosMx run). synth first.
+- Influence is read for the visible half only (the eval mask hides the other half in every cell); no complement pass.
