@@ -1895,3 +1895,98 @@ The user's success criterion (spatially variable genes among the most influentia
 - "Spatially variable" is relative (top quarter of the panel), so about a third to a half of the genes qualify; `expected` is the bar, not 0.
 - Cost unmeasured: one pass per visible gene, section and region (~480 x 6 x 2 per CosMx run). synth first.
 - Influence is read for the visible half only (the eval mask hides the other half in every cell); no complement pass.
+
+## 2026-11-09 — Task 4 stability read: three seeds + twin on rand50, FOV-shuffled split 0, and the notebook's flow at seeds 43/44 (`results/cosmx_stability`)
+
+What came back: `rand50_split0_s42/s43/s44` and `rand50_split0_s42_untrained`, each flow read under both hidden gene halves; `stability.md`
+with the `net_flow_seeds` tables. **Not back: split draws 1 and 2 (seed 42)**, so no split spread; `stability.md` has no `split` rows.
+`sections/rand50_split0_s44.md` holds two `training` sections (the run trained twice; scores identical, 7.4 vs 6.8 s/epoch). Extra checks
+below were computed locally from the shipped tables and npz files (no data loaded).
+
+**What worked**
+- Scores are seed-stable: centred cosine on all hidden spots 0.244 / 0.243 / 0.231 (SD 0.007); within type, spillover=no 0.157 / 0.158 /
+  0.156. Training is cheap (7-10 s / epoch, 1.5-1.8 GB).
+- Per-gene within-type scores agree between seeds (Spearman 0.996, top-20 Jaccard 0.90-1.0), but also with the own-cell ridge (0.987): this
+  stability is mostly *which genes are predictable*. The informative part: model minus ref_own per gene still agrees between seeds
+  (0.79-0.82); per-gene seed SD 0.002. Beyond ref_own by > 0.02 in every seed: CHGA, GCG, SST, TTR (spillover) and MEG3; beyond
+  ref_own+context: none.
+- Decoder gene priority is learned and seed-stable: Spearman 0.97 between seeds, 0.04-0.05 with the twin; top-20 Jaccard 0.74-0.90 between
+  seeds, 0.03 with the twin. The top genes are acinar / islet products and high-variance transcripts (CUZD1, CPB1, SPINK1, NEAT1, ANXA4,
+  MT1X, MT2A, REG1A, PRSS2, INS, MALAT1), so it tracks expression variance and identity; whether it says more than gene variance is unchecked.
+- The trained flow is not cell density: Spearman(net flow, cells within 30 µm) -0.03 to 0.09 per section; the twin 0.21-0.30. (rand50 hides
+  genes, not cells: every cell is visible, so the blobs in the maps are not mask discs.)
+
+**What doesn't work**
+- **The per-cell flow map is not reproducible over seeds**: smoothed net flow Spearman -0.05 / 0.33 / 0.27 between seed pairs, at the level
+  of a mask redraw on one checkpoint (0.32 / 0.28 / 0.48) and not far above trained vs twin (0.14). Visibly: in 2_T1D the large structure at
+  the left of FOV 2 is a strong sink at s42 and a strong source at s43. Seed and mask draw are of similar size; split unknown.
+- **The notebook's sender x receiver flow is not reproducible over seeds at level 0** (only the model seed differs): Spearman over the 36
+  pairs -0.28 to 0.04, one outlier 0.61 (T1D s43/s44); at 100% -0.0 to 0.40. Every level's change from the 0% reference is below the
+  seed SD (median change 0.05-0.13 vs SD 0.11-0.17); 3-14% of pairs beyond 2 SD, about what three seeds' SD gives by chance. So the
+  permutation effect is not separated from seed noise at any level, and the high level-to-level similarity of 2026-11-06 (0.7-0.99) is the
+  shared seed 42, not the data. Caveats: levels 10-80 have seed 42 only, set against a 3-seed mean (the table mixes a single run with a
+  mean, so its change is not like for like at 10-80); an SD from 3 seeds is itself loose.
+- **Cell-type net flow over seeds** (median over sections): Mast 0.26 ± 0.15, Immune 0.13 ± 0.07, Fibroblasts 0.11 ± 0.07, Acinar -0.05 ±
+  0.04; SDs as large as the means for Alpha / Beta / Endocrine. No twin row (the reader skips twins in `cell_type_flow`), so how much of
+  this is geometry is unknown.
+- **Condition (T1D - ND), task 5's bar**: Fibroblasts 0.13 ± 0.03 and Mast 0.24 ± 0.11 are the only rows beyond 2 seed SD, but the SD is
+  over seeds of the slide-averaged difference and omits the donor pairs. Per slide x seed: Mast > 0 in 8 of 9 (one 0.000), yet ND sections
+  hold only 17 / 4 / 12 test mast cells; Fibroblasts > 0 on slides 1-2 in every seed, < 0 on slide 3 in two of three. Alpha > 0 in 8 of 9
+  but 21 T1D alpha cells on slide 1. Nothing here survives donor pairs + twin + cell counts yet.
+
+**Next**
+- Copy back or rerun split draws 1 and 2 (job log first).
+- Add the twin to `cell_type_flow` / `condition_bar`, and report the condition difference per slide with cell counts (min-count filter, e.g.
+  >= 30 per section) instead of one seed SD.
+- Make `net_flow_change` like for like: compare single seeds against the reference's seed spread (or run levels 10-80 at s43/s44 too).
+- Per-cell flow maps need an average over seeds and mask draws before any reading; a single map is mostly its draw.
+
+## 2026-11-09 — Does averaging stabilise the CosMx flow map? Mask halves and seeds of the three rand50 runs (local, from the shipped npz)
+
+Computed with `cosmx_stability_read.py`'s own `load_flow` / `flow_agreement` (30 µm smoothing, 5,000 centres per section, median over the six
+test sections); every map holds the same cells in the same order (checked).
+
+**What worked**
+- Averaging the two mask halves per seed raises the seed-pair agreement a little: -0.04 / 0.32 / 0.28 -> 0.15 / 0.35 / 0.26 (mean 0.19 -> 0.25).
+- The mean of two seeds (mask-averaged) against the third: 0.25 / 0.20 / 0.45 (mean 0.30). A plain signal-plus-noise model with single-run
+  reliability 0.25 predicts 0.32 for this, so the seeds' disagreement behaves like noise around one shared map, not like different solutions.
+  By Spearman-Brown an average of k seeds would have reliability 0.50 (k = 3), 0.63 (5), 0.77 (10), 0.87 (20): two independent 10-seed ensembles
+  should agree at about 0.77. Estimated from three seeds, so rough.
+
+**What doesn't work / caveats**
+- Part of the shared map is what the twin has too: the 3-seed mean against the twin 0.20 (single runs 0.14). An ensemble map is read against
+  the twin like any other.
+- A single run's map stays unreadable; only an ensemble (seeds x mask draws) is. Nothing here makes one model's attention identifiable.
+
+## 2026-11-09 — CosMx flow ensembles (cosmx_ensemble), first read
+
+Results: local `results/cosmx_ensemble/` (cluster `MA/09_11_results/cosmx_ensemble`). hier_tier, whole-cell masking (20 % + 60 um discs), FOV-shuffled split draw 0, 100 epochs on crops; flow from hidden queries (`fold_flow`, 2 fold draws). `cell_l1` (1 layer) seeds 42-51 + twin; `cell_l2` (2 layers) seeds 42-51 + split draws 1-2 + twin.
+
+**Incomplete read:** `stability.md` holds cell_l1 with all 10 seeds but cell_l2 with only 7 (s42-s48), no split draws. Most likely the cell_l1 job's read ran while the cell_l2 job was still training, and the cell_l2 job's own read did not overwrite it (failed or not reached; its runs are complete: flow/ and sections/ for s49-s51, split1, split2 exist). Fix: `STEPS=read sbatch slurm/cosmx_ensemble.sbatch`; check JOB=A's log for the read step. cell_l2 numbers below are 7-seed numbers.
+
+What worked:
+- **Averaging seeds gives a reproducible map, as the signal-plus-noise model predicted.** Disjoint k-seed ensembles agree as Spearman-Brown says from the single-run agreement: cell_l1 k = 1..5: 0.489, 0.675, 0.758, 0.814, 0.840 (SB 0.489, 0.656, 0.741, 0.793, 0.827); cell_l2 k = 1..3: 0.456, 0.585, 0.724 (SB 0.456, 0.626, 0.715). Extrapolated two 10-seed ensembles: ~0.90 (l1), ~0.89 (l2).
+- **Single-run reliability doubled against the rand50 gene-masking runs** (0.25 there, 0.46-0.49 here): whole-cell masking with the flow from hidden queries is the steadier readout. Mask draws hardly matter (two fold draws agree 0.98 / 0.99; twin 0.95).
+- Scores are seed-stable: within-section hidden-cell cosine 0.129 +- 0.001 (l1), 0.134 +- 0.001 (l2); between knn32 (0.124) and knn128 (0.146). Gene readouts seed-stable (dim_gene_priority Spearman 0.994, top-20 Jaccard 0.94).
+
+What does not work / limits:
+- **Reproducible is not learned for the 1-layer model:** its ensemble map shares 0.38 with the untrained twin's (single run 0.34): a large part is geometry (with one layer the last-layer attention is the first-layer attention on input + PE). cell_l2: 0.09 (single 0.01), i.e. its map is learned.
+- **The two depths disagree on cell types.** Mean net flow per cell (positive = source): Alpha -0.083 (l1) vs +0.099 (l2), Beta -0.079 vs +0.100, Ductal -0.038 vs -0.165, Immune -0.011 vs -0.132; only Acinar is a source in both (0.031 / 0.076). Ensemble SEs ~0.025, so the sign flips are real: which type "sends" depends on the architecture. No per-cell l1-vs-l2 ensemble agreement was computed (needed: add to the reader).
+- **Condition differences:** none in cell_l1 (Acinar same sign on 3/3 slides but within the twin). cell_l2 (7 seeds): Acinar T1D - ND = -0.032, 3/3 slides, beyond the twin (max 0.021) — the only candidate; Endocrine (2 slides kept) and Immune (2/3) do not pass. Mast has no slide with 30 test cells in both sections.
+- Maps: source / sink patches of ~50-150 um in both arms and in the twins; without type overlays they cannot be read as islets / ducts. Plot defect: the subtitle runs into the colour bar.
+
+Decision pending (the user): ensembles vs a model-level fix. The data say averaging works and is predictable; it does not make the map biological (l1 = geometry, l1 vs l2 disagree on cell types).
+
+## 2026-11-09 — Type-residual target on whole cells and a sparse-key penalty: built (code and toy data only; no run)
+
+Asked by the user after the ensemble read: run the cell-type-mean target now (3 seeds, 300 epochs) and a second set where attention to sparse regions is penalised a bit, with a slide-dependent density radius.
+
+What worked (checks, not results):
+- The penalty is exactly the sparsity-weighted key mass of the attention the pass uses: equal to the hand sum over the exported cell-level attention for dense, routed and recomputed routed blocks; the gradient reaches the attention projections and not the decoder; the forward pass is unchanged bit for bit; off, nothing is computed. Three mutants (query weights for key weights, CLS penalised, recomputed blocks dropping their term) each fail two tests. Full suite 1792 passed.
+- Density per section: relative to the section's own median count, radius 5 x its median nearest-neighbour distance, so two sections at different spacing read alike (tested); a grid corner reads ~0.3, an edge ~0.55, a hole rim ~0.8 of the interior.
+- Both arms pass the config validator on `cosmx_hier.yaml`; `sparse_stats` matches a hand computation.
+
+What doesn't work / open:
+- The type-mean target was never read before: `rand50_type` (gene masking, donor folds) failed its first evaluation and its later scores were not copied here. So there is no earlier number to compare with.
+- Only the cell level is penalised; a coarse cluster token in sparse tissue is not. The readout reports the last layer only (the penalty acts on both layers).
+- Three seeds: the ensemble curve (needs 4) is not drawn; seed agreement and the per-arm SD are.
