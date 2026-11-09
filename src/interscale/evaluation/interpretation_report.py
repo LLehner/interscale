@@ -1110,11 +1110,14 @@ def write_summary(results) -> Path:
     replicated = {n: f for n, f in trained.items() if len(sections_per_condition(f)) == 2 and sections_per_condition(f).min() >= 2}
     paired = {n: f for n, f in trained.items() if n not in replicated}
     condition_panels, condition_marks = [], {}
+    # Runs read on the same test sections share their donors: the independent donor pairs are the distinct section sets, not the runs.
+    slides = {frozenset(f["section"].dropna().astype(str)) for f in paired.values() if "section" in f}
+    n_pairs = max(len(slides), 1)
     for kind in ("state", "identity"):
         table = condition_over_runs(paired, kind=kind)
         if len(table):
             indexed = table.set_index(["sender", "receiver"])
-            name = f"{kind}: later minus earlier condition, mean over {int(indexed['runs'].max())} runs (one donor pair each; runs may share it)"
+            name = f"{kind}: later minus earlier condition, mean over {int(indexed['runs'].max())} runs on {n_pairs} donor pairs"
             condition_panels.append((name, indexed["mean"].unstack("receiver")))
             condition_marks[name] = ((indexed["same_sign"] == indexed["runs"]) & (indexed["runs"] >= 2)).unstack("receiver")
             consistent = table[(table["same_sign"] == table["runs"]) & (table["runs"] >= 2)]
@@ -1122,8 +1125,9 @@ def write_summary(results) -> Path:
             out += [
                 f"## Condition: later minus earlier condition name, {kind} flows, one donor pair per run",
                 "",
-                f"{len(consistent)} of {len(table)} pairs keep their sign over all runs. With {n_runs} independent donor pairs that alone happens for {2 * 0.5**n_runs:.0%} by chance "
-                "(runs that share a test slide are not independent).",
+                f"{len(consistent)} of {len(table)} pairs keep their sign over all {n_runs} runs. The runs are read on {n_pairs} distinct sets of test sections, so they hold "
+                f"{n_pairs} independent donor pairs; with {n_pairs} pairs one sign happens for {2 * 0.5**n_pairs:.0%} of flows by chance (at least that many, since runs on one slide "
+                "agree more than chance).",
                 "",
                 md_table(consistent.head(TABLE_ROWS)),
                 "",

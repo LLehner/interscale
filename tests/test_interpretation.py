@@ -790,6 +790,7 @@ def test_a_report_is_rebuilt_from_its_tables_and_the_summary_reads_over_runs(tmp
         and "Programmes found again" in text
         and "one donor pair per run" in text
     )
+    assert "distinct sets of test sections, so they hold 1 independent donor pairs" in text  # the toy runs share their sections
     report = (tmp_path / "runs" / "rand50_f0" / "report.md").read_text()
     for heading in ("## 1.", "## 2.", "## 3.", "## 4.", "## 5.", "## 6.", "How far this goes"):
         assert heading in report
