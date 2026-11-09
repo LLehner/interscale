@@ -92,6 +92,11 @@ class HierarchySettings:
     chunk_pairs: int = 2**24
     seed: int = 0
     spatial_unit_um: float = 1.0
+    # The sparse-key penalty (optim.aux_loss_weights.sparse_keys > 0): the Data attribute the density bins arrive under, the
+    # number of bins below 1, and the threshold of the key weight (tl.density.sparsity_weights). Empty label: off, nothing computed.
+    sparse_key_label: str = ""
+    sparse_key_bins: int = 20
+    sparse_key_threshold: float = 0.6
 
     @property
     def n_levels(self) -> int:
@@ -162,7 +167,23 @@ def hierarchy_settings(cfg) -> HierarchySettings | None:
         chunk_pairs=int(cand.chunk_pairs),
         seed=int(cfg.optim.get("seed", 0) or 0),
         spatial_unit_um=float(cfg.dataset.get("spatial_unit_um", 1.0)),
+        **_sparse_key_settings(cfg),
     )
+
+
+def _sparse_key_settings(cfg) -> dict:
+    """The sparse-key fields of :class:`HierarchySettings`: empty unless ``optim.aux_loss_weights.sparse_keys`` is non-zero."""
+    weights = cfg.optim.get("aux_loss_weights", None)
+    if weights is None or float(weights.get("sparse_keys", 0.0) or 0.0) == 0.0:
+        return {}
+    from interscale.tl.geome_utils import label_attribute
+
+    keys = cfg.optim.sparse_keys
+    return {
+        "sparse_key_label": label_attribute(cfg, str(keys.obs_key)),
+        "sparse_key_bins": int(keys.n_bins),
+        "sparse_key_threshold": float(keys.threshold),
+    }
 
 
 @dataclass
@@ -175,6 +196,7 @@ class GraphLayout:
     hierarchies: list  # one Hierarchy, or two under shift (layers alternate)
     nodes: list | None = None  # the graph-local node indices pad_batch kept, in sequence order
     radius_um: torch.Tensor | None = None  # [n] each kept cell's density radius (µm), under pe.distance.units local
+    key_sparsity: torch.Tensor | None = None  # [n] each kept cell's weight as a key under the sparse-key penalty, in [0, 1]
 
 
 class HierarchicalContext:
@@ -204,6 +226,21 @@ class HierarchicalContext:
         self.training = training
         self.cache: dict = {}
         self.record: list | None = None
+        # The sparse-key penalty of this pass: the sum over cell queries and heads of each layer's sparsity-weighted key mass, and
+        # how many query-head rows went into it (graphs without key_sparsity add nothing).
+        self.penalty_sum: torch.Tensor | None = None
+        self.penalty_rows = 0
+
+    def add_penalty(self, total: torch.Tensor, rows: int) -> None:
+        """Add one layer's (one graph's) sparsity-weighted key mass, summed over ``rows`` query-head rows."""
+        self.penalty_sum = total if self.penalty_sum is None else self.penalty_sum + total
+        self.penalty_rows += int(rows)
+
+    def sparse_key_penalty(self) -> torch.Tensor | None:
+        """The mean sparsity-weighted key mass per cell query, head and layer of this pass; None when nothing was penalised."""
+        if self.penalty_sum is None or self.penalty_rows == 0:
+            return None
+        return self.penalty_sum / self.penalty_rows
 
 
 def offset_bias(bias, offsets_um: torch.Tensor, query_radius_um: torch.Tensor | None = None) -> torch.Tensor | None:
@@ -576,13 +613,15 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
                 if self.layer_index < len(graph.hierarchies):
                     ctx.cache[key] = prior
                 prior = ctx.cache.get(key, prior)
+            # The sparse-key penalty reads the cell level only: there the keys are cells, whose density is known.
+            sparsity = graph.key_sparsity if level == L else None
             if self.settings.candidates == "dense":
                 outputs[level], attention[level] = self._dense_level(
-                    level, projected, tokens, prior, hier, ctx, L, cls, open_keys[level], radius[level]
+                    level, projected, tokens, prior, hier, ctx, L, cls, open_keys[level], radius[level], sparsity
                 )
             else:
                 outputs[level], attention[level] = self._routed_level(
-                    level, projected, tokens, prior, hier, ctx, L, cls, open_keys[level], radius[level]
+                    level, projected, tokens, prior, hier, ctx, L, cls, open_keys[level], radius[level], sparsity
                 )
 
         if ctx.record is not None:
@@ -627,8 +666,11 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         out = torch.einsum("hqk,khd->qhd", self._dropout(weights), v)
         return out, weights
 
-    def _dense_level(self, level, projected, tokens, prior, hier, ctx, L, cls, open_keys=None, radius=None):
-        """Level ``level`` >= 1 with every token of the level as a key: ``(output [n + 1, H, d], A [H, n, n + 1])``."""
+    def _dense_level(self, level, projected, tokens, prior, hier, ctx, L, cls, open_keys=None, radius=None, key_sparsity=None):
+        """Level ``level`` >= 1 with every token of the level as a key: ``(output [n + 1, H, d], A [H, n, n + 1])``.
+
+        ``key_sparsity`` ``[n]`` (the cell level under the sparse-key penalty): each query's attention mass on the cell keys,
+        weighted by them, summed over queries and heads, goes to ``ctx.add_penalty``."""
         q, k, v = projected[level]
         n, n_par = hier.counts[level], hier.counts[level - 1]
         mode = self.settings.prior_mode
@@ -682,6 +724,8 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
                 log_w = cluster_scores.log_softmax(-1)
                 logits = within + log_w.gather(-1, pk.expand(log_w.shape[0], n, -1))
         weights = logits.softmax(-1)
+        if key_sparsity is not None:
+            ctx.add_penalty((weights[:, :, :n] * key_sparsity.to(weights.dtype)[None, None, :]).sum(), weights.shape[0] * n)
         out = torch.einsum("hqk,khd->qhd", self._dropout(weights), v)
         return out, weights
 
@@ -741,8 +785,11 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
         picks = torch.multinomial(mean.float().cpu(), n_draw, replacement=True, generator=gen).to(device)
         return keys.gather(-1, picks)
 
-    def _routed_level(self, level, projected, tokens, prior, hier, ctx, L, cls, open_keys=None, radius=None):
-        """Level ``level`` >= 1, routed: ``(output [n + 1, H, d], SparseRows)``, a block of parents at a time."""
+    def _routed_level(self, level, projected, tokens, prior, hier, ctx, L, cls, open_keys=None, radius=None, key_sparsity=None):
+        """Level ``level`` >= 1, routed: ``(output [n + 1, H, d], SparseRows)``, a block of parents at a time.
+
+        ``key_sparsity`` ``[n]`` (the cell level under the sparse-key penalty): as in :meth:`_dense_level`, block by block (inside the
+        recomputed block when the block is checkpointed, so its gradient reaches the scores)."""
         q_all, k_all, v_all = projected[level]
         n, n_par = hier.counts[level], hier.counts[level - 1]
         H, d = self.n_heads, self.head_dim
@@ -831,26 +878,46 @@ class HierarchicalEncoderLayer(CustomTransformerEncoderLayer):
                     logits = within + torch.cat([log_w[..., slot], log_w[..., -1:]], -1)
             weights = logits.softmax(-1)
             out = torch.einsum("ghqk,gkhd->gqhd", self._dropout(weights), v)
-            return out, weights
+            penalty = None
+            if key_sparsity is not None:
+                s_keys = torch.where(kid >= 0, key_sparsity.to(weights.dtype)[kid.clamp_min(0)], torch.zeros_like(kid, dtype=weights.dtype))
+                per_row = (weights[..., :-1] * s_keys[:, None, None, :]).sum(-1)  # [G, H, m]
+                penalty = (per_row * (qi >= 0)[:, None, :].to(per_row.dtype)).sum()
+            return out, weights, penalty
 
         outs, rows = [], []
         n_blocks = math.ceil(n_par / rows_per_block)
         for b in range(n_blocks):
             start, stop = b * rows_per_block, min(n_par, (b + 1) * rows_per_block)
+            penalty = None
             if last and not keep_weights and self.training and n_blocks > 1:
-                out = torch.utils.checkpoint.checkpoint(
-                    lambda *t, s=start, e=stop: block(s, e, *t)[0],
-                    q_all,
-                    k_all,
-                    v_all,
-                    a,
-                    a_cls,
-                    kbar,
-                    use_reentrant=False,
-                )
+                if key_sparsity is None:
+                    out = torch.utils.checkpoint.checkpoint(
+                        lambda *t, s=start, e=stop: block(s, e, *t)[0],
+                        q_all,
+                        k_all,
+                        v_all,
+                        a,
+                        a_cls,
+                        kbar,
+                        use_reentrant=False,
+                    )
+                else:
+                    out, penalty = torch.utils.checkpoint.checkpoint(
+                        lambda *t, s=start, e=stop: block(s, e, *t)[0::2],
+                        q_all,
+                        k_all,
+                        v_all,
+                        a,
+                        a_cls,
+                        kbar,
+                        use_reentrant=False,
+                    )
                 w = None
             else:
-                out, w = block(start, stop, q_all, k_all, v_all, a, a_cls, kbar)
+                out, w, penalty = block(start, stop, q_all, k_all, v_all, a, a_cls, kbar)
+            if penalty is not None:
+                ctx.add_penalty(penalty, H * int((children[start:stop] >= 0).sum()))
             outs.append(out)
             rows.append(w)
         out = torch.cat(outs, 0)  # [P, m, H, d]

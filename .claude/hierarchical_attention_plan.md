@@ -708,3 +708,16 @@ becomes P0 for lung_plan.md L2. Its annotation caveat (T1) decides how it is rea
 - From memory, not looked up: Focal Transformer (Yang et al., NeurIPS 2021), PVT (Wang et al., ICCV 2021), FMMformer (Nguyen et al.,
   NeurIPS 2021), H-Transformer-1D (Zhu and Soricut, ACL 2021), Point Transformer V3 (Wu et al., CVPR 2024), Routing Transformer
   (Roy et al., TACL 2021), Combiner (Ren et al., NeurIPS 2021).
+
+
+## Sparse-key penalty (built 2026-11-09)
+
+| item | status |
+|---|---|
+| `optim.aux_loss_weights.sparse_keys` + `optim.sparse_keys` (obs_key, n_bins, threshold); `tl/density.py` (relative density per section, ordered bins, key weights) | built, tested (`tests/test_sparse_key_penalty.py`, 10 tests, 3 mutants killed) |
+| computed in the cell level (`_dense_level`, `_routed_level`, recomputed blocks), accumulated on `HierarchicalContext`, out through `ViewOutput.attn_penalty` | built; forward unchanged bit for bit |
+| first use: `slurm/new/cosmx_typeres.py` (arm `typeres_sparse`, weight 0.1, threshold 0.6) | written, not run |
+
+Why: the user (2026-11-09) wants attention nudged away from sparse tissue (edges, holes, FOV seams), "not too restrictive". Linear ramp below 0.6 of
+the section's median density, so a tissue edge (about half density) weighs ~0.17 and an isolated cell 1; CLS stays an unpenalised sink. Only the
+cell level is penalised (there the keys are cells with a known density); a coarse cluster in sparse tissue is not.

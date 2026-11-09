@@ -1281,3 +1281,10 @@ Things that fail silently rather than loudly:
 - [ ] the ring's inner radius equals the attention mask's reach — derived, not configured
 - [ ] `_ring_nce_gap` read as a *trend*, not a sign
 - [ ] no cross-slide positive or negative unless donor and condition are held fixed across the pair
+
+
+## 2026-11-09 — a non-contrastive term in the same registry: `sparse_keys`
+
+`train/aux_losses.SparseKeyPenalty` (weight `optim.aux_loss_weights.sparse_keys`, default 0, never built): reads `ViewOutput.attn_penalty`, which the
+hierarchical attention fills; refuses a model without a hierarchy and a bin column missing from `dataset.extra_obs_keys`; reports 0 without gradient on a
+pass that has none. Design and invariants: `hierarchical_attention_plan.md`, "Sparse-key penalty". Status: built, tested, not run.

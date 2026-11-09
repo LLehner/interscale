@@ -437,6 +437,22 @@ class TransformerNodeEncoderHook(GlobalModule):
             codes = niche_codes(batched_data, settings.top_label).to(device)
             edges = batched_data.edge_index.to(device=device, dtype=torch.long)
             local = torch.full((len(batch),), -1, dtype=torch.long, device=device)
+        # The sparse-key penalty: each cell's weight as a key, from its density bin (tl.density; code -1, no bin: weight 0).
+        key_weight = None
+        if settings.sparse_key_label:
+            from interscale.tl.density import sparsity_weights
+            from interscale.tl.niches import niche_codes
+
+            table = torch.as_tensor(
+                sparsity_weights(settings.sparse_key_bins, settings.sparse_key_threshold), dtype=torch.float32, device=device
+            )
+            bins = niche_codes(batched_data, settings.sparse_key_label).to(device)
+            if int(bins.max()) >= len(table):
+                raise ValueError(
+                    f"the density bins {settings.sparse_key_label!r} have more categories than optim.sparse_keys.n_bins + 1 "
+                    f"({len(table)}): build them with tl.density.density_bins(n_bins={settings.sparse_key_bins})."
+                )
+            key_weight = torch.where(bins >= 0, table[bins.clamp_min(0)], torch.zeros_like(table[:1]).expand_as(bins))
         graphs = []
         for g, kept in enumerate(index_nodes):
             rows = (batch == g).nonzero().squeeze(1)[torch.as_tensor(kept, dtype=torch.long, device=device)]
@@ -457,7 +473,8 @@ class TransformerNodeEncoderHook(GlobalModule):
             radius = None
             if density is not None:
                 radius = density[rows] * float(settings.spatial_unit_um)
-            graphs.append(GraphLayout(seq_len - len(kept), where, visible, hierarchies, list(kept), radius))
+            sparsity = key_weight[rows] if key_weight is not None else None
+            graphs.append(GraphLayout(seq_len - len(kept), where, visible, hierarchies, list(kept), radius, sparsity))
         coarse = None
         if self.attention_bias is not None and settings.coarse_bias == "shared":
             coarse = [self.attention_bias] * settings.n_levels

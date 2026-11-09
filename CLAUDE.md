@@ -707,3 +707,12 @@ across epochs and the curve is comparable.
 mean of the cell's label (`label_means`, a buffer sized by the data, set in `train` from the training graphs only, saved with the model), and the loss reads prediction and target minus it, cell by cell (`StepOutput.target_center`).
 Inputs are unchanged, so a sender's type stays readable. The column must reach the graphs (`dataset.extra_obs_keys`). `tl._preprocessing.imitation_labels` gives clusters where no annotation exists, fitted on training cells.
 Score with `masked_probing.within_groups` (every head and the truth on its own mean per group; it also works for a gene hidden in every cell, where `within_section` has no visible mean). `FittedReferences(k_nearest=...)` are the ridge bars on neighbour lists, for whole sections.
+
+**The sparse-key penalty** (`optim.aux_loss_weights.sparse_keys`, settings `optim.sparse_keys`; `tl/density.py`; hierarchical attention only;
+`.claude/hierarchical_attention_plan.md`, "Sparse-key penalty"): the mean over cell queries, heads and layers of `sum_k a_qk s_k`, with `s_k =
+clamp(1 - d_k / threshold, 0, 1)` from the key's relative density `d_k`. Invariants: **density on whole sections** (`tl.density.relative_density`,
+radius = `radius_factor` x the section's median nearest-neighbour distance, before any crop), reaching the graphs as an ordered categorical in
+`dataset.extra_obs_keys` (`density_bins`; one-hot column order = code order); **computed inside the cell level** on the weights the pass uses
+(`_dense_level`, `_routed_level`, inside a recomputed block so its gradient reaches the scores), accumulated on `HierarchicalContext` and out through
+`ViewOutput.attn_penalty`; **CLS is never penalised** (the sink stays open); weight 0 computes nothing and the forward pass is unchanged by the option
+bit for bit (tested). Coarse cluster tokens are not penalised.

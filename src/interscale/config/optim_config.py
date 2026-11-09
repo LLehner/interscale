@@ -122,6 +122,20 @@ def get_optim_cfg(cfg):
     cfg.optim.aux_loss_weights.orth_loadings = 0.0
     cfg.optim.aux_loss_weights.orth_decorrelation = 0.0
     cfg.optim.aux_loss_weights.orth_loading_ortho = 0.0
+    # Sparse-key penalty (hierarchical attention only; roadmap task 3, 2026-11-09): the mean, over every cell query, head and layer,
+    # of the attention mass a query puts on cell keys in sparse tissue, each key weighted by how sparse it is (in [0, 1]). CLS is not
+    # penalised, so "read nothing" stays open. See `optim.sparse_keys` and `interscale.tl.density`.
+    cfg.optim.aux_loss_weights.sparse_keys = 0.0
+
+    # Settings of the sparse-key penalty. Inert until it carries a weight.
+    cfg.optim.sparse_keys = CN()
+    # The obs column of relative-density bins (`tl.density.density_bins`, computed on whole sections); it must reach the graphs
+    # through dataset.extra_obs_keys.
+    cfg.optim.sparse_keys.obs_key = "density_bin"
+    # The bins below 1 that column has (it has one more, for 1 and above).
+    cfg.optim.sparse_keys.n_bins = 20
+    # A key's weight is clamp(1 - relative density / threshold, 0, 1): 0 from this share of the section's median density up.
+    cfg.optim.sparse_keys.threshold = 0.6
 
     # Settings of the orthogonality terms. Inert until one of them carries a weight.
     cfg.optim.orthogonality = CN()

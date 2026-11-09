@@ -48,6 +48,9 @@ class ViewOutput:
         graph-level prediction, where tokens are not gathered per cell.
     attn
         Stacked per-layer attention weights, or ``None``.
+    attn_penalty
+        The hierarchical attention's sparse-key penalty of this pass (a scalar with its gradient), or ``None`` when it is off
+        (``optim.aux_loss_weights.sparse_keys``) or the module is not hierarchical.
     """
 
     local_embedding: torch.Tensor | None = None
@@ -55,6 +58,7 @@ class ViewOutput:
     src_padding_mask: torch.Tensor | None = None
     padded_node_idx: torch.Tensor | None = None
     attn: torch.Tensor | None = None
+    attn_penalty: torch.Tensor | None = None
 
     def tokens(self) -> torch.Tensor:
         """``[N_kept, E]`` real cell tokens -- see :func:`gather_tokens`."""

@@ -1254,3 +1254,32 @@ class OrthLoadingOrtho(OrthogonalityTerm):
 
     def value(self, out, batch):
         return loading_orthogonality(global_loading(self.owner, self.name))
+
+
+@register_aux_loss("sparse_keys")
+class SparseKeyPenalty(AuxLoss):
+    """Attention mass on cell keys in sparse tissue, each key weighted by how sparse it is (roadmap task 3, 2026-11-09).
+
+    The hierarchical attention computes it in its cell level, on the attention the pass uses (``HierarchicalContext.add_penalty``),
+    and hands it out through ``ViewOutput.attn_penalty``: the mean over every cell query, head and layer of ``sum_k a_qk s_k``, with
+    ``s_k = clamp(1 - d_k / threshold, 0, 1)`` from the key's relative density ``d_k`` on its whole section (``tl.density``). In
+    [0, 1]. CLS is not penalised, so a query with nothing worth reading can put its mass there. Settings: ``optim.sparse_keys``.
+    A pass without the density bins (or without a hierarchy) reports 0 with no gradient.
+    """
+
+    def __init__(self, cfg, module=None):
+        super().__init__()
+        hier = cfg.model.global_component.get("parameters", {}).get("hierarchy", None)
+        if hier is None or hier.get("kind", "none") == "none":
+            raise ValueError("optim.aux_loss_weights.sparse_keys is computed by the hierarchical attention: set hierarchy.kind.")
+        if not float(cfg.optim.sparse_keys.threshold) > 0:
+            raise ValueError("optim.sparse_keys.threshold must be positive.")
+        key = str(cfg.optim.sparse_keys.obs_key)
+        if key not in (list(cfg.dataset.get("extra_obs_keys", []) or [])):
+            raise ValueError(f"optim.sparse_keys.obs_key {key!r} must reach the graphs: add it to dataset.extra_obs_keys.")
+
+    def forward(self, out: StepOutput, batch) -> dict[str, torch.Tensor]:
+        penalty = out.view.attn_penalty
+        if penalty is None:
+            return {"sparse_keys": out.y_pred.new_zeros(())}
+        return {"sparse_keys": penalty.to(out.y_pred.dtype)}

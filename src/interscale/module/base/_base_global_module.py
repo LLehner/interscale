@@ -617,7 +617,10 @@ class GlobalModule(BaseModule):
         )
         assert not torch.any(torch.isnan(embedding)), "embedding contains NaN values"
 
-        global_embedding, src_padding_mask, pad_index_nodes, _, attn_matrix = self.step(batch_masked, embedding)
+        global_embedding, src_padding_mask, pad_index_nodes, attention_mask, attn_matrix = self.step(batch_masked, embedding)
+        # The hierarchy's context carries the sparse-key penalty of the pass (None when it is off).
+        penalty_of = getattr(attention_mask, "sparse_key_penalty", None)
+        attn_penalty = penalty_of() if callable(penalty_of) else None
 
         if prediction_task == "classification" and prediction_level == "graph":
             y_true = batch.y[batch.ptr[:-1]]
@@ -664,6 +667,7 @@ class GlobalModule(BaseModule):
                     src_padding_mask=src_padding_mask,
                     padded_node_idx=padded_node_idx,
                     attn=attn_matrix,
+                    attn_penalty=attn_penalty,
                 )
             ],
         )
