@@ -651,6 +651,18 @@ cell. Invariants:
   The user wants sources or sinks found, if there are any, not made: nothing in these views selects cells, places or a share of either by what it shows. The
   mask still shapes the flow (hidden cells read their visible neighbours), so read every view against the untrained twin's.
 
+#### Flow domains (`evaluation/flow_domains.py`; roadmap.md "Vector-field context", 2026-11-12)
+
+A thesis chapter's pipeline (host-pathogen Visium) rebuilt as functions of arrays, so it runs on any dataset and against planted truth:
+relevance (`relevance_matrix`, the chapter's `ReLU(mean grad ⊙ attn)` with the gradient of the **masked loss** from
+`attention_with_gradients`; or `head_mean_matrix`), net flow normalised per graph, cell vectors by two constructions (`sender_vectors`,
+the chapter's Eq. 4.8, anchored at the sender; `midpoint_vectors`, ours, whose exact per-cell divergence is `out - in`), gridded fields per
+label channel (`grid_fields`: deposit, smoothing, magnitude, divergence), k-means domains (`flow_domains`, on tissue grid points only),
+roles by a divergence z-threshold (`domain_roles`), the net balance between domains (`net_balance`), and the scores against planted
+senders / receivers (`planted_scores`: AUROC of the divergence, share in a source / sink domain; `partition_agreement`: ARI of two
+partitions). `run_pipeline` strings them for one graph. Pinned by tests: a sender read from all sides has a zero sender-anchored vector
+(the chapter's stated limitation), the exact `out - in` finds it; the cluster hook is `slurm/November/flow_pipeline.py`.
+
 #### Embedding dimensions (`evaluation/dimensions.py`; `.claude/roadmap.md`, task 2, ED0-ED2)
 
 What the decoder reads off each dimension of the embedding a **linear** decoder reads (a GlobalModel's global tokens, hierarchical
