@@ -1074,6 +1074,38 @@ def _validate_group_offset(cfg):
         raise ValueError("model.decoder.group_offset needs regression at prediction_level node.")
 
 
+def _validate_bilinear(cfg):
+    """``model.decoder.bilinear``: a rank >= 0; on, a head index the transformer has, dense attention (the map must exist), no
+    pooling or hierarchy (no cell-over-cells map), regression at node level (a per-cell reconstruction term)."""
+    bilinear = cfg.model.decoder.get("bilinear", None)
+    if bilinear is None:
+        return
+    rank, head = int(bilinear.get("rank", 0)), int(bilinear.get("head", -1))
+    if rank < 0:
+        raise ValueError(f"model.decoder.bilinear.rank must be >= 0 (0: off), got {rank}.")
+    if rank == 0:
+        if head != -1:
+            raise ValueError(f"model.decoder.bilinear.head {head} is read with a rank > 0; the part is off.")
+        return
+    params = cfg.model.global_component.get("parameters", None)
+    if params is None or cfg.model.global_component.name != "self-attn-transformer":
+        raise ValueError("model.decoder.bilinear reads the transformer's attention map: it needs the self-attn-transformer.")
+    if head < -1 or head >= int(params.n_heads):
+        raise ValueError(f"model.decoder.bilinear.head must be -1 (head mean) or a head below n_heads {int(params.n_heads)}, got {head}.")
+    attention = params.get("attention", None)
+    kind = attention.get("kind", "dense") if attention is not None else "dense"
+    if kind != "dense":
+        raise ValueError(f"model.decoder.bilinear needs the explicit attention map: attention.kind dense, not {kind!r}.")
+    pooling = params.get("pooling", None)
+    if pooling is not None and pooling.get("kind", "none") != "none":
+        raise ValueError("model.decoder.bilinear needs a cell-level attention map; pooling attends between patches.")
+    hierarchy = params.get("hierarchy", None)
+    if hierarchy is not None and hierarchy.get("kind", "none") != "none":
+        raise ValueError("model.decoder.bilinear needs one cell-over-cells attention map; a hierarchical transformer has none.")
+    if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":
+        raise ValueError("model.decoder.bilinear adds a per-cell reconstruction term: it needs regression at prediction_level node.")
+
+
 def _validate(cfg):
     """Run every load-time check.
 
@@ -1099,6 +1131,7 @@ def _validate(cfg):
     _validate_own_cell_skip(cfg)
     _validate_section_offset(cfg)
     _validate_group_offset(cfg)
+    _validate_bilinear(cfg)
     _validate_sce(cfg)
     _validate_center_targets(cfg)
     _validate_global_residual(cfg)

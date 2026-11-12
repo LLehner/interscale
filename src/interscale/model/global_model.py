@@ -131,6 +131,9 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
                 node_idx=torch.as_tensor(pad_index_nodes[0], dtype=torch.long, device=embedding.device),
                 section=self.module.section_input(batch, masked=False),
                 group=self.module.group_input(batch, masked=False),
+                bilinear=self.module.bilinear_input(
+                    batch, self.module.last_attention_map(), pad_index_nodes, src_padding_mask, masked=False
+                ),
             )
 
             # I = self_attention_relevance.generate_relevance(transformer_in, src_padding_mask)

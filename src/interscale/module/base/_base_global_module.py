@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from sklearn.decomposition import NMF, PCA
 
 from interscale.tl.masking import MASK_VALUE
+from interscale.tl.padding import pad_like
 
 from ._base_module import BaseModule
 from ._step_output import StepOutput, ViewOutput, gather_cls, gather_tokens
@@ -32,6 +33,8 @@ class GlobalModule(BaseModule):
         own_cell_skip: bool = False,
         own_cell_skip_input: str = "embedding",
         context_only: str = "none",
+        bilinear_rank: int = 0,
+        bilinear_head: int = -1,
         **base_module_kwargs,
     ):
         """``precomputed_mask_fill``: what a hidden cell's ``Precomputed`` embedding is replaced by.
@@ -68,9 +71,36 @@ class GlobalModule(BaseModule):
         its position alone (``TransformerNodeEncoderHook.forward``): the transformer's queries come from one learned
         token plus the cell's node encoding, never from the cell's own token, and they read the cells' input tokens
         through the layers' weights. ``context_token`` is that learned token. ``"none"``: the transformer as it was.
+
+        ``bilinear_rank``: ``r > 0`` adds the part ``bilinear`` to the prediction, ``y_i = sum_j a_ij (x_j V) U^T`` with ``a_ij``
+        the last encoder layer's attention of cell ``i`` over cell ``j`` (``bilinear_head`` -1: the head mean; else that head),
+        ``x_j`` the neighbours' *visible* genes (a hidden entry is 0, so no hidden value reaches the part), ``V`` ``[n_input, r]``
+        and ``U`` ``[n_output, r]``; ``B = U V^T`` is a rank-``r`` gene-to-gene map, sender gene to receiver gene, readable from
+        the parameters (:mod:`interscale.evaluation.bilinear`). ``U`` starts at zero (the model starts as without the part) and
+        ``V`` is drawn from a private generator, so the other weights are initialised as without it. The map must exist with
+        its gradient: the transformer keeps its last layer's map (``return_attention_maps``), dense attention only, no pooling
+        (patch maps are not cell maps) and no hierarchy. 0: off, no state.
         """
         super().__init__(**base_module_kwargs)
         self.pooling = pooling
+        self.bilinear_rank = int(bilinear_rank)
+        self.bilinear_head = int(bilinear_head)
+        if self.bilinear_rank < 0:
+            raise ValueError(f"bilinear_rank must be >= 0, got {bilinear_rank}.")
+        if self.bilinear_rank:
+            if self.type_gex_embedding is None:
+                raise ValueError(
+                    "the bilinear part reads the cells' genes through the transformer's own attention map; it is built for a "
+                    "GlobalModel (a CombinedModel's tokens are the local component's output)."
+                )
+            if pooling is not None:
+                raise ValueError("the bilinear part needs a cell-level attention map; a pooled model attends between patches.")
+            # V from a private generator, U zeros: no draw from the global RNG, the model starts as the one without the part.
+            gen = torch.Generator().manual_seed(0)
+            self.bilinear_sender = torch.nn.Parameter(
+                torch.randn(self.n_input, self.bilinear_rank, generator=gen) / float(self.n_input) ** 0.5
+            )
+            self.bilinear_receiver = torch.nn.Parameter(torch.zeros(self.n_output, self.bilinear_rank))
         if remask not in REMASK_KINDS:
             raise ValueError(f"remask must be one of {REMASK_KINDS}, got {remask!r}.")
         self.remask = remask
@@ -205,6 +235,48 @@ class GlobalModule(BaseModule):
         if self.own_cell_skip_input == "raw":
             return batch.x.float()
         return embedding
+
+    def bilinear_input(self, batch, attn, index_nodes, src_padding_mask, masked: bool = True) -> torch.Tensor | None:
+        """``[N, r]`` in batch node order: what the bilinear part reads, ``sum_j a_ij (x_j V)``; None when the part is off.
+
+        ``attn``: the stacked per-layer maps :meth:`step` returned (``[layers, B * heads, S + 1, S + 1]``, CLS the last key and
+        query, left padding), or the last layer's map alone (``[B * heads, S + 1, S + 1]``); ``index_nodes`` and
+        ``src_padding_mask`` of the same call, so the keys are laid out as the tokens were (``pad_like``). ``masked``: ``batch``
+        is the masked batch of a training-style pass and its hidden entries are set to 0 before ``V`` (no hidden value reaches
+        the part; a cell hidden whole contributes nothing but its attention mass); False: a clean batch, every entry counts.
+        A cell ``pad_batch`` left out gets a zero row. A model whose transformer kept no map refuses (``attn`` None).
+        """
+        if not self.bilinear_rank:
+            return None
+        if attn is None:
+            raise ValueError(
+                "the bilinear part needs the last encoder layer's attention map, but this pass kept none: the transformer "
+                "must keep its maps (return_attention_maps) and the attention backend must form them (attention.kind dense)."
+            )
+        last = attn[-1] if attn.dim() == 4 else attn
+        x = batch.x.float()
+        visible = self.visible_entries(batch) if masked else torch.ones(x.shape, dtype=torch.bool, device=x.device)
+        values = torch.where(visible, x, torch.zeros_like(x)) @ self.bilinear_sender.to(x.dtype)  # [N, r]
+        graph = getattr(batch, "batch", None)
+        graph = torch.zeros(x.shape[0], dtype=torch.long, device=x.device) if graph is None else graph.long()
+        n_graphs = len(index_nodes)
+        seq_len = src_padding_mask.shape[1] - 1  # keys without CLS
+        padded = pad_like(values, graph, index_nodes, seq_len)  # [B, S, r]
+        heads = last.shape[0] // n_graphs
+        maps = last.view(n_graphs, heads, last.shape[1], last.shape[2])[:, :, :seq_len, :seq_len]  # cell queries over cell keys
+        if self.bilinear_head < 0:
+            a = maps.mean(dim=1)
+        else:
+            if self.bilinear_head >= heads:
+                raise ValueError(f"bilinear_head {self.bilinear_head} but the map has {heads} heads.")
+            a = maps[:, self.bilinear_head]
+        received = torch.bmm(a.to(padded.dtype), padded)  # [B, S, r], a cell's rows in token layout
+        out = values.new_zeros(x.shape[0], self.bilinear_rank)
+        offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=x.device), torch.bincount(graph, minlength=n_graphs).cumsum(0)[:-1]])
+        for b, kept in enumerate(index_nodes):
+            rows = torch.as_tensor(kept, dtype=torch.long, device=x.device) + offsets[b]
+            out[rows] = received[b, seq_len - len(kept) :]
+        return out
 
     def hide_embeddings(self, embedding: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
         """``embedding`` with the rows of ``hidden`` cells replaced by the mask fill.
@@ -528,17 +600,29 @@ class GlobalModule(BaseModule):
     #     return y_true, adjusted_mask_idx
 
     def predict_parts(
-        self, global_embedding, src_padding_mask, prediction_level, own_embedding=None, node_idx=None, section=None, group=None
+        self,
+        global_embedding,
+        src_padding_mask,
+        prediction_level,
+        own_embedding=None,
+        node_idx=None,
+        section=None,
+        group=None,
+        bilinear=None,
     ):
         """The named parts whose sum is :meth:`predict`: ``context`` (the decoder on the transformer's tokens), under
-        ``own_cell_skip`` ``own_cell``, under ``section_offset`` ``section``, under ``group_offset`` ``group``.
+        ``own_cell_skip`` ``own_cell``, under ``section_offset`` ``section``, under ``group_offset`` ``group``, under
+        ``bilinear_rank`` ``bilinear`` (``U`` on what :meth:`bilinear_input` gathered).
 
         Same arguments as :meth:`predict`.
         """
         ## Graph-level prediction: get cls_token from last position
         if "graph" in prediction_level:
-            if self.own_cell_skip or self.section_offset != "none" or self.group_offset != "none":
-                raise ValueError("own_cell_skip, section_offset and group_offset are per-cell terms; a graph-level prediction has none.")
+            if self.own_cell_skip or self.section_offset != "none" or self.group_offset != "none" or self.bilinear_rank:
+                raise ValueError(
+                    "own_cell_skip, section_offset, group_offset and the bilinear part are per-cell terms; a graph-level "
+                    "prediction has none."
+                )
             return {"context": self.decoder(gather_cls(global_embedding))}
         ## Node-level prediction: remove cls_token from last position
         elif "node" in prediction_level:
@@ -564,12 +648,27 @@ class GlobalModule(BaseModule):
                         "group=module.group_input(batch, ...) and node_idx."
                     )
                 parts["group"] = group[node_idx].to(parts["context"].dtype)
+            if self.bilinear_rank:
+                if bilinear is None or node_idx is None:
+                    raise ValueError(
+                        "the bilinear part needs each cell's gathered input and the node index to predict: pass "
+                        "bilinear=module.bilinear_input(batch, attn, index_nodes, src_padding_mask) and node_idx."
+                    )
+                parts["bilinear"] = F.linear(bilinear[node_idx].to(parts["context"].dtype), self.bilinear_receiver)
             return parts
         else:
             raise Exception("Choose a valid prediction tasks (graph or node).")
 
     def predict(
-        self, global_embedding, src_padding_mask, prediction_level, own_embedding=None, node_idx=None, section=None, group=None
+        self,
+        global_embedding,
+        src_padding_mask,
+        prediction_level,
+        own_embedding=None,
+        node_idx=None,
+        section=None,
+        group=None,
+        bilinear=None,
     ):
         """Predict with the decoder.
 
@@ -592,9 +691,11 @@ class GlobalModule(BaseModule):
             clean at inference). Required under ``section_offset``, ignored otherwise.
         group: torch.Tensor | None
             ``[N, G]`` in batch node order: :meth:`group_input` of the same batch. Required under ``group_offset``.
+        bilinear: torch.Tensor | None
+            ``[N, r]`` in batch node order: :meth:`bilinear_input` of the same pass. Required under ``bilinear_rank``.
         """
         y_pred, *rest = self.predict_parts(
-            global_embedding, src_padding_mask, prediction_level, own_embedding, node_idx, section, group
+            global_embedding, src_padding_mask, prediction_level, own_embedding, node_idx, section, group, bilinear
         ).values()
         for part in rest:
             y_pred = y_pred + part
@@ -649,6 +750,7 @@ class GlobalModule(BaseModule):
             node_idx=padded_node_idx,
             section=self.section_input(batch_masked, masked=True),
             group=self.group_input(batch_masked, masked=True),
+            bilinear=self.bilinear_input(batch_masked, attn_matrix, pad_index_nodes, src_padding_mask, masked=True),
         )
         y_pred, *rest = parts.values()
         for part in rest:
@@ -710,6 +812,8 @@ class GlobalModule(BaseModule):
             attention = params.get("attention", None)
             n_embed = kwargs.get("n_embed")
             head_dim = attention_head_dim(attention, n_embed, params["n_heads"]) if n_embed is not None else None
+            bilinear = cfg.model.decoder.get("bilinear", None)
+            bilinear_rank = int(bilinear.get("rank", 0)) if bilinear is not None else 0
             return TransformerNodeEncoderHook(
                 max_seq_len=params["max_seq_len"],
                 n_heads=params["n_heads"],
@@ -719,7 +823,8 @@ class GlobalModule(BaseModule):
                 dim_feedforward=params["dim_feedforward"],
                 long_range_attention=params["long_range_attention"],
                 local_mask_hops=local_mask_hops,
-                return_attention_maps=cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION,
+                # The bilinear part reads the last layer's map in every training step, so the maps are kept for it too.
+                return_attention_maps=cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION or bilinear_rank > 0,
                 attention=attention,
                 attention_seed=int(cfg.optim.get("seed", 0) or 0),
                 precomputed_mask_fill=params.get("precomputed_mask_fill", "learned"),
@@ -729,6 +834,8 @@ class GlobalModule(BaseModule):
                 own_cell_skip=bool(cfg.model.decoder.get("own_cell_skip", False)),
                 own_cell_skip_input=str(cfg.model.decoder.get("own_cell_skip_input", "embedding")),
                 context_only=params.get("context_only", "none"),
+                bilinear_rank=bilinear_rank,
+                bilinear_head=int(bilinear.get("head", -1)) if bilinear is not None else -1,
                 hierarchy=hierarchy_settings(cfg),
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,

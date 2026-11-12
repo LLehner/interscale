@@ -63,5 +63,14 @@ def get_model_cfg(cfg):
     # neighbours do). "none": off. Not with section_offset visible_mean.
     cfg.model.decoder.group_offset = "none"
     cfg.model.decoder.group_offset_key = ""
+    # GlobalModel: a bilinear part y_bil = sum_j a_ij (x_j V) U^T, `a_ij` the last encoder layer's attention of cell i over
+    # cell j (head-mean, or one head), `x_j` the neighbours' visible genes (hidden entries 0), B = U V^T a low-rank gene-to-gene
+    # map (sender gene -> receiver gene) readable from the parameters (`evaluation.bilinear`; roadmap "The user's questions for
+    # next week", point 1). The transformer decides where the part reads, B which gene pairs; U starts at zero, so the model
+    # starts as without it. `rank` 0: off (no state, no random draw). `head` -1: the head mean, else that head's map. Dense
+    # attention only (the map must exist with its gradient); not pooled, not hierarchical.
+    cfg.model.decoder.bilinear = CN()
+    cfg.model.decoder.bilinear.rank = 0
+    cfg.model.decoder.bilinear.head = -1
 
     return cfg

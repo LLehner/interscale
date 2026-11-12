@@ -173,6 +173,16 @@ class TransformerNodeEncoderHook(GlobalModule):
         # shifts neither another weight's initialisation nor the batch order.
         self.attention_spec = ATTENTION_REGISTRY[self.attention_kind]
         self.attention_cfg = attention
+        if self.bilinear_rank:
+            # The part multiplies the last layer's explicit map: only the dense backend forms one, and the hierarchy's
+            # per-level maps are not one map of cells over cells.
+            if self.attention_kind != "dense":
+                raise ValueError(
+                    f"the bilinear part (model.decoder.bilinear.rank) reads the last layer's attention map, which attention.kind "
+                    f"{self.attention_kind!r} does not form: use attention.kind dense."
+                )
+            if hierarchy is not None:
+                raise ValueError("the bilinear part reads one cell-over-cells attention map; a hierarchical transformer has none.")
         # `attention.visible_keys_only`: no cell attends to a cell hidden whole (`_without_hidden_keys`).
         self.visible_keys_only = bool(attention.get("visible_keys_only", False)) if attention is not None else False
         self.attention_seed = int(attention_seed)
@@ -224,6 +234,8 @@ class TransformerNodeEncoderHook(GlobalModule):
         # Whether a training step hands every layer's attention map to its loss (the attention
         # entropy loss reads them). Off, `forward` keeps no map unless asked for relevance.
         self.return_attention_maps = bool(return_attention_maps)
+        if self.bilinear_rank and not self.return_attention_maps:
+            raise ValueError("the bilinear part reads the last layer's map in every step: build the transformer with return_attention_maps.")
         # Set only inside `recording_attention`: the list each pass appends its maps and layout to.
         self._attention_record = None
         # Set only inside `hooking_attention`: training-style passes hook their maps for relevance too.
@@ -783,11 +795,21 @@ class TransformerNodeEncoderHook(GlobalModule):
             transformer_in,
             src_padding_mask,
             attn_mask,
-            register_hook=False,
+            # A bilinear model keeps its maps (return_attention_maps): None lets this pass keep them too, so the last layer's map is
+            # readable afterwards (`last_attention_map`); any other model keeps nothing.
+            register_hook=None if self.bilinear_rank else False,
             rotary=rotary,
             **self._query_kwargs(given),
         )
         return transformer_in, transformer_out, src_padding_mask, pad_index_nodes
+
+    def last_attention_map(self) -> torch.Tensor | None:
+        """The last encoder layer's map of the latest pass, ``[B * heads, S + 1, S + 1]`` (None when it kept none).
+
+        What :meth:`~interscale.module.base.GlobalModule.bilinear_input` takes after :meth:`encode` or :meth:`evaluate`, which
+        return no maps; in a training step :meth:`forward` returns the stacked maps instead.
+        """
+        return self.transformer_encoder.layers[-1].get_attn_output_weights()
 
     def evaluate(self, batched_data, embedding):
         """Evaluates transformer encoder on a batch of data without masking and registering hook.

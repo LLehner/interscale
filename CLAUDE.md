@@ -470,6 +470,24 @@ group mean, without the label residual) and `composition` (label shares among th
 `ref_own+group`, `ref_own+context+group`, `ref_own+composition+group`, `ref_own+context+composition+group`; a saved fit keeps both
 attributes (an older fit loads with neither).
 
+### The bilinear part (`model.decoder.bilinear`; `.claude/decoder_plan.md`, D6)
+
+`rank` r > 0 (GlobalModel; default 0, off) adds a part `bilinear` = `sum_j a_ij (x_j V) U^T` to the prediction: `a_ij` the last
+encoder layer's attention of cell i over cell j (`head` -1: the head mean, else that head), `x_j` the neighbours' visible genes, `V`
+`[n_input, r]`, `U` `[n_output, r]`; `B = U V^T` is a readable sender-gene -> receiver-gene map (`evaluation.bilinear`: `gene_map`,
+`components`, `planted_recovery`, `compare_maps`, `pair_weights`). Invariants:
+
+- **The map is the encoder's, kept with its gradient.** `GlobalModule.from_config` sets `return_attention_maps` for the part, so
+  `forward` returns the stacked maps in every step and `encode` keeps the last layer's (`last_attention_map`); the part trains
+  the attention. Dense attention only (the validator and the encoder refuse fused / Performer / linear / Exphormer, pooling and
+  the hierarchy: no cell-over-cells map).
+- **No hidden value reaches it.** `bilinear_input` zeroes the hidden entries of the masked batch before `V`; a cell hidden whole
+  contributes only its attention mass; CLS is dropped from the keys and the weights are not renormalised.
+- **A named part.** `StepOutput.parts["global"]["bilinear"]`; every caller of `predict` / `predict_parts` must pass
+  `bilinear=module.bilinear_input(batch, attn, index_nodes, src_padding_mask, masked=...)` (the module refuses to predict without
+  it). `U` starts at zero and `V` is drawn from a private generator: off, no state and no random draw; on, the model starts as
+  without the part. Tag `-bil<r>[h<k>]` in the decoder part.
+
 ### Orthogonality terms (`train/orthogonality.py`, `.claude/decoder_plan.md`, D4)
 
 Eight auxiliary losses, each its own weight `optim.aux_loss_weights.orth_<name>` (default 0: never built): between the dual
