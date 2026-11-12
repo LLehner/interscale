@@ -37,6 +37,16 @@ Last updated 2026-10-29 (the focus until Tuesday 3 November, below the table); t
 | T9 | literature review and write-up | proposed | | |
 | T10 | comparison with other methods: classification (manuscript Fig. 2), communication methods, spatially variable genes, spatial domains | **workflow planned and started** ([comparison_plan.md](comparison_plan.md), 2026-10-25; CosMx first, synth_spot as the calibration): shared inputs (the section layout from the global pixels), the LIANA+ consensus resource cut to the panel, the output tables, and 4 of 7 baselines (LIANA+, `ligrec`, Moran's I, logistic regression) run locally on a 2-FOV copy; AMICI, Steamboat, NicheCompass, the InterScale arms and readouts, Visium and IMC not started. **2026-10-29: the lung fibrosis data added as the second dataset, with niches** ([lung_plan.md](lung_plan.md); data not ready); the comparison runner scripts were removed by the user, to be written again | local runs on a 2-FOV-per-section copy | 2026-10-29 |
 
+## Reminder set 2026-11-10: noise ceiling first (the user)
+
+After the cosmx_typeres read (every model ties the k-NN smoothers; notes.md 2026-11-10), the next step is to measure how much of a cell's within-type residual is predictable at all, before any new architecture.
+
+- **Ceiling script, not written yet:** count splitting (binomial thinning, p = 0.5) of each cell's raw counts into halves A and B; normalise each like the model's input; score B against A, and the k-NN smoothers built from A against B, by centred cosine within section and within section x `cell_type_coarse`, on the same 6,051 hidden test cells (FOV-shuffled split 0). Dataset-agnostic: label keys from config. Whole-dataset analysis, so a cluster job (flat in slurm/new/, < 12 h), not local.
+- **Read:** ceiling near 0.1 within type -> the data are the limit (report the CosMx negative result with the ceiling); near 0.3 -> the model underfits (architecture/objective work justified).
+- **After it:** constrained variant (senders pass ligands only, receivers predict receptor/target genes), legnini SHH first as the known positive control.
+- **Built 2026-11-10 (toy-checked, not run):** `notebooks_and_scripts/slurm/new/fable/{fields_common,noise_ceiling,band_fields}.py` + `fields.sbatch` (CPU, one job: ceiling, CosMx band fields on the type residual, synth_spot recovery). Plan: `/home/lehnerl/Arbeit/long-range-interaction-plan-v2.md`; notes.md 2026-11-10 (built entry).
+- **Run, read and extended 2026-11-11** (depth-model ceiling, FOV control; full rerun into `MA/12_11_results/fields/` pending): everything about it is in [`ceiling_plan.md`](ceiling_plan.md).
+
 ## Added 2026-11-05: nine high-priority tasks until Tuesday 10 November (the user)
 
 Asked while the net-flow permutation job runs. Where they compete, these take precedence over "Focus until Tuesday 10 November" below. That table's item 2 continues in tasks 1-2, its item 3 in tasks 3, 4 and 7, and its "T7, T8, T10 after details" is now partly specified by tasks 5 and 6. Its "not this week" list no longer rules out the attention and PE arms task 3 needs. The rule "older model, no new variants" (the user, 2026-11-05) is for the PR notebook; tasks 3 and 8 compare fork variants on purpose.
@@ -53,7 +63,7 @@ Asked while the net-flow permutation job runs. Where they compete, these take pr
 | 6 | 5, condition differences | per-slide T1D minus ND of the chosen flow | evaluation only | proposed | Sun 8 |
 | 7 | 6, CellAgentChat global results | `cellagent.sbatch`: run on global coordinates, read by gene | job | **written 2026-11-06, checked on synthetic data, not run**; script from August read `obsm['spatial']` (overlapping FOVs) | Sun 8 |
 | 8 | 8, global-only with an embedding as input | scVI and CellCharter tokens on CosMx | one job | `Precomputed` built; CellCharter not computed | Sun 8 - Mon 9 |
-| alongside | 9, thesis outline | `.claude/thesis_outline.md` with chapters and a page budget | none | not started | by Mon 9 |
+| alongside | 9, thesis outline | `.claude/thesis_outline.md` with chapters and a page budget | none | **first version 2026-11-11** (60 pages, user's target; slots S1-S8 for 11-24 Nov) | by Mon 9 |
 
 **CosMx splits (the user, 2026-11-05):** the predefined `split_0-2` (one slide per split) are not needed for regression; splits can be shuffled independently of donor. First used in task 4: FOVs shuffled within each section, 70 / 15 / 15 by cells, every donor in every split, six sections training instead of two. Scores on such splits say nothing about new donors and are not comparable with the donor-held-out ones. The running permutation notebook and the follow-up of `cosmx_masking` keep the predefined splits, so they stay comparable with their first runs.
 
@@ -142,7 +152,7 @@ Asked while the net-flow permutation job runs. Where they compete, these take pr
 
 - **Deliverable:** `.claude/thesis_outline.md`: chapters and sections with a page budget that adds up to about 50, and per section the plan file or `notes.md` entries it draws on and which figures exist.
 - **Sources:** `description.pdf` (the questions), the manuscript, `notes/summary.txt`, `notes.md`, the plan files, `gene_ranking_literature.md`, T9 below.
-- **State:** not started. No results needed for a first version; a section whose result is missing is marked so.
+- **State:** first version written 2026-11-11 ([thesis_outline.md](thesis_outline.md)): 60 pages (the user moved the target from ~50), the global component and the transformer as the focus, per section its sources, figures and state (have / partial / slot), and slots S1-S8 for experiments of 11-24 November. No results needed for a first version; a section whose result is missing is marked so.
 
 ## Focus until Tuesday 10 November (decided with the user on 2026-11-04)
 

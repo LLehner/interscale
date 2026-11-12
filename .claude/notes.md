@@ -1990,3 +1990,191 @@ What doesn't work / open:
 - The type-mean target was never read before: `rand50_type` (gene masking, donor folds) failed its first evaluation and its later scores were not copied here. So there is no earlier number to compare with.
 - Only the cell level is penalised; a coarse cluster token in sparse tissue is not. The readout reports the last layer only (the penalty acts on both layers).
 - Three seeds: the ensemble curve (needs 4) is not drawn; seed agreement and the per-arm SD are.
+
+## 2026-11-10 — Within-type shuffle benchmark (celltype_shuffle), first read: Steamboat complete, GITIII 0-10 %, InterScale failed
+
+Results: local `results/celltype_shuffle/` (report.md and figures rebuilt locally by `celltype_shuffle_read.py`; small tables only). CosMx, expression shuffled within section x `cell_type_coarse` (54 groups), nested levels 0/10/20/50/80/100 %, seed 42; every method on the same draw.
+
+**Incomplete run:**
+- **InterScale: nothing trained.** All six notebook runs died at the first training step with `CUDA error: no kernel image is available for execution on the device`: the job landed on an NVIDIA B300 node and the `interscale` env has torch 2.12.1+cu126, which has no kernels for that GPU. The `benchmark` env ran on the same GPU. Every job in the `interscale` env (cosmx_typeres, downstream, the ensemble read) can hit this.
+- **GITIII:** 0 % and 10 % only; 20 % was cut by the 12 h limit, the seed bar (seed 43 at 0 %) never ran. 118 min for the first fit, 68 min for the second (20 epochs; my estimate was 30-60).
+
+What worked:
+- **Steamboat's cell-type interaction matrix (the package's symmetric one) hardly moves:** Spearman with its own 0 % matrix 0.999 / 0.993 / 0.977 / 0.965 / 0.945 at 10-100 %, against 0.970 between two seeds at 0 %. Only 80-100 % fall below the seed bar, and only a little. Its pair ranking is set by who sits next to whom (composition), not by the within-type arrangement of expression. The directed matrix moves more (0.870 at 100 %, bar 0.978).
+- **What the shuffle does change in Steamboat is strength, not pattern:** the matrix's magnitude falls to 0.60 of 0 % (seed bar 0.88), and the local scale's marginal explained variance halves (0.101 -> 0.050; the second seed gives 0.125), while ego rises (0.174 -> 0.256) and the total stays (ev_full 0.240 -> 0.235). About half of what Steamboat's local attention explains is within-type spatial structure; the rest, and the whole pair ranking, is composition.
+- GITIII at 10 %: edge matrix 0.947, net 0.924, share 0.995 against its 0 %; no seed bar, so unread. Its fit is weak overall (median per-gene Pearson of the state 0.080, 0.079 at 10 %).
+
+What doesn't work / open:
+- No InterScale curve, so no comparison yet. Steamboat has one seed bar (two seeds); GITIII none.
+- Steamboat stopped at epoch 1742 at every seed-42 level (1748 at seed 43): the early-stopping trajectory is set by the seed; the levels' fits still differ (EV by scale).
+- Next: keep the `interscale` env off B300 (a GPU constraint) or give it a CUDA 12.9+ torch; resume in the same folder with STEPS="interscale gitiii read" (finished runs are skipped; GITIII's four levels + seed bar ~6 h).
+
+## 2026-11-10 — Type-residual target on whole cells (cosmx_typeres), first read: 2 of 3 seeds, sparse-key arm not run
+
+Results: local `results/cosmx_typeres/`. cell_l2 (hierarchical, 2 layers, whole cells hidden, FOV-shuffled split 0, the same 6,051 hidden test cells as the ensemble), `label_mean` on section x `cell_type_coarse`, 300 epochs (4.9 s an epoch: ~25 min training, ~2 min evaluation a run).
+
+**Incomplete run:** typeres_split0_s42, _s43 and the twin were evaluated. s44 trained to the end (best checkpoint at epoch 289, as s43) but has no saved model and no evaluation, and the sparse-key arm never started. The read step ran afterwards, so the training process ended early as a whole (sweep_common would have gone on to the next run after an ordinary error): likely killed (host memory?) during s44's save or evaluation. The job log decides it. Not the time limit (the whole job would have stopped, read included).
+
+What worked:
+- **Within section x type the model is at the best smoother for the first time on CosMx:** centred cosine 0.085 / 0.088 (seed SD 0.002) against ref_nearest_128 0.083, _32 0.069, _8 0.049; the untrained twin 0.0005 (it has the type means and nothing else). Small margin (+0.004), two seeds.
+- **No over-attention to sparse tissue in this model:** hidden queries' last-layer attention on keys below 0.6 of the section's median density is 4.0-5.1 % of their mass, while 6.9 % of the cells are that sparse; weighted mass 0.008-0.010 against the twin's 0.010. The pull towards edges and sparse regions the user saw is not in these rows; the penalty arm has little to remove here (other models and the visible-query flow plots may differ).
+- Flow learned, not geometry: trained against twin 0.046; two fold draws agree 0.98.
+- **Cell-type roles that hold across three models** (cell_l1, cell_l2, typeres): Acinar a source (+0.031 / +0.076 / +0.091), Ductal, Fibroblasts, Endothelial sinks, twin ~0. With the type means out of the target Acinar is still the main source: the residual of other cells is read from acinar neighbours, which fits the segmentation spillover found 2026-11-07 (acinar products in every type) better than signalling. Needs the gene-level readout to decide.
+- Condition: Immune T1D - ND +0.038, all 3 slides agree, beyond the twin (0.028); cell_l2's ensemble gave +0.039 on 2 of 3 slides. The only difference that repeats over two models. Two seeds, three donor pairs, a flow (not signalling).
+
+What doesn't work / open:
+- **Within section the type-residual model is lower than cell_l2:** 0.122 vs 0.134 (visible-mean offset), below ref_nearest_32 (0.124) and _128 (0.146). The cell's own type mean alone (the twin) gives only 0.064 within section, below an 8-neighbour average (0.093): on CosMx a hidden cell's profile is told better by its neighbours than by its own type template (FOV / handling / spillover structure, cf. task 1).
+- Seed agreement of the per-cell flow 0.20 (one pair; cell_l2: 0.46 over 21 pairs, min 0.20). Seed 43 puts 23 % of its attention on CLS, seed 42 3 %.
+- Endocrine, Immune, Mast, Alpha, Beta change sign between the two seeds (SD >= |mean|); the endocrine roles stay unreadable.
+- Next: the job log; then RUNS=typeres_split0_s44,typeres_sparse_split0 (about 2.5 h).
+
+## 2026-11-10 — cosmx_typeres second read: s44 added (3 seeds), sparse-key arm still missing
+
+Results: local `results/cosmx_typeres/` (summary rebuilt 2026-11-10 02:47 from typeres_split0_s42/_s43/_s44 + the s42 twin; read 09:02). s44 trained to the end (val_loss 0.874, 8.4 s an epoch on its node) and was evaluated. **No `typeres_sparse_split0` rows, twin or flow folder anywhere:** the sparse arm either was not in this rerun's RUNS, is still queued/running, or failed; the job log decides it.
+
+What worked:
+- **Within section x type the model holds at the bar over three seeds:** 0.085 / 0.088 / 0.088 (mean 0.087, SD 0.002) against ref_nearest_128 0.083, _32 0.069, _8 0.049, twin ~0. Margin +0.004, about two seed SDs: at the bar, not clearly above it.
+- **No over-attention to sparse keys (3 seeds):** sparse_key_share 4.9 % (SD 0.9) of hidden queries' last-layer cell attention vs 6.9 % sparse cells; weighted mass 0.010 vs twin 0.011. Per section the share tracks the section's sparse fraction (1_T1D: 9-12 % on 13.6 % sparse cells). The penalty has little to remove in this model.
+- Gene readouts stable over seeds: dim_gene_priority Spearman 0.995 (top-20 Jaccard 0.90-1.0), heads_within_per_gene 0.975 (0.82).
+- Cell-type roles over 3 seeds: Acinar source +0.076 (SD 0.035, twin -0.001), Ductal sink -0.123 (SD 0.022, twin -0.003), Fibroblasts sink -0.074 (SD 0.051, twin +0.016). The others have SD >= |mean|.
+- Condition (T1D - ND, slides agree and beyond the twin; none beyond seed): Immune +0.065 (3/3 slides, twin max 0.028; first read +0.038 with 2 seeds; cell_l2 ensemble +0.039), Endothelial +0.049 (3/3, twin max 0.039, seed SD 0.051), Acinar -0.027 (3/3, twin max 0.021), Alpha -0.046 (2/2 slides, only 21 T1D cells).
+
+What doesn't work / open:
+- Within section 0.124 (SD 0.003): = ref_nearest_32 (0.124), below _128 (0.146) and below cell_l2 (0.134). Headline centred cosine (section offset in) 0.166 vs knn128 0.227; raw SCE 0.885, worse than every reference and the twin (0.548).
+- **Per-cell flow not reproducible over seeds:** pairs 0.20 / -0.03 / 0.26 (mean 0.14; cell_l2 0.46 over 21 pairs), while two mask draws of one model agree 0.98 and trained vs twin 0.046. Spearman-Brown: ~0.33 for a 3-seed mean, ~0.62 at 10 seeds. Per-cell flow maps of this target are not citable; only type-level means are. s43 keeps 23 % of attention on CLS (cell_mass 0.77) vs 2-3 % for s42/s44.
+- Next: the sparse arm (RUNS=typeres_sparse_split0 + its twin, ~1 h), after checking why this rerun skipped it.
+
+## 2026-11-10 — Noise ceiling by count splitting and band-pass fields with the type-residual target: built (code and toy data only; no run)
+
+The user's long-range redesign (`/home/lehnerl/Arbeit/long-range-interaction-plan.md`) compared against the fork and trimmed to
+`/home/lehnerl/Arbeit/long-range-interaction-plan-v2.md`: its stage 1 (a linear kernel field on the residual) is `FittedReferences`'
+`ref_own+context` with bands and the `label_mean` target; the attention helpers (attn_pool, per-head windows, raw skip) are `cell_l2`
+already; only the receiver gate and a low-rank readable map are new. Steps 0-1 built as one model-free CPU job in the user's folder
+`notebooks_and_scripts/slurm/new/fable/` (`fields_common.py`, `noise_ceiling.py`, `band_fields.py`, `fields.sbatch`; self-contained,
+`fov_split` copied verbatim, only `interscale.tl.masking.sample_block_mask` imported). Results will go to `MA/10_11_results/fields/`.
+
+What worked (toy data: 3 sections x 8 FOVs x 150 cells with 3 NegPrb channels; synth_spot at 5 slides per condition, 30 x 30):
+- All three steps run end to end and write `ceiling.md`, `fields.md`, `synth_spot/fields.md` with the CSVs behind them.
+- The disc draw mirrors `draw_eval_masks` (one torch generator over the test graphs in section-category order, seed 1, 60 um, 10 %);
+  the script warns when the hidden count is not the reads' 6,051 -- the first thing to check in the log.
+- Bands are **rank shells** of visible neighbours (1-8, 9-32, 33-128, 129-512, 513-2048), not um annuli: one k-NN query, the first
+  three shells are the k-NN bars, and a 1.5 mm ball in dense tissue (~10k cells) over 50k queries would be 10^8-10^9 pairs.
+- Sender identity on the toy synth_spot: the source-only ridge's largest loading names the planted sender for 64 % of the response
+  genes (median rank 1 of 21) with only 6 training slides.
+
+What doesn't work / decided while building:
+- **"Best band vs planted scale" is a weak recovery score for any linear reader.** An all-gene band predicts a smooth response best
+  from its own gene in the nearest band (a smoother); with source genes only, a single smooth peak is still read best in the nearest
+  band whatever the response's range, because its local level says how far the peak is. The file reports sender identity and the
+  far-band gain by programme (all bands minus the nearest: expected > 0 for long-range / sparse responses, ~0 for short-range and
+  noise) and keeps the Spearman marked weak. On the toy the far gain is negative for long_range (6 training slides overfit the
+  extra bands); read it on the real 24.
+- On CosMx there is no "own" feature: whole cells are hidden, so the base is the section x type training mean (scores 0 within type,
+  the twin's number). `own` features would need gene masking, not the setting the model reads were made in.
+- A constant prediction (the base within its type) is scored 0, not NaN (`cosine_rows`): the twin's reading.
+- The half-count ceiling is a lower bound (half the depth); thinning 0.3 is in the job to show the depth trend.
+
+## 2026-11-10 — Within-type shuffle as two notebooks, 0 % vs 100 % (code and toy data only; no run)
+
+Asked by the user: the Steamboat + GITIII shuffle experiment and the InterScale one as notebooks with plots, two runs, two envs, results to `MA/11_11_results`. Only 0 % vs 100 % (within section x `cell_type_coarse`), one seed, no arms. The user (mid-build): "No need to compare older fits or look at seeds, the notebook needs to be reproducible", so neither notebook reads earlier results or seed bars; everything is trained from the data file with fixed seeds.
+
+Files (flat in `slurm/new/`): `celltype_shuffle_baselines.ipynb` + `.sbatch` (env `benchmark`, 256 GB, 12 h; Steamboat tutorial settings and GITIII 20 epochs, code ported from the 09 Nov scripts that ran on the cluster) and `celltype_shuffle_interscale.ipynb` + `.sbatch` (env `interscale`, older checkout on PYTHONPATH, 192 GB, 4 h; the 06 Nov net-flow notebook with only the shuffle, levels, paths and an added 0 vs 100 scatter changed). Both draw the shuffle with the same function and seed 42 and print each order's sha1; on a toy file both gave the same hash. Results `MA/11_11_results/celltype_shuffle_{baselines,interscale}/`.
+
+Checks: the baselines notebook ran end to end on a synthetic toy (1,040 cells, 80 genes) on the local GPU, including resume (all four fits loaded on the second run). One bug found that way: the GITIII settings dict was shadowed by the imported `GITIII` class (renamed to `GITIII_SETTINGS`, class imported as `GITIIIModel`). The InterScale notebook's model cells were not run locally (rule); its data, shuffle and plotting cells ran on the toy with fabricated flow matrices, and a static check found no undefined names (it had found `CONFIG_FILE`, left from the removed YAML override). The interscale sbatch resubmits itself excluding the node if the env cannot run on the GPU (B300).
+
+## 2026-11-11 — Within-type shuffle (InterScale + Steamboat + GITIII) and the fields job (noise ceiling, band fields): first read
+
+Results: local `/home/lehnerl/Arbeit/results/11_11_results/` (`celltype_shuffle_baselines/`, `celltype_shuffle_interscale/`, `fields/` -- the fields job wrote to 11_11, not 10_11). Same shuffle draw in both notebooks (order sha1 0 % `791ba4fe0816`, 100 % `acabdf484822`, 386,665 profiles moved, 54 section x type groups). One seed (42) per level, no seed bars (the notebooks' design).
+
+**Which InterScale ran:** the original `CombinedModel` at commit 4363aea (GCN 2 layers radius 110 px + `self-attn-transformer` 3 layers / 4 heads, n_embed 16, linear dual decoders, GaussianNLL, 20 % node masking, 20 epochs, warm-up 2, batch 8 windows, 466 training windows = 59 steps an epoch, V100, ~5 min a level). The transformer has **no spatial input**: no positional encoding, no distance bias, no coordinates; `long_range_attention` off (raises NotImplementedError in that version); only the diagonal is masked, so every cell attends to every other cell of its window (sliding_window_square, median 631 cells, max 1,600) as a set. Spatial information reaches it only through the GCN embedding (2-hop neighbourhood) and window membership.
+
+What worked:
+- **The shuffle removes what it should (model-free):** per-gene correlation of a cell's within-type state with its 8-NN mean state: mean 0.034 -> 0.000 (max 0.487 -> 0.008); top genes PRSS2, SST, HSPA1A, CPB1, REG1A (0.42-0.49) all go to ~0.
+- **Steamboat (reproduces the 11-10 read):** total EV unchanged (0.239 -> 0.237) but local EV halves (0.108 -> 0.054), ego takes it over (0.132 -> 0.231), global 0.244 -> 0.198. Pair ranking holds (symmetric Spearman 0.93, directed 0.87, net 0.95; adjacency control 1.00); strength drops (magnitude 0.63; net 1.13). Its type x type map = composition; within-type structure lives in the strength.
+- **GITIII responds most:** state PCC median 0.081 -> 0.051 (mean 0.113 -> 0.072); edge Spearman 0.71, magnitude 0.49; share (composition-weighted) 0.97 / 1.00; net 0.45 (net of a nearly symmetric edge matrix: noise-dominated, do not read). PCC stays > 0 at 100 %: probably section-level offsets (GITIII's state is relative to a type mean not taken per section, while the shuffle is within section) -- not checked.
+- **Fields job checks pass:** 6,051 hidden cells, `knn<k>_full` within type 0.049 / 0.069 / 0.083 = the model reads' bars exactly.
+- **CosMx band fields (within type):** cum4 0.085, cum5 0.085 vs knn128 0.083 (= the typeres model's 0.087). Far bands alone (ranks 129-2048, ~150-450 um) 0.080, but the far gain over cum3 is +0.002 in total. The genes that gain from far bands are heat-shock / stress (HSPA1A +0.056, FOS, HSPA1B, BAG3, HSP90AA1, HSPB1) and islet hormones (INS, GCG): handling gradients and hormone spillover more than signalling. **No linear long-range signal beyond rank 128 on CosMx.**
+- **synth_spot band fields:** nearest band (rank 4, 283 um) best (within section 0.399 vs knn4 0.303); adding bands lowers it (cum5 0.346, the ridge overfits more bands). The source-only far-band gain separates programmes as designed: long_range +0.101 (median 0.064), sparse_response +0.019, noise programmes ~0 (-0.005 to +0.002), region_marker -0.067; it grows with the planted scale (MC8 / MC9 / MC10 / MC11 at 2-4 mm: +0.22 to +0.37; scales <= 1.2 mm ~0 except MC14/15).
+
+What doesn't work / open:
+- **The InterScale run never left the gene-mean floor:** masked R2 -0.007 (0 %) / -0.006 (100 %), masked cosine 0.134 / 0.134, val loss -0.5322 / -0.5317, flat from epoch ~6 on in both runs. Its flow keeps its ranking (Spearman ND 0.944 / T1D 0.965, magnitude 0.90 / 0.91) and its per-type signal moves little (largest drops Alpha, Ductal -23 to -30 %), but a model that learned no within-type structure at 0 % has nothing to lose under the shuffle: **this stability is not evidence about composition vs arrangement, and the InterScale arm is not comparable to Steamboat / GITIII.** The flow pattern itself (Acinar net sender to every type, Alpha / Beta net receivers from every type) is the same at both levels. The 20-epoch budget and one training slide are the obvious suspects; the fork models (cell_l2, typeres) get to the knn bars but are not "original-model" material ([[pr-uses-original-model-only]]).
+- **The noise-ceiling read rule was wrong (mine, in noise_ceiling.py's header text).** `own_half` = cos(A half, B half) is a split-half *reliability* rho, not the ceiling of a predictor of B: a perfect predictor (the true profile) scores ~sqrt(rho) against a noisy half. Evidence in the table: for HSPA1A, HSPB1, HSPA1B, FOS the 128-NN mean beats own_half (0.567 vs 0.409 ...), impossible if own_half were a ceiling. Within type: rho = 0.106 at half depth -> ceiling ~0.33; Spearman-Brown to full depth rho ~0.19 -> ceiling ~0.44 (rough: per-cell cosine of log-normalised halves is only correlation-like). So knn128 / the models at ~0.085 explain roughly (0.085/0.44)^2 ~ 4 % of the reproducible within-type residual. Read: the residual is not mostly count noise; most of it is cell-intrinsic and not predicted by neighbours at any band. The "~0.1 = data are the limit" branch does not apply; nor does it show the models underfit, because the ceiling counts the cell's own state, which neighbours need not determine.
+- synth_spot sender identity from the source-only ridge: 5 / 25 (20 %; the toy gave 64 %). Long-range responses 5 / 15 correct, planted sender median rank 3; sparse responses 0 / 10, median rank ~15 of 21 (chance). Sparse responses are not linearly recoverable (cosine <= 0.12).
+- Ridge alphas sit at the top of the grid on CosMx (1e5-1e6, b1/b2/cum* at 1e6, the largest tried): the grid should go higher before reading small differences between fits.
+- Next options: (a) disattenuated ceiling column in noise_ceiling.py (sqrt of own_half, Spearman-Brown to full depth); (b) InterScale shuffle rerun with a budget that leaves the floor, or drop it from the comparison and say why; (c) per-section state for GITIII to test the offset explanation.
+
+## 2026-11-11 — Noise ceiling re-read with a depth model; FOV control and wider alpha grid for the band fields (built, reread run, cluster run pending)
+
+The user asked to improve the ceiling script and add checks (no shuffle rerun). Files changed in `notebooks_and_scripts/slurm/new/fable/`: `noise_ceiling.py` (depth model, per-gene shares, `--reread` mode, corrected read text), `band_fields.py` (FOV control, alpha-edge flag), `fields_common.py` (alphas to 1e8), `fields.sbatch` (step `reread`, results `$FIELDS_RESULTS`, default `MA/11_11_results/fields_v2`).
+
+What worked:
+- **Depth model `r(f) = f / (f + c)` fitted to the split-half value holds on the real data.** Per gene, fitted at 0.5/0.5, it predicts the 0.3/0.7 split-half value with Pearson 0.923 and median observed/predicted 0.995 (874 genes); per cell within type it predicts 0.097 vs observed 0.098. So the sqrt / Spearman-Brown correction is justified, not just theory.
+- **Ceiling within type at full depth ~0.44 per cell** (r_full 0.19); within section ~0.50. knn128 reaches 0.19 of the within-type ceiling (0.29 within section). Per gene (585 of 960 genes with r_full >= 0.1, median r_full 0.115): **knn128 explains a median 1.2 % of a gene's reproducible within-type variance (pooled 3.9 %); the best band ridge (cum5) median 2.7 %, pooled 4.2 %.**
+- **What the neighbourhood explains is stress / quality, not communication-looking genes:** best shares HSPA1A 0.39-0.50, HSPA1B, HSPB1, FOS, JUN, HSP90AA1/AB1, BAG3, ribosomal RPL34/21/22/32, TNFRSF12A, MIF, MT1X. **The most reproducible genes are cell-intrinsic:** SST (r_full 0.70, share 0.004-0.008), IGF2, MALAT1, GCG, CHGA, TPSB2/TPSAB1 (mast), ANXA4 -- subtype / state identity within the coarse type that no neighbourhood predicts.
+- `--reread` wrote `ceiling_reliability.md` + `ceiling_reliability_genes.csv` into the local `11_11_results/fields/` (no data needed).
+- Toy checks (3 sections x 20 FOVs x 300 cells, planted FOV offset on 5 genes, smooth field on 5, intrinsic on 1): both scripts run end to end; for the FOV genes the far gain +0.007 becomes -0.002 after the FOV block (fov alone 0.355 vs cum3 0.372). With 8 FOVs per section each test graph is one FOV and the FOV block is constant (centred away) -- on CosMx a test graph holds 15 % of a section's FOVs, several each.
+
+What doesn't work / open:
+- The per-cell ceiling is approximate: the share at half vs full depth agrees per gene (Spearman 0.85) but not exactly (median ratio 0.87), and knn128 half/full (0.079 / 0.083) is closer than the cell-level model predicts (0.062): neighbour-predictable signal sits in high-reliability genes. Read the genes, not the per-cell number.
+- On the old run the variance-weighted share is missing (no `truth_var` column); the next full run adds it.
+- **Not run on the cluster:** the FOV control (`fov`, `cum3+fov`, `cum5+fov`, per gene `fov_gain`, `far_gain_after_fov`) and the alpha grid to 1e8 (the first run chose 1e6, the top, for most fits). Quickest: `STEPS="cosmx reread" FIELDS_RESULTS=$MA/11_11_results/fields` (overwrites the fields*.csv there), or the full job into `fields_v2`. Time of the first run not recorded; the alpha grid adds ~30 % to the ridge step, the FOV fits ~4 more solves.
+- Idea not built: a finer cell-type key for the within-type residual (SST inside coarse types suggests subtypes are the largest reproducible part); needs a fine label in `cosmx_inputs.h5ad`.
+
+## 2026-11-12 — Fields job run 2 (FOV control, wide alpha grid, variance-weighted ceiling shares): read
+
+Results: `MA/12_11_results/fields/` (local `/home/lehnerl/Arbeit/results/12_11_results/fields/`). Full plan and decision: `.claude/ceiling_plan.md` (run 2 read).
+
+What worked:
+- Fully reproducible: every number run 1 also computed is identical (ceiling, bars 0.049 / 0.069 / 0.083, band fits, synth_spot); 6,051 cells.
+- Alpha grid to 1e8: every fit still picks 1e5-1e6, held-out score falls above (cum5 0.102 / 0.095 / 0.091 at 1e6 / 1e7 / 1e8); no fit at the edge. Run 1's fits stand.
+- Variance-weighted share of the reproducible within-type variance: knn128 0.067, cum5 0.062 (standardised 0.039 / 0.042; median gene 0.012 / 0.027). The plain 128-NN mean matches the ridge.
+- **FOV control: the stress far gain is a FOV offset.** HSPA1A far gain 0.056 -> 0.004 after the FOV block (FOV alone 0.504 vs cum3 0.418), FOS 0.036 -> 0.002, BAG3, HSP90AA1, HSPB1 -> <= 0. 22 genes with far gain > 0.01, 6 after the FOV.
+- Per cell within type: cum3 0.0828, cum3+fov 0.0837, cum5 0.0853, cum5+fov 0.0852, fov alone 0.048. Far gain +0.0025, of which the FOV takes 0.0010.
+
+What doesn't work / open:
+- What survives the FOV is islet-related: INS (far gain after FOV 0.025, FOV gain 0), GCG (0.011), small TIMP1 / RGS2 / INSR / CUZD1. Biology (peri-islet cells) and technique (hormone transcript spillover, ambient RNA) are not separable without the receiver's cell type; not checked.
+- No spread on the third-decimal differences (one draw, per-cell scores not saved, no bootstrap).
+- Decision: steps 2-3 of the long-range plan skipped on CosMx (rule in ceiling_plan.md); CosMx statement for the thesis written there.
+
+## 2026-11-12 — Follow-up to fields run 2: far signal by receiver type and distance (far_by_type.py), built; what the ceiling means for InterScale
+
+Built (toy-checked, not run): `notebooks_and_scripts/slurm/new/fable/far_by_type.py` + step `bytype` in `fields.sbatch` (not in the default STEPS; reads run 2's `fields_alpha.csv`, writes `$RESULTS/by_type/`); `load_cosmx(negprb_obs=)` keeps the NegPrb total per cell (default off, data unchanged). Part A: cum3 / cum5 / cum3+fov / cum5+fov refitted on the same hidden test cells, scored per receiver cell type, FOV-block bootstrap intervals for the target genes (INS, GCG, TIMP1, RGS2, INSR, CUZD1, HSPA1A, FOS), far-band loadings per target gene. Part B (every cell, no fit): within-type residual (SD units of its type) by distance to the nearest source cell (INS:Beta, GCG:Alpha; mirror controls PRSS2:Acinar, CPB1:Acinar), NegPrb / total counts by distance, and the partial correlation with the source count at 150-450 um among receivers beyond 50 um of any source cell.
+
+What worked:
+- Toy (3 sections x 20 FOVs, contact spillover of a T0 marker into cells within 15 um of a T0 cell): Part B shows the contact profile in every receiver type (+0.6 to +0.76 SD under 10 um, below 0 by 20 um), flat profiles for the genes without spillover, flat negative probes, and a far-annulus partial r ~0 with intervals across 0: a contact effect is not called a far effect.
+- The control pairs' annulus counts are skipped (acinar is ~half of all cells; a 450 um ball count over every cell would dominate the run).
+
+What doesn't work / open:
+- Part A on the toy has 277 hidden test cells: its numbers are noise; only the code path is checked. On CosMx Beta / Alpha have ~100-200 hidden test cells each: expect wide intervals; Part B (all cells) carries the decision.
+- The grand-scheme read (ceiling_plan.md, "What it means for InterScale"): on CosMx there is no long-range target for a global component (FOV offsets + composition + possibly islet hormones); the preprint's CosMx programmes (local INS / oxidative stress, global immune / stromal) need the within-type target, the FOV covariate and the smoother before they read as communication; the audit should run before any model; legnini (SHH) is the dataset where it could find a target (slot S10, proposed). S6 dropped on CosMx.
+
+## 2026-11-12 — Run 2 tables re-read: the neighbour term split into FOV, near-beyond-FOV and far; the gene list it leaves
+
+From `12_11_results/fields/` (ceiling_reliability_genes.csv + fields_per_gene.csv; local computation on the result tables, no data). Shares of the reproducible within-type variance, pooled over the 585 reproducible genes: FOV mean alone 2.7 %; neighbourhood within ~100 um given the FOV (cum3+fov minus fov) 1.4 %; far bands given the FOV 0.1 %. So of the "4-7 %" more than half is FOV-scale; the local part is ~1.4 % pooled.
+
+What worked:
+- Per gene, 30 genes have > 5 % of their reproducible variance explained by the near neighbourhood beyond the FOV, 3 above 10 %, none above 20 %: RPL34 0.13, RPL21 0.13, JAK1 0.12, MIF 0.10, GSTP1 0.10, TNFRSF12A 0.09, TUBB 0.09, EZR 0.08, CD63, AZU1, EIF5A, CD81, KRT18, CD44, MT1X, NEAT1, PRSS2, YBX3, HLA-C, RPL32, REG1A, CALM1, MZT2A, IFITM3, DUSP5, S100A6, CLU, AZGP1, CD164, LGALS1 (0.05-0.08).
+- Scale per gene (knn8 share / knn128 share): acinar markers PRSS2, REG1A ~1.0-1.2 = contact scale (spillover-like); the ribosomal / housekeeping / inflammation genes 0.1-0.5 = regional (tens of um), a shared local tissue state rather than contact.
+
+What doesn't work / open:
+- The list is translation / cytoskeleton / stress-adjacent (RPL, EIF5A, TUBB, CALM1, YBX3, MT1X) plus a few inflammation-related genes (JAK1, TNFRSF12A, MIF, CD44, IFITM3, HLA-C, LGALS1, DUSP5): local tissue state and quality more than ligand-receptor biology. Whether any of it is expression-dependent (communication) rather than "which types are nearby" (composition) is untested: a composition block (type counts per band) in the band ridge decides it. Not built.
+
+## 2026-11-12 — Composition control, spillover index, legnini audit and the conditional-reading sweep: built (toys and unit tests; no run)
+
+The user's request after the run-2 read: items 1 and 2 into the fields job, item 3 noted for later, item 4 implemented, a legnini script. All plans and the status in `ceiling_plan.md`.
+
+What worked:
+- **Composition control** (`band_fields.py`, CosMx): `comp<k>+fov` = the visible neighbours' cell-type shares per band + the FOV mean; `cum<k>|comp<k>+fov` = the expression bands fitted on its out-of-fold residual (stagewise, because one ridge would shrink 27 composition columns with the expression bands' alpha ~1e6). Toy (3 sections x 20 FOVs, a smooth type-independent field on 5 genes): within type comp+FOV 0.094, expression on its residual 0.153, cum3+fov 0.155: the control credits expression that composition does not carry.
+- **Spillover index** (`spillover_index.py`, step `spill`): per gene its source type (highest linear mean; on the log scale a 10-fold marker read 1.3-fold, fixed), the within-type residual in other types' cells at < 15 um vs 25-50 um vs farther. Toy: the planted 15 um contact spillover of a T0 marker gives +0.99 SD (SE 0.016), the only flag; the field genes lead the near-term list as "flat".
+- **legnini audit** (`--dataset legnini` in `noise_ceiling.py` and `band_fields.py`, step `legnini`): counts from `layers['raw']` (the file's X is not used), coordinates x 0.138 um, evaluation = the usual val + test organoids (7), discs 60 um over 20 %, a per programme x condition table (SHH vs Ctrl organoids as the negative control). Stub (17 organoids with the real sample names, planted SHH readout gradients in SHH organoids): readouts 0.17 within SHH organoids, ~0.02 in Ctrl.
+- **Item 4 in the fork** (branch `conditional-context`): `model.decoder.group_offset: visible_mean` + `group_offset_key` (the FOV's visible mean of the residual from the type means as a known part, weight per gene from 1, tag `-grp-<key>`), `draw_masks(kind="gene_set+blocks")` (a gene set hidden only in disc cells; at rate 0 the same cells as a disc draw), `FittedReferences(group_attr=, composition_attr=)` (+4 references). `tests/test_group_offset.py` 8 pass; two mutations (group mean ignoring the graph, no label residual) caught; 371 tests of the touched areas pass. `CLAUDE.md` documents the option and points at ceiling_plan.md.
+- **The sweep** (`slurm/new/cosmx_conditional.py`, `make_cosmx_conditional_yaml.py`, `cosmx_conditional_read.py`, `cosmx_conditional.sbatch`; `sweep_common.py` gains `EVAL_GENE_SET_DISCS`, `FITTED_GROUP_KEY`, `FITTED_COMPOSITION_KEY`): arms cond_fov_w150 (seeds 42, 43), cond_w150, cond_fov_w1000, twin; all three configs pass the fork's validators against cosmx_hier.yaml; checkpoint names 235-244 characters (first draft 254-255, shortened: column `fovs`, names c1-c3); `prepare` checked on a minimal AnnData (FOV codes per section, split by FOV, gene groups).
+
+What doesn't work / open:
+- Nothing ran on real data. Run 3 of the fields job (`13_11_results/fields`) comes first; the conditional sweep reads its ceiling and near-term list.
+- The validator warns that channels at a cell rate of 0.2 let a neighbour give a hidden gene away: intended (the band fields read neighbours' expression of every gene too, and the ridges get the same inputs), but it means the model can smooth the hidden gene from neighbours; the bars include that (`ref_own+context`).
+- The 150 um window is soft (frozen distance windows, ~e^-4.5 at 450 um; coarse cluster tokens are windowed by their radius), not a hard cut.
+- Crops (1 mm) cut FOVs during training, so the FOV offset is computed from part of a FOV there and from whole FOVs at evaluation.
+- On the legnini stub the band ridges chose the largest alpha (1e8); watch the edge warnings on the real data.
+- ruff is not installed in interscale_env: the fork changes are not linted.
+- Item 3 noted for later (ceiling_plan.md, open ideas): per gene typeres (3 seeds) against the band ridge on the same cells.
