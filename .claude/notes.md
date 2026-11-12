@@ -2205,3 +2205,17 @@ What doesn't work / open:
 - Dense attention only: the part multiplies the explicit map, so CosMx whole sections (fused / routed) are out until a read-out head of its own exists (decoder_plan.md D6, last point). synth_spot and legnini run as they are.
 - The attention serves two paths (tokens and the bilinear read); whether it compromises is a question for the run (compare the sum and the context part's shares against rank 0).
 - Sweep `bilinear_decoder` (synth_spot planted pairs + legnini, ranks 8 / 16 / 32 vs 0, 3 seeds) not yet written; per-gene flow maps from `pair_weights` not yet wired into `flow_maps`.
+
+## 2026-11-12 — Flow-domain pipeline (the vector-field chapter's attention -> fields -> domains -> roles) built with planted-truth scores; tests only, no run
+
+Built on main: `evaluation/flow_domains.py` (relevance by the masked loss's gradient or the head mean; net flow normalised per graph; the chapter's sender-anchored vectors (Eq. 4.8) and our midpoint arrows; gridded fields per label channel with magnitude and divergence (Eq. 4.9-4.10); k-means domains on tissue grid points (Eq. 4.11-4.12); roles (Eq. 4.13); net balance (Eq. 4.14) with Spearman against the domains' divergence; planted scores: AUROC of the divergence for planted senders / receivers, share in a source / sink domain; ARI between partitions). Cluster hook `slurm/November/flow_pipeline.py` (MODE evaluate on the distance-window checkpoints `lin_dist_m11_skipraw`, 3 seeds + twin, programme masks; variants relevance x construction x channels = 8 per slide; grids saved) + `flow_pipeline_read.py` (seed ARI, trained vs twin, sender vs midpoint, balance rho) + `flow_pipeline.sbatch`.
+
+What worked:
+- `tests/test_flow_domains.py`: 8 tests. On a lattice with planted senders the midpoint pipeline ranks the senders first by the exact out - in (AUROC 1) and by the field divergence (> 0.9) and puts them in a source domain; the senders' domain has a negative net balance; channels split the fields by the sender's label; ARI 1 / ~0; the model hook returns maps and gradients of the masked loss over the kept cells and restores the module.
+- **The chapter's limitation is reproducible:** a sender read from all sides has a sender-anchored vector that cancels to ~0 (below the noise of non-senders), so its field divergence misses it, while the exact out - in and the midpoint construction find it. Pinned as a test.
+- Toy end-to-end of the hook (two calls = trained + twin) and the read on a tiny GlobalModel.
+
+What doesn't work / open:
+- Not run on the cluster. The pipeline's settings (d_max 1000 um, 64 x 64 grid, sigma 300 / 200 um, k 5, kappa 1) are guesses for synth_spot's spacing; the chapter's Table B.1 values were not given.
+- The twin is told from the trained model by call order inside one `_RUN` (sweep_common evaluates trained then twin): fragile if that order changes.
+- Dense attention only (explicit maps with gradients); CosMx sections would need the fused backend's maps per block, not built.
