@@ -42,10 +42,11 @@ allow?** Two questions, one CPU job, no model:
 | idea | Within-type residual by a finer cell-type label | not built (needs a fine label in `cosmx_inputs.h5ad`) |
 | 2b | INS / GCG far signal: far gain by receiver type + distance profiles with mirror and background controls (`far_by_type.py`, step `bytype`) | built 2026-11-12, toy-checked (planted contact spillover found, no false far effect); not run |
 | decision | Steps 2-3 of the long-range plan on CosMx | **skip** (2026-11-12, see run 2 read); synth_spot / legnini SHH only |
-| 1d | Composition control: neighbours' cell-type shares per band + FOV (`comp<k>+fov`), the expression bands fitted on its residual (`cum<k>\|comp<k>+fov`, stagewise, out of fold) | built 2026-11-12, toy-checked (a planted type-independent field: 0.153 vs comp+FOV 0.094); run 3 pending |
-| 2c | Spillover index for every gene + the near-term genes annotated (`spillover_index.py`, step `spill`) | built 2026-11-12, toy-checked (planted 15 um spillover: +0.99 SD, flagged alone; field genes "flat"); run 3 pending |
-| L | The same audit on legnini (`--dataset legnini` in `noise_ceiling.py` / `band_fields.py`, step `legnini`): ceiling + bands + per programme x condition (SHH vs Ctrl organoids as negative control) | built 2026-11-12, stub-checked (planted SHH readouts: 0.17 in SHH, ~0.02 in Ctrl organoids); run 3 pending |
-| run 3 | `fields.sbatch` default steps `ceiling cosmx reread spill legnini` into `MA/13_11_results/fields/` | written 2026-11-12, not run |
+| 1d | Composition control: neighbours' cell-type shares per band + FOV (`comp<k>+fov`), the expression bands fitted on its residual (`cum<k>\|comp<k>+fov`, stagewise, out of fold) | built 2026-11-12, toy-checked (a planted type-independent field: 0.153 vs comp+FOV 0.094); run 3, read 2026-11-12 |
+| 2c | Spillover index for every gene + the near-term genes annotated (`spillover_index.py`, step `spill`) | built 2026-11-12, toy-checked (planted 15 um spillover: +0.99 SD, flagged alone; field genes "flat"); run 3, read 2026-11-12 |
+| L | The same audit on legnini (`--dataset legnini` in `noise_ceiling.py` / `band_fields.py`, step `legnini`): ceiling + bands + per programme x condition (SHH vs Ctrl organoids as negative control) | built 2026-11-12, stub-checked (planted SHH readouts: 0.17 in SHH, ~0.02 in Ctrl organoids); run 3: **no output** (`13_11_results/fields/legnini/` empty; log not read yet) |
+| run 3 | `fields.sbatch` default steps `ceiling cosmx reread spill legnini` into `MA/13_11_results/fields/` | run 2026-11-12; ceiling, cosmx, reread, spill read 2026-11-12; legnini empty |
+| 1e | A far reader that passes the synth_spot control with all genes as features (`far\|cum3` stagewise with its own alpha; optionally far bands as top PCs) + `synth` back in the default steps | proposed 2026-11-12 (the all-gene ridge fails the control, see run 3 read); not built |
 | 4 | Conditional reading by the global model: gene masking with the cell's other genes visible, type-residual target, FOV offset as a known input (`model.decoder.group_offset`, fork branch `conditional-context`), soft 150 um window; per-gene shares against ridges from the same inputs (`cosmx_conditional.*`, `slurm/new/`) | built 2026-11-12 (8 unit tests, configs validated); not run; after run 3 |
 | idea 3 | Per gene, the typeres models (3 seeds) against the band ridge on the same 6,051 cells: genes where the model's share beats `cum3+fov` beyond the seed spread | noted 2026-11-12, for later (needs the per-gene within-type tables of `10_11_results/cosmx_typeres`) |
 
@@ -252,6 +253,45 @@ or two islet hormones. By the rule above: **steps 2-3 of the long-range plan are
 is "within-type residual ~19 % reproducible at full depth (ceiling ~0.44 per cell); neighbours explain ~4-7 % of that, all within
 ~100 um (rank 128) except an islet-hormone signal; the reproducible rest is cell-intrinsic (subtype markers SST, GCG, IGF2,
 MALAT1)". Optional follow-up: INS / GCG far gain split by receiver cell type (cheap, model-free).
+
+### Run 3 (2026-11-12, `MA/13_11_results/fields/`, local copy `/home/lehnerl/Arbeit/results/13_11_results/fields/`)
+
+Steps `ceiling cosmx reread spill legnini`. Ceiling, k-NN bars and every run 2 fit identical (checks pass: 6,051 cells, 0.049 /
+0.069 / 0.083). New: the composition control and the spillover index. `legnini/` is an empty folder (step failed or did not run:
+read the job's `.out` / `.err`); `13_11_results/cosmx_conditional/` is empty too.
+
+**Read 2026-11-12.**
+
+- **Composition adds nothing beyond the FOV, per cell within type:** fov 0.0476, comp3+fov 0.0482, comp5+fov 0.047. The expression
+  bands on the composition + FOV residual reach 0.0785 (`cum3|comp3+fov`; `cum5|comp5+fov` 0.079), so +0.030 over composition + FOV;
+  the joint `cum3+fov` is 0.0837 (the stagewise order costs 0.005: out-of-fold residuals are noisier; read it as a lower bound).
+  Pooled shares: `cum3|comp3+fov` 0.038 vs `cum3+fov` 0.041. Low alphas do not rescue composition (comp3+fov held out 0.068 at
+  alpha 1 vs fov 0.072), so it is not shrunk away. Per gene: `comp_gain` median -0.0007, > 0.02 for 7 genes only (GCG 0.086,
+  PRSS2 0.074, REG1A 0.072, TTR 0.061, CPB1 0.038, INS 0.036, GC 0.031: hormones and acinar enzymes, i.e. markers of the
+  neighbouring types); `expr_beyond_comp` median 0.010, > 0.02 for 192 genes; `far_expr_beyond_comp` median 0.001, > 0.02 for 1 gene
+  (RGS2 0.032). **The within-type neighbourhood term is not "which types are around"; it is what the neighbours express**,
+  within ~100 um.
+- **Spillover is real for type markers, not for the near-term genes.** 21 genes flagged (specificity >= 2, index >= 0.1 SD, >= 3 SE):
+  Alpha's GCG (0.71 SD), TTR, CHGA, GC, SERPINA1; Beta's INS, IAPP, SST; mast TPSB2 / TPSAB1; immune CD74, HLA-DRA / DRB1, C1QA-C,
+  CD163, CD68, ITGB2, LYZ; ductal ANXA4. Of the 30 near-term genes (share beyond the FOV > 0.05) none is flagged; MIF, TUBB, HLA-C,
+  MZT2A are `regional` (raised equally < 15 um and 25-50 um from islet cells), the rest `flat`.
+- **Two exceptions to "no spillover in the near-term list":** PRSS2 (contact +0.14, ref -0.12, index 0.27) and REG1A (+0.11 /
+  -0.10, index 0.21) have a contact-shaped profile but specificity 1.4 / 1.3 (acinar and another type both express them), so the
+  gate does not flag them. They are also the two genes with a composition gain: read them as acinar spillover / acinar proximity,
+  not a field.
+- **INS is wider than contact:** within other types' cells +0.71 SD < 15 um, +0.46 at 25-50 um, +0.08 at 50-150 um, -0.14 beyond.
+  Islet surroundings carry INS out to ~50 um (ambient RNA or peri-islet cells); it is the profile the INS far gain could come from.
+  `far_by_type.py` (step `bytype`, not run) separates it.
+- SST is flagged as Beta-sourced spillover (0.12 SD): delta cells sit inside the coarse Beta / islet type, which also explains SST
+  as the most reproducible within-type gene (subtype identity).
+
+**What run 3 does not settle (my read of run 2's synth tables, 2026-11-12).** The CosMx far test uses a ridge on all genes per
+band. On synth_spot that reader fails the positive control: the long_range programme drops as bands are added (cum1 0.732, cum5
+0.637, far 0.593), and `far_gain_all_genes` is negative for all 15 long-range genes (-0.04 to -0.22), the 2-4 mm ones (MC8-MC11)
+included, where the source-only reader (21 genes per band) gains +0.22 to +0.37. notes.md 2026-11-10 put the negative far gain
+on the toy's 6 slides; it holds on the real 24. So the band-field leg of "no far signal on CosMx" rests on a reader that misses
+planted far signal; the decision to skip steps 2-3 stays on the other evidence (every nonlinear model ties the smoother) until a
+reader that passes the control (stage 1e) gives the same null. Run 3's default steps did not include `synth`.
 
 ## Open ideas
 

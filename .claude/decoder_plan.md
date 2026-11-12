@@ -21,6 +21,7 @@ the same commit as the work.
 | D3.1 — additive linear decoder in the dual model | **implemented, unverified** -- `model.decoder.additive` (2026-10-22): `y = W_l h_local + W_g h_global + b`, the loss on the sum; sweep `additive_decoder` (10 runs) **run and read 2026-10-23** (notes.md): the sum 0.843 against the plain global head's 0.820 (3 seeds), programme mean 0.687 at the bar; without D1 the global part repeats the local one (0.60 of the short-range variance) and the parts cancel on the mirror programmes; weights 0.1 / 0.9 keep the sum and give a readable local part; a part scored alone carries its decoder's bias (read the shares) | 22 tests, 41 mutations caught (with the raw skip and the probe cost), harness IDENTICAL; synth_spot | 2026-10-23 |
 | D3 — the rest | D3.2 (gated mixture) and D3.3 (FiLM) proposed | | |
 | D5 — section offset (`model.decoder.section_offset: visible_mean`) | **implemented, unverified on data** (2026-10-31, roadmap Tier 1): a LocalModel's or GlobalModel's prediction gets the part `section` = w * (each gene's mean over the visible entries of the cell's section), w per gene from 1; the embedding need not carry the section's offset (80-89% of the CosMx centred cosine, notes.md 2026-10-31). Scoring: `masked_probing.within_section`. Combined models refuse it for now | 15 tests, 18 mutations caught (3 after stronger tests), harness IDENTICAL | 2026-10-31 |
+| D6 — bilinear part (`model.decoder.bilinear.rank`) | **implemented 2026-11-12, unrun**: a GlobalModel's prediction gets `bilinear` = sum_j a_ij (x_j V) U^T, a_ij the last layer's attention (head mean or `head`), x_j the neighbours' visible genes, B = U V^T a rank-r sender-gene -> receiver-gene map read from the parameters (`evaluation.bilinear`: `gene_map`, `components`, `planted_recovery`, `compare_maps`, `pair_weights`). Dense attention only, no pooling / hierarchy; the transformer keeps its maps for it. Sweep `bilinear_decoder` (synth_spot + legnini) to write | 10 tests, 3 mutations caught, touched areas pass | 2026-11-12 |
 | D4 — orthogonality terms (rewritten 2026-10-23: eight scale-free forms as auxiliary losses) | **implemented, unverified on synth_spot** (2026-10-23): `train.orthogonality`, the `orth_*` terms; a term lowers its measure on a toy dual model only without dropout, so terms that read cells refuse dropout; the sweep to design | 55 tests, 43 mutations, harness IDENTICAL | 2026-10-23 |
 
 ## Why the two components do not separate today
@@ -319,6 +320,41 @@ the eight `orth_*` terms in `train.aux_losses`, `optim.orthogonality` (`subsampl
   IDENTICAL.
 - *Not built:* a nonlinear redundancy read for the evaluation (the redundancy table is a ridge); the sweep (to be designed
   with the user).
+
+## D6 — the bilinear part: a readable cross-cell gene map (2026-11-12)
+
+The user's question (roadmap.md, "The user's questions for next week", point 1): the model should find genes that co-vary across
+space -- a gene in a neighbour that predicts a gene in the cell. The decoder on the global tokens (`W h_global`) hides that map
+inside the transformer: which neighbour genes moved which token dimension is only readable by attribution (IG per gene), and the
+band ridge of ceiling_plan.md gives the same map model-free as a `[G, G]` coefficient matrix per band. D6 puts the map into the
+model as a parameter, where the transformer's attention plays the band:
+
+    y_i = W h_i (+ own_cell, section, group)  +  sum_j a_ij (x_j V) U^T
+
+- `a_ij`: the last encoder layer's attention of cell `i` over cell `j` (head mean, or one head: `bilinear.head`), the map the
+  transformer already forms. It is kept with its gradient (`return_attention_maps`), so the part trains the attention too: the
+  transformer learns where to read for the bilinear term, not only for the tokens. CLS is dropped from the keys, the weights are
+  not renormalised (CLS mass lowers the part); a cell's own key is blocked as everywhere.
+- `x_j`: the neighbours' visible genes of the masked batch, a hidden entry 0, so no hidden value reaches the part and a cell hidden
+  whole contributes nothing but its attention mass. At inference the clean genes.
+- `V` `[n_input, r]` (sender side, from a private generator), `U` `[n_output, r]` (receiver side, zeros): the model starts as
+  without the part and no other weight moves at initialisation. `B = U V^T` is the cross-cell gene map: `B[g, h]` the weight with
+  which gene `h` in the attention-weighted neighbourhood moves gene `g` in the cell.
+- Readouts (`evaluation/bilinear.py`): `gene_map` (B with gene names), `components` (SVD of B: receiver and sender programmes,
+  the rotation-free reading; `raw` for the columns as trained), `planted_recovery` (synth_spot: the rank of the planted sender gene
+  in the receiver's row of B), `compare_maps` (B against a band ridge's coefficients or another seed's B: cosine, row cosine,
+  top-pair overlap), `pair_weights` (`a_ij (x_j B)_g`: the arrows of a per-gene flow map, for `flow_maps`).
+- Refused: non-dense attention (no explicit map: fused, Performer, linear, Exphormer), pooling, the hierarchy, a CombinedModel
+  (the tokens are the local component's), graph-level prediction. CosMx whole sections therefore need crops or the dense model on
+  FOV-sized graphs for now; synth_spot (2,501 tokens) and legnini (4,299) run as they are. Tag `-bil<r>[h<k>]`.
+- Not a new attention: the part reuses the encoder's map. A dedicated read-out head with its own softmax and the distance prior
+  (as the context query reads) would make it independent of the token path and usable with the fused backend; build it only if
+  the shared map turns out to serve two masters badly (the token path wants content, the bilinear path wants senders).
+
+What the first run should show (sweep `bilinear_decoder`, to write): on synth_spot, `planted_recovery` of B against the 25 planted
+pairs (the band ridge's source-only reader names the sender for 20 %), B vs the ridge map (`compare_maps`), seed stability of B
+(3 seeds), and whether the sum's score moves (it need not: the part is for readability). On legnini, B's top components against the
+SHH readouts and the identity code. Rank 8 / 16 / 32 against rank 0.
 
 ## Recommended order
 

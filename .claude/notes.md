@@ -2178,3 +2178,30 @@ What doesn't work / open:
 - On the legnini stub the band ridges chose the largest alpha (1e8); watch the edge warnings on the real data.
 - ruff is not installed in interscale_env: the fork changes are not linted.
 - Item 3 noted for later (ceiling_plan.md, open ideas): per gene typeres (3 seeds) against the band ridge on the same cells.
+
+## 2026-11-12 — Fields run 3 (composition control, spillover index): read; legnini step gave nothing
+
+Results `MA/13_11_results/fields/` (local `/home/lehnerl/Arbeit/results/13_11_results/fields/`). Ceiling, bars and every run 2 fit identical. Details in ceiling_plan.md, "Run 3".
+
+What worked:
+- Composition control: within type per cell fov 0.0476, comp3+fov 0.0482 (composition adds ~0 beyond the FOV, also at alpha 1), expression bands on that residual 0.0785 (+0.030), joint cum3+fov 0.0837. Per gene comp_gain > 0.02 only for type markers of the neighbours (GCG, PRSS2, REG1A, TTR, CPB1, INS, GC); expr_beyond_comp > 0.02 for 192 genes; far beyond composition ~0 (RGS2 alone > 0.02). The within-type neighbourhood term is neighbours' expression within ~100 um, not composition.
+- Spillover index: 21 type markers flagged (GCG 0.71 SD, TTR, CHGA, INS, IAPP, SST, TPSB2/TPSAB1, CD74, HLA-DR, C1Q, CD163, CD68, LYZ, ANXA4); none of the 30 near-term genes; MIF, TUBB, HLA-C, MZT2A regional around islet cells.
+
+What doesn't work / open:
+- `fields/legnini/` and `cosmx_conditional/` are empty: legnini step failed or did not run; read the job log.
+- PRSS2 / REG1A have contact-shaped profiles (index 0.27 / 0.21) but fail the specificity gate (1.4 / 1.3): acinar spillover the flag misses.
+- INS spreads to ~50 um (+0.71 < 15 um, +0.46 at 25-50, +0.08 at 50-150 um): wider than contact; far_by_type.py not run.
+- The all-gene band ridge fails synth_spot's control (from run 2's tables): long_range cum1 0.732 -> cum5 0.637, far_gain_all_genes < 0 for all 15 long-range genes incl. 2-4 mm (source-only reader +0.22 to +0.37). The 2026-11-10 "toy's 6 slides" explanation does not hold on the real 24. The CosMx far null needs a reader that passes the control (stagewise far|cum3 with its own alpha, or far bands as PCs) before it counts; `synth` was not in run 3's steps.
+
+## 2026-11-12 — Bilinear part (readable cross-cell gene map) built; tests and mutations only, no run
+
+The user's point 1 for next week (roadmap.md): genes that co-vary across space. Built on main: `model.decoder.bilinear.rank` / `.head` (decoder_plan.md D6; CLAUDE.md). `y_i += sum_j a_ij (x_j V) U^T`: a_ij the last layer's attention (head mean or one head, kept with its gradient), x_j the neighbours' visible genes (hidden entries 0), B = U V^T the sender-gene -> receiver-gene map. `evaluation/bilinear.py`: `gene_map`, `components` (SVD / raw), `planted_recovery`, `compare_maps`, `pair_weights` (per-gene flow arrows). Validator `_validate_bilinear`, tag `-bil<r>[h<k>]`, `TransformerNodeEncoderHook.last_attention_map()`, `encode` keeps the map for a bilinear model.
+
+What worked:
+- `tests/test_bilinear_decoder.py`: 10 tests (the part by hand from the returned map for the head mean and one head; no hidden value under cell and gene masking while visible values do reach it; off = no new state, no random draw, same prediction; the part trains U, V and the last layer's in_proj and not the context decoder; the clean pass reads its own map; refusals; the readouts on known matrices). Mutations caught: hidden values passed through (2 fail), the first layer's map (3), a right-padded gather (2).
+- U zero at the start: a bilinear model's first prediction equals the plain model's bit for bit.
+
+What doesn't work / open:
+- Dense attention only: the part multiplies the explicit map, so CosMx whole sections (fused / routed) are out until a read-out head of its own exists (decoder_plan.md D6, last point). synth_spot and legnini run as they are.
+- The attention serves two paths (tokens and the bilinear read); whether it compromises is a question for the run (compare the sum and the context part's shares against rank 0).
+- Sweep `bilinear_decoder` (synth_spot planted pairs + legnini, ranks 8 / 16 / 32 vs 0, 3 seeds) not yet written; per-gene flow maps from `pair_weights` not yet wired into `flow_maps`.
