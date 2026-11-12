@@ -20,6 +20,10 @@ It is append-only: after reading a new test, add a dated entry at the end with a
 test was about, then its **What worked** and **What doesn't work** points; never overwrite or edit an earlier
 entry (a correction is a new entry).
 
+The noise ceiling, the model-free band fields (CosMx, synth_spot, legnini) and what they mean for the global model are in
+[`.claude/ceiling_plan.md`](.claude/ceiling_plan.md) (status table, results of each run, item 4: conditional reading). Read it before
+interpreting any CosMx score against the k-NN smoothers.
+
 Work on contrastive / auxiliary losses for the global component is planned in
 [`.claude/contrastive_plan.md`](.claude/contrastive_plan.md). It carries the staged design, a
 status table, and an invariants checklist — read it before touching `train/losses.py`,
@@ -441,6 +445,30 @@ helper); `within_section(pred)` subtracts it from every head and the truth, and 
 within-section centred cosine: how well a head tells a hidden cell from the visible rest of its own section. The slide mean is the
 centre (its cosine is rounding noise around 0). Read it next to the usual centred cosine, which counts the section's offset from the
 training mean as signal.
+
+### The group offset (`model.decoder.group_offset`; `.claude/ceiling_plan.md`, item 4)
+
+`visible_mean` (default `none`; GlobalModel) adds a part `group` = `w * m` to the prediction: `m` each gene's mean over the visible
+entries of the cells of the cell's graph **and** group (`group_offset_key`, an obs column reaching the graphs through
+`dataset.extra_obs_keys`, e.g. a field of view's index within its section), `w` one weight per gene starting at 1. Under
+`section_offset: label_mean` the mean is of the residual `x - label_mean(label)`, so the part is the group's offset from its cells'
+types. Why: on CosMx the FOV mean carries more of the neighbourhood term than the neighbours do (ceiling_plan.md, fields run 2), so a
+model is credited only for what lies beyond it. Invariants:
+
+- **Visible entries only** (`BaseModule.group_input`, `tl.masking.group_visible_mean` = `section_visible_mean` over (graph, group)
+  pairs); a gene hidden in every cell of a group gets 0, so under programme masking (`mask_genes` in every cell) the part is empty
+  and its weight learns nothing: use it with genes hidden in some cells (channels at a cell rate, discs). Group codes need only
+  differ within a graph.
+- **A named part**: `StepOutput.parts["global"]["group"]`; every caller of `predict` / `predict_parts` must pass
+  `group=module.group_input(batch, masked=...)` (the module refuses to predict without it). Not with `section_offset: visible_mean`.
+- Off, the module holds no new state and draws no random number (tested). Checkpoint tag `-grp-<key>` in the decoder part.
+
+**Disc-only gene sets and their bars.** `masked_probing.draw_masks(kind="gene_set+blocks")` hides a gene set only in the cells of
+discs (at `rate` 0 exactly the cells of a `"blocks"` draw with the same seed and share), so a hidden gene is read from the cell's
+other genes and from neighbours that show it. `FittedReferences(group_attr=, composition_attr=)` adds the parts `group` (the same
+group mean, without the label residual) and `composition` (label shares among the `k_nearest` cells) and the references
+`ref_own+group`, `ref_own+context+group`, `ref_own+composition+group`, `ref_own+context+composition+group`; a saved fit keeps both
+attributes (an older fit loads with neither).
 
 ### Orthogonality terms (`train/orthogonality.py`, `.claude/decoder_plan.md`, D4)
 

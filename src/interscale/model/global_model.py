@@ -52,6 +52,12 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
                 if self._cfg.model.decoder.get("section_offset", "none") == "label_mean"
                 else None
             ),
+            group_offset=self._cfg.model.decoder.get("group_offset", "none"),
+            group_offset_attr=(
+                label_attribute(self._cfg, self._cfg.model.decoder.group_offset_key)
+                if self._cfg.model.decoder.get("group_offset", "none") != "none"
+                else None
+            ),
         )
 
         self._attach_aux_losses()
@@ -124,6 +130,7 @@ class GlobalModel(NodeMaskingTrainingPlan, BaseModel):
                 own_embedding=self.module.own_cell_input(batch, embedding),
                 node_idx=torch.as_tensor(pad_index_nodes[0], dtype=torch.long, device=embedding.device),
                 section=self.module.section_input(batch, masked=False),
+                group=self.module.group_input(batch, masked=False),
             )
 
             # I = self_attention_relevance.generate_relevance(transformer_in, src_padding_mask)

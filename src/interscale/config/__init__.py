@@ -1050,6 +1050,30 @@ def _validate_section_offset(cfg):
         )
 
 
+def _validate_group_offset(cfg):
+    """``model.decoder.group_offset`` adds a group's (a field of view's) visible mean: a known kind, its key on the graphs, not with
+    ``section_offset: visible_mean``, regression at node level."""
+    from interscale.tl.masking import GROUP_OFFSETS
+
+    kind = cfg.model.decoder.get("group_offset", "none")
+    if kind not in GROUP_OFFSETS:
+        raise ValueError(f"model.decoder.group_offset must be one of {GROUP_OFFSETS}, got {kind!r}.")
+    key = cfg.model.decoder.get("group_offset_key", "")
+    if kind == "none":
+        if key:
+            raise ValueError(f"model.decoder.group_offset_key {key!r} is read under group_offset visible_mean, not none.")
+        return
+    if not key:
+        raise ValueError("model.decoder.group_offset visible_mean needs model.decoder.group_offset_key, an obs column.")
+    from interscale.tl.geome_utils import label_attribute
+
+    label_attribute(cfg, key)  # raises, naming the fix, when the column does not reach the graphs
+    if cfg.model.decoder.get("section_offset", "none") == "visible_mean":
+        raise ValueError("model.decoder.group_offset is not combined with section_offset visible_mean: use label_mean or none.")
+    if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":
+        raise ValueError("model.decoder.group_offset needs regression at prediction_level node.")
+
+
 def _validate(cfg):
     """Run every load-time check.
 
@@ -1074,6 +1098,7 @@ def _validate(cfg):
     _validate_regime_loss(cfg)
     _validate_own_cell_skip(cfg)
     _validate_section_offset(cfg)
+    _validate_group_offset(cfg)
     _validate_sce(cfg)
     _validate_center_targets(cfg)
     _validate_global_residual(cfg)

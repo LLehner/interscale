@@ -56,5 +56,12 @@ def get_model_cfg(cfg):
     # reads prediction and target minus it: the decoder predicts only what the label does not explain.
     cfg.model.decoder.section_offset = "none"
     cfg.model.decoder.label_offset_key = ""
+    # GlobalModel: "visible_mean" adds a part `group`, each gene's mean over the visible entries of the cells of the cell's group
+    # inside its graph (`group_offset_key`, an obs column reaching the graphs through dataset.extra_obs_keys: a field of view),
+    # of the residual from the label mean under section_offset label_mean; times a learned weight per gene starting at 1. The FOV
+    # offset is then a known input (ceiling_plan.md, 2026-11-12: on CosMx it carries more of the neighbourhood term than the
+    # neighbours do). "none": off. Not with section_offset visible_mean.
+    cfg.model.decoder.group_offset = "none"
+    cfg.model.decoder.group_offset_key = ""
 
     return cfg

@@ -69,7 +69,7 @@ from interscale.tl.geome_utils import label_codes
 from interscale.tl.masking import sample_block_mask, sample_gene_set_mask, sample_unit_mask, section_visible_mean
 from interscale.tl.niches import graph_label_patches
 
-MASK_KINDS = ("entries", "cells", "blocks", "gene_set", "cells+blocks")
+MASK_KINDS = ("entries", "cells", "blocks", "gene_set", "cells+blocks", "gene_set+blocks")
 
 
 def draw_masks(
@@ -93,7 +93,10 @@ def draw_masks(
     ``columns`` -- and nothing else -- in each cell with probability ``rate`` (1.0: every cell), as
     ``dataset.mask_genes`` does in training; read it with ``mask_strategy="gene"``. ``"cells+blocks"`` is cell masking
     with discs as a config trains it (``mask_percentage`` and ``mask_block_*``): every gene of the cells hidden at
-    ``rate`` (0: none) and of the cells in discs of ``radius`` covering ``block_rate`` of each graph. With ``label`` (the
+    ``rate`` (0: none) and of the cells in discs of ``radius`` covering ``block_rate`` of each graph. ``"gene_set+blocks"``
+    hides the gene ``columns`` only, in the cells of discs of ``radius`` covering ``block_rate`` of each graph and, with ``rate``
+    > 0, in further cells at that rate (with ``rate`` 0 the draw is ``"blocks"``' at that share, random number for random number,
+    so the cells are exactly those of a disc evaluation): a hidden gene is read from the cell's other genes and from neighbours that show it. With ``label`` (the
     Data attribute of a niche label) ``"blocks"`` and ``"cells+blocks"`` hide niche patches (``tl.niches``, larger ones cut
     to ``max_cells``) in place of discs, as ``dataset.mask_block_kind: label`` trains, and take no radius. The global torch
     generator is not touched.
@@ -105,6 +108,13 @@ def draw_masks(
         raise ValueError(f"'blocks' needs a radius > 0 and a rate in (0, 1), got radius {radius} and rate {rate}.")
     if kind == "gene_set" and (columns is None or not len(columns) or not 0 < rate <= 1):
         raise ValueError(f"'gene_set' needs columns and a cell rate in (0, 1], got {columns} and {rate}.")
+    if kind == "gene_set+blocks" and not (
+        has_block and block_rate is not None and 0 < block_rate < 1 and 0 <= rate < 1 and columns is not None and len(columns)
+    ):
+        raise ValueError(
+            f"'gene_set+blocks' needs columns, a radius > 0, a disc share in (0, 1) and a cell rate in [0, 1), got {columns}, "
+            f"{radius}, {block_rate} and {rate}."
+        )
     if kind == "cells+blocks" and not (has_block and block_rate is not None and 0 < block_rate < 1 and 0 <= rate < 1):
         raise ValueError(
             f"'cells+blocks' needs a cell rate in [0, 1), a radius > 0 and a disc share in (0, 1), got {rate}, {radius} and "
@@ -125,6 +135,15 @@ def draw_masks(
             gene_mask = (torch.rand(n, generator=gen) < rate)[:, None].expand(n, g).clone()
         elif kind == "gene_set":
             gene_mask = sample_gene_set_mask(n, g, columns, rate, generator=gen)
+        elif kind == "gene_set+blocks":
+            if label is None and getattr(data, "pos", None) is None:
+                raise ValueError("'gene_set+blocks' draws discs over cell coordinates, but a graph has no `pos`.")
+            cells = blocks(data, block_rate)  # first: the same draw as "blocks" at this share
+            if rate > 0:
+                cells = cells | (torch.rand(n, generator=gen) < rate)
+            gene_mask = torch.zeros(n, g, dtype=torch.bool)
+            gene_mask[:, torch.as_tensor(list(columns), dtype=torch.long)] = True
+            gene_mask &= cells[:, None]
         elif kind == "cells+blocks":
             if label is None and getattr(data, "pos", None) is None:
                 raise ValueError("'cells+blocks' draws discs over cell coordinates, but a graph has no `pos`.")
@@ -953,15 +972,27 @@ def _sparse_references(
 
 
 def _reference_parts(
-    batch, hidden: torch.Tensor, *, spatial_unit_um: float, kernels_um, position, drivers=None, k_nearest=()
+    batch,
+    hidden: torch.Tensor,
+    *,
+    spatial_unit_um: float,
+    kernels_um,
+    position,
+    drivers=None,
+    k_nearest=(),
+    group_attr: str | None = None,
+    composition_attr: str | None = None,
 ) -> dict:
     """Per cell, model-free inputs of the fitted references, in batch node order (float64).
 
     ``own``: the cell's visible values (a hidden entry reads 0); ``context``: Gaussian-kernel means
     of the visible values of the other cells of its graph, one block of genes per bandwidth, and / or means over the
     ``k_nearest`` cells (neighbour lists: no distance matrix, for whole sections);
-    ``position``: :func:`position_features` (or absent); ``driver``: :func:`oracle_features` (or absent). No
-    hidden value enters any of them.
+    ``position``: :func:`position_features` (or absent); ``driver``: :func:`oracle_features` (or absent); ``group``
+    (with ``group_attr``, a one-hot group such as a field of view): each gene's mean over the visible entries of the cells of the
+    cell's graph and group (``tl.masking.group_visible_mean``, the model's ``group_offset`` without the label residual);
+    ``composition`` (with ``composition_attr``, a one-hot label): the label shares among the ``k_nearest`` other cells (an
+    annotation of the neighbours, read whether or not they have hidden entries). No hidden value enters any of them.
     """
     x = batch.x.double()
     parts = {"own": torch.where(hidden, torch.zeros_like(x), x)}
@@ -979,6 +1010,26 @@ def _reference_parts(
         parts["context"] = torch.cat(
             [refs[f"ref_kernel_{s:g}um"] for s in kernels_um] + [refs[f"ref_nearest_{k}"] for k in k_nearest], dim=1
         )
+    if group_attr:
+        from interscale.tl.geome_utils import label_codes
+        from interscale.tl.masking import group_visible_mean
+
+        graph = getattr(batch, "batch", None)
+        parts["group"] = group_visible_mean(x, ~hidden, graph, label_codes(batch, group_attr))
+    if composition_attr:
+        if not k_nearest:
+            raise ValueError("the composition part needs k_nearest (the neighbours whose labels it counts).")
+        onehot = getattr(batch, composition_attr).double()
+        shares = reference_predictions(
+            onehot,
+            torch.zeros_like(onehot, dtype=torch.bool),
+            batch.pos,
+            batch.batch,
+            spatial_unit_um=spatial_unit_um,
+            k_nearest=tuple(k_nearest),
+            method="sparse",
+        )
+        parts["composition"] = torch.cat([shares[f"ref_nearest_{k}"] for k in k_nearest], dim=1).double()
     if position is not None:
         parts["position"] = position(batch, hidden)[POSITION].double()
     if drivers is not None:
@@ -992,6 +1043,11 @@ FITTED_REFERENCES = {
     "ref_own+context": ("own", "context"),
     "ref_own+context+position": ("own", "context", "position"),
     "ref_oracle": ("own", "driver"),
+    # With a group (field of view) and / or a composition label (FittedReferences(group_attr=, composition_attr=)):
+    "ref_own+group": ("own", "group"),
+    "ref_own+context+group": ("own", "context", "group"),
+    "ref_own+composition+group": ("own", "composition", "group"),
+    "ref_own+context+composition+group": ("own", "context", "composition", "group"),
 }
 #: The reference that reads the planted drivers (:func:`oracle_features`): a bar for the task, not for a model. The
 #: report leaves it out of "the best reference".
@@ -1035,6 +1091,13 @@ class FittedReferences:
         A :func:`position_features` function, or None to leave the position reference out.
     drivers
         An :func:`oracle_features` function, or None to leave the oracle out.
+    group_attr
+        The graphs' one-hot group attribute (a field of view): adds the ``group`` part and the ``*+group`` references, the bar for
+        a model with ``model.decoder.group_offset``.
+    composition_attr
+        The graphs' one-hot label attribute (cell types): adds the ``composition`` part (label shares among the ``k_nearest``
+        cells) and ``ref_own+composition+group`` / ``ref_own+context+composition+group``: what neighbours' expression adds beyond
+        which types they are.
     alphas
         Candidate ridge penalties (on standardised features). Each reference takes the one with the
         lowest squared error on held-out training graphs (``folds`` groups of whole graphs) and is
@@ -1055,6 +1118,8 @@ class FittedReferences:
         k_nearest=(),
         position=None,
         drivers=None,
+        group_attr: str | None = None,
+        composition_attr: str | None = None,
         alphas=(0.1, 1.0, 10.0, 100.0, 1e3, 1e4),
         folds: int = 3,
         device="cpu",
@@ -1062,9 +1127,12 @@ class FittedReferences:
         self.spatial_unit_um, self.kernels_um, self.position = float(spatial_unit_um), tuple(kernels_um), position
         self.drivers = drivers
         self.k_nearest = tuple(k_nearest)
+        self.group_attr, self.composition_attr = group_attr or None, composition_attr or None
         names = [n for n, parts in FITTED_REFERENCES.items() if position is not None or "position" not in parts]
         names = [n for n in names if kernels_um or k_nearest or "context" not in FITTED_REFERENCES[n]]
         names = [n for n in names if drivers is not None or "driver" not in FITTED_REFERENCES[n]]
+        names = [n for n in names if self.group_attr or "group" not in FITTED_REFERENCES[n]]
+        names = [n for n in names if self.composition_attr or "composition" not in FITTED_REFERENCES[n]]
         chunks, targets, hidden_rows, graph_of = {}, [], [], []
         graphs = list(train_data)
         loader = DataLoader(dataset=graphs, shuffle=False, batch_size=1, num_workers=0)
@@ -1104,6 +1172,8 @@ class FittedReferences:
             position=self.position,
             drivers=self.drivers,
             k_nearest=getattr(self, "k_nearest", ()),
+            group_attr=getattr(self, "group_attr", None),
+            composition_attr=getattr(self, "composition_attr", None),
         )
 
     def _choose_alpha(self, x, y, rows, fold, alphas) -> float:
@@ -1139,7 +1209,8 @@ class FittedReferences:
         return fitted
 
     #: What a fitted instance holds besides the ``position`` function (a closure, which a file cannot keep).
-    STATE = ("spatial_unit_um", "kernels_um", "k_nearest", "fill", "target_columns", "models", "alpha_")
+    STATE = ("spatial_unit_um", "kernels_um", "k_nearest", "fill", "target_columns", "models", "alpha_", "group_attr",
+             "composition_attr")
 
     def state(self) -> dict:
         """The fit as a plain dict of arrays and sklearn objects, for :func:`pickle` (see :meth:`from_state`)."""
@@ -1152,7 +1223,8 @@ class FittedReferences:
         Lets jobs that evaluate different models on the same training slides share one fit: the ridge
         regressions depend on the graphs, their masks and the settings only, never on a model.
         """
-        state = {"k_nearest": (), **state}  # a fit saved before k_nearest existed
+        # a fit saved before k_nearest / the group and composition parts existed
+        state = {"k_nearest": (), "group_attr": None, "composition_attr": None, **state}
         missing = [name for name in cls.STATE if name not in state]
         if missing:
             raise ValueError(f"the saved fit lacks {missing}")

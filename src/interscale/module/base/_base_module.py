@@ -6,7 +6,14 @@ import torch
 
 from interscale.nn import LinearDecoder, LinearLSEDecoder, NonLinearDecoder
 from interscale.tl.geome_utils import label_codes
-from interscale.tl.masking import MASK_STRATEGIES, SECTION_OFFSETS, apply_mask, section_visible_mean
+from interscale.tl.masking import (
+    GROUP_OFFSETS,
+    MASK_STRATEGIES,
+    SECTION_OFFSETS,
+    apply_mask,
+    group_visible_mean,
+    section_visible_mean,
+)
 
 
 class BaseModule(L.LightningModule, ABC):
@@ -27,6 +34,8 @@ class BaseModule(L.LightningModule, ABC):
         block_masking: bool = False,
         section_offset: str = "none",
         label_offset_attr: str | None = None,
+        group_offset: str = "none",
+        group_offset_attr: str | None = None,
     ):
         """
         Parameters
@@ -62,6 +71,13 @@ class BaseModule(L.LightningModule, ABC):
             The model then predicts each cell as its section's visible mean plus what the decoder adds, so a section's own
             offset (donor, condition, batch) is not what the embedding has to carry. Reconstruction only (``n_output`` is the
             genes); a LocalModel or GlobalModel puts it into its prediction, a combined one refuses it.
+        group_offset: Literal["none", "visible_mean"]
+            ``"visible_mean"`` (GlobalModel; ``group_offset_attr`` the graphs' one-hot group, a field of view): the prediction gets
+            a part ``group`` = ``w * m``, ``m`` each gene's mean over the visible entries of the cells of the cell's graph and group
+            -- of the residual from the label mean under ``section_offset: label_mean``, of the expression otherwise -- and ``w``
+            one learned weight per gene starting at 1. A field of view's offset (handling, imaging, the patch of tissue) is then a
+            known input, and the embedding is credited only for what lies beyond it. Not with ``section_offset: visible_mean``
+            (two means of one expression).
         """
         super().__init__()
 
@@ -104,6 +120,20 @@ class BaseModule(L.LightningModule, ABC):
                 self.label_offset_attr = label_offset_attr
                 # [labels, G], sized by set_label_means (or by the checkpoint it is loaded from). A buffer: saved with the model.
                 self.register_buffer("label_means", torch.zeros(0, n_output))
+
+        if group_offset not in GROUP_OFFSETS:
+            raise ValueError(f"group_offset must be one of {GROUP_OFFSETS}, got {group_offset!r}.")
+        self.group_offset = group_offset
+        if group_offset != "none":
+            if n_output != n_input:
+                raise ValueError(f"group_offset needs a reconstruction (n_output {n_output} = n_input {n_input}).")
+            if not group_offset_attr:
+                raise ValueError("group_offset is built for a GlobalModel (it passes group_offset_attr, the graphs' group attribute).")
+            if section_offset == "visible_mean":
+                raise ValueError("group_offset is not combined with section_offset visible_mean: use label_mean or none.")
+            self.group_offset_attr = group_offset_attr
+            # Ones, not an initialiser: no draw from the global RNG.
+            self.group_offset_weight = torch.nn.Parameter(torch.ones(n_output))
 
         # Define components
         self.local_component = None
@@ -209,6 +239,27 @@ class BaseModule(L.LightningModule, ABC):
         graph = getattr(batch, "batch", None)
         mean = section_visible_mean(x, visible, None if graph is None else graph.long())
         return mean * self.section_offset_weight.to(mean.dtype)
+
+    def group_input(self, batch, masked: bool = True) -> torch.Tensor | None:
+        """``[N, G]`` in batch node order: the group part of each cell's prediction (``group_offset``), None when off.
+
+        Each gene's mean over the visible entries of the cells of the cell's graph and group (``group_offset_attr``); under
+        ``section_offset: label_mean`` the mean of the residual ``x - label_mean(label)``, so the part is the group's offset from
+        its cells' types. ``masked`` as in :meth:`section_input`: hidden entries never enter a mean.
+        """
+        if self.group_offset == "none":
+            return None
+        x = batch.x.float()
+        visible = self.visible_entries(batch) if masked else torch.ones(x.shape, dtype=torch.bool, device=x.device)
+        if self.section_offset == "label_mean":
+            if not self.label_means.numel():
+                raise ValueError("group_offset under section_offset label_mean: no label means yet; train or load the model.")
+            codes = label_codes(batch, self.label_offset_attr).to(self.label_means.device)
+            x = x - self.label_means[codes].to(x.dtype).to(x.device)
+        group = label_codes(batch, self.group_offset_attr).to(x.device)
+        graph = getattr(batch, "batch", None)
+        mean = group_visible_mean(x, visible, None if graph is None else graph.long(), group)
+        return mean * self.group_offset_weight.to(mean.dtype)
 
     @abstractmethod
     def _common_step(self, batch):

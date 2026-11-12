@@ -130,6 +130,8 @@ def hides_gene_set(cfg) -> bool:
 #: What a section offset is (``model.decoder.section_offset``): none, the mean of the section's visible entries, or the
 #: training mean of the cell's label (``label_mean``, ``model.decoder.label_offset_key``: the loss then reads what the label leaves).
 SECTION_OFFSETS = ("none", "visible_mean", "label_mean")
+#: ``model.decoder.group_offset``: a part for a group inside the graph (a field of view), on top of the section offset.
+GROUP_OFFSETS = ("none", "visible_mean")
 
 
 def section_visible_mean(x: torch.Tensor, visible: torch.Tensor, graph: torch.Tensor | None) -> torch.Tensor:
@@ -149,6 +151,21 @@ def section_visible_mean(x: torch.Tensor, visible: torch.Tensor, graph: torch.Te
     total = x.new_zeros(n_graphs, x.shape[1]).index_add_(0, graph, x * weight)
     count = x.new_zeros(n_graphs, x.shape[1]).index_add_(0, graph, weight)
     return (total / count.clamp_min(1.0))[graph]  # a gene with no visible entry: 0 / 1
+
+
+def group_visible_mean(x: torch.Tensor, visible: torch.Tensor, graph: torch.Tensor | None, group: torch.Tensor) -> torch.Tensor:
+    """``[N, G]``: per cell, the mean of each gene over the visible entries of the cells of its graph *and* group (a field of
+    view in a section), 0 where none is: :func:`section_visible_mean` over the pairs (graph, group).
+
+    ``group`` ``[N]`` integer codes; they need only be distinct within a graph (the same code in two graphs is two groups). A
+    hidden entry never enters a mean, so a cell's own hidden gene is read from the other cells of its group alone.
+    """
+    if graph is None:
+        graph = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+    graph = graph.to(device=x.device, dtype=torch.long)
+    group = group.to(device=x.device, dtype=torch.long)
+    n_groups = int(group.max()) + 1 if group.numel() else 1
+    return section_visible_mean(x, visible, graph * n_groups + group)
 
 
 def sample_node_mask(num_nodes: int, pct: float, generator: torch.Generator | None = None) -> torch.Tensor:

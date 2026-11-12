@@ -528,17 +528,17 @@ class GlobalModule(BaseModule):
     #     return y_true, adjusted_mask_idx
 
     def predict_parts(
-        self, global_embedding, src_padding_mask, prediction_level, own_embedding=None, node_idx=None, section=None
+        self, global_embedding, src_padding_mask, prediction_level, own_embedding=None, node_idx=None, section=None, group=None
     ):
         """The named parts whose sum is :meth:`predict`: ``context`` (the decoder on the transformer's tokens), under
-        ``own_cell_skip`` ``own_cell``, under ``section_offset`` ``section``.
+        ``own_cell_skip`` ``own_cell``, under ``section_offset`` ``section``, under ``group_offset`` ``group``.
 
         Same arguments as :meth:`predict`.
         """
         ## Graph-level prediction: get cls_token from last position
         if "graph" in prediction_level:
-            if self.own_cell_skip or self.section_offset != "none":
-                raise ValueError("own_cell_skip and section_offset are per-cell terms; a graph-level prediction has none.")
+            if self.own_cell_skip or self.section_offset != "none" or self.group_offset != "none":
+                raise ValueError("own_cell_skip, section_offset and group_offset are per-cell terms; a graph-level prediction has none.")
             return {"context": self.decoder(gather_cls(global_embedding))}
         ## Node-level prediction: remove cls_token from last position
         elif "node" in prediction_level:
@@ -557,12 +557,19 @@ class GlobalModule(BaseModule):
                         "section=module.section_input(batch, ...) and node_idx."
                     )
                 parts["section"] = section[node_idx].to(parts["context"].dtype)
+            if self.group_offset != "none":
+                if group is None or node_idx is None:
+                    raise ValueError(
+                        "group_offset needs each cell's group part and the node index to predict: pass "
+                        "group=module.group_input(batch, ...) and node_idx."
+                    )
+                parts["group"] = group[node_idx].to(parts["context"].dtype)
             return parts
         else:
             raise Exception("Choose a valid prediction tasks (graph or node).")
 
     def predict(
-        self, global_embedding, src_padding_mask, prediction_level, own_embedding=None, node_idx=None, section=None
+        self, global_embedding, src_padding_mask, prediction_level, own_embedding=None, node_idx=None, section=None, group=None
     ):
         """Predict with the decoder.
 
@@ -583,9 +590,11 @@ class GlobalModule(BaseModule):
         section: torch.Tensor | None
             ``[N, G]`` in batch node order: :meth:`section_input` of the batch that was tokenised (masked in training,
             clean at inference). Required under ``section_offset``, ignored otherwise.
+        group: torch.Tensor | None
+            ``[N, G]`` in batch node order: :meth:`group_input` of the same batch. Required under ``group_offset``.
         """
         y_pred, *rest = self.predict_parts(
-            global_embedding, src_padding_mask, prediction_level, own_embedding, node_idx, section
+            global_embedding, src_padding_mask, prediction_level, own_embedding, node_idx, section, group
         ).values()
         for part in rest:
             y_pred = y_pred + part
@@ -639,6 +648,7 @@ class GlobalModule(BaseModule):
             own_embedding=self.own_cell_input(batch_masked, embedding),
             node_idx=padded_node_idx,
             section=self.section_input(batch_masked, masked=True),
+            group=self.group_input(batch_masked, masked=True),
         )
         y_pred, *rest = parts.values()
         for part in rest:
