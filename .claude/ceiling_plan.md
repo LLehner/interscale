@@ -44,9 +44,11 @@ allow?** Two questions, one CPU job, no model:
 | decision | Steps 2-3 of the long-range plan on CosMx | **skip** (2026-11-12, see run 2 read); synth_spot / legnini SHH only |
 | 1d | Composition control: neighbours' cell-type shares per band + FOV (`comp<k>+fov`), the expression bands fitted on its residual (`cum<k>\|comp<k>+fov`, stagewise, out of fold) | built 2026-11-12, toy-checked (a planted type-independent field: 0.153 vs comp+FOV 0.094); run 3, read 2026-11-12 |
 | 2c | Spillover index for every gene + the near-term genes annotated (`spillover_index.py`, step `spill`) | built 2026-11-12, toy-checked (planted 15 um spillover: +0.99 SD, flagged alone; field genes "flat"); run 3, read 2026-11-12 |
-| L | The same audit on legnini (`--dataset legnini` in `noise_ceiling.py` / `band_fields.py`, step `legnini`): ceiling + bands + per programme x condition (SHH vs Ctrl organoids as negative control) | built 2026-11-12, stub-checked (planted SHH readouts: 0.17 in SHH, ~0.02 in Ctrl organoids); run 3: **no output** (`13_11_results/fields/legnini/` empty; log not read yet) |
+| L | The same audit on legnini (`--dataset legnini` in `noise_ceiling.py` / `band_fields.py`, step `legnini`): ceiling + bands + per programme x condition (SHH vs Ctrl organoids as negative control) | built 2026-11-12, stub-checked (planted SHH readouts: 0.17 in SHH, ~0.02 in Ctrl organoids); run 3: **no output** (`13_11_results/fields/legnini/` empty). Cause found 2026-11-21 without the log: `legnini23.h5ad`'s `layers['raw']` (and X) is `normalize_total` to 279 per cell, not counts, so `load_legnini` stopped at its integer check before writing anything. Fixed: counts recovered exactly per cell (`recover_counts`), halves normalised to the file's 279 (`uns['target_sum']`); stand-in (real metadata, simulated counts normalised to 279) runs all three commands. In run 4 |
 | run 3 | `fields.sbatch` default steps `ceiling cosmx reread spill legnini` into `MA/13_11_results/fields/` | run 2026-11-12; ceiling, cosmx, reread, spill read 2026-11-12; legnini empty |
-| 1e | A far reader that passes the synth_spot control with all genes as features (`far\|cum3` stagewise with its own alpha; optionally far bands as top PCs) + `synth` back in the default steps | proposed 2026-11-12 (the all-gene ridge fails the control, see run 3 read); not built |
+| 1e | A far reader that passes the synth_spot control: `far\|cum<reach>` (far bands on the near fit's out-of-fold residual, one alpha per gene chosen by held-out squared error, off unless it helps) and the cross reader `far\|cum<reach>\|x` (the same with the target genes left out of the features); `synth` back in the default steps with a PASS / FAIL verdict per reader (`synth_control.csv`) | built 2026-11-21, toy-checked (see "Run 4"): on a toy synth_spot the cross reader passes (2-4 mm genes +0.097 median, null programmes 0), the every-gene stagewise reader shows no loss (0 vs the old reader's -0.094); in run 4 |
+| V | The audit on lung fibrosis (vannan25, Xenium): `load_vannan` (fold 0's test patients, residual within sample x fine cell type from each graph's visible cells, composition control without FOV), `--dataset vannan` in both scripts, steps `vannan_inputs` (builds `vannan25_pp.h5ad` with `make_lung_inputs.py` if missing) and `vannan` | built 2026-11-21, stand-in checked (10 samples, planted smooth field); in run 4 |
+| run 4 | `fields.sbatch` default steps `synth cosmx reread legnini vannan_inputs vannan` into `MA/21_11_results/fields/` (ceiling CSVs copied from run 3; 11 h, 128 GB) | written 2026-11-21, not submitted |
 | 4 | Conditional reading by the global model: gene masking with the cell's other genes visible, type-residual target, FOV offset as a known input (`model.decoder.group_offset`, fork branch `conditional-context`), soft 150 um window; per-gene shares against ridges from the same inputs (`cosmx_conditional.*`, `slurm/new/`) | built 2026-11-12 (8 unit tests, configs validated); not run; after run 3 |
 | idea 3 | Per gene, the typeres models (3 seeds) against the band ridge on the same 6,051 cells: genes where the model's share beats `cum3+fov` beyond the seed spread | noted 2026-11-12, for later (needs the per-gene within-type tables of `10_11_results/cosmx_typeres`) |
 
@@ -83,7 +85,13 @@ Local: `notebooks_and_scripts/slurm/new/fable/` (the user's folder for this job;
   legnini_plan.md's genes, split train = the usual training organoids, test = the usual val + test organoids: 7 evaluation
   organoids, discs 60 um over 20 %); `noise_ceiling.py --dataset legnini` (scores within the organoid) and `band_fields.py --dataset
   legnini` (per programme x condition table). No FOVs, no cell types: no FOV or composition control there.
-- `fields.sbatch`: one CPU job (96 GB, 8 cores, 4 h limit, time not measured yet). Steps: `ceiling cosmx synth reread spill
+- Run 4 (2026-11-21): `band_fields.py` adds stage 1e (`far|cum<reach>`, `far|cum<reach>+fov`, the cross reader `cum<reach>|x` /
+  `far|cum<reach>|x`; per gene `far_gain_sw`, `far_gain_sw_after_fov`, `far_gain_x`, `far_alpha_sw`, `far_alpha_x`), the synth_spot
+  verdict (`synth_control.csv`, "Positive control" in fields.md) and `--dataset vannan`; `fields_common.py` adds
+  `BlockRidge.choose_alpha_per_gene` / `fit_per_gene` (one eigen-decomposition per held-out graph), `recover_counts`,
+  `layer_target_sum`, `load_vannan`; `noise_ceiling.py` adds `--dataset vannan` and normalises the halves to `uns['target_sum']`.
+  `make_lung_inputs.py` is copied into the folder (the original stays in `notebooks_and_scripts/`).
+- `fields.sbatch`: one CPU job (run 4: 128 GB, 8 cores, 11 h limit; runs 1-3: 96 GB, 4 h). Steps: `ceiling cosmx synth reread spill
   legnini bytype`; default (run 3, 2026-11-12) `ceiling cosmx reread spill legnini`, results in `$FIELDS_RESULTS` (default
   `MA/13_11_results/fields`; runs 1 and 2 stay in `11_11_results` / `12_11_results`). Run 2 used `ceiling cosmx synth reread` into
   `12_11_results/fields`.
@@ -292,6 +300,61 @@ included, where the source-only reader (21 genes per band) gains +0.22 to +0.37.
 on the toy's 6 slides; it holds on the real 24. So the band-field leg of "no far signal on CosMx" rests on a reader that misses
 planted far signal; the decision to skip steps 2-3 stays on the other evidence (every nonlinear model ties the smoother) until a
 reader that passes the control (stage 1e) gives the same null. Run 3's default steps did not include `synth`.
+
+### Run 4 (built 2026-11-21, not run): stage 1e, legnini fixed, vannan
+
+**Why the all-gene reader failed, and what the control can ask (found on a toy synth_spot, 8 training slides, 2026-11-21).** Two
+separate problems:
+
+1. *One alpha for every gene and band* (runs 1-3): the joint ridge cum5 chose alpha 1e4-1e5 where the nearest band alone wants 1e3,
+   so adding far bands blurred the near band and every planted long-range gene *lost* (toy: 2-4 mm genes -0.094 median, real run 2
+   -0.04 to -0.22). Fixed by stagewise fitting: `far|cum<reach>` = the `cum<reach>` fit (unchanged) + the far bands fitted on its
+   out-of-fold residual, one alpha per gene, a gene's far part off unless it lowers the pooled held-out squared error.
+2. *With every gene visible, a smooth long-range field is read locally*: the near band holds the target gene itself in its visible
+   neighbours (toy: MC11, 4 mm, nearest band alone 0.935; MC8-MC11 0.76-0.94), so the far bands rightly add ~0 beyond it. The
+   source-only reader gains (+0.24) only because it cannot see the response's own neighbours. So "far gain with every gene visible"
+   cannot tell "no long-range biology" from "long-range but smooth": on CosMx the band-field null of runs 1-3 says only that nothing
+   beyond ~100 um adds to what the neighbours' own expression of a gene already says. The test that can find a far gain is the
+   **cross reader** `far|cum<reach>|x`: the target genes left out of the features (the band-field form of gene masking). Splits:
+   synth_spot the responses from every non-response gene (sources + ~200 noise genes) and the null programmes from every other gene
+   (its null); CosMx / legnini / vannan two seeded random halves of the genes, each predicted from the other.
+
+**Choices made on the toys (not open; each was tried and failed first):** stage 1 keeps one shared alpha (one alpha per gene there
+overfit the genes without signal on a lung stand-in with 6 training graphs: within section 0.549 -> 0.433); stage 2's alpha is chosen
+by held-out **squared error**, not the cosine (the cosine is blind to scale and let noise far parts in at full amplitude: per cell
+0.350 -> 0.235); no gate in standard errors over graphs (the 2-4 mm genes sit on some slides only: 1 of 4 kept at 2 SE over 8
+slides, 0 at 3 SE).
+
+**Toy result (8 training / 2 test slides of the generator, seed 3):**
+
+| reader | 2-4 mm long-range genes (median) | null programmes (median) | per cell within slide | verdict |
+|---|---|---|---|---|
+| joint ridge, one alpha (runs 1-3) | -0.094 | +0.001 | cum1 0.350 -> cum5 0.291 | FAIL (loss) |
+| `far\|cum1` (every gene visible) | 0.000 | 0.000 | 0.350 -> 0.352 | PASS (no loss) |
+| `far\|cum1\|x` (cross reader) | +0.097 (MC8 +0.044, MC9 +0.018, MC10 +0.363, MC11 +0.150) | 0.000 | 0.086 -> 0.145 | PASS |
+| source genes only (reference) | +0.238 | 0.000 | | |
+
+The pass rule was fixed before the run (`SYNTH_CONTROL` in band_fields.py): cross reader >= +0.02 median on the >= 2 mm genes, the
+every-gene readers >= -0.005 (no loss), null programmes within +-0.005. On 2 test slides single genes still swing (MC14 / MC15 -0.32,
+present on some slides only; sparse MC24 -0.10); the real synth_spot has more test slides.
+
+**How to read run 4.** First `synth_spot/fields.md`, "Positive control": the cross reader must PASS, else no far statement anywhere.
+Then per dataset `far_gain_x` (fields_per_gene.csv) against `far_gain_sw`: a far gain in the cross reader that the every-gene reader
+lacks is a smooth field read locally when the gene is visible; a far gain in both is far information the near neighbours do not
+carry. CosMx: `far|cum3+fov` vs `cum3+fov` (the FOV in stage 1). legnini: the programme x condition table now has `far_gain_x` (SHH
+readouts in SHH organoids vs Ctrl). vannan: within sample x fine type (final_CT), composition control `comp<k>` / `cum<k>|comp<k>`
+(no FOV). Per-gene gains on null genes swing by +-0.02 on the toy's 2 test slides (22 % of null genes beyond 0.02 in the cross
+reader): read single genes against that spread, programmes by their medians.
+
+**legnini fix.** `legnini23.h5ad`: X and `layers['raw']` are `normalize_total(target_sum=279)` (every row sums to 279, values are
+counts x one factor per cell: 5.1667, 93.0, 25.83 ...); `log1p_norm` is log1p of the same. Counts come back exactly (value / (row
+minimum / k), k the row's smallest count, 1 in nearly every cell: 3,000 of 3,000 cells in a spot check). The halves are now
+normalised to 279 like the file's `log1p_norm` (they were 1e4: half and full depth would not have been on one scale).
+
+**vannan.** `vannan25_pp.h5ad` (make_lung_inputs.py: layers raw / log1p_norm at 1e4, obs sample, patient, cell_type_fine = final_CT,
+split_0..4 by patient). Fold 0: test = its patient group, val left out (no model selected), train = the rest; graphs per sample; discs
+60 um over 10 % and CosMx's rank shells (~20 / 40 / 80 / 160 / 330 um at ~9 um spacing). Patients never cross splits, so the baseline
+of every graph (training ones too) is its own visible cells' sample x type mean.
 
 ## Open ideas
 
