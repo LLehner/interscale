@@ -73,6 +73,10 @@ class StructuredMask(NamedTuple):
 
     ``hidden_keys`` (``attention.visible_keys_only``, a backend whose spec says ``hidden_keys``) is ``[B, S + 1]``,
     True at every key that is a cell hidden whole: blocked for every query, as padding is. The CLS slot is False.
+
+    For the interaction read-out (``readout``; ``.claude/ccc_model_plan.md``): ``token_codes`` ``[B, S + 1]`` long, each
+    token's label code (``context_query.type_key``), -1 at padding and CLS; ``same_type`` blocks every pair of a query and
+    a key with one code (AMICI's exclusion of same-type neighbours).
     """
 
     blocked: torch.Tensor
@@ -82,6 +86,8 @@ class StructuredMask(NamedTuple):
     pair_bias: torch.Tensor | None = None
     bias_rows: Callable | None = None
     hidden_keys: torch.Tensor | None = None
+    token_codes: torch.Tensor | None = None
+    same_type: bool = False
 
 
 @dataclass(frozen=True)
@@ -803,6 +809,209 @@ class FusedAttention(ProjectedAttention):
         return torch.cat(outs, dim=2).reshape(n_rows, seq_len, head_dim), None
 
 
+#: The content-dependent rate's factors are ``exp`` of a value clamped to this (a rate between ~3e-4 and ~3e3 times the prior's):
+#: unbounded, one large factor times a bias of 0 (CLS, padding) would give NaN.
+RATE_LOG_LIMIT = 8.0
+
+
+class ReadoutAttention(FusedAttention):
+    """The interaction read-out's attention (``.claude/ccc_model_plan.md``, IR): the fused attention's blocks, computed
+    explicitly, with what AMICI adds to softmax attention.
+
+    The same blocked pairs, padding, hidden keys and bias rows as :class:`FusedAttention`, a block of query rows at a time
+    (under activation checkpointing in training, so no ``S x S`` tensor is kept), and on top:
+
+    * **A null key** (``null_key``): one more key per head with a learned logit ``c_h`` (zero at the start: torch's
+      ``add_zero_attn``) and a zero value, so a head can attend to nothing -- "no interaction" -- instead of being forced to
+      spread its mass over the cells. CLS is then no key (the null replaces it as the sink). Without it CLS stays open, as in
+      the fused attention.
+    * **A content-dependent decay rate** (``content_rate``): the distance prior's bias row is multiplied by
+      ``exp(w_h . k_hj) * exp(u_h[t_i])``, a factor from the key's own projection and one from the query's label code
+      (``StructuredMask.token_codes``). Both parameters start at zero, so at the start the bias is the prior's exactly. The
+      bias is ``-s_h phi(d / l_h) <= 0``, so the factors scale each pair's decay rate (AMICI's per-pair ``b_1``) and keep it
+      monotone in distance. The validator allows it only with the distance prior as the sole bias.
+    * **The same-type block** (``StructuredMask.same_type``): a query reads no key of its own label.
+    * **The entropy of every query row** (``track_entropy``), normalised by ``log`` of its open keys (null included), summed
+      over the cell rows (not CLS, not padding) and returned with the block, so a checkpointed block counts once:
+      ``last_entropy = (sum, rows)`` after each call.
+    * **A recording** (``recording`` a list): each call appends its projected queries, keys and values, the mask and the key
+      factors, detached, so :meth:`weights_rows` can rebuild any block's weights afterwards (the exact influence export,
+      ``evaluation.interaction_readout``).
+
+    Asked for weights (``need_weights``) it returns the ``[B * heads, L, L]`` map without the null column: a row then sums to
+    one minus its null mass.
+    """
+
+    supports_cross = True
+    supports_rotary = False
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        head_dim: int,
+        *,
+        dropout: float = 0.0,
+        chunk_pairs: int = 2**22,
+        null_key: bool = True,
+        content_rate: bool = False,
+        type_vocab: int = 0,
+    ):
+        super().__init__(embed_dim, num_heads, head_dim, dropout=dropout, chunk_pairs=chunk_pairs)
+        self.null_key = bool(null_key)
+        if self.null_key:
+            # Zeros: no draw from any generator, and the null key starts as torch's add_zero_attn (logit 0).
+            self.null_logit = nn.Parameter(torch.zeros(self.num_heads))
+        self.content_rate = bool(content_rate)
+        if self.content_rate:
+            self.rate_key = nn.Parameter(torch.zeros(self.num_heads, self.head_dim))
+            self.rate_type = nn.Parameter(torch.zeros(max(int(type_vocab), 1), self.num_heads))
+        self.track_entropy = False
+        self.last_entropy = None
+        self.recording = None
+
+    def extra_repr(self) -> str:
+        return super().extra_repr() + f", null_key={self.null_key}, content_rate={self.content_rate}"
+
+    def _key_factor(self, k: torch.Tensor) -> torch.Tensor | None:
+        """``[B, heads, L]``: each key's factor of its decay rate, ``exp(w_h . k_hj)``; None without ``content_rate``."""
+        if not self.content_rate:
+            return None
+        return torch.einsum("bhld,hd->bhl", k, self.rate_key.to(k.dtype)).clamp(-RATE_LOG_LIMIT, RATE_LOG_LIMIT).exp()
+
+    def _scores(self, q_rows, k, context, blocked, padding, start, stop, key_factor) -> torch.Tensor:
+        """``[B, heads, rows, L (+1)]``: the logits of query rows ``start..stop`` over every key, ``-inf`` where closed, and the
+        null key's logit last when it is on."""
+        n_graphs, n_heads, n_rows, head_dim = q_rows.shape
+        seq_len, device = k.shape[2], q_rows.device
+        # What the fused attention's block mask holds, built as its two halves: the closed pairs, and the bias rows -- the rate
+        # factors scale the bias *before* the closed pairs are filled with -inf, so no gradient ever meets an infinity.
+        graph, query, key = blocked
+        closed = torch.zeros(n_graphs, stop - start, seq_len, dtype=torch.bool, device=device)
+        closed[graph, query - start, key] = True
+        if padding is not None:
+            closed |= padding[:, None, :]
+        if context.hidden_keys is not None:
+            closed |= context.hidden_keys[:, None, :]
+        if context.same_type and context.token_codes is not None:
+            query_codes = context.token_codes[:, start:stop]
+            closed |= (query_codes[:, :, None] == context.token_codes[:, None, :]) & (query_codes[:, :, None] >= 0)
+        if self.null_key:
+            closed[:, :, -1] = True  # CLS is no key: the null key is the sink
+        if context.bias_rows is None:
+            bias = torch.zeros(n_graphs, 1, stop - start, seq_len, dtype=q_rows.dtype, device=device)
+        else:
+            bias = context.bias_rows(start, stop).to(q_rows.dtype)
+            if key_factor is not None:
+                factor = key_factor[:, :, None, :]
+                codes = context.token_codes
+                if codes is not None:
+                    rows = codes[:, start:stop].clamp_min(0).clamp_max(self.rate_type.shape[0] - 1)
+                    log_rate = self.rate_type.to(q_rows.dtype)[rows].clamp(-RATE_LOG_LIMIT, RATE_LOG_LIMIT)
+                    factor = factor * log_rate.exp().permute(0, 2, 1)[..., None]
+                bias = bias * factor  # the zero CLS / padding bias stays zero: the factors are positive and finite
+        mask = bias.masked_fill(closed[:, None], float("-inf"))
+        scores = (q_rows / math.sqrt(head_dim)) @ k.transpose(-2, -1) + mask
+        if self.null_key:
+            null = self.null_logit.to(scores.dtype).view(1, n_heads, 1, 1).expand(n_graphs, n_heads, stop - start, 1)
+            scores = torch.cat([scores, null], dim=-1)
+        return scores
+
+    @staticmethod
+    def _row_entropy(weights: torch.Tensor, scores: torch.Tensor, padding, start: int, stop: int, seq_len: int):
+        """``(sum, rows)``: the summed normalised entropy (over heads, mean) of the cell rows ``start..stop``."""
+        open_keys = torch.isfinite(scores).sum(-1).to(weights.dtype)  # [B, H, r]
+        ent = -(weights * torch.log(weights.clamp_min(1e-12))).sum(-1)
+        norm = torch.log(open_keys.clamp_min(2.0))
+        ent = (ent / norm).mean(1)  # [B, r], mean over heads
+        rows = torch.arange(start, stop, device=weights.device)
+        valid = (rows < seq_len - 1)[None, :].expand_as(ent)
+        if padding is not None:
+            valid = valid & ~padding[:, start:stop]
+        return (ent * valid.to(ent.dtype)).sum(), valid.sum().to(ent.dtype)
+
+    def _attend(self, q, k, v, padding, attn_mask, need_weights, context):
+        if attn_mask is not None or not isinstance(context, StructuredMask):
+            raise ValueError(
+                "the read-out attention takes its mask as a StructuredMask (blocked pairs, the biases by rows), never as a "
+                "dense attention mask; common_step_local_to_global builds it."
+            )
+        n_rows, seq_len, head_dim = q.shape
+        n_graphs = n_rows // self.num_heads
+        q, k, v = (t.view(n_graphs, self.num_heads, seq_len, head_dim) for t in (q, k, v))
+        key_factor = self._key_factor(k)
+        graph, query, key = context.blocked
+        order = torch.argsort(query)
+        graph, query, key = graph[order], query[order], key[order]
+        if self.recording is not None:
+            self.recording.append(
+                {
+                    "q": q.detach(),
+                    "k": k.detach(),
+                    "v": v.detach(),
+                    "padding": None if padding is None else padding.detach(),
+                    "context": context,
+                    "blocked": (graph, query, key),
+                    "key_factor": None if key_factor is None else key_factor.detach(),
+                }
+            )
+        dropout = self.dropout if self.training else 0.0
+        track = self.track_entropy
+
+        if need_weights:
+            scores = self._scores(q, k, context, (graph, query, key), padding, 0, seq_len, key_factor)
+            weights = torch.softmax(scores, dim=-1)
+            if track:
+                self.last_entropy = self._row_entropy(weights, scores, padding, 0, seq_len, seq_len)
+            cells = weights[..., :seq_len]
+            if self.training and dropout > 0.0:
+                cells = F.dropout(cells, p=dropout)
+            out = cells @ v
+            return out.reshape(n_rows, seq_len, head_dim), cells.reshape(n_rows, seq_len, seq_len)
+
+        rows = self.block_rows(n_graphs, seq_len)
+        starts = list(range(0, seq_len, rows))
+        edges = torch.tensor(starts + [seq_len], device=query.device, dtype=query.dtype)
+        bounds = torch.searchsorted(query, edges).tolist()
+
+        def block(q_rows, k_all, v_all, factor, start, stop, lo, hi):
+            blocked = (graph[lo:hi], query[lo:hi], key[lo:hi])
+            scores = self._scores(q_rows, k_all, context, blocked, padding, start, stop, factor)
+            weights = torch.softmax(scores, dim=-1)
+            if track:
+                ent_sum, ent_rows = self._row_entropy(weights, scores, padding, start, stop, seq_len)
+            else:
+                ent_sum = ent_rows = weights.new_zeros(())
+            cells = weights[..., :seq_len]
+            if dropout > 0.0:
+                cells = F.dropout(cells, p=dropout)
+            return cells @ v_all, ent_sum, ent_rows
+
+        recompute = torch.is_grad_enabled() and len(starts) > 1
+        outs, ent_sum, ent_rows = [], q.new_zeros(()), q.new_zeros(())
+        for i, start in enumerate(starts):
+            stop = min(start + rows, seq_len)
+            inputs = (q[:, :, start:stop], k, v, key_factor, start, stop, bounds[i], bounds[i + 1])
+            out, s, r = checkpoint(block, *inputs, use_reentrant=False) if recompute else block(*inputs)
+            outs.append(out)
+            ent_sum, ent_rows = ent_sum + s, ent_rows + r
+        if track:
+            self.last_entropy = (ent_sum, ent_rows)
+        return torch.cat(outs, dim=2).reshape(n_rows, seq_len, head_dim), None
+
+    def weights_rows(self, record: dict, start: int, stop: int) -> torch.Tensor:
+        """``[B, heads, stop - start, L (+1)]``: the weights of query rows ``start..stop`` of a recorded call (no dropout), the
+        null key's column last when it is on. Rebuilt from :attr:`recording`'s entry, with the module's current parameters."""
+        q, k = record["q"], record["k"]
+        graph, query, key = record["blocked"]
+        lo, hi = torch.searchsorted(query, torch.tensor([start, stop], device=query.device, dtype=query.dtype)).tolist()
+        blocked = (graph[lo:hi], query[lo:hi], key[lo:hi])
+        scores = self._scores(
+            q[:, :, start:stop], k, record["context"], blocked, record["padding"], start, stop, record["key_factor"]
+        )
+        return torch.softmax(scores, dim=-1)
+
+
 # --------------------------------------------------------------------------- registry entries
 
 
@@ -1017,6 +1226,49 @@ def _validate_fused(attention_cfg):
 def _build_fused(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
     return FusedAttention(
         embed_dim, num_heads, head_dim, dropout=dropout, chunk_pairs=int(attention_cfg.fused.chunk_pairs)
+    )
+
+
+def _validate_readout(attention_cfg):
+    readout = attention_cfg.get("readout", None)
+    if readout is None:
+        raise ValueError("attention.kind 'readout' needs the attention.readout block.")
+    if int(readout.chunk_pairs) < 1:
+        raise ValueError(f"attention.readout.chunk_pairs must be >= 1, got {readout.chunk_pairs}.")
+    if not 0.0 <= float(readout.key_dropout) < 1.0:
+        raise ValueError(f"attention.readout.key_dropout is the largest share of keys dropped per step, in [0, 1); got {readout.key_dropout}.")
+    if int(readout.type_vocab) < 1:
+        raise ValueError(f"attention.readout.type_vocab must be >= 1, got {readout.type_vocab}.")
+    if attention_cfg.get("center_qk", False):
+        raise ValueError(
+            "attention.kind 'readout' with center_qk: centring queries and keys on the mean of every token puts each cell's own "
+            "token into its query (weight 1 / S), which the read-out keeps out by construction. Set center_qk false."
+        )
+
+
+@register_attention(
+    "readout",
+    validate=_validate_readout,
+    mask="pairs",
+    bias_forms=frozenset({"pairs"}),
+    rotary=False,
+    training_maps=False,
+    note="The read-out attention (the interaction read-out, ccc_model_plan.md) reads each bias a block of query rows at a time "
+    "and carries no rotary encoding.",
+    hidden_keys=True,
+    cross=True,
+)
+def _build_readout(attention_cfg, *, embed_dim, num_heads, head_dim, dropout, bias_factor_dim):
+    readout = attention_cfg.readout
+    return ReadoutAttention(
+        embed_dim,
+        num_heads,
+        head_dim,
+        dropout=dropout,
+        chunk_pairs=int(readout.chunk_pairs),
+        null_key=bool(readout.null_key),
+        content_rate=bool(readout.content_rate),
+        type_vocab=int(readout.type_vocab),
     )
 
 

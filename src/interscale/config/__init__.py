@@ -230,6 +230,9 @@ def _validate_masking(cfg):
     )
     if blocks_alone and cfg.dataset.mask_percentage == 0:
         return
+    # Every cell a target, its prediction blind to its own values (`_validate_interaction_readout`): nothing needs hiding.
+    if cfg.dataset.get("score_all_cells", False) and cfg.dataset.mask_percentage == 0:
+        return
     if not 0 < cfg.dataset.mask_percentage <= 1:
         raise ValueError(
             f"dataset.mask_percentage must be in (0, 1] for a regression task, got "
@@ -945,6 +948,124 @@ def _validate_context_only(cfg):
         )
 
 
+#: What a context query may start from (``context_query.inputs``) and what its keys are computed from (``key_inputs``).
+CONTEXT_QUERY_INPUTS = ("position", "type", "own")
+KEY_INPUTS = ("expression", "type", "none")
+CONTEXT_READOUTS = ("stream", "additive")
+SAME_TYPE_KEYS = ("open", "block")
+
+
+def _validate_interaction_readout(cfg):
+    """The interaction read-out (``.claude/ccc_model_plan.md``): ``context_query``, ``context_readout``, the ``readout`` attention's
+    settings, ``dataset.score_all_cells`` and the two penalties (``attn_entropy``, ``value_l1``).
+
+    What it guards: a prediction that is scored on every cell must never read the cell's own values; the label every type-based
+    option reads must reach the graphs; the content-dependent rate scales the distance prior only; an entropy penalty needs a
+    place for "no interaction" (the null key).
+    """
+    params = cfg.model.global_component.get("parameters", None)
+    if params is None:
+        params = {}
+    query = params.get("context_query", None)
+    inputs = list(query.get("inputs", ["position"])) if query is not None else ["position"]
+    type_key = str(query.get("type_key", "") or "") if query is not None else ""
+    key_inputs = str(query.get("key_inputs", "expression")) if query is not None else "expression"
+    readout_mode = str(params.get("context_readout", "stream"))
+    context_only = params.get("context_only", "none")
+    attention = params.get("attention", None)
+    kind = attention.get("kind", "dense") if attention is not None else "dense"
+    settings = attention.get("readout", None) if attention is not None else None
+    weights = cfg.optim.get("aux_loss_weights", {}) or {}
+    entropy_w = float(weights.get("attn_entropy", 0.0))
+    l1_w = float(weights.get("value_l1", 0.0))
+    score_all = bool(cfg.dataset.get("score_all_cells", False))
+    where = "model.global_component.parameters"
+
+    unknown = sorted(set(inputs) - set(CONTEXT_QUERY_INPUTS))
+    if unknown:
+        raise ValueError(f"{where}.context_query.inputs: unknown {unknown}; known {list(CONTEXT_QUERY_INPUTS)}.")
+    if key_inputs not in KEY_INPUTS:
+        raise ValueError(f"{where}.context_query.key_inputs must be one of {KEY_INPUTS}, got {key_inputs!r}.")
+    if readout_mode not in CONTEXT_READOUTS:
+        raise ValueError(f"{where}.context_readout must be one of {CONTEXT_READOUTS}, got {readout_mode!r}.")
+    changed = inputs != ["position"] or key_inputs != "expression" or readout_mode != "stream"
+    if changed and context_only != "query":
+        raise ValueError(
+            f"{where}: context_query (inputs {inputs}, key_inputs {key_inputs!r}) and context_readout {readout_mode!r} shape the "
+            "context query's read-out; set context_only: query."
+        )
+    if ("type" in inputs or key_inputs == "type") and not type_key:
+        raise ValueError(f"{where}.context_query: a type input reads the label context_query.type_key; name the obs column.")
+    if type_key:
+        extra = list(cfg.dataset.get("extra_obs_keys", []) or [])
+        roles = [cfg.dataset.get("celltype_key", None)]
+        if type_key not in extra and type_key not in roles:
+            raise ValueError(
+                f"{where}.context_query.type_key {type_key!r} must reach the graphs: add it to dataset.extra_obs_keys."
+            )
+    if "own" in inputs and cfg.model.global_component.get("name", "") != "self-attn-transformer":
+        raise ValueError(f"{where}.context_query.inputs own reads the cell's visible genes in a GlobalModel's transformer.")
+
+    if kind == "readout":
+        if context_only != "query":
+            raise ValueError("attention.kind 'readout' is the interaction read-out's attention; set context_only: query.")
+        same = str(settings.get("same_type_keys", "open")) if settings is not None else "open"
+        if same not in SAME_TYPE_KEYS:
+            raise ValueError(f"attention.readout.same_type_keys must be one of {SAME_TYPE_KEYS}, got {same!r}.")
+        if same == "block" and not type_key:
+            raise ValueError("attention.readout.same_type_keys block compares labels: set context_query.type_key.")
+        if settings is not None and bool(settings.get("content_rate", False)):
+            pe = params.get("pe", None)
+            biases = list(pe.get("bias", [])) if pe is not None else []
+            distance_kind = pe.distance.get("kind", "profile") if pe is not None else "profile"
+            if biases != ["distance"] or distance_kind != "scales":
+                raise ValueError(
+                    "attention.readout.content_rate scales the distance prior's decay per pair; it needs pe.bias [distance] with "
+                    f"pe.distance.kind scales and no other bias (got bias {biases}, kind {distance_kind!r})."
+                )
+        if settings is not None and float(settings.get("key_dropout", 0.0)) > 0 and params.get("pooling", None) is not None:
+            if params.pooling.get("kind", "none") != "none":
+                raise ValueError("attention.readout.key_dropout drops cell keys; a pooled model has patch keys.")
+    else:
+        if entropy_w or l1_w:
+            raise ValueError(
+                "optim.aux_loss_weights.attn_entropy / value_l1 read the read-out attention (attention.kind readout)."
+            )
+    if entropy_w and not (settings is not None and bool(settings.get("null_key", True))):
+        raise ValueError(
+            "optim.aux_loss_weights.attn_entropy without attention.readout.null_key: a head with nowhere to put 'no interaction' "
+            "would be pushed to read one cell. Keep the null key on."
+        )
+    if entropy_w < 0 or l1_w < 0:
+        raise ValueError("optim.aux_loss_weights.attn_entropy and value_l1 must not be negative.")
+    if int(cfg.optim.get("attn_entropy", {}).get("ramp_epochs", 0)) < 0:
+        raise ValueError("optim.attn_entropy.ramp_epochs must not be negative.")
+
+    if score_all:
+        why = "dataset.score_all_cells scores every cell, so its prediction must never read the cell's own values"
+        if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":
+            raise ValueError(f"{why}: it is a node-level reconstruction setting.")
+        if cfg.dataset.mask_strategy != "node":
+            raise ValueError(f"{why}; it is defined for mask_strategy node (cells and discs hidden as keys).")
+        if context_only != "query" or kind != "readout":
+            raise ValueError(f"{why}: use context_only query with attention.kind readout.")
+        if "own" in inputs:
+            raise ValueError(f"{why}: context_query.inputs own reads them; use [type] or [position, type].")
+        if cfg.model.decoder.get("own_cell_skip", False):
+            raise ValueError(f"{why}: model.decoder.own_cell_skip reads them.")
+        if cfg.model.decoder.get("section_offset", "none") == "visible_mean" or cfg.model.decoder.get("group_offset", "none") != "none":
+            raise ValueError(
+                f"{why}: a visible-mean offset (section_offset visible_mean, group_offset) holds the cell itself when it is "
+                "visible. Use section_offset label_mean or none."
+            )
+        hidden = cfg.dataset.mask_percentage > 0 or cfg.dataset.get("mask_block_fraction", 0.0) > 0
+        if hidden and not (attention is not None and attention.get("visible_keys_only", False)):
+            raise ValueError(
+                "dataset.score_all_cells with cells hidden (mask_percentage or discs): set attention.visible_keys_only, so a hidden "
+                "cell is no key -- that is what hiding means under score_all_cells (it removes senders, not targets)."
+            )
+
+
 def _validate_regime_loss(cfg):
     """``optim.regime_loss`` (each head's loss on its regime's hidden cells): known values, cells hidden whole."""
     from interscale.tl.depth import REGIME_CELLS, REGIME_KINDS
@@ -1127,6 +1248,7 @@ def _validate(cfg):
     _validate_hierarchy(cfg)
     _validate_remask(cfg)
     _validate_context_only(cfg)
+    _validate_interaction_readout(cfg)
     _validate_regime_loss(cfg)
     _validate_own_cell_skip(cfg)
     _validate_section_offset(cfg)

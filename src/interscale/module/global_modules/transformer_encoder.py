@@ -56,6 +56,9 @@ class GlobalInput(_GlobalInputFields):
     """
 
     queries: torch.Tensor | None = None
+    #: ``[S, B, E]``: the tokens the read-out's keys come from (``context_query.key_inputs`` type / none), laid out as the
+    #: tokens; None when the keys are the tokens themselves. Pass it on as ``forward(..., key_memory=...)``.
+    key_memory: torch.Tensor | None = None
 
 
 class TransformerNodeEncoderHook(GlobalModule):
@@ -188,6 +191,16 @@ class TransformerNodeEncoderHook(GlobalModule):
         self.attention_seed = int(attention_seed)
         # Draws a sparse backend's pattern when it is resampled in training (Exphormer's `resample`).
         self.attention_generator = torch.Generator().manual_seed(self.attention_seed)
+        # The read-out attention's settings (attention.readout): the same-type block and key dropout act on its mask, here.
+        readout = attention.get("readout", None) if (attention is not None and self.attention_kind == "readout") else None
+        self.same_type_block = readout is not None and str(readout.get("same_type_keys", "open")) == "block"
+        self.key_dropout = float(readout.get("key_dropout", 0.0)) if readout is not None else 0.0
+        # Key dropout draws from its own generator, never the global one (off: no draw at all).
+        self.key_dropout_generator = torch.Generator().manual_seed(self.attention_seed + 104729)
+        if self.same_type_block and self.context_type_attr is None:
+            raise ValueError("attention.readout.same_type_keys block compares labels: set context_query.type_key.")
+        if self.context_readout == "additive" and self.context_only == "none":
+            raise ValueError("context_readout additive sums the context query's reads: set context_only query.")
         generator = torch.Generator().manual_seed(int(attention_seed))
         for layer in self.transformer_encoder.layers:
             if hasattr(layer.self_attn, "draw_features"):
@@ -362,6 +375,9 @@ class TransformerNodeEncoderHook(GlobalModule):
             # 0 * -inf that an "inverse adjacency" built by arithmetic would produce.
             attention_mask = attention_mask.to(dtype=torch.bool)
 
+        if self.attention_kind == "readout":
+            attention_mask = self._readout_mask(attention_mask, batched_data, index_nodes, src_padding_mask, eval_step)
+
         if self.visible_keys_only and not eval_step:
             # Before the bias is merged in: the dense mask is still boolean here. A backend that never forms it takes
             # the hidden keys as a row of the StructuredMask and blocks them in every block (fused).
@@ -372,6 +388,8 @@ class TransformerNodeEncoderHook(GlobalModule):
                         f"attention.visible_keys_only: attention.kind {self.attention_kind!r} cannot block keys "
                         "(it takes a pattern or folds its mask into features)."
                     )
+                if attention_mask.hidden_keys is not None:  # key dropout drew some already
+                    keys = keys | attention_mask.hidden_keys.to(keys.device)
                 attention_mask = attention_mask._replace(hidden_keys=keys)
             else:
                 attention_mask = self._without_hidden_keys(attention_mask, keys)
@@ -409,7 +427,31 @@ class TransformerNodeEncoderHook(GlobalModule):
         given = GlobalInput(padded_emb, src_padding_mask, index_nodes, attention_mask, rotary)
         if self.context_only != "none":
             given.queries = self._query_encoding(node_encoding, batched_data, index_nodes, padded_emb)
+            keys = self.key_tokens(batched_data)
+            if keys is not None:
+                seq_len = padded_emb.shape[0]
+                given.key_memory = pad_like(keys.to(padded_emb.dtype), batched_data.batch, index_nodes, seq_len).transpose(0, 1)
         return given
+
+    def _readout_mask(self, mask: StructuredMask, batched_data, index_nodes, src_padding_mask, eval_step: bool) -> StructuredMask:
+        """The read-out attention's mask: the tokens' label codes (``[B, S + 1]``, -1 at padding and CLS) and the same-type
+        block when a label is set, and -- in a training step -- the keys key dropout removes (``hidden_keys``)."""
+        n_graphs, seq_len = src_padding_mask.shape
+        device = src_padding_mask.device
+        changes = {}
+        if self.context_type_attr is not None:
+            codes = self.type_codes(batched_data).to(device)
+            padded = pad_like((codes + 1).float()[:, None], batched_data.batch.to(device), index_nodes, seq_len)[..., 0]
+            codes = torch.nn.functional.pad(padded.round().long() - 1, (0, 1), value=-1)  # CLS: -1
+            changes["token_codes"] = codes
+            changes["same_type"] = self.same_type_block
+        if self.key_dropout > 0 and self.training and not eval_step:
+            share = torch.rand(n_graphs, generator=self.key_dropout_generator) * self.key_dropout
+            drop = torch.rand(n_graphs, seq_len, generator=self.key_dropout_generator) < share[:, None]
+            drop = torch.nn.functional.pad(drop, (0, 1), value=False).to(device)  # CLS never dropped
+            hidden = mask.hidden_keys
+            changes["hidden_keys"] = drop if hidden is None else hidden.to(device) | drop
+        return mask._replace(**changes) if changes else mask
 
     def _hierarchical_context(
         self, batched_data, index_nodes, src_padding_mask, eval_step: bool, device
@@ -527,9 +569,15 @@ class TransformerNodeEncoderHook(GlobalModule):
         made -- ``pad_like`` with this call's ``index_nodes``, never a second padding.
         """
         seq_len, n_graphs, _ = padded_emb.shape
-        if node_encoding is None:
-            return padded_emb.new_zeros(padded_emb.shape)
-        return pad_like(node_encoding, batched_data.batch, index_nodes, seq_len).transpose(0, 1).to(padded_emb.dtype)
+        if node_encoding is None or "position" not in self.context_query_inputs:
+            queries = padded_emb.new_zeros(padded_emb.shape)
+        else:
+            queries = pad_like(node_encoding, batched_data.batch, index_nodes, seq_len).transpose(0, 1).to(padded_emb.dtype)
+        # The interaction read-out's receiver inputs (the label's embedding, the visible genes' projection).
+        extra = self.query_extras(batched_data)
+        if extra is not None:
+            queries = queries + pad_like(extra.to(padded_emb.dtype), batched_data.batch, index_nodes, seq_len).transpose(0, 1)
+        return queries
 
     def _hidden_keys(self, batched_data, index_nodes, seq_len: int) -> torch.Tensor:
         """``[B, S + 1]`` bool: True at every key that is a cell hidden whole; the CLS slot (last) is False.
@@ -606,7 +654,14 @@ class TransformerNodeEncoderHook(GlobalModule):
             self._hook_attention = saved
 
     def forward(
-        self, padded_h_node, src_padding_mask, mask=None, register_hook: bool | None = None, rotary=None, queries=None
+        self,
+        padded_h_node,
+        src_padding_mask,
+        mask=None,
+        register_hook: bool | None = None,
+        rotary=None,
+        queries=None,
+        key_memory=None,
     ):
         """
         N_b_max: maximum number of nodes in the batch
@@ -657,6 +712,11 @@ class TransformerNodeEncoderHook(GlobalModule):
                 "(GlobalInput.queries); without them there is no position to read from."
                 if queries is None
                 else "forward() got queries, but context_only is off."
+            )
+        if (key_memory is not None) != (self.context_only != "none" and self.key_inputs != "expression"):
+            raise ValueError(
+                "context_query.key_inputs is not expression, so forward() needs the key_memory common_step_local_to_global "
+                "returned (GlobalInput.key_memory)." if key_memory is None else "forward() got key_memory, but the keys are the tokens."
             )
         if queries is not None and tuple(queries.shape) != tuple(padded_h_node.shape):
             raise ValueError(
@@ -715,6 +775,13 @@ class TransformerNodeEncoderHook(GlobalModule):
             encoder.attention_context = mask if structured else None
             if hierarchical:
                 encoder.hier_context = mask
+            if hasattr(encoder.self_attn, "track_entropy"):
+                encoder.self_attn.track_entropy = self.track_attn_entropy
+                encoder.self_attn.last_entropy = None
+        if key_memory is not None:
+            # The keys' tokens, CLS last as in the memory, normalised as the tokens are.
+            cls_key = self.cls_embedding.expand(1, key_memory.size(1), -1)
+            key_memory = self.norm_input(torch.cat([key_memory, cls_key], dim=0))
         try:
             if self.context_only == "none":
                 transformer_out = self.transformer_encoder(
@@ -724,7 +791,7 @@ class TransformerNodeEncoderHook(GlobalModule):
                 )  # (S, B, h_d)
             else:
                 transformer_out = self._read_context(
-                    queries, padded_h_node, key_padding_mask, None if structured or hierarchical else mask
+                    queries, padded_h_node, key_padding_mask, None if structured or hierarchical else mask, key_memory
                 )  # (S, B, h_d)
         finally:
             for encoder in self.transformer_encoder.layers:
@@ -733,6 +800,14 @@ class TransformerNodeEncoderHook(GlobalModule):
                 if hierarchical:
                     encoder.hier_context = None
 
+        self.last_attn_entropy = None
+        if self.track_attn_entropy:
+            entropies = [getattr(encoder.self_attn, "last_entropy", None) for encoder in self.transformer_encoder.layers]
+            entropies = [e for e in entropies if e is not None]
+            if entropies:
+                total = sum(e[0] for e in entropies)
+                rows = sum(e[1] for e in entropies)
+                self.last_attn_entropy = total / rows.clamp_min(1.0)
         attn_matrices = []
         for encoder in self.transformer_encoder.layers:
             if keep_maps:
@@ -758,7 +833,7 @@ class TransformerNodeEncoderHook(GlobalModule):
 
         return transformer_out, src_padding_mask, final_attn
 
-    def _read_context(self, queries, memory, key_padding_mask, mask) -> torch.Tensor:
+    def _read_context(self, queries, memory, key_padding_mask, mask, key_memory=None) -> torch.Tensor:
         """The query stream (``context_only: query``): ``[S + 1, B, E]``, position-only queries read the cells' input tokens.
 
         Every cell starts as ``context_token + its node encoding`` (CLS as the CLS token), normalised like the tokens,
@@ -772,8 +847,17 @@ class TransformerNodeEncoderHook(GlobalModule):
         """
         cls = self.cls_embedding.expand(1, memory.size(1), -1)
         state = self.norm_input(torch.cat([self.context_token.view(1, 1, -1) + queries, cls], dim=0))
+        if self.context_readout == "additive":
+            # The interaction read-out: the sum of every layer's read is the output (no final norm, no feed-forward on it), so
+            # through a linear decoder the context part is exactly a sum over the cells read; the stream's feed-forward blocks
+            # only shape where the next layer reads.
+            total = None
+            for layer in self.transformer_encoder.layers:
+                read, state = layer.read_step(state, memory, mask, key_padding_mask, key_memory)
+                total = read if total is None else total + read
+            return total
         for layer in self.transformer_encoder.layers:
-            state = layer.read_context(state, memory, attn_mask=mask, key_padding_mask=key_padding_mask)
+            state = layer.read_context(state, memory, attn_mask=mask, key_padding_mask=key_padding_mask, key_memory=key_memory)
         return self.transformer_encoder.norm(state)
 
     def encode(self, batched_data, embedding):

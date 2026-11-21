@@ -51,6 +51,9 @@ class ViewOutput:
     attn_penalty
         The hierarchical attention's sparse-key penalty of this pass (a scalar with its gradient), or ``None`` when it is off
         (``optim.aux_loss_weights.sparse_keys``) or the module is not hierarchical.
+    attn_entropy
+        The read-out attention's mean normalised row entropy of this pass (a scalar with its gradient: cell queries, heads and
+        read layers, null key included), or ``None`` unless ``optim.aux_loss_weights.attn_entropy`` asks for it.
     """
 
     local_embedding: torch.Tensor | None = None
@@ -59,6 +62,7 @@ class ViewOutput:
     padded_node_idx: torch.Tensor | None = None
     attn: torch.Tensor | None = None
     attn_penalty: torch.Tensor | None = None
+    attn_entropy: torch.Tensor | None = None
 
     def tokens(self) -> torch.Tensor:
         """``[N_kept, E]`` real cell tokens -- see :func:`gather_tokens`."""

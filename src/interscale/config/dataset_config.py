@@ -73,6 +73,12 @@ def get_dataset_cfg(cfg):
     # cells and nothing else. mask_percentage is then the share of cells (1.0: every cell), and
     # discs, if on, select cells for it too. Empty: random entries, as before.
     cfg.dataset.mask_genes = []
+    # Every cell is a target (`.claude/ccc_model_plan.md`, training modes b and c): the loss and the metrics read every cell's
+    # whole row, not only the hidden ones. Only for a model whose prediction never reads the cell's own values (a GlobalModel with
+    # context_only query and the read-out attention, no own-cell skip, no `own` query input; the validator says so). Masking
+    # (cells, discs; mask_percentage may then be 0) still hides cells from the input, and with visible_keys_only they are no keys:
+    # it removes senders, not targets.
+    cfg.dataset.score_all_cells = False
     # What the sweeps' gene-set evaluation hides for this run (selectors as for mask_genes). Empty: the sweep's setting, else mask_genes.
     # Read by the evaluation only, never by training.
     cfg.dataset.eval_mask_genes = []

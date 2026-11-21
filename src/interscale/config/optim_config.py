@@ -126,6 +126,15 @@ def get_optim_cfg(cfg):
     # of the attention mass a query puts on cell keys in sparse tissue, each key weighted by how sparse it is (in [0, 1]). CLS is not
     # penalised, so "read nothing" stays open. See `optim.sparse_keys` and `interscale.tl.density`.
     cfg.optim.aux_loss_weights.sparse_keys = 0.0
+    # The interaction read-out's penalties (`.claude/ccc_model_plan.md`; attention.kind readout only), AMICI's: `attn_entropy`, the
+    # mean over cell queries, heads and read layers of each attention row's entropy over its open keys and the null key, divided
+    # by log(number of them) (in [0, 1]: 0 = one key, 1 = uniform), ramped from 0 to its weight over `optim.attn_entropy.ramp_epochs`;
+    # it needs the null key, or "no interaction" would have to be one cell. `value_l1`: the mean absolute value projection
+    # weight of the read layers (sparse messages).
+    cfg.optim.aux_loss_weights.attn_entropy = 0.0
+    cfg.optim.aux_loss_weights.value_l1 = 0.0
+    cfg.optim.attn_entropy = CN()
+    cfg.optim.attn_entropy.ramp_epochs = 0
 
     # Settings of the sparse-key penalty. Inert until it carries a weight.
     cfg.optim.sparse_keys = CN()

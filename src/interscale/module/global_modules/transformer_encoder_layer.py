@@ -150,12 +150,13 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
         """
         return self._attend(x, x, attn_mask, key_padding_mask, is_causal)
 
-    def _attend(self, x, memory, attn_mask, key_padding_mask, is_causal):
+    def _attend(self, x, memory, attn_mask, key_padding_mask, is_causal, key_memory=None):
         """Attention of the tokens ``x`` ``[L, N, E]`` over ``memory`` ``[L, N, E]`` (its keys and values), with the hooks.
 
         Self-attention is ``memory is x``: queries, keys and values from one sequence, as ever. Anything else is a
         read-out (:meth:`read_context`): the queries come from ``x``, the keys and values from ``memory``, row ``l`` of
-        each being the same cell (the mask, the rotation and the padding are laid out once for both).
+        each being the same cell (the mask, the rotation and the padding are laid out once for both). ``key_memory``
+        (a read-out only; ``context_query.key_inputs``): the keys come from it instead, the values still from ``memory``.
         """
         # Torch's vendored attention always takes its explicit path (need_weights=True), which is
         # what keeps its numbers unchanged. Other backends compute the map only when it is kept, and
@@ -165,7 +166,9 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
         self_attention = memory is x
         query = key = x
         if not self_attention:
-            key = memory
+            key = memory if key_memory is None else key_memory
+        elif key_memory is not None:
+            raise ValueError("key_memory gives a read-out its keys; self-attention takes its keys from its own tokens.")
         if self.center_qk or self.record_tokens:
             cells = cell_positions(memory, key_padding_mask)
             if self.record_tokens:
@@ -197,7 +200,7 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
         #     attn_output_weights.register_hook(self.save_attn_gradients) # Note: Source code modification in MultiHeadAttention Module (F.multi_head_attention_forward function) to calculate gradient on weights
         return self.dropout1(attn_output)
 
-    def read_context(self, queries, memory, attn_mask=None, key_padding_mask=None):
+    def read_context(self, queries, memory, attn_mask=None, key_padding_mask=None, key_memory=None):
         """This layer as a step of a read-out stream: ``queries`` ``[L, N, E]`` read ``memory`` ``[L, N, E]``, then the feed-forward block.
 
         The pre-norm layer with the query stream in place of the tokens: ``q + attention(norm1(q), norm1(memory))``,
@@ -208,5 +211,20 @@ class CustomTransformerEncoderLayer(TransformerEncoderLayer):
         """
         if not self.norm_first:
             raise ValueError("read_context is the pre-norm layer; this one is post-norm.")
-        queries = queries + self._attend(self.norm1(queries), self.norm1(memory), attn_mask, key_padding_mask, False)
-        return queries + self._ff_block(self.norm2(queries))
+        return self.read_step(queries, memory, attn_mask, key_padding_mask, key_memory)[1]
+
+    def read_step(self, queries, memory, attn_mask=None, key_padding_mask=None, key_memory=None):
+        """One read of the query stream: ``(read, state)``.
+
+        ``read`` is the attention output alone (after the output projection and its dropout): what this layer adds from the
+        other cells, a sum over them weighted by the attention. ``state`` is the stream after the read and the feed-forward
+        block, what the next layer queries from. :meth:`read_context` keeps ``state``; the additive read-out
+        (``context_readout: additive``) sums the ``read`` of every layer and uses ``state`` for routing only, so its output is
+        exactly a sum over senders. ``key_memory``: the keys' tokens (``context_query.key_inputs``), normalised like the memory.
+        """
+        if not self.norm_first:
+            raise ValueError("read_step is the pre-norm layer; this one is post-norm.")
+        keys = None if key_memory is None else self.norm1(key_memory)
+        read = self._attend(self.norm1(queries), self.norm1(memory), attn_mask, key_padding_mask, False, key_memory=keys)
+        state = queries + read
+        return read, state + self._ff_block(self.norm2(state))

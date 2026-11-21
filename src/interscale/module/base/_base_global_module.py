@@ -35,6 +35,13 @@ class GlobalModule(BaseModule):
         context_only: str = "none",
         bilinear_rank: int = 0,
         bilinear_head: int = -1,
+        context_query_inputs=("position",),
+        context_type_attr: str | None = None,
+        type_vocab: int = 64,
+        key_inputs: str = "expression",
+        context_readout: str = "stream",
+        score_all_cells: bool = False,
+        track_attn_entropy: bool = False,
         **base_module_kwargs,
     ):
         """``precomputed_mask_fill``: what a hidden cell's ``Precomputed`` embedding is replaced by.
@@ -125,7 +132,38 @@ class GlobalModule(BaseModule):
             # initialised as in the model without it.
             gen = torch.Generator().manual_seed(0)
             self.context_token = torch.nn.Parameter(torch.randn(self.n_embed, generator=gen))
+        # The interaction read-out (`.claude/ccc_model_plan.md`): what a context query starts from, what its keys are made of,
+        # whether its output is the sum of the reads, whether every cell is a target. Off (the defaults): no state, no draw.
+        self.context_query_inputs = tuple(context_query_inputs)
+        self.context_type_attr = context_type_attr or None
+        self.type_vocab = int(type_vocab)
+        self.key_inputs = str(key_inputs)
+        self.context_readout = str(context_readout)
+        self.score_all_cells = bool(score_all_cells)
+        self.track_attn_entropy = bool(track_attn_entropy)
+        self.last_attn_entropy = None
+        if self.context_readout not in ("stream", "additive"):
+            raise ValueError(f"context_readout must be stream or additive, got {context_readout!r}.")
+        if (set(self.context_query_inputs) - {"position"} or self.key_inputs != "expression" or self.context_readout != "stream") and (
+            context_only == "none"
+        ):
+            raise ValueError("context_query inputs, key_inputs and context_readout shape the context query: set context_only query.")
+        if ("type" in self.context_query_inputs or self.key_inputs == "type") and self.context_type_attr is None:
+            raise ValueError("a type input reads the label context_query.type_key; it reaches the module as context_type_attr.")
+        if "type" in self.context_query_inputs:
+            # Zeros: no draw, and the query starts as without it.
+            self.query_type = torch.nn.Parameter(torch.zeros(self.type_vocab, self.n_embed))
+        if "own" in self.context_query_inputs:
+            if self.score_all_cells:
+                raise ValueError("score_all_cells: a query that reads the cell's own genes would read its target.")
+            self.query_own = torch.nn.Parameter(torch.zeros(self.n_embed, self.n_input))
+        if self.key_inputs == "type":
+            # Keys made of the label alone: drawn (a zero key would be one constant token), from a private generator.
+            gen = torch.Generator().manual_seed(1)
+            self.key_type = torch.nn.Parameter(torch.randn(self.type_vocab, self.n_embed, generator=gen))
         self.own_cell_skip = bool(own_cell_skip)
+        if self.score_all_cells and self.own_cell_skip:
+            raise ValueError("score_all_cells: the own-cell skip reads the cell's own values, which are its target.")
         if own_cell_skip_input not in OWN_CELL_SKIP_INPUTS:
             raise ValueError(f"own_cell_skip_input must be one of {OWN_CELL_SKIP_INPUTS}, got {own_cell_skip_input!r}.")
         self.own_cell_skip_input = own_cell_skip_input
@@ -224,6 +262,43 @@ class GlobalModule(BaseModule):
         if self.type_gex_embedding == "Precomputed" and hidden is not None:
             embedding = self.hide_embeddings(embedding, hidden)
         return embedding
+
+    def type_codes(self, batch) -> torch.Tensor:
+        """``[N]`` the cells' label codes (``context_query.type_key``), checked against ``type_vocab``."""
+        from interscale.tl.geome_utils import label_codes
+
+        codes = label_codes(batch, self.context_type_attr)
+        if codes.numel() and int(codes.max()) >= self.type_vocab:
+            raise ValueError(
+                f"the label {self.context_type_attr!r} has code {int(codes.max())}, beyond context_query.type_vocab {self.type_vocab}."
+            )
+        return codes
+
+    def query_extras(self, batch) -> torch.Tensor | None:
+        """``[N, E]`` in batch node order: what a context query adds to its learned token besides the position, or None.
+
+        ``type``: the embedding of the cell's label. ``own``: a projection of the cell's *visible* genes -- an entry hidden by the
+        masking is :data:`MASK_VALUE` in the batch and counts as 0, so no hidden value reaches the query.
+        """
+        extra = None
+        if "type" in self.context_query_inputs:
+            codes = self.type_codes(batch).to(self.query_type.device)
+            extra = self.query_type[codes]
+        if "own" in self.context_query_inputs:
+            x = batch.x.float()
+            visible = torch.where(x == MASK_VALUE, torch.zeros_like(x), x)
+            own = visible @ self.query_own.to(x.dtype).T
+            extra = own if extra is None else extra + own.to(extra.dtype)
+        return extra
+
+    def key_tokens(self, batch) -> torch.Tensor | None:
+        """``[N, E]``: the tokens a read-out's keys come from when they are not the expression (``key_inputs``), or None."""
+        if self.key_inputs == "expression":
+            return None
+        if self.key_inputs == "type":
+            codes = self.type_codes(batch).to(self.key_type.device)
+            return self.key_type[codes]
+        return torch.zeros(batch.x.shape[0], self.n_embed, device=batch.x.device)
 
     def own_cell_input(self, batch, embedding: torch.Tensor) -> torch.Tensor:
         """``[N, ·]`` in batch node order: what the own-cell skip reads, from ``batch`` as the model got it.
@@ -427,9 +502,16 @@ class GlobalModule(BaseModule):
 
     @staticmethod
     def _query_kwargs(given) -> dict:
-        """``forward``'s ``queries=`` for the input ``common_step_local_to_global`` returned: only where it has any."""
+        """``forward``'s ``queries=`` (and ``key_memory=``) for the input ``common_step_local_to_global`` returned: only where it
+        has any."""
+        out = {}
         queries = getattr(given, "queries", None)
-        return {} if queries is None else {"queries": queries}
+        if queries is not None:
+            out["queries"] = queries
+        key_memory = getattr(given, "key_memory", None)
+        if key_memory is not None:
+            out["key_memory"] = key_memory
+        return out
 
     def _pca_transform(self, embeddings):
         """Project onto the stored PCA basis: ``(X - mean_) @ components_.T``.
@@ -506,6 +588,11 @@ class GlobalModule(BaseModule):
         if "classification" in prediction_task:
             y_true = batch.y[padded_node_idx]
             entry_mask = None
+        elif "regression" in prediction_task and getattr(self, "score_all_cells", False):
+            # Every cell a target (`dataset.score_all_cells`): its prediction never reads its own values (validated), so its
+            # whole row is scored, hidden or not.
+            y_true = batch.x[padded_node_idx]
+            entry_mask = torch.ones_like(y_true, dtype=torch.bool)
         elif "regression" in prediction_task:
             y_true = batch.x[padded_node_idx]
             use_gene_mask = self.mask_strategy == "gene"
@@ -780,6 +867,7 @@ class GlobalModule(BaseModule):
                     padded_node_idx=padded_node_idx,
                     attn=attn_matrix,
                     attn_penalty=attn_penalty,
+                    attn_entropy=self.last_attn_entropy,
                 )
             ],
         )
@@ -814,6 +902,13 @@ class GlobalModule(BaseModule):
             head_dim = attention_head_dim(attention, n_embed, params["n_heads"]) if n_embed is not None else None
             bilinear = cfg.model.decoder.get("bilinear", None)
             bilinear_rank = int(bilinear.get("rank", 0)) if bilinear is not None else 0
+            # The interaction read-out (.claude/ccc_model_plan.md).
+            context_query = params.get("context_query", None)
+            type_key = str(context_query.get("type_key", "") or "") if context_query is not None else ""
+            from interscale.tl.geome_utils import label_attribute
+
+            type_attr = label_attribute(cfg, type_key) if type_key else None
+            weights = cfg.optim.get("aux_loss_weights", {}) or {}
             return TransformerNodeEncoderHook(
                 max_seq_len=params["max_seq_len"],
                 n_heads=params["n_heads"],
@@ -836,6 +931,13 @@ class GlobalModule(BaseModule):
                 context_only=params.get("context_only", "none"),
                 bilinear_rank=bilinear_rank,
                 bilinear_head=int(bilinear.get("head", -1)) if bilinear is not None else -1,
+                context_query_inputs=tuple(context_query.get("inputs", ["position"])) if context_query is not None else ("position",),
+                context_type_attr=type_attr,
+                type_vocab=int(context_query.get("type_vocab", 64)) if context_query is not None else 64,
+                key_inputs=str(context_query.get("key_inputs", "expression")) if context_query is not None else "expression",
+                context_readout=str(params.get("context_readout", "stream")),
+                score_all_cells=bool(cfg.dataset.get("score_all_cells", False)),
+                track_attn_entropy=float(weights.get("attn_entropy", 0.0)) > 0,
                 hierarchy=hierarchy_settings(cfg),
                 **build_positional_encodings(cfg, n_embed=n_embed, n_heads=params["n_heads"], head_dim=head_dim),
                 **kwargs,

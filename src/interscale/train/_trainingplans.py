@@ -903,6 +903,13 @@ class TrainingPlan(pl.LightningModule):
             return y_pred, y_true
         return y_pred - center, y_true - center
 
+    def on_train_epoch_start(self) -> None:
+        """Tell the module which epoch it is in: auxiliary terms that ramp in (``attn_entropy``) read ``module.training_epoch``."""
+        self.module.training_epoch = int(self.current_epoch)
+        parent = getattr(super(), "on_train_epoch_start", None)
+        if callable(parent):
+            parent()
+
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""
         params = []

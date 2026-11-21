@@ -131,6 +131,15 @@ def _attention_tag(cfg) -> str:
         settings = f"-a{float(entmax.get('alpha', 1.5)):g}" + ("l" if learn else "")
     elif kind == "topk":
         settings = f"-k{int(attention.get('topk', {}).get('k', 32))}"
+    elif kind == "readout":
+        # The interaction read-out's attention: n (null key), r (content rate), st (same-type block), kd<share> (key dropout).
+        readout = attention.get("readout", {})
+        settings = (
+            ("-n" if bool(readout.get("null_key", True)) else "")
+            + ("-r" if bool(readout.get("content_rate", False)) else "")
+            + ("-st" if str(readout.get("same_type_keys", "open")) == "block" else "")
+            + (f"-kd{float(readout.get('key_dropout', 0.0)):g}" if float(readout.get("key_dropout", 0.0)) > 0 else "")
+        )
     return (
         f"attn-{kind}{settings}"
         + (f"-hd{head_dim}" if head_dim > 0 else "")
@@ -315,6 +324,18 @@ def _training_tag(cfg) -> str:
         parts.append(f"rmk-{params.remask}")
     if params is not None and params.get("context_only", "none") != "none":
         parts.append(f"ctx-{params.context_only}")
+        # The interaction read-out (ccc_model_plan.md): query inputs, key inputs, additive read-out, every cell a target.
+        query = params.get("context_query", None)
+        if query is not None:
+            inputs = [str(i) for i in query.get("inputs", ["position"])]
+            if inputs != ["position"]:
+                parts.append("q-" + "".join(i[0] for i in inputs))
+            if str(query.get("key_inputs", "expression")) != "expression":
+                parts.append(f"k-{query.key_inputs}")
+        if str(params.get("context_readout", "stream")) != "stream":
+            parts.append(f"ro-{params.context_readout}")
+    if cfg.dataset.get("score_all_cells", False):
+        parts.append("all")
     regime = cfg.optim.get("regime_loss", None)
     if regime is not None and regime.get("kind", "none") != "none":
         parts.append(f"rgm{float(regime.depth_um):g}-{regime.local_cells}-{regime.global_cells}")
@@ -367,7 +388,9 @@ def _training_tag(cfg) -> str:
         parts.append(f"drop{len(dropped)}-{digest}")
     weights = {name: float(w) for name, w in dict(cfg.optim.get("aux_loss_weights", {})).items() if float(w) != 0.0}
     if weights:
-        parts.append("aux-" + "-".join(f"{name}{w:g}" for name, w in sorted(weights.items())))
+        # the interaction read-out's penalties go short: the name must stay under 255 characters (older names unchanged)
+        short = {"attn_entropy": "ent", "value_l1": "vl1"}
+        parts.append("aux-" + "-".join(f"{short.get(name, name)}{w:g}" for name, w in sorted(weights.items())))
     return f"var-{'+'.join(parts)}_" if parts else ""
 
 

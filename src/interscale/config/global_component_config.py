@@ -293,6 +293,25 @@ def get_global_component_cfg(cfg, global_component_name):
         # backends), node-level prediction. Attention rollout and relevance (which compose attention over
         # layers as token mixing) are not defined for it.
         cfg.model.global_component.parameters.context_only = "none"
+        # The interaction read-out (`.claude/ccc_model_plan.md`, IR), on top of `context_only: query`.
+        # `context_query.inputs`: what a cell's query starts from besides the learned token -- `position` (its node encoding,
+        # the context query as it was), `type` (an embedding of its label `type_key`, AMICI / GITIII: the receiver's type
+        # chooses its senders), `own` (a projection of its *visible* genes: under programme masking a receptor marker). Every
+        # added input starts at zero, so the model starts as without it. `type_key`: an obs column reaching the graphs through
+        # dataset.extra_obs_keys; it also gives the read-out attention its label codes (receiver rate factor, same-type block).
+        # `type_vocab`: the most label codes the embedding takes. `key_inputs`: what the keys are computed from --
+        # `expression` (the cells' tokens, as ever), `type` (the label embedding alone: sender choice by type and distance
+        # only, values still the expression), `none` (constant keys: distance and the null key alone).
+        cq = cfg.model.global_component.parameters.context_query = CN()
+        cq.inputs = ["position"]
+        cq.type_key = ""
+        cq.type_vocab = 64
+        cq.key_inputs = "expression"
+        # `stream` (as it was): the query stream's final state, after every feed-forward block and the final norm, is the
+        # global embedding. `additive`: the sum of the read layers' attention outputs is -- the feed-forward blocks update
+        # the stream for the next read (routing) only -- so the context part of the prediction is exactly a sum over senders
+        # (`evaluation.interaction_readout`). Needs context_only query.
+        cfg.model.global_component.parameters.context_readout = "stream"
         # The attention mechanism, see `.claude/attention_plan.md`. `kind`: any registered backend
         # (`module/global_modules/attention.py`): `dense` is softmax attention over every pair, the
         # model from before backends existed. `head_dim` sets the width of one attention head apart
@@ -361,5 +380,18 @@ def get_global_component_cfg(cfg, global_component_name):
         # RoPE and the long-range mask; maps only when read (explicit path, S x S).
         att.fused = CN()
         att.fused.chunk_pairs = 16777216
+        # `readout` (the interaction read-out's attention, `attention.ReadoutAttention`): the fused attention's blocks computed
+        # explicitly, with a null key (`null_key`: a head may attend to nothing; CLS is then no key), a decay rate scaled per
+        # pair by the key and the query's label (`content_rate`: only with the distance prior as the sole bias; both factors
+        # start at 1), the same-type block (`same_type_keys: block`: a query reads no key of its own label), and key dropout
+        # (`key_dropout`: each training step a share U(0, key_dropout) of each graph's keys is no key, from a private
+        # generator; never at evaluation). `type_vocab`: the label codes the receiver rate factor takes.
+        att.readout = CN()
+        att.readout.chunk_pairs = 4194304
+        att.readout.null_key = True
+        att.readout.content_rate = False
+        att.readout.same_type_keys = "open"
+        att.readout.key_dropout = 0.0
+        att.readout.type_vocab = 64
         cfg.model.global_component.latent_obsm_key = None  # Use the obms key where precomputed embeddings are stored, only if type_gex_embedding is "Precomputed"
     return cfg

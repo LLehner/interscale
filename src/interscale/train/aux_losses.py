@@ -1283,3 +1283,65 @@ class SparseKeyPenalty(AuxLoss):
         if penalty is None:
             return {"sparse_keys": out.y_pred.new_zeros(())}
         return {"sparse_keys": penalty.to(out.y_pred.dtype)}
+
+
+def _readout_layers(module) -> list:
+    """The read-out attention modules of ``module``'s transformer (``attention.kind readout``), in layer order."""
+    encoder = getattr(module, "transformer_encoder", None)
+    if encoder is None:
+        return []
+    return [layer.self_attn for layer in encoder.layers if hasattr(layer.self_attn, "null_key")]
+
+
+@register_aux_loss("attn_entropy")
+class AttentionEntropy(AuxLoss):
+    """The read-out attention's normalised row entropy (``.claude/ccc_model_plan.md``; AMICI's attention penalty).
+
+    The mean, over cell queries, heads and read layers, of each attention row's entropy over its open keys and the null key,
+    divided by ``log`` of their number: 0 when a row reads one key (or only the null), 1 when it is uniform. Computed inside the
+    attention's blocks on the weights the pass uses (``ViewOutput.attn_entropy``). Ramped from 0 to its weight over
+    ``optim.attn_entropy.ramp_epochs`` (AMICI: the penalty grows once the model has found its senders); the epoch comes from the
+    training plan (``module.training_epoch``). Reported raw as ``_attn_entropy_raw`` (a diagnostic, not in the objective).
+    """
+
+    def __init__(self, cfg, module=None):
+        super().__init__()
+        attention = cfg.model.global_component.parameters.get("attention", None)
+        if attention is None or attention.get("kind", "dense") != "readout":
+            raise ValueError("optim.aux_loss_weights.attn_entropy is computed by the read-out attention: set attention.kind readout.")
+        self.ramp_epochs = int(cfg.optim.get("attn_entropy", {}).get("ramp_epochs", 0))
+        # A tuple, not a registered child: the module holds the terms, so a registered back-reference would recurse.
+        self._owner = (module,)
+
+    def ramp(self) -> float:
+        if self.ramp_epochs <= 0:
+            return 1.0
+        epoch = int(getattr(self._owner[0], "training_epoch", self.ramp_epochs) or 0) if self._owner[0] is not None else self.ramp_epochs
+        return min(1.0, (epoch + 1) / self.ramp_epochs)
+
+    def forward(self, out: StepOutput, batch) -> dict[str, torch.Tensor]:
+        entropy = out.view.attn_entropy
+        if entropy is None:
+            zero = out.y_pred.new_zeros(())
+            return {"attn_entropy": zero, "_attn_entropy_raw": zero.detach()}
+        entropy = entropy.to(out.y_pred.dtype)
+        return {"attn_entropy": self.ramp() * entropy, "_attn_entropy_raw": entropy.detach()}
+
+
+@register_aux_loss("value_l1")
+class ValueL1(AuxLoss):
+    """The mean absolute value-projection weight of the read-out attention's layers (AMICI's L1 on the values): sparse messages."""
+
+    def __init__(self, cfg, module=None):
+        super().__init__()
+        attention = cfg.model.global_component.parameters.get("attention", None)
+        if attention is None or attention.get("kind", "dense") != "readout":
+            raise ValueError("optim.aux_loss_weights.value_l1 reads the read-out attention's values: set attention.kind readout.")
+        self._owner = (module,)
+
+    def forward(self, out: StepOutput, batch) -> dict[str, torch.Tensor]:
+        layers = _readout_layers(self._owner[0]) if self._owner[0] is not None else []
+        if not layers:
+            return {"value_l1": out.y_pred.new_zeros(())}
+        terms = [layer.in_proj_weight.chunk(3)[2].abs().mean() for layer in layers]
+        return {"value_l1": torch.stack(terms).mean().to(out.y_pred.dtype)}
