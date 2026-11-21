@@ -21,7 +21,7 @@ the same commit as the work.
 | D3.1 — additive linear decoder in the dual model | **implemented, unverified** -- `model.decoder.additive` (2026-10-22): `y = W_l h_local + W_g h_global + b`, the loss on the sum; sweep `additive_decoder` (10 runs) **run and read 2026-10-23** (notes.md): the sum 0.843 against the plain global head's 0.820 (3 seeds), programme mean 0.687 at the bar; without D1 the global part repeats the local one (0.60 of the short-range variance) and the parts cancel on the mirror programmes; weights 0.1 / 0.9 keep the sum and give a readable local part; a part scored alone carries its decoder's bias (read the shares) | 22 tests, 41 mutations caught (with the raw skip and the probe cost), harness IDENTICAL; synth_spot | 2026-10-23 |
 | D3 — the rest | D3.2 (gated mixture) and D3.3 (FiLM) proposed | | |
 | D5 — section offset (`model.decoder.section_offset: visible_mean`) | **implemented, unverified on data** (2026-10-31, roadmap Tier 1): a LocalModel's or GlobalModel's prediction gets the part `section` = w * (each gene's mean over the visible entries of the cell's section), w per gene from 1; the embedding need not carry the section's offset (80-89% of the CosMx centred cosine, notes.md 2026-10-31). Scoring: `masked_probing.within_section`. Combined models refuse it for now | 15 tests, 18 mutations caught (3 after stronger tests), harness IDENTICAL | 2026-10-31 |
-| D6 — bilinear part (`model.decoder.bilinear.rank`) | **implemented 2026-11-12, unrun**: a GlobalModel's prediction gets `bilinear` = sum_j a_ij (x_j V) U^T, a_ij the last layer's attention (head mean or `head`), x_j the neighbours' visible genes, B = U V^T a rank-r sender-gene -> receiver-gene map read from the parameters (`evaluation.bilinear`: `gene_map`, `components`, `planted_recovery`, `compare_maps`, `pair_weights`). Dense attention only, no pooling / hierarchy; the transformer keeps its maps for it. Sweep `bilinear_decoder` (synth_spot + legnini) to write | 10 tests, 3 mutations caught, touched areas pass | 2026-11-12 |
+| D6 — bilinear part (`model.decoder.bilinear.rank`) | **run and read 2026-11-21** (`14_11_results`, synth_spot programme masking, ranks 8 / 16 / 32, 3 seeds at 16): the part is unused (share of the prediction 0.000-0.001), the sum unchanged (0.766 vs 0.769), B names no planted sender (rank among the 25 sources at chance, median 12-15 of 25), one component holds 94-99 % of B: a shared response-level direction fed by noise genes. Read and reasons below the D6 section. Implemented 2026-11-12: a GlobalModel's prediction gets `bilinear` = sum_j a_ij (x_j V) U^T, a_ij the last layer's attention (head mean or `head`), x_j the neighbours' visible genes, B = U V^T a rank-r sender-gene -> receiver-gene map read from the parameters (`evaluation.bilinear`: `gene_map`, `components`, `planted_recovery`, `compare_maps`, `pair_weights`). Dense attention only, no pooling / hierarchy; the transformer keeps its maps for it. Sweep `bilinear_decoder` (synth_spot + legnini) to write | 10 tests, 3 mutations caught, touched areas pass | 2026-11-12 |
 | D4 — orthogonality terms (rewritten 2026-10-23: eight scale-free forms as auxiliary losses) | **implemented, unverified on synth_spot** (2026-10-23): `train.orthogonality`, the `orth_*` terms; a term lowers its measure on a toy dual model only without dropout, so terms that read cells refuse dropout; the sweep to design | 55 tests, 43 mutations, harness IDENTICAL | 2026-10-23 |
 
 ## Why the two components do not separate today
@@ -355,6 +355,40 @@ What the first run should show (sweep `bilinear_decoder`, to write): on synth_sp
 pairs (the band ridge's source-only reader names the sender for 20 %), B vs the ridge map (`compare_maps`), seed stability of B
 (3 seeds), and whether the sum's score moves (it need not: the part is for readability). On legnini, B's top components against the
 SHH readouts and the identity code. Rank 8 / 16 / 32 against rank 0.
+
+**First run, read 2026-11-21** (`MA/14_11_results/bilinear_decoder`, local `/home/lehnerl/Arbeit/results/14_11_results/`; synth_spot
+only, no legnini arm; base `lin_fourier_skipraw`: global-only, isotropic Fourier bias, no distance window, 100 epochs; every response
+gene hidden in every spot).
+
+| arm | centred cosine (all hidden) | SCE | bilinear share | planted sender top-1 | median rank among 25 sources | top component's share of B |
+|---|---|---|---|---|---|---|
+| skipraw (3 seeds) | 0.769 (sd 0.002) | 0.038 | - | - | - | - |
+| bil8 s42 | 0.768 | 0.038 | 0.000 | 1 / 27 | 14 | 0.991 |
+| bil16 (3 seeds) | 0.766 (sd 0.004) | 0.038 | 0.001 | 1 / 27 per seed | 12 (s43, s44) | 0.97-0.98 |
+| bil32 s42 | 0.763 | 0.038 | 0.001 | 0 / 27 | 15 | 0.939 |
+| bil16 s42 untrained | -0.006 | 1.052 | 0.000 | - | - | B = 0 |
+
+(bar: `ref_own+context` 0.682, oracle 0.995; programmes 6 / 13 / 5 wins / ties / losses for every arm.)
+
+- **The part does not take.** It supplies 0.000-0.001 of the prediction's variance at every rank; the sum, the programmes, the IG
+  sender ranks (0.48-0.62, as rank 0) and the final losses (train 0.216, val 0.228-0.232) do not move. Only the 29 response rows of B are non-zero (the loss
+  sits on the hidden responses only), with entries of order 0.01 (max |B| 0.04-0.09).
+- **B names no sender.** Over all 253 genes the planted sender ranks 7-241 (median 34-79 per programme), which looks better than
+  chance only because sources are more structured than noise genes; among the 25 source genes it is at chance (median 12-15 of 25,
+  chance 13; top-1 0-1 of 27 pairs, chance ~1). The band ridge's source-only reader names the sender for 20 %.
+- **One component, no programmes.** The top SVD component holds 94-99 % of B; its receiver side is the same response set in every
+  seed (R2, MC1, MC15, MC6, MC4, MC3, MC2: an overall response level), its sender side mostly noise genes (POI9 / POI10 / POI29 /
+  POI40, MR16) with a different set per seed. Seed stability of B: cosine 0.73 (s43 vs s44), 0.45-0.58 across ranks.
+- Why, my reading (not tested): `a_ij` is the last layer's head-mean attention over ~2,500 tokens without a distance window; with
+  near-uniform attention (uniform-attention diagnosis) `sum_j a_ij x_j` is close to the slide's visible mean, so the part can only
+  add a slide-level offset, which the context path already gives. U starts at zero and gets no gradient advantage over the token
+  path. The test of that reading: the same arms on the windowed `lin_dist_m11_skipraw` base (attention concentrated within ~300 um),
+  or a dedicated read-out head with its own softmax and distance prior (the point above), or a larger learning rate / no weight decay
+  on U, V. Planned outcome stated before the run ("B names the sender at least as often as the ridge, 20 %") not met.
+- **Bug: `bilinear/bil16_seed42.csv` is the untrained twin's B (all zeros).** The hook saves `<tag>_seed<seed>.csv` and the twin runs
+  second under the same tag and seed, overwriting the trained map. The s42 recovery and component tables in `results.md` are the
+  trained model's (they are computed in the hook before the save); only the CSV is lost. Fix before a rerun: name by `_RUN` or skip the
+  save for the twin (its B is zero by construction).
 
 ## Recommended order
 

@@ -24,6 +24,12 @@ The noise ceiling, the model-free band fields (CosMx, synth_spot, legnini) and w
 [`.claude/ceiling_plan.md`](.claude/ceiling_plan.md) (status table, results of each run, item 4: conditional reading). Read it before
 interpreting any CosMx score against the k-NN smoothers.
 
+Which model the global component should be, from the cell-cell communication papers (AMICI, GITIII, Steamboat, CellNEST,
+TERRA, scDIVA, ...) and SAFFRON, is in [`.claude/ccc_model_plan.md`](.claude/ccc_model_plan.md) (2026-11-21): verdicts per
+idea, the interaction read-out (receiver-aware query, null key, output additive in senders), new evaluations (SAE probes
+against known spatial variables, semi-synthetic CosMx, interventions with controls) and decision rules. Read it before
+touching the context query, the attention's keys, or the attribution plan's Stage M (`.claude/attribution_plan.md`).
+
 Work on contrastive / auxiliary losses for the global component is planned in
 [`.claude/contrastive_plan.md`](.claude/contrastive_plan.md). It carries the staged design, a
 status table, and an invariants checklist — read it before touching `train/losses.py`,
@@ -507,6 +513,40 @@ their gene-space loadings), and within the global part (`orth_decorrelation`, `o
 - **The owner.** A loading term reads the decoders of the module that holds it, kept in a tuple that `nn.Module` does not
   register: not a child, not in the state dict, and a deep copy points at the copy. Add no registered back-reference.
 - Checkpoint names carry every non-zero auxiliary weight (`aux-<name><weight>`, since 2026-10-23, the contrastive terms too).
+
+### The interaction read-out (`attention.kind: readout`, `context_readout: additive`; `.claude/ccc_model_plan.md`, S0)
+
+The context query (above) with a read-out made for cell-cell communication: the receiver's query from its type, its visible genes or
+its position (`context_query.inputs`: `type` needs `type_key`, a column in `dataset.extra_obs_keys`), keys from the senders'
+expression, their type or nothing (`context_query.key_inputs`), the read-out attention `attention.readout.*` (`ReadoutAttention`, a
+`FusedAttention`), and the reads summed over layers (`context_readout: additive`), so the context part is exactly a sum over senders
+and `evaluation.interaction_readout` reads each sender's influence through the linear decoder. Invariants:
+
+- **Exact decomposition.** With the null key the per-sender contributions sum to the context part (tested, null on and off, one or
+  many blocks), and `influence` equals the direct decomposition. Keep the read-out linear after the attention: anything nonlinear between
+  the weighted values and the decoder breaks it (GITIII's argument).
+- **Blind to its own cell** (tested): as for the context query; the same-type block (`same_type_keys: block`) closes a query's own
+  label; `key_inputs: none` makes the weights independent of expression (sender choice by distance and the null key alone).
+- **The null key** (`null_key`, default on): one learned logit per head, zero at the start; CLS is then no key. A returned map leaves
+  the null column out, so a row sums to one minus its null mass. The entropy penalty (`optim.aux_loss_weights.attn_entropy`, ramped by
+  `optim.attn_entropy.ramp_epochs`) needs it and is normalised by `log` of the open keys, block for block the same (tested).
+- **The content-dependent rate** (`content_rate`) scales the distance prior's bias by the key's and the receiver type's factors (both
+  zero at the start: the plain prior), log factors clamped to +-8, applied **before** blocked pairs are set to `-inf` (scaling an
+  infinite logit made NaN gradients). Needs `pe.bias: [distance]` with `kind: scales`.
+- **Key dropout** (`key_dropout`) acts in training only and draws from its own generator, never the global one (tested).
+- **Every cell a target** (`dataset.score_all_cells`; modes b / c of the plan): the step scores every cell's whole row; allowed only
+  when no input can show the cell its own values: node-level regression, `mask_strategy: node`, `context_only: query` with the read-out
+  attention, no `own` query input, no own-cell skip, no `visible_mean` section or group offset, and `visible_keys_only` whenever cells
+  are hidden (hiding then removes senders, not targets). Mode (c) = discs and hidden cells removed as keys only. The flag only chooses the scored
+  entries, so an evaluation that scores hidden cells may switch it off (the cluster hook `ir_common.py` does).
+- Tags: `ro-additive`, `q-<inputs>`, `k-<keys>`, `attn-readout-n[-r][-st][-kd<p>][-vk]`, `all`; aux `ent<w>` / `vl1<w>` (short, the name
+  must stay under 255 characters). Off (the defaults), nothing is built and the fused read-out is unchanged (tested).
+
+`evaluation/sae_probe.py` (E1): a Matryoshka BatchTopK sparse autoencoder per embedding, each feature's max |Spearman| with a known spatial
+variable within domains against within-domain permutations, OMP curves, the index-scale test (early vs late features), naive baselines.
+`evaluation/semi_synthetic.py` (E2): planted sender type -> receiver type programmes on real cells as Poisson count spike-ins (`step`,
+`exp`, `field` kernels; `field` scaled to the median receiver, unscaled it saturates), truth in `uns['synthetic']`'s format, a model-free
+check. Cluster jobs and their checks: the plan's section "Build".
 
 ### Preprocessing / robustness utilities (`interscale.pp`)
 

@@ -70,6 +70,8 @@ cluster cost and timing, the tests and harness checks, the list of every negativ
   source reaches few receivers; direction does not carry between sections; responses mix with cell identity.
 - These cases became synth_spot's programme classes (short range, rings, directional, dense, sparse, rare): the link to 3.1.
 - Sources: background.md (motivation), PE_plan.md "Benchmark dataset: synth_spot", legnini_plan.md.
+- Added 2026-11-21: the EV range paper (Colombo et al. 2025: 80 % of vesicle signal within 40 um of the donor, shorter in
+  dense tissue), via ccc_model_plan.md.
 
 ### 1.3 Methods for cell-cell communication (2.5)
 
@@ -83,6 +85,9 @@ cluster cost and timing, the tests and harness checks, the list of every negativ
 - Open problems, one table: no ground truth, one scale per method, prior dependence, composition confound, readouts that
   are not validated against known senders; which of them concern long range most.
 - Sources: comparison_plan.md, gene_ranking_literature.md, cellagentchat memory, notes.md 2026-11-10 (Steamboat, GITIII).
+- Added 2026-11-21: ccc_model_plan.md (papers read: AMICI, GITIII, Steamboat, CellNEST, TERRA, scDIVA, CellChat protocol, two
+  reviews; what the learned CCC methods agree on, all short range by construction; GITIII 0.0136 within-type variance explained on
+  CosMx NSCLC); SAFFRON for the evaluation of embeddings against known spatial variables (2.8, 4.5).
 
 ### 1.4 Representation learning: a detour (2.5)
 
@@ -381,6 +386,8 @@ One master ablation table, then the five findings:
 - Downstream programmes: the spatial-state programme (ANXA4, COL18A1, FGFR3) recurs over folds and matches the local
   Moran's I set; nothing repeats as a flow over folds; the known-pair test.
 - Sparse-key penalty arm: [slot, ~1 h].
+- Is the model's use of the neighbourhood linear? Attribution methods agree / Sensitivity-n holds only for a locally linear model
+  (Ancona et al. 2018, Prop. 4): a model-side line next to the score (ties the smoother) and the data (ceiling audit) [slot S13].
 - Sources: notes.md 2026-10-30 to 11-10; cosmx memories; downstream-interpretation memory.
 - Figures (exist): flow ensemble maps and curve over ensemble size; cell-type net flow bars; condition per slide. To
   make: scores within type vs smoothers vs ceiling in one panel.
@@ -435,5 +442,6 @@ One master ablation table, then the five findings:
 | S10 | the same audit (ceiling + band fields) on legnini: is there a long-range target for the global component? SHH vs Ctrl organoids as the negative control | built 2026-11-12 (`fields.sbatch` step `legnini`), stub-checked | 4.6, 5.1 | CPU job (run 3) |
 | S11 | composition control + spillover index on CosMx: is the near term composition, spillover, or neighbours' expression? | built 2026-11-12 (`fields.sbatch` run 3, steps `cosmx`, `spill`) | 4.7 | CPU job (run 3) |
 | S12 | conditional reading by the global model: own genes, type mean and FOV offset given, per-gene share against ridges from the same inputs (`cosmx_conditional.sbatch`, fork branch `conditional-context`) | built 2026-11-12, not run | 4.7, 5.2 | ~5 h GPU, after run 3 |
+| S13 | **must pursue (user, 2026-11-21):** is the learned neighbourhood function linear? Attribution agreement, Sensitivity-n and pairwise sender interactions on the retrained CosMx model, synth_spot's thresholded MC23 as the positive control (attribution_plan.md A6); novelty unchecked (NCEM's linear vs nonlinear comparison first) | proposed | 4.7, 5.2 | after the retrain + A0 |
 
 Writing from the start in parallel: chapters 1-3 and 4.1-4.5 depend on no slot.

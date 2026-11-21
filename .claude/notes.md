@@ -2234,3 +2234,100 @@ What doesn't work / open:
 - Three variants failed on the toys before the final one (kept in ceiling_plan.md): one alpha per gene in stage 1 (overfits genes without signal with few graphs: per cell 0.549 -> 0.433), choosing stage 2 by the cosine (scale-blind: noise far parts at full amplitude, per cell 0.350 -> 0.235), a gate in standard errors over graphs (too strict where a signal sits on some slides: 1 of 4 planted genes kept at 2 SE).
 - On the toy's 2 test slides single genes swing: MC14 / MC15 -0.32 in the cross reader (present on some slides only), 22 % of null genes beyond +-0.02. Read single genes against that spread.
 - Nothing ran on real data; run 4's time is not measured (11 h limit). vannan25_pp.h5ad is built by the job if missing (make_lung_inputs.py must be in MA/scripts).
+
+## 2026-11-21 — Bilinear part (D6) first run read: unused, B names no sender
+
+Sweep `bilinear_decoder` (`MA/14_11_results/bilinear_decoder`, local `/home/lehnerl/Arbeit/results/14_11_results/`): synth_spot programme masking, base `lin_fourier_skipraw` (global-only, no window), ranks 8 / 16 / 32, 3 seeds for rank 0 and 16, twin for bil16. Table and reasoning in decoder_plan.md, D6 "First run".
+
+What worked:
+- Training and evaluation ran for every arm; the sum is unharmed (0.766 vs 0.769 centred cosine, SCE 0.038 for all; 6 / 13 / 5 programme wins / ties / losses for every arm). U at zero kept the start identical to the plain model (untrained twin -0.006, as designed).
+- Reading B among the source genes only (25) rather than all 253 genes: the all-gene rank (median 34-55 for long_range) looked above chance, the source-only rank (median 12-15 of 25, chance 13) shows it is not. Use the source-only rank for planted recovery from now on.
+
+What doesn't work / open:
+- The part is not used: 0.000-0.001 of the prediction's variance; entries ~0.01; one SVD component holds 94-99 % of B (receiver side = the response set, sender side = noise genes, different per seed); planted sender top-1 0-1 of 27 per arm (ridge source-only reader: 20 %). Expectation stated before the run not met.
+- My reading, untested: the last layer's head-mean attention over ~2,500 tokens is near-uniform without a window, so `sum_j a_ij x_j` is about the slide's visible mean and the part can only add a slide offset the context path already supplies. Next test: the same arms on the windowed base `lin_dist_m11_skipraw`, or the dedicated read-out head with a distance prior.
+- Bug: `bilinear/bil16_seed42.csv` is all zeros: the untrained twin's save (`<tag>_seed<seed>.csv`) overwrote the trained map. The results.md tables for s42 are the trained model's. Fix before any rerun (name by `_RUN`, or skip the twin's save).
+- No legnini arm was in this sweep.
+
+## 2026-11-21 — Fields run 4 read: control passes, no far gain on CosMx / legnini / vannan, the per-gene gate leaks across individuals
+
+Run 4 (`MA/21_11_results/fields`, local `/home/lehnerl/Arbeit/results/21_11_results/fields/`); every step wrote output; the CosMx ceiling is identical to run 3. Full read and tables in ceiling_plan.md, Run 4 "Read 2026-11-21".
+
+What worked:
+- **Positive control PASS on the real synth_spot:** cross reader `far_gain_x` +0.167 median on the four >= 2 mm genes (MC10 +0.331, MC8 +0.203, MC9 +0.132, MC11 +0.059), null programmes 0.000; stagewise `far_gain_sw` 0.000 everywhere (no loss); the joint ridge fails as before (-0.116). The toy's design choices hold on 8 test slides.
+- **CosMx: the far null holds with a reader that passes the control.** `cum3|x` 0.0789 -> `far|cum3|x` 0.0802 within type; 7 of 960 genes > 0.02 (0.7 %, synth null genes 8.8 %). INS is the one robust far gene (+0.05 in both readers, +0.054 after the FOV): islet proximity at 100-450 um, consistent with run 3's INS profile; GCG weaker. Stress genes (HSPA1A, HSPB1, FOS, BAG3) are the FOV: their far gain goes after the FOV.
+- **legnini audit ran** (fixed loader): ceiling 0.80 within organoid, k-NN at 0.43-0.47 of it, ~25 % of the reproducible variance explained; nearest band best (cum1 0.365 > cum3 0.360 > cum5 0.339); no far gain in either reader; SHH readouts 0.000 in SHH and Ctrl organoids.
+- **vannan audit ran** (8 test samples, 34,134 cells): ceiling 0.518 within sample x final_CT, knn128 at 0.165 of it, pooled share ~0.04, the same as CosMx (0.19, 0.04). Expression beyond composition +0.031; composition takes 0.002 from the expression fit. Best-explained genes form recognisable niches: IFN response (IFIT1-3, CXCL9), airway secretory (SCGB1A1, SCGB3A2, BPIFA1, MUC5AC/B), fibrosis (COL1A1, COL3A1, POSTN, CTHRC1), lymphoid aggregates (CXCL13, MS4A1, JCHAIN, LTB). IFIT1 is the one far candidate (+0.034 cross).
+
+What doesn't work / open:
+- **The stage-1e gate (far part on if the pooled held-out squared error over training graphs drops, FAR_MIN_GAIN 0) leaks on heterogeneous data:** legnini keeps 24 % of genes, which lose -0.011 on average (DLX2 -0.072), per cell -0.0046; vannan keeps 65 %, -0.003 (SCGB3A2 -0.096, COL15A1, SFRP4, FN1, LUM), per cell -0.0056, past the no-loss rule. The far bands learn the training individuals' regional layout. Verdict unchanged (no reader gains); a gate by a sign count over held-out graphs would fix it (not built).
+- The cross reader's random halves keep programme partners in the features, so a smooth field carried by co-regulated genes reads as local on real data (legnini's SHH gradient). The null means "no reach beyond ~100 um needed for linear information", not "no long-range biology".
+- The shared alpha shrinks the strongest genes: knn128 beats the band ridge for SHH (0.635 vs 0.412) and FOXA1 in SHH organoids, and SCGB3A2 / BPIFA1 / CXCL13 on vannan.
+- Still not run: `far_by_type.py` (step `bytype`, would place INS's far gain by receiving type); a `far|cum3+fov|x` head (would remove the FOV from the cross reader explicitly) is not built.
+
+## 2026-11-21 — Attribution plan (IG on real data, attribution source / sink maps, influence by distance; DeepLIFT and Sensitivity-n from Shrikumar 2017 / Ancona 2018): proposed, nothing built
+
+The user asked for the three never-done flow items (IG on real data, an attribution-based source / sink map, influence against distance for trained / twin / permuted) and what is worth trying from the DeepLIFT and Ancona et al. papers. Plan with stages A0-A5 and a fixed decision rule: `.claude/attribution_plan.md`.
+
+What the papers change for us (details in the plan):
+- The reference is the decision: our IG uses the graph's mean cell for every cell; for real data the sender's own type mean (attribution beyond type) and sampled same-type references are proposed.
+- DeepLIFT-Rescale = one-pass IG by a secant-gradient override at the ReLU / GELU; on a transformer (multiplicative attention, LayerNorm) it may lose completeness, so it is measured against 50-step IG on synth_spot before it may replace IG for dense maps.
+- Sensitivity-n (hide n senders with the model's own mask, correlate with summed attributions) is a faithfulness test without ground truth, usable on CosMx; agreement between methods is a linearity diagnostic (Ancona Prop. 4).
+- Occlusion (hide one sender, one forward gives its effect on every receiver) misses redundant smooth senders, as the 11-03 deletion did; keep signs (positive / negative senders).
+
+Open: the user's choice of references, models, datasets, targets; whether to retrain the windowed synth arm for the validation (also unblocks the flow pipeline).
+
+## 2026-11-21 — Attribution plan: the user's decisions, retrain recipes, synth targets, and the linearity question (A6, must pursue)
+
+Recorded in attribution_plan.md ("Decisions", "Stage M", "A6"); thesis_outline.md slot S13 and a bullet in 4.7.
+
+- Decisions (user): type-mean reference with sampled same-type cells as the check; retrain one model per dataset with the best settings so far; datasets in the order CosMx, legnini, synth_spot, vannan; targets = predicted deviation from the type mean + INS (CosMx), IFIT1 (vannan), GLI1 / PTCH1 / HHIP (legnini), plus a medium and a hard synth programme.
+- My choices, to say when reading: medium = M11 -> MC14 / MC15 (mid range; attention 73 % vs IG 100 % on 10-31), hard = M19 -> MC23 (thresholded sparse response, learned at 300 epochs) with M16 -> MC20 (same rule, 10x fewer receivers, never learned) as the must-not-find control. legnini has no cell types in the pipeline, so its reference is the organoid's mean cell. CosMx starts with IG (validated on synth 10-31); DeepLIFT enters the maps only after A1's rule passes.
+- Stage M recipes are my proposal from the reads, not confirmed: CosMx `typeres` (hier_tier, whole-cell masking, 300 epochs, 3 seeds + twin, optional h8), synth_spot `lin_dist_skipraw` at 300 epochs, legnini the CosMx recipe without types, vannan lung_hier.yaml with the typeres target.
+- **A6 (user: "pursue for sure"):** whether the trained transformer uses its neighbourhood linearly (attribution agreement, Sensitivity-n, pairwise sender interaction I_jk = D_jk - D_j - D_k), against synth_spot's learned thresholded rule as the positive control. It would be a model-side third line next to the score level (ties the smoother) and the data level (ceiling audit). Novelty is not established: check NCEM's linear vs nonlinear comparison and the transformer-attribution literature first. Traps: trivial agreement when the context contributes ~0; small within-type deviations look linear to first order.
+
+## 2026-11-21 — Attribution plan: legnini skipped for now; attribution without cell types added as a later stage (A7)
+
+The user: skip legnini (no cell types in our pipeline, so the type-mean reference and the deviation-from-type target do not apply), but test the attribution methods on data without cell-type annotation in the end. Order now CosMx, synth_spot, vannan. New stage A7 in attribution_plan.md: replacements for the type-based reference and target (graph mean, k-NN expression neighbourhood, unsupervised clusters, unrestricted sampled cells), the comparison "with labels vs without" on CosMx / vannan, legnini (SHH readouts) as the candidate dataset; not designed further until A2-A4 have run on CosMx.
+
+## 2026-11-21 — Model choices from the CCC papers and SAFFRON: read, verdicts, the interaction read-out proposed (nothing built, no run)
+
+The user asked to rethink the global model before the attribution plan: read the CCC papers in `/home/lehnerl/Arbeit/to_read/` (AMICI, GITIII, Steamboat, CellNEST, TERRA, scDIVA, CellChat protocol, EV range, two reviews) and SAFFRON, keep what works, drop what did not help. Plan with verdicts, a design and decision rules: `.claude/ccc_model_plan.md`.
+
+What the papers agree on (details and numbers in the plan):
+- Predict a cell's within-type residual from the other cells (AMICI, GITIII, NCEM's metric); one interaction layer whose output is a sum over senders (GITIII: 1-4 layers marginal, influence tensor exact because nothing nonlinear follows the aggregation); distance as a learned, mostly decreasing decay (AMICI recovers planted 10 / 20 um scales; EV paper: 80 % of vesicle signal within 40 um); interpretation by intervention with controls (AMICI type ablation + per-gene test, Steamboat transplant, TERRA knockouts against random / housekeeping genes; CellNEST drops softmax-normalised attention as not comparable across tissue); composition and segmentation as the confounds; naive baselines hard to beat (SAFFRON).
+- All four learned CCC methods are short range by construction (k = 8-50 or 300 um). GITIII's best within-type variance explained on CosMx NSCLC is 0.0136, and removing its cell-type input changes nothing: in line with our CosMx ceiling.
+
+What it means for our model:
+- Our context query is receiver-agnostic (learned token + position), so a hidden receiver's attention cannot depend on its type: a plausible reason the 1-layer CosMx map was geometry and only the 2nd layer learned (hypothesis, S4).
+- Proposed: an interaction read-out (IR) on the context query: receiver-aware query (type, own visible genes), null key (attention_plan Stage 4, never built), output additive in senders (routing may stay deep) with an exact influence export, options content-dependent decay rate (AMICI), entropy + L1 with ramp (only with the null key), key dropout (TERRA), same-type block (AMICI), keys from type only (is sender choice composition?), all-cell targets on annotated data (AMICI / GITIII objective).
+- Evaluation: E1 SAFFRON probes (Matryoshka BatchTopK SAE on embeddings vs known spatial variables, within-domain nulls, matched dictionary size, OMP, PCA / smoother / gene-SAE / twin baselines); E2 semi-synthetic CosMx (AMICI's generator on real coordinates and cells, incl. 200-500 um pairs: power for long range, fills K20); E3 AMICI's sender / receiver / gene AUPRC and length scales; E4 group ablation with tests, segmentation filter, transplant and knockout controls; E5 maps from interaction mass, rank-product ensembles.
+- Dropped from new defaults: LR-gated cores, type x type attention sums without composition control, proximity as validation, entropy without a null; from our runs: long-range mask, RoPE, hierarchical priors, PCA / scVI tokens, channel masking, residual decoder, regime loss, relevance / CLS scores, the bilinear add-on, single-seed per-cell flow.
+
+Open: the user's decisions listed in the plan (type in the query, all-cell targets, same-type block, E2 design, E1 variables, order E1 first vs IR first, which checkpoints remain on the cluster, AMICI install).
+
+## 2026-11-21 — CCC model plan, second round: the user's decisions, the reviews read in full, SAFFRON's analyses, the semi-synthetic generator (plan only, no run)
+
+Recorded in ccc_model_plan.md ("Second round").
+- Decisions: type label in the query (yes); same-type block arm (yes); E1 variables my choice; no old checkpoints (E1 runs on new J1 / J4 models; J2 dropped); AMICI not installable, so an "AMICI-like" IR arm stands in, GITIII / Steamboat stay external.
+- Training modes explained: masking picks targets and removes senders at once; the blind-to-self context query lets them be separated. Main CosMx arm = all cells as targets with key-side masking (random cells + discs removed as keys only), today's masking as the control, no-masking as one arm.
+- The two reviews (skimmed on the first pass, read in full now): no model change, but evaluation items: several metrics instead of one ranking (benchmarks disagree), label-robustness arms (coarse vs fine labels, 10 % shuffled labels: annotation errors are a benchmark axis and the type now enters query and target), seed agreement for every output, phenotype separation and tensor factorisation of the per-section influence tensor (T7), curated positive controls (an IPF CCC database for vannan), scMultiSim as an external simulator.
+- SAFFRON, ideas not package: a small Matryoshka SAE; position-only 1-D axes first (their MorphoGAM control: expression-derived axes inflate every model and PCA, ~0.87 -> ~0.46), scored within domains / niches, best feature drawn, OMP, genes along the reference and rebuilt axes; early-vs-late nesting turned into a test (feature index vs the length scale of its map and the kind of variable it tracks: a label-free local / global split if early = wide, late = narrow). The paper states the nesting as design intent; its concrete case is two features splitting the tumour axis by domain, one early, one late.
+- E2 concrete: count spike-in on real CosMx cells (Poisson counts scaled by each cell's library size along a range kernel to the nearest sender type; response genes with low within-type structure, not sender markers; null receiver type and control genes; truth in uns['synthetic'] format), checked first by the model-free fields reader; AMICI's profile swap as a second variant.
+
+## 2026-11-21 — Interaction read-out jobs built (J1 synth, J4 CosMx, J3 spiked CosMx); pre-submit checks found eight bugs (no run yet)
+
+The user asked to implement everything the discussed runs need, with job arrays for parallel GPUs, and results that can be evaluated. Built and checked; what exists, the arms and the deviations are in ccc_model_plan.md, section "Build". No model was run on real data (rule); the checks used toy-sized modules on the CPU, as the tests do.
+
+What worked:
+- The checks that need no model catch the cluster-only failures in seconds: every arm through `load_arms` + `_validate` + the masking check, unique checkpoint names under 250 characters, run order equal to what the array indexes. Then the evaluation hooks end to end on toy modules (read-out arm, reference arm, both twins), the reader on their tables, the spike script on a toy CosMx-shaped file.
+- Toy runs give every table for every arm (synth: scores, planted truth from the exact influence, windows, E1; CosMx: within-type scores on the disc-masked and the clean pass, type tests real vs shuffled, maps, E1 with baselines, the standard heads / dims tables).
+
+What doesn't work (found, fixed):
+- Would have stopped every CosMx task at start: module-level upper-case imports in the run script (`configure` refuses unknown settings).
+- Would have failed every run's evaluation after training: numpy string addition for the E1 domain labels.
+- Silent losses: the baselines' E1 tables replaced the model's in the baseline run; modes b / c lost the standard tables (references score hidden cells, the step scored all); a tie with the untrained twin counted as a detection.
+- A checkpoint name of 258 characters (aux-loss names); the two new penalties now tag as `ent` / `vl1`.
+- Semi-synthetic design: NegPrb probes could become response genes (the runs drop them); the `field` kernel saturated at 1 for every receiver (20 senders in reach), a constant the within-type target removes: now scaled to the median receiver and summed over every sender within 3 l. Receivers were scored against every other cell, which a type-aware query separates by type alone: now against the receiver type's own cells (as GITIII's readout).
+- J3's "AUPRC >= 2x base rate" cannot be met with the balanced negative draw (base rate ~0.5): the call is now AUROC >= 0.6 and strictly above a model-free k-NN reference and the untrained twin.
+- The read-out arms had half the reference's crops per epoch (copied from the tiers job's fused arm): set to the same 8, so a gap is not training length.

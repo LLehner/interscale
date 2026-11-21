@@ -44,11 +44,11 @@ allow?** Two questions, one CPU job, no model:
 | decision | Steps 2-3 of the long-range plan on CosMx | **skip** (2026-11-12, see run 2 read); synth_spot / legnini SHH only |
 | 1d | Composition control: neighbours' cell-type shares per band + FOV (`comp<k>+fov`), the expression bands fitted on its residual (`cum<k>\|comp<k>+fov`, stagewise, out of fold) | built 2026-11-12, toy-checked (a planted type-independent field: 0.153 vs comp+FOV 0.094); run 3, read 2026-11-12 |
 | 2c | Spillover index for every gene + the near-term genes annotated (`spillover_index.py`, step `spill`) | built 2026-11-12, toy-checked (planted 15 um spillover: +0.99 SD, flagged alone; field genes "flat"); run 3, read 2026-11-12 |
-| L | The same audit on legnini (`--dataset legnini` in `noise_ceiling.py` / `band_fields.py`, step `legnini`): ceiling + bands + per programme x condition (SHH vs Ctrl organoids as negative control) | built 2026-11-12, stub-checked (planted SHH readouts: 0.17 in SHH, ~0.02 in Ctrl organoids); run 3: **no output** (`13_11_results/fields/legnini/` empty). Cause found 2026-11-21 without the log: `legnini23.h5ad`'s `layers['raw']` (and X) is `normalize_total` to 279 per cell, not counts, so `load_legnini` stopped at its integer check before writing anything. Fixed: counts recovered exactly per cell (`recover_counts`), halves normalised to the file's 279 (`uns['target_sum']`); stand-in (real metadata, simulated counts normalised to 279) runs all three commands. In run 4 |
+| L | The same audit on legnini (`--dataset legnini` in `noise_ceiling.py` / `band_fields.py`, step `legnini`): ceiling + bands + per programme x condition (SHH vs Ctrl organoids as negative control) | built 2026-11-12, stub-checked (planted SHH readouts: 0.17 in SHH, ~0.02 in Ctrl organoids); run 3: **no output** (`13_11_results/fields/legnini/` empty). Cause found 2026-11-21 without the log: `legnini23.h5ad`'s `layers['raw']` (and X) is `normalize_total` to 279 per cell, not counts, so `load_legnini` stopped at its integer check before writing anything. Fixed: counts recovered exactly per cell (`recover_counts`), halves normalised to the file's 279 (`uns['target_sum']`); stand-in (real metadata, simulated counts normalised to 279) runs all three commands. Run 4 (2026-11-21): **ran** (ceiling 0.80 within organoid, k-NN 0.43 of it; no far gain in either reader; see Run 4 read) |
 | run 3 | `fields.sbatch` default steps `ceiling cosmx reread spill legnini` into `MA/13_11_results/fields/` | run 2026-11-12; ceiling, cosmx, reread, spill read 2026-11-12; legnini empty |
-| 1e | A far reader that passes the synth_spot control: `far\|cum<reach>` (far bands on the near fit's out-of-fold residual, one alpha per gene chosen by held-out squared error, off unless it helps) and the cross reader `far\|cum<reach>\|x` (the same with the target genes left out of the features); `synth` back in the default steps with a PASS / FAIL verdict per reader (`synth_control.csv`) | built 2026-11-21, toy-checked (see "Run 4"): on a toy synth_spot the cross reader passes (2-4 mm genes +0.097 median, null programmes 0), the every-gene stagewise reader shows no loss (0 vs the old reader's -0.094); in run 4 |
-| V | The audit on lung fibrosis (vannan25, Xenium): `load_vannan` (fold 0's test patients, residual within sample x fine cell type from each graph's visible cells, composition control without FOV), `--dataset vannan` in both scripts, steps `vannan_inputs` (builds `vannan25_pp.h5ad` with `make_lung_inputs.py` if missing) and `vannan` | built 2026-11-21, stand-in checked (10 samples, planted smooth field); in run 4 |
-| run 4 | `fields.sbatch` default steps `synth cosmx reread legnini vannan_inputs vannan` into `MA/21_11_results/fields/` (ceiling CSVs copied from run 3; 11 h, 128 GB) | written 2026-11-21, not submitted |
+| 1e | A far reader that passes the synth_spot control: `far\|cum<reach>` (far bands on the near fit's out-of-fold residual, one alpha per gene chosen by held-out squared error, off unless it helps) and the cross reader `far\|cum<reach>\|x` (the same with the target genes left out of the features); `synth` back in the default steps with a PASS / FAIL verdict per reader (`synth_control.csv`) | built 2026-11-21, toy-checked (see "Run 4"): on a toy synth_spot the cross reader passes (2-4 mm genes +0.097 median, null programmes 0), the every-gene stagewise reader shows no loss (0 vs the old reader's -0.094). Run 4 (2026-11-21, real synth_spot): **PASS** (cross reader +0.167 on the >= 2 mm genes, stagewise 0.000, null 0.000); the per-gene gate leaks on legnini / vannan (far parts that lose on test graphs; see Run 4 read) |
+| V | The audit on lung fibrosis (vannan25, Xenium): `load_vannan` (fold 0's test patients, residual within sample x fine cell type from each graph's visible cells, composition control without FOV), `--dataset vannan` in both scripts, steps `vannan_inputs` (builds `vannan25_pp.h5ad` with `make_lung_inputs.py` if missing) and `vannan` | built 2026-11-21, stand-in checked (10 samples, planted smooth field). Run 4 (2026-11-21): **ran** (34,134 test cells, 8 samples; ceiling 0.52 within type, k-NN 0.165 of it; no far gain; see Run 4 read) |
+| run 4 | `fields.sbatch` default steps `synth cosmx reread legnini vannan_inputs vannan` into `MA/21_11_results/fields/` (ceiling CSVs copied from run 3; 11 h, 128 GB) | **run and read 2026-11-21** (local copy `/home/lehnerl/Arbeit/results/21_11_results/fields/`); every step wrote its output |
 | 4 | Conditional reading by the global model: gene masking with the cell's other genes visible, type-residual target, FOV offset as a known input (`model.decoder.group_offset`, fork branch `conditional-context`), soft 150 um window; per-gene shares against ridges from the same inputs (`cosmx_conditional.*`, `slurm/new/`) | built 2026-11-12 (8 unit tests, configs validated); not run; after run 3 |
 | idea 3 | Per gene, the typeres models (3 seeds) against the band ridge on the same 6,051 cells: genes where the model's share beats `cum3+fov` beyond the seed spread | noted 2026-11-12, for later (needs the per-gene within-type tables of `10_11_results/cosmx_typeres`) |
 
@@ -301,7 +301,7 @@ on the toy's 6 slides; it holds on the real 24. So the band-field leg of "no far
 planted far signal; the decision to skip steps 2-3 stays on the other evidence (every nonlinear model ties the smoother) until a
 reader that passes the control (stage 1e) gives the same null. Run 3's default steps did not include `synth`.
 
-### Run 4 (built 2026-11-21, not run): stage 1e, legnini fixed, vannan
+### Run 4 (built and run 2026-11-21, `MA/21_11_results/fields/`, local copy `/home/lehnerl/Arbeit/results/21_11_results/fields/`): stage 1e, legnini fixed, vannan
 
 **Why the all-gene reader failed, and what the control can ask (found on a toy synth_spot, 8 training slides, 2026-11-21).** Two
 separate problems:
@@ -355,6 +355,83 @@ normalised to 279 like the file's `log1p_norm` (they were 1e4: half and full dep
 split_0..4 by patient). Fold 0: test = its patient group, val left out (no model selected), train = the rest; graphs per sample; discs
 60 um over 10 % and CosMx's rank shells (~20 / 40 / 80 / 160 / 330 um at ~9 um spacing). Patients never cross splits, so the baseline
 of every graph (training ones too) is its own visible cells' sample x type mean.
+
+**Read 2026-11-21.** Every step wrote its output; the CosMx ceiling (`ceiling.md`, `ceiling_cells.csv`) is identical to run 3.
+
+*Positive control (synth_spot, 8 test slides, 6,251 hidden cells): PASS for the cross reader and the stagewise reader, FAIL for
+the joint ridge (as expected).*
+
+| reader | >= 2 mm long-range genes (median, n 4) | long-range all (n 15) | sparse (n 10) | null programmes (n 170) | null genes beyond +-0.02 | per cell within slide | verdict |
+|---|---|---|---|---|---|---|---|
+| joint ridge `far_gain_all_genes` | -0.116 | -0.101 | +0.017 | +0.002 | 10.0 % | cum1 0.399 -> cum5 0.346 | FAIL |
+| stagewise `far_gain_sw` | 0.000 | 0.000 | 0.000 | 0.000 | 0.0 % | 0.399 -> 0.399 | PASS |
+| cross `far_gain_x` | **+0.167** (MC10 +0.331, MC8 +0.203, MC9 +0.132, MC11 +0.059) | +0.001 | 0.000 | 0.000 | 8.8 % | 0.100 -> 0.147 | PASS |
+| source genes only `src_far_gain` | +0.294 | +0.064 | +0.011 | -0.002 | 9.4 % | | reference |
+
+The real synth_spot reproduces the toy: the cross reader finds the planted far fields, the every-gene stagewise reader rightly adds
+nothing (the response is read from its own neighbours: MC10 cum1 0.949), 91 % of genes take no far part there. Null genes swing
+up to ~0.03 in the cross reader (POI28 +0.028): read single real genes against that. The sparse responses stay invisible to every
+linear reader (cross 0.000, source-only +0.011).
+
+*CosMx (6,051 hidden cells, within type): no far gain with the reader that passes the control.*
+
+| fit | within type | | fit | within type |
+|---|---|---|---|---|
+| cum3 | 0.0828 | | cum3\|x | 0.0789 |
+| far\|cum3 | 0.0830 | | far\|cum3\|x | 0.0802 |
+| cum3+fov | 0.0837 | | far\|cum3+fov | 0.0830 |
+| cum5 (joint) | 0.0853 | | knn128 | 0.083 |
+
+- `far_gain_x` over 960 genes: mean +0.0013, median +0.0003, 7 genes > 0.02 (0.7 %; synth null genes: 8.8 %). Shares of the
+  reproducible within-type variance: `fit_far|cum3|x` 0.039 pooled vs `fit_cum3|x` 0.037. The runs 1-3 null now holds with a reader
+  that finds planted far signal: **beyond ~100 um nothing linear adds to what the neighbours' other genes already say.**
+- What the null covers: the cross reader's random halves keep a gene's programme partners in the features (on synth_spot the split
+  removed them). A smooth biological field carried by co-regulated genes is therefore read locally here too; the null says a model
+  needs no reach beyond ~100 um for linear information, not that no long-range biology exists.
+- **INS is the one robust far gene:** cross +0.049, stagewise +0.050, stagewise after the FOV +0.054 (the joint ridge's +0.025 after
+  FOV too), so far information the near neighbours do not carry and not the FOV. With run 3's profile (INS in other types' cells
+  +0.71 SD < 15 um, +0.08 at 50-150 um, -0.14 beyond) read it as islet proximity / ambient INS at the 100-450 um scale of bands 4-5,
+  i.e. where the islets are, not signalling. GCG (+0.032 cross, +0.016 sw, +0.015 after FOV) the same for alpha cells. `far_by_type.py`
+  (step `bytype`, still not run) separates it by receiving type.
+- **Stress genes are the FOV:** HSPA1A (+0.045 cross), HSPB1, HSPA1B, FOS, BAG3 gain in the joint ridge (HSPA1A +0.056) and lose it
+  after the FOV (+0.004); the cross reader has no FOV in stage 1, so its HSPA1A gain is the FOV handling offset read from the other
+  stress genes. A `far|cum3+fov|x` head would make that explicit (not built).
+- MT2A: `far_gain_sw_after_fov` +0.049 against +0.012 without the FOV; one gene, not followed up.
+
+*legnini (2,983 hidden cells, within organoid): no far gain; the nearest band is best.*
+
+- Ceiling: r_full 0.64 per cell (ceiling 0.80); k-NN 8/32 at 0.47 of it, knn128 0.43; the neighbourhood explains ~25 % of the
+  reproducible within-organoid variance (pooled share: knn8 0.26, cum3 0.24, far alone 0.06). Model check at thinning 0.3: Pearson
+  0.974, ratio 1.003. Most reproducible: DBX1, FOXA1, NKX6.1, NKX2.2, STMN2, FOXA2, GAD1, OTX2 (r_full 0.86-0.94).
+- Fits: cum1 0.365 > cum2 0.361 > cum3 0.360 > cum5 0.339 (joint), knn128 0.340, far alone 0.162. Stagewise `far|cum3` 0.356
+  (-0.0046, just inside the -0.005 no-loss rule), cross `far|cum3|x` 0.296 vs `cum3|x` 0.298. `far_gain_x` 0 genes > 0.02.
+- Programme x condition: the SHH readouts (GLI1, PTCH1, HHIP) have `far_gain_x` 0.000 in SHH and Ctrl organoids alike. The
+  organoids' known SHH gradient is smooth and carried by the neighbours' identity code, so it is read locally (the point above).
+- knn128 beats the band ridge for the strongest genes in SHH organoids (SHH 0.635 vs cum3 0.412, FOXA1 0.774 vs 0.657, FOXA2 0.633
+  vs 0.573): the shared alpha shrinks the most structured genes. Per gene the linear limit is the better of the two.
+
+*vannan (fold 0, 8 test samples, 34,134 hidden cells, within sample x final_CT): no far gain; CosMx-like ceiling.*
+
+- Ceiling within type 0.518 (r_full 0.27 per cell; model check Pearson 0.992); knn128 0.085 = 0.165 of it; pooled share of the
+  reproducible within-type variance ~0.04 for every neighbourhood head (CosMx: ceiling 0.437, knn128 0.19 of it, share 0.04). The
+  two real tissues agree: the neighbourhood holds ~4 % of the reproducible within-type signal.
+- Fits: cum3 0.088, cum4 0.089, knn128 0.085, comp3 0.055, `cum3|comp3` 0.086. Composition alone reaches 60 % of cum1 (0.055 vs
+  0.079), more than on CosMx (fine types here, 0.048 incl. FOV there), but expression adds +0.031 beyond it and composition takes only
+  0.002 from the expression fit: as on CosMx the term is what the neighbours express, not which types they are.
+- Genes the neighbourhood explains best: interferon response (IFIT1 share 0.19, IFIT3, IFIT2, CXCL9), airway secretory (SCGB1A1,
+  SCGB3A2, BPIFA1, MUC5AC / MUC5B), fibrosis (COL1A1, COL3A1, POSTN, CTHRC1, SFRP2), lymphoid aggregates (CXCL13, MS4A1, JCHAIN, LTB).
+  Recognisable niches within type: IFN-response patches, airways, fibrotic foci, tertiary lymphoid structures.
+- IFIT1 is the one far candidate (cross +0.034, stagewise +0.011, IFIT3 +0.013): an interferon field wider than ~100 um. One gene,
+  one fold; not a statement yet.
+
+*Stage 1e's per-gene gate leaks on real data across individuals.* The far part is switched on when it lowers the pooled held-out
+squared error over the training graphs (FAR_MIN_GAIN 0). On synth_spot that kept 9 % of genes and lost nothing; on legnini it kept 24 %
+and those genes lose -0.011 on average (DLX2 -0.072, MSX2 -0.048), on vannan 65 % and -0.003 (SCGB3A2 -0.096, COL15A1 -0.051, SFRP4,
+FN1, LUM, CCL2: airway and fibrotic-region genes), per cell -0.0046 / -0.0056 (vannan past the no-loss rule). CosMx kept 62 % and
+gained +0.0007. Reading: the far bands learn the training individuals' regional layout (airway vs fibrotic regions, Ctrl vs SHH
+organoid mix), which does not transfer to new patients / organoids. It does not change the verdict (no reader gains), but a gate for
+heterogeneous datasets should ask for the gain on most held-out graphs (a sign count, not the SE gate that failed on the toy), or
+report the far part's held-out gain per graph. Not built.
 
 ## Open ideas
 
