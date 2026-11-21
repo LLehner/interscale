@@ -18,7 +18,7 @@ first, gate with decision rules fixed before the run.
 | Stage | What | Status | Date |
 |---|---|---|---|
 | R | Read the 11 papers, verdict per idea (this file) | **done** | 2026-11-21 |
-| S0 | Build the interaction read-out (IR): receiver-aware query, null key, additive read-out, exact influence export; options: content-dependent decay, entropy + L1 with ramp, key dropout, same-type keys, key inputs, all-cell targets | **built** (branch `interaction-readout`, uncommitted; section "Build") | 2026-11-21 |
+| S0 | Build the interaction read-out (IR): receiver-aware query, null key, additive read-out, exact influence export; options: content-dependent decay, entropy + L1 with ramp, key dropout, same-type keys, key inputs, all-cell targets | **built**, on main since 2026-11-21 (c9a43aa, 90ae83d; section "Build") | 2026-11-21 |
 | E1 | SAFFRON-style probes: sparse autoencoder on embeddings against known spatial variables, nulls, OMP, naive baselines | **built** (`evaluation/sae_probe.py`), runs inside J1 / J3 / J4 | 2026-11-21 |
 | S1 | synth_spot gate: IR arms against the current best (`lin_dist_skipraw`, 300 epochs), readouts E1 + E3 | job J1 written and checked (`ir_synth`), **not run** | 2026-11-21 |
 | E2 | Semi-synthetic CosMx: planted interactions on real coordinates, types and cells (AMICI's generator idea), incl. long range | **built** (`evaluation/semi_synthetic.py`), job J3 written (`ir_semi`), **not run** | 2026-11-21 |
@@ -619,7 +619,7 @@ geometry, composition, segmentation and noise, which synth_spot (lattice, K20) c
 The user (2026-11-21): implement what these runs need, test everything discussed, use several GPUs through arrays, make sure the
 results are proper and can be evaluated; the attribution plan follows.
 
-### Library (fork, branch `interaction-readout`, not committed)
+### Library (fork, main since 2026-11-21: c9a43aa read-out, 90ae83d probes and spike-in)
 
 - `attention.kind: readout` (`ReadoutAttention`, a `FusedAttention`): null key (`readout.null_key`), content-dependent decay rate
   (`content_rate`: the key's factor and the receiver type's factor on the distance bias, log factors clamped to +-8, scaled before the
@@ -687,6 +687,6 @@ vannan arm of S4 (no loader / preprocessed file yet).
 
 ### Submit
 
-Copy the November files above to `MA/scripts/` (the sbatch and `ir_submit.sh` to `MA/slurm/`), install the fork's branch editable in the
+Copy the November files above to `MA/scripts/` (the sbatch and `ir_submit.sh` to `MA/slurm/`), install the fork's main (pull, editable) in the
 `interscale` env, then `cd $MA && bash slurm/ir_submit.sh synth` (and `cosmx`, `semi`). `MAX_PARALLEL` caps concurrent tasks (default
 14). A task resubmitted after a B300 node finishes after the report: run `STEP=report` again (minutes).
