@@ -13,7 +13,10 @@ comparison). ``grad_input``: gradient at the input times the deviation from the 
 points, a receiver whose completeness gap stays above ``gap_limit`` is integrated again with ``retry_steps``). ``deeplift``: DeepLIFT-
 Rescale, i.e. gradient times deviation with every ReLU / GELU's derivative replaced by its secant between the reference and the input
 (:func:`_secant_activations`); softmax and LayerNorm keep their gradients, so completeness is not guaranteed and is reported.
-``occlusion``: one sender's token set to its reference, one forward per sender (a whole column of the effect matrix at once).
+``conservative``: gradient x input with every softmax output and LayerNorm's scale held constant in the backward pass (Ali et al. 2022;
+AttnLRP), which restores conservation through attention; it needs explicit attention weights, so the SDPA kernel is replaced by its explicit
+form for the pass (the read-out and fused backends compute block by block, so a section of ~10^4 cells fits). ``occlusion``: one sender's
+token set to its reference (or hidden by the model's own mask, ``removal="mask"``), one forward per sender (a whole column at once).
 
 **References** (:data:`REFERENCES`). ``graph_mean`` (R1: the graph's mean token), ``type_mean`` (R2: the mean token of the sender's
 label in the graph: what a sender expresses beyond its type, so composition drops out), ``sampled`` (R4: a random other cell of the
@@ -45,7 +48,10 @@ from scipy.stats import spearmanr
 from interscale.evaluation.context_test import _hidden_entries
 from interscale.evaluation.receptive_field import _integration_points, _replayable_rng
 
-METHODS = ("decomposition", "attention", "grad_input", "ig", "deeplift", "occlusion")
+METHODS = ("decomposition", "attention", "grad_input", "ig", "deeplift", "conservative", "occlusion")
+#: How occlusion, Sensitivity-n and pairwise interactions remove a sender: its token set to its reference, or the model's own removal (the cell
+#: hidden whole: under ``visible_keys_only`` no key; node-masked models only).
+REMOVALS = ("reference", "mask")
 REFERENCES = ("graph_mean", "type_mean", "sampled")
 
 
@@ -282,6 +288,49 @@ def _secant_activations(module, mode: str, store: list):
                 m.activation = old
 
 
+@contextmanager
+def _conservative_rules():
+    """Inside, softmax outputs (``torch.softmax``, ``F.softmax``, ``Tensor.softmax``; ``log_softmax`` likewise) are detached, the SDPA
+    kernel is computed explicitly with detached weights, and ``F.layer_norm`` divides by a detached standard deviation: the forward values
+    are unchanged, the backward treats attention weights and LayerNorm scales as constants."""
+    t_softmax, f_softmax, f_log_softmax = torch.softmax, F.softmax, F.log_softmax
+    m_softmax, m_log_softmax = torch.Tensor.softmax, torch.Tensor.log_softmax
+    f_sdpa, f_layer_norm = F.scaled_dot_product_attention, F.layer_norm
+
+    def sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
+        if is_causal:
+            raise ValueError("conservative: causal attention is not supported.")
+        scores = (q @ k.transpose(-2, -1)) * (scale if scale is not None else 1.0 / math.sqrt(q.shape[-1]))
+        if attn_mask is not None:
+            scores = scores.masked_fill(~attn_mask, float("-inf")) if attn_mask.dtype == torch.bool else scores + attn_mask
+        return t_softmax(scores, dim=-1).detach() @ v
+
+    def layer_norm(x, normalized_shape, weight=None, bias=None, eps=1e-5):
+        dims = tuple(range(-len(normalized_shape), 0))
+        mu = x.mean(dim=dims, keepdim=True)
+        sd = torch.sqrt(x.var(dim=dims, unbiased=False, keepdim=True) + eps).detach()
+        y = (x - mu) / sd
+        if weight is not None:
+            y = y * weight
+        if bias is not None:
+            y = y + bias
+        return y
+
+    torch.softmax = lambda *a, **k: t_softmax(*a, **k).detach()
+    F.softmax = lambda *a, **k: f_softmax(*a, **k).detach()
+    F.log_softmax = lambda *a, **k: f_log_softmax(*a, **k).detach()
+    torch.Tensor.softmax = lambda self, *a, **k: m_softmax(self, *a, **k).detach()
+    torch.Tensor.log_softmax = lambda self, *a, **k: m_log_softmax(self, *a, **k).detach()
+    F.scaled_dot_product_attention = sdpa
+    F.layer_norm = layer_norm
+    try:
+        yield
+    finally:
+        torch.softmax, F.softmax, F.log_softmax = t_softmax, f_softmax, f_log_softmax
+        torch.Tensor.softmax, torch.Tensor.log_softmax = m_softmax, m_log_softmax
+        F.scaled_dot_product_attention, F.layer_norm = f_sdpa, f_layer_norm
+
+
 # ----------------------------------------------------------------------------------------------- the interface
 
 
@@ -302,6 +351,7 @@ def attribute(
     senders=None,
     eval_step: bool = False,
     spatial_unit_um: float = 1.0,
+    removal: str = "reference",
     seed: int = 0,
 ) -> Attribution:
     """Attribute each receiver's target (``weights`` ``[Q, G]`` over the predicted genes) to every cell of the single graph ``batch``.
@@ -324,6 +374,7 @@ def attribute(
         return _decomposition(module, batch, receivers, weights, method, eval_step, spatial_unit_um, started)
     if reference != "graph_mean" and labels is None:
         raise ValueError(f"reference {reference!r} needs labels.")
+    _check_removal(module, removal)
     rng = np.random.default_rng(seed)
     was_training = module.training
     module.eval()
@@ -342,7 +393,7 @@ def attribute(
                                    usable=~_hidden_entries(batch, "gene").all(axis=1))  # fmt: skip
             ref = torch.where(movable, ref, tokens)
             reader = _Reader(module, batch, receivers, weights, head)
-            reads.append(_one_reference(reader, tokens, ref, method, steps, retry_steps, gap_limit, senders, fixed))
+            reads.append(_one_reference(reader, tokens, ref, method, steps, retry_steps, gap_limit, senders, fixed, removal))
         contribution = np.mean([r[0] for r in reads], axis=0)
         change = np.mean([r[1] for r in reads], axis=0)
         used = reads[0][2]
@@ -362,17 +413,19 @@ def attribute(
     return Attribution(method, reference, receivers, contribution.astype(np.float32), change, gap, time.time() - started, used, extra)
 
 
-def _one_reference(reader, tokens, ref, method, steps, retry_steps, gap_limit, senders, fixed):
+def _one_reference(reader, tokens, ref, method, steps, retry_steps, gap_limit, senders, fixed, removal="reference"):
     delta = (tokens - ref).double()
     q = len(reader.receivers)
     with torch.no_grad():
         end = reader(tokens.clone())
         start = reader(ref.clone())
     change = (end - start).cpu().numpy()
-    if method == "grad_input":
+    if method in ("grad_input", "conservative"):
         leaf = tokens.clone().requires_grad_(True)
+        rules = _conservative_rules() if method == "conservative" else _no_rules()
         with torch.enable_grad():
-            value = reader(leaf)
+            with rules:
+                value = reader(leaf)
             contribution = _grad_rows(value, leaf, delta).numpy()
         return contribution, change, None
     if method == "deeplift":
@@ -414,10 +467,41 @@ def _one_reference(reader, tokens, ref, method, steps, retry_steps, gap_limit, s
     contribution = np.full((q, tokens.shape[0]), np.nan)
     with torch.no_grad():
         for j in cells:
+            if removal == "mask":
+                contribution[:, j] = (end - _masked_read(reader, tokens, [j])).cpu().numpy()
+                continue
             changed = tokens.clone()
             changed[j] = ref[j]
             contribution[:, j] = (end - reader(changed)).cpu().numpy()
     return contribution, np.full(q, np.nan), None
+
+
+@contextmanager
+def _no_rules():
+    yield
+
+
+def _check_removal(module, removal: str) -> None:
+    if removal not in REMOVALS:
+        raise ValueError(f"removal must be one of {REMOVALS}, got {removal!r}.")
+    if removal == "mask" and getattr(module, "mask_strategy", "node") != "node":
+        raise ValueError("removal='mask' hides cells whole: a node-masked model only (mask_strategy node).")
+
+
+def _masked_read(reader, tokens, rows) -> torch.Tensor:
+    """The receivers' targets with ``rows`` hidden whole by the model's own mask (their tokens are what the step makes of the masked cells;
+    the other cells keep ``tokens``)."""
+    batch = reader.batch
+    copy = batch.clone()
+    mask = (batch.mask.clone() if getattr(batch, "mask", None) is not None else torch.zeros(batch.num_nodes, dtype=torch.bool, device=batch.x.device)).bool()
+    mask[torch.as_tensor(np.asarray(rows, dtype=np.int64), device=mask.device)] = True
+    copy.mask = mask
+    hidden_tokens = _actual_tokens(reader.module, copy)
+    changed = tokens.clone()
+    idx = torch.as_tensor(np.asarray(rows, dtype=np.int64), device=tokens.device)
+    changed[idx] = hidden_tokens[idx]
+    sub = _Reader(reader.module, copy, reader.receivers.numpy(), reader.weights.numpy(), reader.head)
+    return sub(changed)
 
 
 def _decomposition(module, batch, receivers, weights, method, eval_step, unit, started) -> Attribution:
@@ -549,8 +633,13 @@ def agreement(a: Attribution, b: Attribution, *, top: int = 32, k: int = 5) -> d
 # ----------------------------------------------------------------------------------------------- A6: Sensitivity-n and pairwise interactions
 
 
-def _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, replace_rows) -> np.ndarray:
-    """``[Q]`` targets with the tokens of ``replace_rows`` set to their references (no gradient)."""
+def _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, replace_rows, removal: str = "reference") -> np.ndarray:
+    """``[Q]`` targets with the cells ``replace_rows`` removed: tokens set to their references, or hidden by the model's mask (no gradient)."""
+    if removal == "mask":
+        with torch.no_grad():
+            if not len(replace_rows):
+                return _Reader(module, batch, receivers, weights, head)(tokens.clone()).cpu().numpy()
+            return _masked_read(_Reader(module, batch, receivers, weights, head), tokens, replace_rows).cpu().numpy()
     changed = tokens.clone()
     if len(replace_rows):
         idx = torch.as_tensor(np.asarray(replace_rows, dtype=np.int64), device=tokens.device)
@@ -582,17 +671,19 @@ def sensitivity_n(
     labels=None,
     reference: str = "graph_mean",
     head: str = "global",
+    removal: str = "reference",
     seed: int = 0,
 ) -> dict:
     """Ancona et al.'s Sensitivity-n on the receivers' own nearby cells: per draw and ``n``, every receiver has ``n`` random cells of its
     ``candidates`` row set to their reference tokens (all receivers in one forward), and the change of its target is correlated over draws
     with the sum of each attribution over the same cells. Returns ``{method: {n: [Q] Pearson r}}`` and ``"_change_sd"`` per n."""
+    _check_removal(module, removal)
     rng = np.random.default_rng(seed)
     receivers = np.asarray(receivers, dtype=np.int64)
     with _evaluating(module), torch.no_grad():
         tokens = _actual_tokens(module, batch)
         ref = reference_tokens(tokens, labels if labels is not None else np.zeros(len(tokens)), reference, rng=rng)
-        base = _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, [])
+        base = _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, [], removal)
         out = {name: {} for name in attributions}
         out["_change_sd"] = {}
         for n in ns:
@@ -603,7 +694,7 @@ def sensitivity_n(
                     pool = row[row >= 0]
                     picked.append(rng.choice(pool, size=min(int(n), len(pool)), replace=False) if len(pool) else np.zeros(0, np.int64))
                 rows = np.unique(np.concatenate(picked)) if picked else np.zeros(0, np.int64)
-                deltas.append(base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, rows))
+                deltas.append(base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, rows, removal))
                 for name, attr in attributions.items():
                     contrib = np.nan_to_num(attr.contribution.astype(np.float64))
                     sums[name].append(np.array([contrib[i, p].sum() for i, p in enumerate(picked)]))
@@ -630,11 +721,13 @@ def pairwise_interactions(
     labels=None,
     reference: str = "graph_mean",
     head: str = "global",
+    removal: str = "reference",
     seed: int = 0,
 ) -> dict:
     """``I_jk = Delta_jk - Delta_j - Delta_k`` for ``pairs`` random pairs from each receiver's ``candidates`` (its nearby cells), ``Delta``
     the drop of the target when those cells take their reference tokens; all receivers in one forward per pair index and condition.
     Returns ``interaction``, ``single`` (``|Delta_j| + |Delta_k|``) and ``relative`` (``|I| / single``), each ``[Q, pairs]``."""
+    _check_removal(module, removal)
     rng = np.random.default_rng(seed)
     receivers = np.asarray(receivers, dtype=np.int64)
     q = len(receivers)
@@ -642,7 +735,7 @@ def pairwise_interactions(
     with _evaluating(module), torch.no_grad():
         tokens = _actual_tokens(module, batch)
         ref = reference_tokens(tokens, labels if labels is not None else np.zeros(len(tokens)), reference, rng=rng)
-        base = _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, [])
+        base = _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, [], removal)
         for p in range(pairs):
             js, ks = [], []
             for row in candidates:
@@ -654,9 +747,9 @@ def pairwise_interactions(
                 js.append(j), ks.append(k)
             js, ks = np.asarray(js), np.asarray(ks)
             ok = js >= 0
-            d_j = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(js[ok]))
-            d_k = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(ks[ok]))
-            d_jk = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(np.concatenate([js[ok], ks[ok]])))
+            d_j = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(js[ok]), removal)
+            d_k = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(ks[ok]), removal)
+            d_jk = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(np.concatenate([js[ok], ks[ok]])), removal)
             inter[ok, p] = (d_jk - d_j - d_k)[ok]
             single[ok, p] = (np.abs(d_j) + np.abs(d_k))[ok]
     with np.errstate(invalid="ignore", divide="ignore"):

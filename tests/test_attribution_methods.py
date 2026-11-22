@@ -212,3 +212,48 @@ def test_references_and_measures():
     assert fields["flow_cells"].sum() == 10
     same = agreement(attr, attr, top=3, k=2)
     assert np.allclose(same["top_overlap"], 1.0)
+
+
+def test_conservative_keeps_the_forward_and_restores_every_patched_function(stream, ir):
+    from interscale.evaluation.attribution import _conservative_rules
+
+    saved = (torch.softmax, torch.nn.functional.softmax, torch.Tensor.softmax, torch.nn.functional.scaled_dot_product_attention, torch.nn.functional.layer_norm)
+    for module, graph, labels in (stream, ir):
+        receivers = np.array([3, 12])
+        w = gene_targets([0, 2], 2, G)
+        from interscale.evaluation.attribution import _Reader, _actual_tokens
+
+        tokens = _actual_tokens(module, graph)
+        with torch.no_grad():
+            plain = _Reader(module, graph, receivers, w, "global")(tokens.clone())
+            with _conservative_rules():
+                ruled = _Reader(module, graph, receivers, w, "global")(tokens.clone())
+        torch.testing.assert_close(plain, ruled, rtol=1e-5, atol=1e-6)
+        attr = attribute(module, graph, receivers, w, "conservative", labels=labels, reference="type_mean")
+        assert np.isfinite(attr.contribution).all() and np.isfinite(attr.gap).all()
+    assert saved == (torch.softmax, torch.nn.functional.softmax, torch.Tensor.softmax, torch.nn.functional.scaled_dot_product_attention,
+                     torch.nn.functional.layer_norm)  # fmt: skip
+
+
+def test_removal_by_the_models_own_mask(stream):
+    from types import SimpleNamespace
+
+    from interscale.evaluation.attribution import _Reader, _actual_tokens, _check_removal
+
+    module, graph, labels = stream
+    receivers = np.array([9])
+    w = gene_targets([1], 1, G)
+    cand = near_candidates(graph.pos.numpy(), receivers, np.ones(graph.num_nodes, bool), k=4)
+    occ = attribute(module, graph, receivers, w, "occlusion", senders=cand[0], removal="mask")
+    j = int(cand[0][0])
+    hidden = graph.clone()
+    hidden.mask = graph.mask.clone()
+    hidden.mask[j] = True
+    with torch.no_grad():
+        base = _Reader(module, graph, receivers, w, "global")(_actual_tokens(module, graph))
+        without = _Reader(module, hidden, receivers, w, "global")(_actual_tokens(module, hidden))
+    assert occ.contribution[0, j] == pytest.approx(float(base[0] - without[0]), abs=1e-5)
+    sens = sensitivity_n(module, graph, receivers, w, {"occlusion": occ}, cand, ns=(1,), draws=8, removal="mask", seed=3)
+    assert sens["occlusion"][1][0] == pytest.approx(1.0, abs=1e-5)
+    with pytest.raises(ValueError, match="node-masked"):
+        _check_removal(SimpleNamespace(mask_strategy="gene"), "mask")
