@@ -18,12 +18,13 @@ from interscale.tl.masking import (
     BLOCK_KINDS,
     MASK_STRATEGIES,
     resolve_mask_genes,
+    sample_anchor_rings,
     sample_block_mask,
     sample_channel_mask,
-    sample_sets_mask,
     sample_gene_mask,
     sample_gene_set_mask,
     sample_node_mask,
+    sample_sets_mask,
     sample_unit_mask,
 )
 
@@ -35,6 +36,10 @@ def block_mask_kwargs(cfg) -> dict:
     ``obsm[spatial_key]``, so the radius is divided by ``dataset.spatial_unit_um`` here, once for
     every entrypoint. Niche patches (``mask_block_kind: label``) take no radius: the label's Data attribute instead.
     """
+    rings = cfg.dataset.get("anchor_rings", None)
+    if rings is not None and int(rings.get("grid", 0)) > 0:
+        unit = float(cfg.dataset.spatial_unit_um)
+        return {"anchor_rings": {"grid": int(rings.grid), "r_disc": float(rings.r_disc_um) / unit, "r_max": float(rings.r_max_um) / unit}}
     fraction = float(cfg.dataset.get("mask_block_fraction", 0.0))
     if fraction == 0:
         return {}
@@ -120,6 +125,7 @@ class GraphAnnDataModule(pl.LightningDataModule):
         mask_block_label: str | None = None,
         mask_block_max_cells: int = 0,
         crop: dict | None = None,
+        anchor_rings: dict | None = None,
     ):
         """Manages loading and sampling schemes before loading to GPU.
 
@@ -208,6 +214,10 @@ class GraphAnnDataModule(pl.LightningDataModule):
                 f"Spatial blocks need a fraction in (0, 1) and a radius > 0, got fraction "
                 f"{mask_block_fraction} and radius {mask_block_radius}."
             )
+        if anchor_rings is not None and (mask_strategy != "gene" or mask_gene_columns is None or not len(mask_gene_columns)):
+            raise ValueError("anchor_rings hides a gene set in the ring cells: it needs mask_strategy 'gene' and mask_gene_columns.")
+        # {"grid", "r_disc", "r_max"} in the units of `pos` (block_mask_kwargs converts), or None.
+        self.anchor_rings = dict(anchor_rings) if anchor_rings is not None else None
         self.mask_block_radius = mask_block_radius
         self.mask_block_fraction = mask_block_fraction
         self.mask_block_kind = mask_block_kind
@@ -346,6 +356,20 @@ class GraphAnnDataModule(pl.LightningDataModule):
         cell and drawn anew by every call: the gene-set branch below with fresh columns (from `mask_channel_pool` when
         given). With `mask_gene_sets` they are the union of `mask_sets_per_draw` sets of the pool, drawn the same way.
         """
+        if self.anchor_rings is not None:
+            # The flipped anchored-SVG task: one grid disc (senders, every gene visible, the only keys), the gene set hidden
+            # in its ring cells (receivers). `key_mask` is read by the global module (`_closed_keys`).
+            if getattr(data, "pos", None) is None:
+                raise ValueError("anchor_rings draws discs over cell coordinates, but a graph has no `pos`.")
+            ar = self.anchor_rings
+            disc, rings, disc_id = sample_anchor_rings(data.pos, ar["grid"], ar["r_disc"], ar["r_max"])
+            gene_mask = torch.zeros(data.num_nodes, data.x.shape[1], dtype=torch.bool)
+            gene_mask[rings.nonzero(as_tuple=True)[0][:, None], torch.as_tensor(self.mask_gene_columns)[None, :]] = True
+            data.gene_mask = gene_mask
+            data.mask = rings.clone()
+            data.key_mask = disc.clone()
+            data.anchor_disc = torch.tensor([disc_id])
+            return
         if self.mask_strategy == "gene" and self.mask_channel_fraction:
             gene_mask = sample_channel_mask(
                 data.num_nodes,

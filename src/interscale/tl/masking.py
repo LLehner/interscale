@@ -425,6 +425,62 @@ def sample_block_mask(
     return _draw_blocks(pos.shape[0], fraction, lambda centre: (pos - pos[centre]).norm(dim=1) <= radius, generator)
 
 
+def anchor_grid_discs(pos: torch.Tensor, grid: int) -> list[tuple[int, int]]:
+    """The anchored-SVG task's discs (``.claude/svg_targets_plan.md``, round 3): ``[(disc_id, centre_cell), ...]``.
+
+    Centres at the fractions ``(i + 0.5) / grid``, ``(j + 0.5) / grid`` of the graph's bounding box, each snapped to the
+    nearest cell and dropped when none lies within half a grid step (the smaller side); ``disc_id = i * grid + j``. Positions
+    alone, and the same rule as the bridge script ``svg_targets.py`` (its ``grid_discs``), so the discs whose SVG curves
+    diffsvg fitted are the discs a model is trained and read on.
+    """
+    pos = pos.double()[:, :2]
+    lo, hi = pos.min(dim=0).values, pos.max(dim=0).values
+    step = (hi - lo) / grid
+    out = []
+    for i in range(grid):
+        for j in range(grid):
+            target = lo + step * torch.tensor([i + 0.5, j + 0.5], dtype=pos.dtype)
+            d = (pos - target).norm(dim=1)
+            k = int(torch.argmin(d))
+            if float(d[k]) <= 0.5 * float(step.min()):
+                out.append((i * grid + j, k))
+    return out
+
+
+def anchor_ring_masks(pos: torch.Tensor, centre: int, r_disc: float, r_max: float, n_rings: int = 3):
+    """``(disc, rings, ring)`` around one disc: the disc's cells ``[N]`` (within ``r_disc`` of the centre cell), the ring cells
+    ``[N]`` (beyond the disc, at most ``r_max`` from its edge), and each cell's ring ``[N]`` (0 .. ``n_rings - 1`` of equal
+    width from the edge, -1 outside the rings). Units of ``pos``.
+    """
+    pos = pos.double()[:, :2]
+    d = (pos - pos[centre]).norm(dim=1)
+    disc = d <= r_disc
+    edge = d - r_disc
+    rings = (edge > 0) & (edge <= r_max)
+    ring = torch.clamp(torch.floor(edge / (r_max / n_rings)).long(), 0, n_rings - 1)  # np.digitize's bins, as the bridge
+    ring = torch.where(rings, ring, torch.full_like(ring, -1))
+    return disc, rings, ring
+
+
+def sample_anchor_rings(
+    pos: torch.Tensor, grid: int, r_disc: float, r_max: float, generator: torch.Generator | None = None, disc_id=None
+):
+    """One of the graph's grid discs (``anchor_grid_discs``), uniformly (or ``disc_id``): ``(disc cells, ring cells, disc_id)``."""
+    discs = anchor_grid_discs(pos, grid)
+    if not discs:
+        raise ValueError("no grid disc lies on this graph's tissue.")
+    if disc_id is None:
+        pick = int(torch.randint(len(discs), (1,), generator=generator))
+    else:
+        found = [k for k, (d, _) in enumerate(discs) if d == int(disc_id)]
+        if not found:
+            raise ValueError(f"disc {disc_id} is not on this graph (discs {[d for d, _ in discs]}).")
+        pick = found[0]
+    did, centre = discs[pick]
+    disc, rings, _ = anchor_ring_masks(pos, centre, r_disc, r_max)
+    return disc, rings, did
+
+
 def sample_unit_mask(units: torch.Tensor, fraction: float, generator: torch.Generator | None = None) -> torch.Tensor:
     """Draw whole units -- niche patches (``tl.niches``) -- until at least ``fraction`` of the cells lie in one.
 

@@ -284,6 +284,31 @@ def _validate_crop(cfg):
             )
 
 
+def _validate_anchor_rings(cfg):
+    """The flipped anchored-SVG task (``dataset.anchor_rings``): a gene set hidden in the ring cells of one grid disc."""
+    rings = cfg.dataset.get("anchor_rings", None)
+    if rings is None or int(rings.get("grid", 0)) == 0:
+        return
+    if int(rings.grid) < 1:
+        raise ValueError(f"dataset.anchor_rings.grid must be >= 1 (0: off), got {rings.grid}.")
+    if not (float(rings.r_disc_um) > 0 and float(rings.r_max_um) > 0):
+        raise ValueError("dataset.anchor_rings needs r_disc_um > 0 and r_max_um > 0.")
+    if cfg.dataset.mask_strategy != "gene" or not list(cfg.dataset.get("mask_genes", []) or []):
+        raise ValueError("dataset.anchor_rings hides the gene set dataset.mask_genes in the ring cells: it needs mask_strategy gene and mask_genes.")
+    if float(cfg.dataset.mask_percentage) != 1.0:
+        raise ValueError("dataset.anchor_rings hides the gene set in every ring cell: set dataset.mask_percentage to 1.0.")
+    if float(cfg.dataset.get("mask_block_fraction", 0.0)) > 0:
+        raise ValueError("dataset.anchor_rings chooses the cells itself; leave dataset.mask_block_fraction at 0.")
+    if cfg.dataset.spatial_key is None:
+        raise ValueError("dataset.anchor_rings draws discs over cell coordinates: set dataset.spatial_key.")
+    params = cfg.model.global_component.get("parameters", None)
+    if params is not None:
+        if params.get("hierarchy", None) is not None and params.hierarchy.get("kind", "none") != "none":
+            raise ValueError("dataset.anchor_rings restricts the keys through Data.key_mask, which the hierarchy does not read.")
+        if params.get("pooling", None) is not None and params.pooling.get("kind", "none") != "none":
+            raise ValueError("dataset.anchor_rings restricts the keys per cell; pooled tokens do not read Data.key_mask.")
+
+
 def _validate_block_mask(cfg):
     """Spatial blocks (``dataset.mask_block_fraction``) need coordinates and a node-level reconstruction."""
     from interscale.tl.masking import BLOCK_KINDS
@@ -1237,6 +1262,7 @@ def _validate(cfg):
     _validate_optim(cfg)
     _validate_val_interval(cfg)
     _validate_block_mask(cfg)
+    _validate_anchor_rings(cfg)
     _validate_crop(cfg)
     _validate_masking(cfg)
     _validate_objective(cfg)

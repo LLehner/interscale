@@ -378,14 +378,24 @@ class TransformerNodeEncoderHook(GlobalModule):
         if self.attention_kind == "readout":
             attention_mask = self._readout_mask(attention_mask, batched_data, index_nodes, src_padding_mask, eval_step)
 
-        if self.visible_keys_only and not eval_step:
+        # The anchored-SVG task (`dataset.anchor_rings`): a batch carrying `key_mask` lets only those cells be keys, in
+        # training and in evaluation alike (the evaluation sets it for the disc it reads; without it nothing changes).
+        key_mask = getattr(batched_data, "key_mask", None)
+        if (self.visible_keys_only and not eval_step) or key_mask is not None:
             # Before the bias is merged in: the dense mask is still boolean here. A backend that never forms it takes
             # the hidden keys as a row of the StructuredMask and blocks them in every block (fused).
-            keys = self._hidden_keys(batched_data, index_nodes, src_padding_mask.shape[1])
+            seq_len = src_padding_mask.shape[1]
+            keys = (
+                self._hidden_keys(batched_data, index_nodes, seq_len)
+                if self.visible_keys_only and not eval_step
+                else self._lay_out_keys(torch.zeros(batched_data.x.shape[0], dtype=torch.bool, device=src_padding_mask.device), batched_data, index_nodes, seq_len)
+            )
+            if key_mask is not None:
+                keys = keys | self._lay_out_keys(~key_mask.bool().to(keys.device), batched_data, index_nodes, seq_len)
             if isinstance(attention_mask, StructuredMask):
                 if not self.attention_spec.hidden_keys:
                     raise ValueError(
-                        f"attention.visible_keys_only: attention.kind {self.attention_kind!r} cannot block keys "
+                        f"attention.visible_keys_only / key_mask: attention.kind {self.attention_kind!r} cannot block keys "
                         "(it takes a pattern or folds its mask into features)."
                     )
                 if attention_mask.hidden_keys is not None:  # key dropout drew some already
@@ -585,8 +595,12 @@ class TransformerNodeEncoderHook(GlobalModule):
         Laid out like the tokens (``pad_like`` with this call's ``index_nodes``), so left padding and subsampling stay
         aligned; padding slots are False (the padding mask blocks them already).
         """
-        hidden = self.wholly_hidden(batched_data)
-        keys = pad_like(hidden[:, None].float(), batched_data.batch, index_nodes, seq_len)[..., 0] > 0  # [B, S]
+        return self._lay_out_keys(self.wholly_hidden(batched_data), batched_data, index_nodes, seq_len)
+
+    @staticmethod
+    def _lay_out_keys(closed: torch.Tensor, batched_data, index_nodes, seq_len: int) -> torch.Tensor:
+        """``closed`` ``[N]`` (True: no key) laid out as ``[B, S + 1]`` like the tokens; padding False, the CLS slot open."""
+        keys = pad_like(closed[:, None].float(), batched_data.batch, index_nodes, seq_len)[..., 0] > 0  # [B, S]
         return torch.nn.functional.pad(keys, (0, 1))  # CLS open
 
     def _without_hidden_keys(self, mask: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:

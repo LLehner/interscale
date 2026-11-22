@@ -59,6 +59,14 @@ def get_dataset_cfg(cfg):
     cfg.dataset.mask_block_kind = "disc"
     cfg.dataset.mask_block_label_key = ""
     cfg.dataset.mask_block_max_cells = 0
+    # The flipped anchored-SVG task (`.claude/svg_targets_plan.md`, round 3): per graph and draw one disc of a `grid` x `grid`
+    # grid over the graph's bounding box (`tl.masking.anchor_grid_discs`, the bridge script's rule) is the sender region,
+    # every gene visible; the gene set `mask_genes` (the SVG targets) is hidden in its ring cells (beyond the disc, up to
+    # `r_max_um` from its edge); and only the disc's cells are keys (`Data.key_mask`). grid 0 (default): off, nothing drawn.
+    cfg.dataset.anchor_rings = CN()
+    cfg.dataset.anchor_rings.grid = 0
+    cfg.dataset.anchor_rings.r_disc_um = 0.0
+    cfg.dataset.anchor_rings.r_max_um = 0.0
     # Training on crops (roadmap Tier 3, K18; `tl/crops.py`): with `size_um` > 0 every training graph hands the trainer `per_graph`
     # random crops per epoch -- squares (or discs, `shape`) of `size_um` µm around a cell drawn uniformly, with every per-cell
     # attribute and the masks of the whole section -- instead of itself. Validation and test stay whole sections. A window with fewer

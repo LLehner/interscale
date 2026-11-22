@@ -353,6 +353,9 @@ def _training_tag(cfg) -> str:
         parts.append(f"blklab-{label}{f'-mx{most}' if most else ''}f{cfg.dataset.mask_block_fraction:g}")
     elif cfg.dataset.get("mask_block_fraction", 0.0) > 0:
         parts.append(f"blk{cfg.dataset.mask_block_radius_um:g}f{cfg.dataset.mask_block_fraction:g}")
+    rings = cfg.dataset.get("anchor_rings", None)
+    if rings is not None and int(rings.get("grid", 0)) > 0:
+        parts.append(f"ar{int(rings.grid)}-{float(rings.r_disc_um):g}-{float(rings.r_max_um):g}")
     crop = cfg.dataset.get("crop", None)
     if crop is not None and float(crop.get("size_um", 0.0)) > 0:
         disc = "d" if crop.get("shape", "square") == "disc" else ""
