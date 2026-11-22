@@ -21,14 +21,14 @@ wants this for newer models on the more relevant data (the flow pipeline waits f
 
 | Stage | What | Status | Date |
 |---|---|---|---|
-| A0 | One attribution interface: methods x references, signed, cell- and gene-resolved, completeness gap and time per receiver | **built** (`evaluation/attribution.py`: decomposition, attention, grad_input, ig, deeplift, occlusion x R1 / R2 / R4; tests) -- `conservative` not built | 2026-11-22 |
+| A0 | One attribution interface: methods x references, signed, cell- and gene-resolved, completeness gap and time per receiver | **built** (`evaluation/attribution.py`: decomposition, attention, grad_input, ig, deeplift, conservative, occlusion x R1 / R2 / R4; removal by reference or by the model's own mask; tests) | 2026-11-22 |
 | A1 | synth_spot validation: planted senders, completeness, method agreement, Sensitivity-n, cost; decides whether DeepLIFT may replace IG for maps | job written and checked (`attr_submit.sh synth`, J1's ref + ir2_rate), **not run** | 2026-11-22 |
-| A2 | Item 1: sampled receivers on CosMx / vannan, against the twin and the within-type permuted section | CosMx job written and checked (`attr_submit.sh cosmx`, J4's ir_c_ktype x 3, typeres, ir_c), **not run**; vannan untrained | 2026-11-22 |
+| A2 | Item 1: sampled receivers on CosMx / vannan, against the twin and the within-type permuted section | CosMx and vannan jobs written and checked (`attr_submit.sh cosmx` on J4; `attr_submit.sh vannan` on `ir_submit.sh vannan`'s new checkpoints), **not run** | 2026-11-22 |
 | A3 | Item 2: attribution source / sink maps from disc targets | in the CosMx job (disc targets, `plot_source_sink` layout), **not run** | 2026-11-22 |
 | A4 | Item 3: influence against distance (trained, twin, permuted; attention next to it) | in both jobs (`attr_distance`), **not run** | 2026-11-22 |
-| A5 | Optional: positive / negative split (RevealCancel idea), multi-reference DeepLIFT (DeepSHAP), conservative transformer propagation | signs kept everywhere; `deeplift` with `reference="sampled"` is the DeepSHAP-like average; RevealCancel and `conservative` not built | 2026-11-22 |
+| A5 | Optional: positive / negative split (RevealCancel idea), multi-reference DeepLIFT (DeepSHAP), conservative transformer propagation | signs kept everywhere; `deeplift` with `reference="sampled"` is the DeepSHAP-like average; `conservative` built; RevealCancel not built (only if a model learns an AND-type programme) | 2026-11-22 |
 | A7 | **Later (user, 2026-11-21):** the attribution methods on data without cell-type annotation (legnini the candidate): what replaces the type-mean reference and the deviation target there | to note, not planned in detail | 2026-11-21 |
-| A6 | **Must pursue (user, 2026-11-21):** is the learned neighbourhood function linear? Method agreement, Sensitivity-n and pairwise sender interactions on real data, with synth_spot's thresholded programme as the positive control | measures built (`sensitivity_n`, `pairwise_interactions`, `agreement`), in both jobs (MC23 / MC20 / M11 named on synth), **not run**; NCEM novelty check still to do | 2026-11-22 |
+| A6 | **Must pursue (user, 2026-11-21):** is the learned neighbourhood function linear? Method agreement, Sensitivity-n and pairwise sender interactions on real data, with synth_spot's thresholded programme as the positive control | measures built (`sensitivity_n`, `pairwise_interactions`, `agreement`) with small and large perturbations (type mean, sampled cells, the model's mask), in all jobs (MC23 / MC20 / M11 named on synth), **not run**; NCEM novelty check still to do | 2026-11-22 |
 | M | Retrain one model per dataset with the best settings so far (CosMx, synth_spot, vannan; legnini skipped, user 2026-11-21) | recipes proposed below, to confirm | 2026-11-21 |
 | check | Status check after the CCC runs (J1 / J3 / J4 read; section "Status check 2026-11-22" at the end): nothing of A0-A6 built; Stage M answered by J1 / J4 for synth_spot and CosMx with checkpoints that exist (no retraining), vannan untrained; A6 has its first architecture-level evidence | **done**; building waits for the user | 2026-11-22 |
 
@@ -316,7 +316,7 @@ thesis_outline.md.
 | A3 | disc-target attributions over the fold passes, out / in strength per cell, maps in `flow_maps`' layout (one slide per figure, tissue only), twin and permuted section | ~0.5 day |
 | A4 | influence against distance from A2 / A3 (trained, twin, permuted; attention mass beside it) | ~0.25 day |
 | A6 | pairwise sender interaction I_jk (hide j, k, both; the model's own removal), method agreement, Sensitivity-n on CosMx with synth_spot's controls (MC23 learned, MC20 not, M11) | ~0.5 day (on A0) |
-| vannan | no preprocessed inputs used by any job yet (`vannan25.h5ad` on the cluster, not preprocessed; `make_lung_inputs.py` exists), no training | preprocessing + one training job |
+| vannan | `vannan25_pp.h5ad` exists on the cluster (ceiling run 4 used it: 34,134 test cells, 8 samples; corrected 2026-11-22); no trained model | one training job (Stage M recipe) |
 
 ### What the CCC runs settle
 
@@ -371,7 +371,7 @@ thesis_outline.md.
 | `synth` (A1, A4, A6 controls) | J1: `ref` (lin_dist_skipraw), `ir2_rate` x 2 seeds + twins | programme masks as trained; 6 planted receivers per programme and graph, target = its response genes; decomposition, attention, grad_input, IG 5 / 20 / 50 (the 50-step IG is the reference), DeepLIFT, occlusion; R1; planted top-5 by class, gaps, agreement, seconds, distance; A6 on receivers 600 um apart, grouped MC23 (threshold, learned by the reference), MC20 (unlearned), M11 (mid), classes |
 | `cosmx` (A2-A4, A6, A3) | J4: `ir_c_ktype` x 3, `typeres_s42`, `ir_c_s42` + twins of typeres / ir_c | clean pass; up to 40 receivers per type 150 um apart; deviation targets (INS for Beta cells); R2 for every method, R4 for IG; the within-type permuted section (non-receivers' rows swapped within type); sender type x receiver type, distance, A6; A3 disc maps (30 discs of 30 um per section, IG, receivers with gap > 0.1 dropped) |
 
-Files: `attr.py` (`ATTR_JOB=synth|cosmx`, every setting from ir_synth.py / ir_cosmx.py so the data and checkpoints match), `attr_common.py` (the hook),
+Files: `attr_job.py` (`ATTR_JOB=synth|cosmx`, every setting from ir_synth.py / ir_cosmx.py so the data and checkpoints match), `attr_common.py` (the hook),
 `attr_read.py` (the A1 rule; the A6 tables beside the twins; uses gene_rank_read.py's helpers), `attr_job.sbatch`, `attr_submit.sh`. Copy them with
 `gene_rank_read.py` to `MA/scripts/` (sbatch and submit to `MA/slurm/`), install the fork's main, then `bash slurm/attr_submit.sh synth` (and `cosmx`).
 
@@ -385,9 +385,27 @@ so the toy maps are skipped with a message, by design). Found and fixed: the dec
 
 ### Not built / open
 
-- `conservative` (softmax and LN scale detached: dense attention only) and RevealCancel (A5).
-- vannan: preprocessing and training (A2's second dataset).
+- `conservative` (softmax and LN scale detached) and RevealCancel (A5). Correction (2026-11-22, the user): `conservative` needs explicit attention weights, not dense attention; the read-out and fused backends have that path (`need_weights`), and the CosMx test graphs (~10k cells) fit an explicit map (~0.4 GB per head and layer), so it can cover every J4 arm. Only whole 100k-cell sections would be heavy (~40 GB per head); fused attention's measured cost there was compute (127 s per training step), not memory (5.6 GiB).
+- vannan: training (A2's second dataset); the preprocessed file exists.
 - A7 (data without labels): R1 and the k-NN / cluster references are possible with `labels` set to clusters; not wired into a job.
 - Cost is estimated, not measured: CosMx ~5,000 backward passes per section per model (IG 5 steps, R4, permuted, discs), at an assumed 0.1 s each about
   1 h per model and twin; the job reports seconds per receiver and per run.
 - Before calling A6 novel: the NCEM check (linear vs nonlinear node-centric models) remains to do.
+
+### Build, second part (2026-11-22; the user: dense attention is not the limit, vannan's preprocessed file exists)
+
+- **`conservative`** (`_conservative_rules`): during the pass `torch.softmax`, `F.softmax`, `Tensor.softmax` (and `log_softmax`) return detached outputs,
+  the SDPA kernel runs in explicit form with detached weights, `F.layer_norm` divides by a detached standard deviation; forward values unchanged (tested on
+  a read-out and a dense model), every function restored. Covers dense, fused / read-out and hierarchical (Tensor.softmax) models.
+- **Removal by the model's own mask** (`removal="mask"` in `attribute(..., "occlusion")`, `sensitivity_n`, `pairwise_interactions`): the cells hidden whole
+  through `mask` (under `visible_keys_only` no key); node-masked models only (refused otherwise). Tested: the column equals the prediction with that cell
+  hidden; Sensitivity-1 against mask occlusion is 1.
+- **A6 with large perturbations**: the jobs run every A6 measure for `(type_mean, reference)`, `(sampled, reference)` and `(type_mean, mask)` (synth: graph
+  mean and sampled; no mask, the J1 models are gene-masked); tables carry `variant`.
+- **vannan**: `make_ir_vannan_yaml.py` + `ir_vannan.py` (training only; `bash slurm/ir_submit.sh vannan`): J4's `typeres` and `ir_c_ktype` with fine types
+  (the type residual by sample x final_CT), fold `split_0`, graphs per sample, 2 crops per sample and epoch, 3 seeds; controls among the genes dropped.
+  `attr_submit.sh vannan` (ir_c_ktype x 3, typeres_s42; IFIT1 as named target, 15 receivers per fine type) and `rank_submit.sh vannan` read them.
+- **Renamed** `attr.py` -> `attr_job.py`: a script named `attr` in the scripts folder shadows the `attrs` package that `rich` (scvi-tools) imports as
+  `attr`, so every job started from there would have crashed at import. Found by the configure check.
+- Checks: vannan arms through `_validate` / masking / names (<= 217 characters); `configure()` and run lists for `attr_job.py` / `gene_rank.py` with vannan;
+  the attribution hook end to end again (conservative everywhere, three variants on node-masked models, two on gene-masked ones); 90 tests pass.

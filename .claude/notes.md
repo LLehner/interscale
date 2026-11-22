@@ -2435,3 +2435,18 @@ What worked:
 What doesn't work / limits:
 - `conservative` and RevealCancel not built; vannan untrained; costs are estimates until the first CosMx task reports them.
 - Sensitivity-n / pairwise interactions across receivers in one pass assume distant receivers do not interact (stated approximation).
+
+## 2026-11-22 — Attribution second part: conservative, mask removal, large-perturbation A6, vannan training job (no run yet)
+
+The user corrected two claims: `conservative` needs explicit weights, not dense attention (the read-out / fused path has them; ~10k-cell test graphs fit),
+and `vannan25_pp.h5ad` exists on the cluster (ceiling run 4 used it). Built: `conservative`, removal by the model's own mask, A6 over three perturbation
+variants, a vannan training job and the vannan arms of the attribution and ranking jobs; attribution_plan.md "Build, second part".
+
+What worked:
+- `conservative` as a set of patched functions (softmax outputs, the SDPA kernel, LayerNorm's scale) covers every backend, the hierarchy included, with the
+  forward unchanged.
+- The configure check found that a script named `attr.py` shadows the `attrs` package (`rich` imports `attr`): renamed `attr_job.py` before any job ran.
+
+What doesn't work / limits:
+- My earlier "dense attention only" for `conservative` and "vannan never preprocessed" were wrong (corrected in the plan and the memory).
+- vannan training time is estimated (2 crops per sample and epoch to stay near J4's epoch cost); RevealCancel not built.

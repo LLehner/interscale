@@ -561,11 +561,12 @@ in folds (`gene_folds`, `hide_genes` sets `gene_mask` *and* `mask`, which `apply
 
 `evaluation/attribution.py` (`.claude/attribution_plan.md`, A0-A6, 2026-11-22): `attribute(module, batch, receivers, weights, method, reference=)` for
 `decomposition` / `attention` (read-out models), `grad_input`, `ig`, `deeplift` (secant gradient at the layers' stored ReLU / GELU and `nn.ReLU` /
-`nn.GELU`, restored after), `occlusion`, with references `graph_mean` / `type_mean` / `sampled`; measures `agreement`, `planted_top_k`, `sensitivity_n`,
+`nn.GELU`, restored after), `conservative` (softmax outputs, the SDPA kernel's weights and LayerNorm's scale detached for the pass), `occlusion` (removal by
+reference or, node-masked models, by the model's own mask), with references `graph_mean` / `type_mean` / `sampled`; measures `agreement`, `planted_top_k`, `sensitivity_n`,
 `pairwise_interactions`, `distance_profile`, `strengths` / `disc_strengths` / `map_fields`. Invariants: paths run in token space (`gex_embedding`
 replaced for the pass); the receivers' own rows and cells hidden whole never move; targets are fixed gene weights per receiver (linear, so rows add); the
 decomposition's intercept is the decoder bias plus every read layer's output-projection bias through the decoder (sums to the context part, tested); the
-module's mode, parameter flags and the global generators are restored. Cluster: `slurm/November/attr*.py`, `attr_submit.sh synth|cosmx`.
+module's mode, parameter flags and the global generators are restored. Cluster: `slurm/November/attr_*.py`, `attr_submit.sh synth|cosmx`.
 
 ### Preprocessing / robustness utilities (`interscale.pp`)
 
