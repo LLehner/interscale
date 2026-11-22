@@ -626,10 +626,62 @@ def context_use(flows: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------------------------------------------------------------------------- interventions: gene flows
 
 
+#: What a readout scores: the entries the graph hides (the training-style masked step), or every entry of every cell (``"all"``: the clean pass of a model
+#: that never reads a cell's own values, e.g. the interaction read-out trained with every cell a target).
+TARGETS = ("hidden", "all")
+
+
+def blind_to_own(module) -> bool:
+    """Whether ``module``'s prediction for a cell never reads that cell's own values: a context query (``context_only: query``) without the own-cell skip
+    and without a section or group offset that averages over the cell's own entries. The label's training mean (``section_offset: label_mean``) is a constant
+    of the label and is allowed."""
+    return (
+        getattr(module, "context_only", "none") == "query"
+        and not bool(getattr(module, "own_cell_skip", False))
+        and getattr(module, "section_offset", "none") != "visible_mean"
+        and getattr(module, "group_offset", "none") == "none"
+    )
+
+
+def scored_entries(graph, module, targets: str) -> np.ndarray:
+    """``[N, G]`` bool: the entries a readout scores (:data:`TARGETS`). ``"all"`` refuses a module that reads a cell's own values (:func:`blind_to_own`):
+    scoring an entry the model was shown measures nothing but copying."""
+    if targets not in TARGETS:
+        raise ValueError(f"targets must be one of {TARGETS}, got {targets!r}.")
+    if targets == "hidden":
+        return _hidden_entries(graph, "gene")
+    if not blind_to_own(module):
+        raise ValueError(
+            "targets='all' scores every entry of every cell, so the model must never read a cell's own values: a context query (context_only: query) "
+            "without the own-cell skip or a visible-mean offset. Score hidden entries instead."
+        )
+    return np.ones((int(graph.num_nodes), int(graph.x.shape[1])), dtype=bool)
+
+
+class _scoring_every_cell:
+    """Inside, a module with ``score_all_cells`` scores every cell's row (restored on exit): what ``targets='all'`` needs from a model trained on hidden
+    cells (the step would otherwise return the hidden cells only, and with nothing hidden, none)."""
+
+    def __init__(self, module, on: bool):
+        self.module, self.on = module, on and hasattr(module, "score_all_cells")
+
+    def __enter__(self):
+        if self.on:
+            self.saved = self.module.score_all_cells
+            self.module.score_all_cells = True
+        return self
+
+    def __exit__(self, *exc):
+        if self.on:
+            self.module.score_all_cells = self.saved
+        return False
+
+
 @dataclass
 class GeneFlows:
     """``drop`` (a target's centred cosine within the receiver type, unchanged minus changed, from sums pooled over graphs; NaN: not read) and ``sum_shift``
-    ``[S, R, G]``; ``count``, ``expressed`` ``[R, G]``; the names of each axis.
+    ``[S, R, G]``; ``count``, ``expressed`` ``[R, G]``; the names of each axis; ``base`` ``[R, G]``, the unchanged model's centred cosine per receiver type and
+    target (NaN: not read; None from code older than 2026-11-22).
     """
 
     senders: list[str]
@@ -639,6 +691,7 @@ class GeneFlows:
     sum_shift: np.ndarray
     count: np.ndarray
     expressed: np.ndarray
+    base: np.ndarray | None = None
 
     def delta_cos(self) -> np.ndarray:
         """``[S, R, G]``: the drop in the target's centred cosine within the receiver type (NaN: not read)."""
@@ -662,17 +715,21 @@ def gene_flows(
     per_type: int = 1000,
     seed: int = 0,
     device="cpu",
+    targets: str = "hidden",
 ) -> GeneFlows:
     """Each gene of ``senders`` (those visible in every graph) permuted in the context of the receivers, one pass per sender and graph.
 
     ``within_labels``: among cells of one type, so a marker's cell type stays where it is and only which cell has how much changes. ``labels`` is one array per graph.
     ``far_radius`` (units of ``pos``): above 0, the cells within it of a receiver keep their values too, so only distant cells change (the ``far`` region).
+    ``targets`` (:data:`TARGETS`): the hidden entries (default), or ``"all"``, every entry of the receivers, for a model blind to its own cell
+    (:func:`scored_entries`); only visible entries are ever permuted either way.
     """
     genes = [str(g) for g in genes]
     position = {g: k for k, g in enumerate(genes)}
     labels = [np.asarray(v).astype(str) for v in labels]
     types = sorted(set().union(*[set(v.tolist()) for v in labels]))
     hidden = [_hidden_entries(d, "gene") for d in graphs]
+    scored_masks = [scored_entries(d, module, targets) for d in graphs]
     usable = [str(s) for s in dict.fromkeys(senders) if str(s) in position]
     usable = [s for s in usable if all(not h[:, position[s]].all() for h in hidden)]
     if not usable:
@@ -686,22 +743,22 @@ def gene_flows(
     was_training = module.training
     module.eval()
     try:
-        with _rng_untouched(device), torch.no_grad():
-            for graph, label, h in zip(graphs, labels, hidden, strict=True):
+        with _rng_untouched(device), torch.no_grad(), _scoring_every_cell(module, targets == "all"):
+            for graph, label, h, target in zip(graphs, labels, hidden, scored_masks, strict=True):
                 truth = graph.x.double().cpu().numpy()
                 visible = torch.as_tensor(~h)
                 pos = graph.pos[:, :2].double().cpu().numpy()
-                receivers, keep = pick_receivers(pos, label, h.any(axis=1), float(far_radius), rng=rng, per_type=int(per_type))
+                receivers, keep = pick_receivers(pos, label, target.any(axis=1), float(far_radius), rng=rng, per_type=int(per_type))
                 base = _predict(module, [graph], head=head, batch_size=1, device=device)[0]
                 variance = _type_variance(truth, label, types)
                 free = np.flatnonzero(~keep)
                 groups = [free[label[free] == t] for t in types] if within_labels else [free]
                 cells = {r: receivers[label[receivers] == t] for r, t in enumerate(types)}
-                centres = _type_centres(base, truth, h, label, types)
+                centres = _type_centres(base, truth, target, label, types)
                 for r, t in enumerate(types):
                     if len(cells[r]):
-                        count[r] += h[cells[r]].sum(axis=0)
-                        valid = h[cells[r]] & np.isfinite(base[cells[r]])
+                        count[r] += target[cells[r]].sum(axis=0)
+                        valid = target[cells[r]] & np.isfinite(base[cells[r]])
                         base_sums[:, r] += centred_sums(base[cells[r]], truth[cells[r]], valid, *centres[t])
                         # A near-constant target has no pattern within the type to lose (as in type_flows).
                         readable[r] &= variance[t] >= max(1e-3, float(np.nanmedian(variance[t])) * 0.1)
@@ -723,7 +780,7 @@ def gene_flows(
                     for r in range(len(types)):
                         rows = cells[r]
                         if len(rows):
-                            scored = h[rows] & np.isfinite(pred[rows]) & np.isfinite(base[rows])
+                            scored = target[rows] & np.isfinite(pred[rows]) & np.isfinite(base[rows])
                             pred_sums[:, s, r] += centred_sums(pred[rows], truth[rows], scored, *centres[types[r]])
                             scored_count[s, r] += scored.sum(axis=0)
                             sum_shift[s, r] += np.where(scored, pred[rows] - base[rows], 0.0).sum(axis=0)
@@ -731,7 +788,7 @@ def gene_flows(
         module.train(was_training)
     base_cos = cosine_from_sums(base_sums, count)
     drop = np.where(readable[None], base_cos[None] - cosine_from_sums(pred_sums, scored_count), np.nan)
-    return GeneFlows(usable, types, genes, drop, sum_shift, count, detected / np.maximum(total, 1))
+    return GeneFlows(usable, types, genes, drop, sum_shift, count, detected / np.maximum(total, 1), np.where(readable, base_cos, np.nan))
 
 
 def gene_flow_tables(
