@@ -20,10 +20,12 @@ first, gate with decision rules fixed before the run.
 | R | Read the 11 papers, verdict per idea (this file) | **done** | 2026-11-21 |
 | S0 | Build the interaction read-out (IR): receiver-aware query, null key, additive read-out, exact influence export; options: content-dependent decay, entropy + L1 with ramp, key dropout, same-type keys, key inputs, all-cell targets | **built**, on main since 2026-11-21 (c9a43aa, 90ae83d; section "Build") | 2026-11-21 |
 | E1 | SAFFRON-style probes: sparse autoencoder on embeddings against known spatial variables, nulls, OMP, naive baselines | **built** (`evaluation/sae_probe.py`), runs inside J1 / J3 / J4 | 2026-11-21 |
-| S1 | synth_spot gate: IR arms against the current best (`lin_dist_skipraw`, 300 epochs), readouts E1 + E3 | job J1 written and checked (`ir_synth`), **not run** | 2026-11-21 |
-| E2 | Semi-synthetic CosMx: planted interactions on real coordinates, types and cells (AMICI's generator idea), incl. long range | **built** (`evaluation/semi_synthetic.py`), job J3 written (`ir_semi`), **not run** | 2026-11-21 |
-| S4 | CosMx + vannan with the IR (type residual, all-cell targets), key-input and same-type ablations, readouts E4 / E5 | CosMx job J4 written and checked (`ir_cosmx`), **not run**; vannan not built | 2026-11-21 |
+| S1 | synth_spot gate: IR arms against the current best (`lin_dist_skipraw`, 300 epochs), readouts E1 + E3 | **run, read**: R2 pass, R1 / R3 / R4 fail -> IR = readout model beside the score model; entropy arms not evaluated (synth-only failure) | 2026-11-22 |
+| E2 | Semi-synthetic CosMx: planted interactions on real coordinates, types and cells (AMICI's generator idea), incl. long range | **run, read**: generator works model-free; model readout inconclusive (binary receiver truth near-degenerate, n = 48); GITIII not run | 2026-11-22 |
+| S4 | CosMx + vannan with the IR (type residual, all-cell targets), key-input and same-type ablations, readouts E4 / E5 | CosMx **run, read**: J4 rule passes (0.137 clean / 0.096 masked vs knn128 0.109 / 0.089), keys need no expression; vannan not built | 2026-11-22 |
 | S5 | Optional, gated by E1: Matryoshka / TopK context code, nuisance subspaces (scDIVA), metagene heads (Steamboat), JEPA auxiliary (TERRA) | to note | 2026-11-21 |
+| E7 | Gene rankings of interaction (the user, 2026-11-22: judge a model by which genes it finds interacting, not by reconstruction): responders, drivers, pairs by intervention; truth on synth_spot (roles) and the spiked file; bars (Moran, variance, neighbour ridge, twin); rules G1-G3, S1-S3, C1 | **built** (`evaluation/gene_ranking.py`, `gene_flows(targets=)`; tests, mutants; section "E7") | 2026-11-22 |
+| J5 / J6 | Ranking jobs: J5 synth_spot (ir_ch, ctx_ch trained with channel masks, 2 seeds + twins), J6 CosMx (J4 checkpoints, evaluation only), J6b spiked file (J3 checkpoints) | written and checked (`rank_submit.sh synth\|cosmx\|semi`), **not run** | 2026-11-22 |
 | D2 | Second round: the user's decisions, the two reviews read in full, SAFFRON's gradient / niche / nesting analyses, the semi-synthetic generator made concrete, the training modes explained (section "Second round" at the end) | **done** | 2026-11-21 |
 
 ## What was read
@@ -690,3 +692,191 @@ vannan arm of S4 (no loader / preprocessed file yet).
 Copy the November files above to `MA/scripts/` (the sbatch and `ir_submit.sh` to `MA/slurm/`), install the fork's main (pull, editable) in the
 `interscale` env, then `cd $MA && bash slurm/ir_submit.sh synth` (and `cosmx`, `semi`). `MAX_PARALLEL` caps concurrent tasks (default
 14). A task resubmitted after a B300 node finishes after the report: run `STEP=report` again (minutes).
+
+## Results (2026-11-22): J1, J4, J3 read
+
+Results: `MA/21_11_results/ir_{synth,cosmx,semi}` (`ir_read.md` = the rules, `results.md` = the standard tables, `ir_tables/<run>/`).
+The short version is in notes.md (2026-11-22). Centred cosine throughout.
+
+### J1, synth_spot (2 seeds, 300 epochs)
+
+| arm | programme mean | mid (M11) | dense recv | top-5 short / mid | val loss | s / epoch |
+|---|---|---|---|---|---|---|
+| ref (`lin_dist_skipraw`) | **0.805** | 0.894 | 0.671 | (attention 0.97 / 0.73; IG 0.99 / 1.00) | 0.052 | 2.3 |
+| ir1 | 0.727 | 0.551 | 0.019 | 1.00 / 0.60 | 0.110 | 3.3 |
+| ir2 | 0.757 | 0.719 | 0.019 | 1.00 / 0.99 | 0.073 | 5.5 |
+| ir2_rate | 0.766 | **0.927** | 0.019 | 1.00 / 1.00 | 0.063 | 5.7 |
+| ir2_kd | 0.761 | 0.751 | 0.019 | 1.00 / 0.99 | 0.074 | 5.5 |
+| ir2_pen, amici_like | not evaluated | | | | 0.101 / 0.117 | 6.0 / 3.6 |
+| ir2 untrained | 0.135 | | | 0.60 / 0.07 | | |
+
+- **R1 fails** (0.766 vs 0.805; worst class: dense, -0.13). The loss sits in M19-M21: the 200-500-receiver sparse-response programmes
+  whose receivers respond only **beyond** 1-3 mm of the nearest source. Within receivers every IR arm gives the same -0.129 / -0.443 /
+  0.628 (the raw own-cell skip's solution), the reference 0.54 / 0.57 / 0.90. A threshold needs a nonlinearity after the aggregation,
+  which `context_readout: additive` removes by design (the reference keeps its feed-forward block on the output path). This is the price
+  of the exact decomposition, measured.
+- **R2 passes** (ir2, ir2_rate, ir2_kd): the decomposition matches IG for short and mid senders with no gradient. Gene AP 0.97-0.98.
+- **R3 fails** on the sparse class only (no arm, the reference included, solves sparse receivers: within-receiver 0.466 for all). The
+  interaction mass does not separate receivers (0.55-0.66): null mass ~0.2 everywhere, the null key is a constant sink without the
+  entropy penalty, and the entropy arms were not evaluated.
+- **R4 fails**, partly by its estimator: `range_um` is the influence-weighted mean distance over all keys (long tail; twin 1,183 um for
+  short). Read the radius holding 50 % of the influence instead.
+- **R5** by hand: lowest IR val loss = ir2_rate = best R2 arm (the reader's val_loss column was empty).
+- Outcome by the rule fixed before the run: **R2 passes, R1 fails -> the IR is the readout model beside the score model**; on synth
+  Stage M keeps `lin_dist_skipraw` for scores and adds ir2_rate for the per-sender readout.
+
+### J4, CosMx (3 seeds for typeres, ir_c, ir_a, ir_b, ir_c_ktype, ir_c_knone; one seed for the rest)
+
+Within section x coarse type (`ir_read.md`): clean = every cell a target, every other cell a key; masked = hidden disc cells.
+
+| arm | clean | masked | raw SCE (masked) | note |
+|---|---|---|---|---|
+| knn128 / knn32 / knn8 | 0.109 / 0.096 / 0.078 | 0.089 / 0.074 / 0.052 | 0.439 (nearest_128) | the bar |
+| typeres | – | 0.092 | 0.870 | |
+| ir_c (mode c) | 0.137 | 0.096 | 0.451 | J4 rule passes |
+| ir_a (mode a, masking) | 0.135 | 0.097 | 0.491 | |
+| ir_b (mode b, nothing hidden) | 0.132 | (0.121) | 0.465 | masked not comparable (reads hidden cells as keys) |
+| ir_c_ktype | **0.141** | 0.098 | **0.436** | maps most stable (sent 0.83, reach 0.79) |
+| ir_c_knone | 0.138 | 0.097 | 0.440 | routing by distance alone |
+| ir_c_same | 0.103 | 0.079 | 0.491 | same-type keys carry a quarter of the gain |
+| ir_c_rate / kd / local / noisy | 0.138 / 0.138 / 0.137 / 0.138 | 0.096 / 0.094 / 0.099 / 0.096 | | no effect; label noise tolerated |
+| ir_c_pen | 0.127 | 0.068 | 0.432 | entropy pushes towards the type mean |
+| ir_c_fine | (0.150) | (0.125) | | not comparable: fine-type mean scored within coarse type |
+| amici_like | 0.091 | 0.056 | 0.478 | below the smoother |
+
+- **Keys:** type only >= none >= expression (0.1406 / 0.1384 / 0.1369, seed SD <= 0.001). Sender expression in the keys adds
+  nothing; the reader's "no" comes from a rule that tests a tie. For A6 / project goal 2: routing needs distance and, by 0.002, sender
+  type; sender expression enters through the values only.
+- **Maps** are seed-stable (ir_c received 0.86, mass 0.73, sent 0.65; typeres' flow 0.14), but stability is not interaction: the twin's
+  maps are not yet compared.
+- **Type tables** are heat-shock / immediate-early genes and hormone / enzyme spillover, unstable across arms: no CCC reading.
+- **E1:** the trained context embedding ties knn-PCA and is at or below its untrained twin on composition variables; the early-vs-late
+  test is negative for every embedding, the twins and PCA included (a property of the SAE).
+- **Bar missing:** the +0.028 clean gain is over a raw smoother. Before it is called interaction: a fitted ridge on neighbourhood means per
+  type and an FOV offset reference (fov_depth is the context embedding's best-tracked variable).
+- Outcome by the rule: **ir_c passes**; Stage M's CosMx model becomes the IR in mode c, with `key_inputs: type` as the candidate default
+  (best score, SCE and stability; one key input fewer).
+
+### J3, spiked CosMx (2 seeds for ir_c / typeres)
+
+- Generator: model-free Spearman of the receivers' within-type response-gene residual with the kernel 0.05-0.25 (planted), 0.04 / -0.04
+  (null pairs): it works, the signal is small.
+- Calls (`receiver_auroc >= max(0.6, k-NN reference, twin)`): ir_c 3 of 6 callable pairs (Endothelial>Acinar@exp50 both effects,
+  Beta>Acinar@exp200 x2), ir_c_rate 2, ir_a and amici_like 0. **Not evidence:** the receiver truth (any receiver-type cell with a sender
+  in reach) covers 94 % / 81 % / 100 % of the receiver type for exp50 / exp200 / field, so the negatives are cells far from any sender
+  (geometry; the twin's interaction mass reaches 0.86-0.87); 48 + 48 cells per programme (SE ~0.06). The clean test, contact
+  Immune>Ductal@20 um (25 % receivers, own-residual AUROC 0.67), is missed by every arm. Gene AP shows some learned response (Beta>Acinar
+  x2: 0.17 vs twin 0.011). GITIII did not run past preprocessing.
+- E1 on the kernels cannot tell planted from null pairs (null 0.30-0.54 vs planted 0.29-0.61).
+
+### Next (proposed, nothing started)
+
+1. **Entropy arms on synth:** read the `.err` of the four array tasks (ir2_pen, amici_like x 2 seeds), fix the synth-only evaluation
+   failure, evaluate the existing checkpoints (STEP=report afterwards). Only this arm tests whether the null key can mean "no interaction".
+2. **Readout fixes (evaluation only, existing checkpoints):** range as the 50 %-influence radius; J3 with graded truth (Spearman of each
+   receiver-type cell's influence on the response genes with its kernel, every cell, not 48) and a response-gene within-type score
+   against knn; `ir_read.py` val_loss and the key rule (`type >= expression - 0.002`).
+3. **CosMx bars:** a fitted ridge on k-NN neighbourhood means per type (`FittedReferences(k_nearest=...)`) and an FOV group offset
+   reference on the same clean / masked passes; the twin's maps next to the seed agreement.
+4. **Thresholds without losing the split:** a receiver-level (or gene-wise) gate on the additive context, `y_ctx,i = g_i * sum_j c_ij`
+   with `g_i` from the stream state: still exactly a sum over senders per receiver. One synth arm against ref on M19-M21; switchable, off
+   by default.
+5. The attribution plan's Stage M can start with the outcomes above (synth: ref scores + ir2_rate readout; CosMx: ir_c_ktype), or wait for
+   items 1-3. The user decides.
+
+## E7: gene rankings of interaction (2026-11-22)
+
+The user (2026-11-22), after the J1 / J3 / J4 read: "I feel like you are still too focused on predicting gene expression. The model should find genes that
+interact, i.e. show some kind of variability and respond to others. We need a ranking to judge how well the model worked." Then: "Write and build it."
+They agreed that genes that only vary in space (synth_spot's spatially variable and region genes, spillover on CosMx) count as negatives, not hits.
+
+### Design: three rankings, by intervention
+
+Built on `interpretation.py`'s interventions: receivers keep their own rows, only other cells change, the score is a target's centred cosine within
+the receiver group (cell type, or every cell without types), pooled over graphs, so a level or scale error of the model cancels. Per receiver group:
+
+1. **Responders** (`gene_ranking.context_flows`, kind `all_state`): every other cell's visible row swapped with another cell's of the same label; a target's
+   drop is what the model took from the arrangement of the other cells' states, beyond composition. A gene scores only if it varies within the group
+   *and* the model explains that from other cells. `responder_cross` takes off the part the **same gene in other cells** carries (the drop when that gene
+   alone is permuted): smoothness, regional states, spillover. With the target hidden in every cell (channel folds) that pair is not read.
+2. **Drivers** (`interpretation.gene_flows`): one sender gene permuted within label among the other cells; the driver score is its largest drop over
+   the other targets (`top`; the planted drivers move 1-3 targets each), the mean (`influence`) beside it.
+3. **Pairs** sender gene -> target gene: the same drops, `sender != target`.
+4. **Sender types** (labelled data): `identity` (a type's cells take random other-type profiles) minus `identity_null` (the same on as many nearby cells
+   of other types).
+
+**Bars** (model-free, same cells, `BASELINE_RUN` only): within-type Moran's I (spatially variable genes), within-type variance (variable genes), the
+**neighbour ridge** (each target on the k nearest cells' within-type residuals and label shares, the target's own neighbour feature left out exactly by the
+one-column downdate; a weak bar on purpose: the neighbour means do not tell the sender's type), and each arm's untrained twin.
+
+**Targets.** A model trained with channel masks is read in **folds** (`gene_folds`: ~20 % of the genes hidden in every cell, 2 partitions, so almost
+every pair is read in some fold; `hide_genes` sets `gene_mask` and `mask` as the dataloader does). A model that never reads its own cell is read on the
+**clean pass** (`targets="all"`, every cell a target; `scored_entries` refuses it for a model that reads its own cell, `_scoring_every_cell` switches
+`score_all_cells` on for mode-a models such as typeres).
+
+**Why synth_spot needs new training.** J1 hid only the 29 response genes, so no other gene was ever a target: a ranking over all genes would rediscover
+the mask. J5 trains with channel masks (20 % of the genes in every spot, redrawn every epoch): every gene is a target sometimes and can then be predicted
+only from other genes. The comparison arm is the reference recipe as a context query (`ctx_ch`: feed-forward on the output path, blind to its own spot):
+`lin_dist_skipraw` itself reads its own token, so its context part is not a statement about other cells.
+
+### Truth
+
+- synth_spot (`roles_truth`): responders = roles `receiver` / `response` (R1-R4, MC1-MC25: 29), drivers = `sender` / `source` (S1-S4, M1-M21: 25), pairs =
+  every driver -> responder of one `interaction` programme (31), **hard negatives** = roles `spatial`, `marker`, `batch`, `condition` (SP1-10, CM1-3, bg, cg).
+  Receptors MR16-25 (the receiver's own gate) are ordinary negatives.
+- spiked CosMx (`programme_truth`): per receiver type the spiked genes; the null programmes' genes (chosen by the same rule, never spiked) as hard
+  negatives; the planted sender type per programme.
+- real CosMx: none; stability over seeds, flags (a responder that marks another type: `spillover_flags`; handling stress / ribosomal genes from
+  `biology_resource.json`), known ligand-receptor pairs against expression-matched targets (`lr_support_by_type`).
+
+### Decision rules (fixed 2026-11-22, before any run; `gene_rank_read.py`)
+
+A bar is the best of Moran, variance, ridge and the arm's twin; means over seeds.
+
+- **G1 responders** (synth): AUPRC >= best bar + 0.10 and AUROC against the hard negatives >= 0.80.
+- **G2 drivers** (synth): AUPRC >= best bar + 0.10.
+- **G3 pairs** (synth): precision at k (k = the planted pairs scored, 31) >= 0.5 and AUPRC above the ridge's.
+- The ranking model for synth is the arm passing more of G1-G3 (tie: higher pair AUPRC); none passing: no ranking model, said so.
+- **S1** (spiked): per spiked receiver type, AUROC of the planted genes >= 0.75 and above every bar and the twin, in every spiked type.
+- **S2** (spiked): every null programme's genes outside the top 20 % of their receiver type's responders.
+- **S3** (spiked): the planted sender type first for at least half of the spiked programmes. A programme is *detected* when its genes' median rank lies in
+  the top 10 % of the receiver type's responders (the shortest range and smallest effect detected are reported).
+- **C1** (CosMx): responder ranking stable over seeds, mean RBO (p = 0.9) over types and seed pairs >= 0.5 (drivers and pairs reported). **C2** reported:
+  the flagged share (spillover, handling) of the top 50 responders per type.
+
+### Jobs (`slurm/November/`, flat; results `MA/22_11_results/rank_{synth,cosmx,semi}/gene_rank.md`)
+
+| Job | What | Runs | Per task |
+| --- | --- | --- | --- |
+| J5 `synth` | `make_rank_synth_yaml.py`: ir_ch (J1's ir2_rate), ctx_ch; channel masks 0.2; 300 epochs; standard programme evaluation (hiding J1's set) + rankings in folds; bars in ir_ch_s42 | 4 (+ twins of both at s42) | 1 GPU, train ~30 min, rankings minutes |
+| J6 `cosmx` | J4 checkpoints, evaluation only (`MODE = "evaluate"`): typeres, ir_c, ir_c_ktype, ir_c_knone x 3 seeds, ir_c_same; twins of typeres, ir_c; clean pass, every cell a target; bars in ir_c_s42 | 13 | 1 GPU; ~960 sender passes per section (estimate 10-30 min per model) |
+| J6b `semi` | J3 checkpoints on the spiked file, as J6 with the programme truth | 7 | as J6 |
+
+Files: `gene_rank.py` (one script, `RANK_JOB=synth|cosmx|semi`, every setting of ir_synth.py / ir_cosmx.py taken over so the data, split and checkpoints
+match), `gene_rank_common.py` (the hook), `gene_rank_read.py` (the rules), `make_rank_synth_yaml.py`, `rank_job.sbatch`, `rank_submit.sh`. Copy them with
+`biology_resource.json` (slurm/new) to `MA/scripts/` (sbatch and submit to `MA/slurm/`), install the fork's main, then `bash slurm/rank_submit.sh synth`
+(and `cosmx`, `semi`). cosmx / semi need the J4 / J3 sweep yamls in `MA/yaml/` and their checkpoints as ir_submit.sh left them.
+
+### Checks run (no model on real data)
+
+- Library: `tests/test_gene_ranking.py` (10 tests on a grid of known dependence: responders g0 / g2 found, g1 never moves, the same-gene responder g6 loses its
+  score once its own gene is taken off, the pairs g3 -> g0 and g4 -> g2 on top, no self pair, drivers leave themselves out; folds cover every gene and merge
+  by averaging where read; metrics by hand; truth builders; the ridge leaves its own neighbours out). Six mutants (self path kept, self pairs kept, ridge
+  reading its own neighbours, no blind check, `hide_genes` without `mask`, merge dividing by all parts) all caught. `test_interpretation.py` unchanged and
+  passing (`gene_flows` defaults are the old behaviour).
+- Jobs: the synth arms through `load_sweep` / `arm_cfg` / `_validate` / `check_masking` (channel masks 20 % in every cell; names unique, <= 163 characters;
+  run order = runs file); `configure()` for cosmx and semi; their run lists equal the J4 / J3 runs restricted to the ranked arms (13 / 7).
+- The hook end to end on real GlobalModels at toy size on the CPU (a read-out and a stream context query under channel masks with folds and roles truth; a
+  mode-c read-out and a typeres-like mode-a model on labelled data with flags and a toy resource; the programme truth), then the reader on their tables.
+- Bugs these found, fixed: `hide_genes` left `mask` unset, which `apply_mask` asserts under gene masking (every synth fold would have failed); the reader
+  failed on the empty `rank_scores.csv` of a run without truth; it named a "ranking model" when no arm passed a rule.
+
+### Limits, said before the run
+
+- The neighbour ridge does not tell a sender's type (diluted by other types: 0.2-0.3 on the test grid where the rule is exact); smooth targets pick up
+  chance correlations with smooth features (~0.1).
+- Responder scores are drops of a centred cosine under a scramble: comparable within a run and against its twin, not an effect size in expression units.
+- Channel masking hardly fitted its own task in 2026-10-23's run (0.245 on the programme; notes.md). If J5's arms do not fit, the rankings say little; the
+  standard programme evaluation in the same job shows the fit.
+- On CosMx (clean pass) a responder's neighbours show the same gene, so the model may have learnt to read that instead of other genes; `responder_cross`
+  is then a conservative cross-gene score. A channel-masked CosMx arm would remove the shortcut (not written).

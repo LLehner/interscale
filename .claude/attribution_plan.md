@@ -21,15 +21,16 @@ wants this for newer models on the more relevant data (the flow pipeline waits f
 
 | Stage | What | Status | Date |
 |---|---|---|---|
-| A0 | One attribution interface: methods x references, signed, cell- and gene-resolved, completeness gap and time per receiver | proposed | 2026-11-21 |
-| A1 | synth_spot validation: planted senders, completeness, method agreement, Sensitivity-n, cost; decides whether DeepLIFT may replace IG for maps | proposed | 2026-11-21 |
-| A2 | Item 1: sampled receivers on CosMx / vannan, against the twin and the within-type permuted section | proposed | 2026-11-21 |
-| A3 | Item 2: attribution source / sink maps from disc targets | proposed | 2026-11-21 |
-| A4 | Item 3: influence against distance (trained, twin, permuted; attention next to it) | proposed | 2026-11-21 |
-| A5 | Optional: positive / negative split (RevealCancel idea), multi-reference DeepLIFT (DeepSHAP), conservative transformer propagation | proposed | 2026-11-21 |
+| A0 | One attribution interface: methods x references, signed, cell- and gene-resolved, completeness gap and time per receiver | **built** (`evaluation/attribution.py`: decomposition, attention, grad_input, ig, deeplift, occlusion x R1 / R2 / R4; tests) -- `conservative` not built | 2026-11-22 |
+| A1 | synth_spot validation: planted senders, completeness, method agreement, Sensitivity-n, cost; decides whether DeepLIFT may replace IG for maps | job written and checked (`attr_submit.sh synth`, J1's ref + ir2_rate), **not run** | 2026-11-22 |
+| A2 | Item 1: sampled receivers on CosMx / vannan, against the twin and the within-type permuted section | CosMx job written and checked (`attr_submit.sh cosmx`, J4's ir_c_ktype x 3, typeres, ir_c), **not run**; vannan untrained | 2026-11-22 |
+| A3 | Item 2: attribution source / sink maps from disc targets | in the CosMx job (disc targets, `plot_source_sink` layout), **not run** | 2026-11-22 |
+| A4 | Item 3: influence against distance (trained, twin, permuted; attention next to it) | in both jobs (`attr_distance`), **not run** | 2026-11-22 |
+| A5 | Optional: positive / negative split (RevealCancel idea), multi-reference DeepLIFT (DeepSHAP), conservative transformer propagation | signs kept everywhere; `deeplift` with `reference="sampled"` is the DeepSHAP-like average; RevealCancel and `conservative` not built | 2026-11-22 |
 | A7 | **Later (user, 2026-11-21):** the attribution methods on data without cell-type annotation (legnini the candidate): what replaces the type-mean reference and the deviation target there | to note, not planned in detail | 2026-11-21 |
-| A6 | **Must pursue (user, 2026-11-21):** is the learned neighbourhood function linear? Method agreement, Sensitivity-n and pairwise sender interactions on real data, with synth_spot's thresholded programme as the positive control | proposed | 2026-11-21 |
+| A6 | **Must pursue (user, 2026-11-21):** is the learned neighbourhood function linear? Method agreement, Sensitivity-n and pairwise sender interactions on real data, with synth_spot's thresholded programme as the positive control | measures built (`sensitivity_n`, `pairwise_interactions`, `agreement`), in both jobs (MC23 / MC20 / M11 named on synth), **not run**; NCEM novelty check still to do | 2026-11-22 |
 | M | Retrain one model per dataset with the best settings so far (CosMx, synth_spot, vannan; legnini skipped, user 2026-11-21) | recipes proposed below, to confirm | 2026-11-21 |
+| check | Status check after the CCC runs (J1 / J3 / J4 read; section "Status check 2026-11-22" at the end): nothing of A0-A6 built; Stage M answered by J1 / J4 for synth_spot and CosMx with checkpoints that exist (no retraining), vannan untrained; A6 has its first architecture-level evidence | **done**; building waits for the user | 2026-11-22 |
 
 ## What exists (2026-11-21)
 
@@ -288,3 +289,105 @@ what they found before citing it), and the attribution / LRP-for-transformers li
 
 **Where it goes:** thesis 4.7 (CosMx) and 5.2 (what the transformer can read), next to the ceiling audit; slot S13 in
 thesis_outline.md.
+
+## Status check 2026-11-22 (after the CCC runs; the user asked whether the files are ready or something still needs building)
+
+### What exists
+
+- **IG** (`receptive_field._program_attribution`, `receiver_dependence`, `response_influence`): Gauss-Legendre points, retry on a large completeness gap,
+  reference = the graph's mean cell (R1) or a fixed row; summed over a target gene set. Validated on synth_spot (2026-10-31). It is what A0 refactors.
+- **The exact decomposition** of the interaction read-out (`interaction_readout.influence`, `ReadoutPass`): per receiver every sender's contribution
+  through the linear decoder, top-k senders, null mass, gene-resolved. This is A0's `decomposition` method, already built (ccc_model_plan.md, S0); on J1 it
+  found the planted short / mid senders for 1.00 / 0.99-1.00 of receivers (head-mean attention 0.97 / 0.73, IG 0.99 / 1.00), without a gradient.
+- **Interventions** (`interpretation.type_flows`, `gene_flows`, and E7's `gene_ranking.context_flows`): type and gene removals with location-matched nulls,
+  receivers' own rows kept, pooled over sections. The within-type permuted section of A2's control is `context_flows`' `all_state` kind.
+- **Gene rankings** (E7, 2026-11-22): the gene-resolved part of A3 ("which genes in the senders drive") by permutation, with truth and bars; jobs written.
+- **Checkpoints** on the cluster: J1 (synth_spot, 300 epochs: `lin_dist_skipraw` as `ref` x 2 seeds, `ir2` / `ir2_rate` / `ir2_kd` / `ir1` x 2), J4 (CosMx:
+  typeres, ir_c, ir_a, ir_b, ir_c_ktype, ir_c_knone x 3 seeds, the single-seed options), J3 (spiked CosMx). Untrained twins are built at evaluation from the
+  config and seed (`EVAL_UNTRAINED`), so no twin checkpoint is needed.
+
+### Not built (everything else of the plan)
+
+| Stage | Missing | Size |
+| --- | --- | --- |
+| A0 | `evaluation/attribution.py`: one interface (methods `attention`, `grad_input`, `ig` (refactored from receptive_field), `deeplift` (secant override at ReLU / GELU), `conservative` (softmax and LN scale detached; dense only), `occlusion` (one forward per sender: a column of the effect matrix), `decomposition` (wrap `interaction_readout.influence`)); references R1 / R2 (type mean) / R4 (sampled same-type cells) / R3 (mask, occlusion only); targets incl. the deviation direction; seconds and gap per receiver; tests on a module of known dependence | ~1.5 days |
+| A1 | synth_spot validation job on J1's checkpoints: planted top-5 by class per method x reference, gap distributions, agreement with 50-step IG, Sensitivity-n (hide = the model's mask), seconds; the DeepLIFT decision rule | ~0.5 day + one job |
+| A2 | CosMx sampled receivers (500-1,000 per test section, stratified by type), R2 + R4, deviation targets + INS; twin, within-type permuted section, Sensitivity-n; gradients through the fused backend (training does it; `conservative` not available there) | ~0.5 day + one job |
+| A3 | disc-target attributions over the fold passes, out / in strength per cell, maps in `flow_maps`' layout (one slide per figure, tissue only), twin and permuted section | ~0.5 day |
+| A4 | influence against distance from A2 / A3 (trained, twin, permuted; attention mass beside it) | ~0.25 day |
+| A6 | pairwise sender interaction I_jk (hide j, k, both; the model's own removal), method agreement, Sensitivity-n on CosMx with synth_spot's controls (MC23 learned, MC20 not, M11) | ~0.5 day (on A0) |
+| vannan | no preprocessed inputs used by any job yet (`vannan25.h5ad` on the cluster, not preprocessed; `make_lung_inputs.py` exists), no training | preprocessing + one training job |
+
+### What the CCC runs settle
+
+- **Stage M is answered for two datasets without retraining** (the plan's outcome rules for J1 and J4): synth_spot keeps `lin_dist_skipraw` for scores
+  (J1 `ref`, 300 epochs, 2 seeds; the plan asked for 3) and adds `ir2_rate` as the per-sender readout model (exact decomposition, R2 passed); CosMx moves
+  from typeres to the read-out in mode (c), `ir_c_ktype` the candidate (3 seeds: within section x type 0.141 clean / 0.098 masked, raw SCE 0.436, the most
+  seed-stable maps). vannan has nothing. **To confirm by the user** (the plan's rule: confirm before the job). If the E7 rankings (J5 / J6) disagree with
+  this choice -- e.g. ctx_ch ranks interacting genes better than ir_ch on synth_spot -- that should weigh in before A2.
+- **A6, first evidence at the level of the architecture** (not yet the attribution test): on CosMx a model whose output is a sum over senders with routing
+  by distance and sender type only (`ir_c_ktype`, `ir_c_knone`) scores at least as well as one that reads sender expression in its keys (0.141 / 0.138 vs
+  0.137) and as typeres (masked 0.098 vs 0.092): nothing on CosMx shows that a nonlinear use of the neighbourhood helps. On synth_spot the same additive model
+  loses exactly the thresholded programmes (M19-M21; within receivers -0.13 / -0.44 / 0.63 vs the reference's 0.54 / 0.57 / 0.90): the positive control
+  that the nonlinearity matters where the data has it. A6's attribution measures (method agreement, Sensitivity-n, I_jk) are still needed to say it from
+  inside one trained model; the synth controls in the plan stay (MC23 learned by the reference, not by the IR).
+- **A0's reference question is partly moot for the read-out**: its decomposition needs no reference; IG / DeepLIFT still need R2 / R4 for the
+  non-decomposable models (typeres, the reference).
+
+### Recommended order (nothing started)
+
+1. The user confirms Stage M as above (or waits for J5 / J6's rankings).
+2. A0 with `decomposition`, `ig`, `grad_input`, `occlusion` first (DeepLIFT and `conservative` after), tests.
+3. A1 on J1's checkpoints and A2 on J4's in one job each (A1 does not block A2's IG read, as decided 2026-11-21); A4 from A2's outputs; A6 on A0.
+4. A3 maps; vannan preprocessing and training when the user returns to it.
+
+## Build 2026-11-22 (the user: "while we wait for the evaluation run can you start implementing stage A0-A6?")
+
+### Library: `evaluation/attribution.py`
+
+- `attribute(module, batch, receivers, weights, method, reference=...)`: one call for every method; the path runs in **token space** (what the model reads;
+  for the linear token embedding the same as expression space). Targets are fixed gene weights per receiver: `deviation_targets` (predicted deviation from
+  the type mean, unit length), `gene_targets` (named genes), or a programme's genes. **Fixed rows:** the receivers' own rows and cells hidden whole never
+  move, so a receiver's prediction is attributed to other cells only, for models that read their own cell too (the J1 reference).
+- Methods: `decomposition` (the read-out's exact share; the intercept is the decoder bias plus each read layer's output-projection bias through the
+  decoder, which the first version missed: the toy test caught a gap of 0.3-0.6, now < 1e-4), `attention` (head- and layer-mean read-out weight),
+  `grad_input`, `ig` (Gauss-Legendre, retry on gap), `deeplift` (Rescale: the layers' stored activation functions and the `nn.ReLU` / `nn.GELU` modules
+  swapped for a secant-gradient function during the pass and restored after; softmax and LayerNorm keep their gradients, so completeness is measured, not
+  assumed), `occlusion` (one forward per sender gives a column for all receivers; restricted to each receiver's nearby cells and planted senders).
+- References: `graph_mean` (R1), `type_mean` (R2), `sampled` (R4: a random other cell of the same label, `draws` times averaged, spread kept).
+- Measures: `planted_top_k`, `agreement` (Spearman over the union of the two methods' top cells, top-k overlap), `sensitivity_n` and
+  `pairwise_interactions` (many receivers per forward: receivers chosen far apart by `separated_receivers`, each perturbing only its own nearby cells;
+  cross-talk between distant receivers is the stated approximation), `distance_profile`, `strengths`, `disc_strengths` (A3: by linearity in the target a
+  disc's attribution is the sum of its receivers' rows), `map_fields` (the fields `flow_maps.plot_source_sink` draws).
+- Tests (`tests/test_attribution_methods.py`, real GlobalModels at toy size): the decomposition sums to the context part; IG's gap shrinks with steps; module mode,
+  parameter flags, the graph and the global generators left as found; hidden cells never move; occlusion = the change when one sender takes its reference,
+  and with one receiver Sensitivity-1 against occlusion is exactly 1; the secant gradient is the secant and the activations are restored; references and
+  measures by hand.
+
+### Jobs (`slurm/November/`, flat; evaluation only, no training; results `MA/22_11_results/attr_{synth,cosmx}/attr_read.md`)
+
+| Job | Checkpoints | What |
+| --- | --- | --- |
+| `synth` (A1, A4, A6 controls) | J1: `ref` (lin_dist_skipraw), `ir2_rate` x 2 seeds + twins | programme masks as trained; 6 planted receivers per programme and graph, target = its response genes; decomposition, attention, grad_input, IG 5 / 20 / 50 (the 50-step IG is the reference), DeepLIFT, occlusion; R1; planted top-5 by class, gaps, agreement, seconds, distance; A6 on receivers 600 um apart, grouped MC23 (threshold, learned by the reference), MC20 (unlearned), M11 (mid), classes |
+| `cosmx` (A2-A4, A6, A3) | J4: `ir_c_ktype` x 3, `typeres_s42`, `ir_c_s42` + twins of typeres / ir_c | clean pass; up to 40 receivers per type 150 um apart; deviation targets (INS for Beta cells); R2 for every method, R4 for IG; the within-type permuted section (non-receivers' rows swapped within type); sender type x receiver type, distance, A6; A3 disc maps (30 discs of 30 um per section, IG, receivers with gap > 0.1 dropped) |
+
+Files: `attr.py` (`ATTR_JOB=synth|cosmx`, every setting from ir_synth.py / ir_cosmx.py so the data and checkpoints match), `attr_common.py` (the hook),
+`attr_read.py` (the A1 rule; the A6 tables beside the twins; uses gene_rank_read.py's helpers), `attr_job.sbatch`, `attr_submit.sh`. Copy them with
+`gene_rank_read.py` to `MA/scripts/` (sbatch and submit to `MA/slurm/`), install the fork's main, then `bash slurm/attr_submit.sh synth` (and `cosmx`).
+
+### Checks run (no model on real data)
+
+The hook end to end on real GlobalModels at toy size on the CPU: a full-encoder reference and a read-out under programme masks with planted edges (synth
+path), a mode-c read-out with type keys and a typeres-like fused model on the clean pass (CosMx path), both readers on the tables; planted senders map to
+the right nodes. The A3 map fields drawn by `plot_source_sink` on a 3,000-cell synthetic section (the toy sections are below its 100-cell tissue block,
+so the toy maps are skipped with a message, by design). Found and fixed: the decomposition's missing output-projection bias; type tables keyed by
+`Attribution.method` (all IG variants are "ig") instead of their names.
+
+### Not built / open
+
+- `conservative` (softmax and LN scale detached: dense attention only) and RevealCancel (A5).
+- vannan: preprocessing and training (A2's second dataset).
+- A7 (data without labels): R1 and the k-NN / cluster references are possible with `labels` set to clusters; not wired into a job.
+- Cost is estimated, not measured: CosMx ~5,000 backward passes per section per model (IG 5 steps, R4, permuted, discs), at an assumed 0.1 s each about
+  1 h per model and twin; the job reports seconds per receiver and per run.
+- Before calling A6 novel: the NCEM check (linear vs nonlinear node-centric models) remains to do.

@@ -2331,3 +2331,107 @@ What doesn't work (found, fixed):
 - Semi-synthetic design: NegPrb probes could become response genes (the runs drop them); the `field` kernel saturated at 1 for every receiver (20 senders in reach), a constant the within-type target removes: now scaled to the median receiver and summed over every sender within 3 l. Receivers were scored against every other cell, which a type-aware query separates by type alone: now against the receiver type's own cells (as GITIII's readout).
 - J3's "AUPRC >= 2x base rate" cannot be met with the balanced negative draw (base rate ~0.5): the call is now AUROC >= 0.6 and strictly above a model-free k-NN reference and the untrained twin.
 - The read-out arms had half the reference's crops per epoch (copied from the tiers job's fused arm): set to the same 8, so a gap is not training length.
+
+## 2026-11-22 — Interaction read-out runs read (J1 synth, J4 CosMx, J3 spiked CosMx)
+
+Results in `MA/21_11_results/ir_{synth,cosmx,semi}` (`ir_read.md`, `results.md`, `ir_tables/`). Details, numbers per arm and the
+decisions in ccc_model_plan.md, section "Results (2026-11-22)".
+
+What worked:
+- synth (J1, 2 seeds, 300 epochs): the model's own decomposition finds the planted senders without gradients: top-5 holds the
+  planted sender for 1.00 (short) and 0.99 / 1.00 (mid, ir2 / ir2_rate) of receivers, untrained twin 0.60 / 0.07 (the reference's
+  head-mean attention was 0.97 / 0.73, IG 0.99 / 1.00); gene AP 0.97-0.98 (twin 0.01 / 0.16). R2 passes for every 2-layer arm.
+- Two read layers are needed: ir1 mid 0.55 (top-5 0.60), ir2 0.72 (0.99).
+- The content-dependent rate rescues the mid-range programme M11: 0.927 (within receivers 0.950) vs ir2 0.719 and ref 0.894 (0.873);
+  ir2_rate has the best IR programme mean (0.766) and the lowest IR val loss (0.063), so R5 holds by hand.
+- CosMx (J4, 3 seeds for the main arms): within section x coarse type, mode c 0.137 +- 0.001 on the clean pass (knn128 0.109) and
+  0.096 on the disc-masked pass (knn128 0.089, typeres 0.092): the J4 rule passes. Raw SCE 0.451 against typeres' 0.870 (nearest_128
+  0.439): typeres' calibration problem is gone. Per-cell maps are seed-stable: received 0.86, mass 0.73, sent 0.65 (typeres' flow 0.14).
+  10 % of training labels shuffled: 0.138 (robust).
+- Keys: type only 0.1406 +- 0.000, none 0.1384, expression 0.1369 +- 0.001. Sender expression in the keys adds nothing (slightly
+  worse); distance alone is within 0.002 of distance + type. Every bit of sender expression the model uses enters through the values.
+  ir_c_ktype also has the best raw SCE of the 3-seed arms (0.436) and the most stable maps (sent 0.83, reach 0.79).
+- The spike-in generator works model-free: Spearman of the receivers' within-type residual of the response genes with the kernel
+  0.05-0.25 on the planted pairs, 0.04 / -0.04 on the null pairs.
+
+What doesn't work:
+- synth R1 fails: best IR 0.766 vs ref 0.805. The loss sits in M19-M21 (synth_spot's "dense" sparse-response programmes: receivers
+  respond only beyond 1-3 mm of the nearest source): within receivers ref 0.54 / 0.57 / 0.90, every IR arm exactly -0.129 / -0.443 /
+  0.628. Identical to three decimals across four arms: that is the raw own-cell skip's solution, the context part adds nothing. A
+  threshold needs a nonlinearity after the aggregation; the additive read-out removes it by design (the reference keeps its feed-forward
+  block on the output path). Smaller losses on M3 (0.68 vs 0.45-0.50), M17, M1.
+- The interaction mass does not mark receivers (mass AUROC 0.55-0.66; null mass ~0.2 in receivers and non-receivers alike): without the
+  entropy penalty the null key is a constant sink. R3 fails on the sparse class only, which no arm solves (short / mid receiver AUROC
+  by influence magnitude 0.93-1.00).
+- R4 fails: range_um 183-214 um (short, planted 100) and 465-584 um (mid, planted 310; ir2_rate x1.50 on the boundary). The estimator,
+  the influence-weighted mean distance over every key, is pulled up by the long tail (twin 1,183 um).
+- ir2_pen and amici_like (entropy + L1) trained (val loss 0.101 / 0.117, the worst) but wrote no evaluation on synth; the same settings
+  evaluated on CosMx, so a synth-only evaluation step fails for the entropy arms (logs on the cluster). The entropy arm was the one test
+  of whether the null key can mean "no interaction".
+- Key dropout changes nothing (synth 0.761 vs 0.757; CosMx 0.138 / 0.094).
+- ir_read.py: the val_loss column stays empty (R5 not applied automatically); the J4 key rule tests a tie and prints "no" when type
+  beats expression.
+- CosMx: the entropy penalty hurts (0.127 / 0.068, context share 0.33 vs 0.57); amici_like is below knn128 (0.091 / 0.056); the
+  same-type block costs 0.034 clean (0.103) and 0.017 masked: a quarter of the gain over the type mean comes from same-type neighbours
+  (shared regional states or spillover, not separable here). content_rate, local units, key dropout: within +-0.003 (single seeds).
+  Modes a / b / c lie within 0.005 on the clean pass: the 5x targets of mode c buy ~0.002 (and raw SCE 0.451 vs 0.491).
+- Not comparable: ir_b's masked 0.121 (trained without hidden keys, it reads hidden cells as keys on the masked pass); ir_c_fine's
+  0.150 / 0.125 (scored within coarse types while its fixed part is the fine-type mean: the receiver's own fine label counts as signal).
+- The bar is a raw k-NN smoother; the IR adds windows per head, a receiver-type query and a cross-gene linear map. A fitted ridge on
+  neighbourhood means and an FOV offset reference are missing before the +0.028 can be called interaction (the context embedding's
+  best-tracked E1 variable is fov_depth, 0.79).
+- Type tables (E4): the top genes are heat-shock / immediate-early genes (HSPA1A/B, BAG3, FOS, JUNB, HSP90AB1) and hormone /
+  acinar-enzyme spillover (SST, INS, GCG, PRSS2, CPB1, REG1A, SPINK1); the top pairs differ between arms and between decomposition and
+  ablation. Not readable as CCC; the shuffled-label control does not remove regional stress states.
+- E1 (SAE probes): the untrained twin's context embedding scores at or above the trained arms on most variables (synth dist_M10 / M13 /
+  M15 / M17 / M19; CosMx acinar / immune / fibroblast / local density, fov_depth, islet distance). Trained arms beat the twin clearly only
+  on synth's rings M7 / M8 (ridge R^2 0.93 vs -1.35), M11 and CosMx's duct distance; they tie baseline_knn_pca and beat typeres, PCA and
+  the gene SAE. On the spiked file the null pairs' kernel variables score like the planted ones (0.30-0.54 vs 0.29-0.61): E1 reads
+  composition and geometry, not the planting. Early vs late (feature index vs length scale) is negative for every embedding, untrained
+  twins (synth -0.57 / -0.60) and PCA included: a property of the Matryoshka SAE, not of learning; no support for S5's Matryoshka option.
+- J3 (spiked CosMx): within-type scores equal the real CosMx run (the spike is too small to move them). ir_c is "detected" on
+  Endothelial>Acinar@exp50 (0.62 / 0.64) and Beta>Acinar@exp200x2 (0.606), but the receiver truth is any receiver-type cell with a sender
+  in reach: 94 % / 81 % of acinar cells (field pair 100 %, no negatives). The untrained twin's interaction mass separates those better
+  (0.86-0.87 on exp50): geometry. 48 receivers and 48 negatives per programme give an AUROC SE of ~0.06. The one clean test, contact
+  Immune>Ductal@20 um (25 % receivers, model-free own-residual AUROC 0.67), is missed by every arm (0.52-0.60). Sender AP at the twin's
+  level. Some learning shows in gene AP: ir_c ranks the planted genes of Beta>Acinar@200 x2 at 0.17 (twin 0.011, base ~0.01),
+  Endothelial>Acinar ~0.085 (twin 0.018). GITIII on the spiked file never got past preprocessing.
+- Cost: an IR epoch is 3x typeres on CosMx (29.6 vs 9.7 s) and 2.4x the reference on synth (5.5 vs 2.3 s).
+
+## 2026-11-22 — Gene rankings of interaction built (E7; jobs J5 synth, J6 CosMx, J6b spiked; no run yet)
+
+The user: the read of 2026-11-22 was still about predicting expression; a model should find genes that interact (vary, and respond to others), judged
+by a ranking. Built: `evaluation/gene_ranking.py`, `interpretation.gene_flows(targets=)`, cluster jobs `gene_rank*.py` / `rank_submit.sh`; design, rules
+and checks in ccc_model_plan.md, section "E7".
+
+What worked:
+- Reusing `interpretation.py`'s interventions (receivers keep their rows, only other cells change) gives one design for every model kind, the stream
+  context query and typeres included, not only the additive read-out: responders (every other cell's state scrambled within type), drivers and pairs (one
+  sender gene permuted within type), sender types (identity minus its location-matched null).
+- The grid of known dependence pins the point of the exercise: a smooth gene read from the neighbours' same gene (g6) responds, and loses its score once
+  the same gene in other cells is taken off; the cross-gene targets keep theirs; the planted pairs come out on top; six mutants caught.
+- The end-to-end check on real GlobalModels at toy size caught an interface bug the toy stand-ins could not: under gene masking `apply_mask` asserts a node
+  `mask`, which the fold copies lacked (every J5 fold would have failed on the cluster).
+
+What doesn't work / limits:
+- J1's checkpoints cannot give a responder ranking: only the 29 response genes were ever targets. J5 retrains with channel masks, which fitted badly in
+  2026-10-23's run (0.245); the job's programme evaluation shows whether the new arms fit.
+- The neighbour ridge bar does not tell a sender's type, so a gene acting from one type is diluted (0.2-0.3 on the test grid where the rule is exact);
+  per-type features would be ~10^4 per CosMx type. Smooth targets pick up ~0.1 chance correlation with smooth features.
+- `lin_dist_skipraw` reads its own token, so it is not ranked; the comparison arm is the same recipe as a context query (ctx_ch).
+- No ruff on the local machine: the new files were checked for unused imports by hand, lint is left for pre-commit.
+
+## 2026-11-22 — Attribution A0-A6 built (library + two evaluation-only jobs; no run yet)
+
+The user asked to implement the attribution plan's A0-A6 while the ranking jobs wait. Details in attribution_plan.md, "Build 2026-11-22".
+
+What worked:
+- One interface in token space with fixed rows (receivers' own rows, hidden cells) serves every model kind, including the J1 reference that reads its own
+  cell; the targets are fixed gene weights, so attributions add (disc targets for A3 come for free from per-receiver rows).
+- Sensitivity-n and pairwise interactions read many receivers per forward when the receivers are far apart and perturb only their own nearby cells.
+- Testing on real toy GlobalModels caught a real error the stand-ins could not: the read-out decomposition's intercept lacked each read layer's
+  output-projection bias (gap 0.3-0.6, now < 1e-4).
+
+What doesn't work / limits:
+- `conservative` and RevealCancel not built; vannan untrained; costs are estimates until the first CosMx task reports them.
+- Sensitivity-n / pairwise interactions across receivers in one pass assume distant receivers do not interact (stated approximation).

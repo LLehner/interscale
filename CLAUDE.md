@@ -548,6 +548,25 @@ variable within domains against within-domain permutations, OMP curves, the inde
 `exp`, `field` kernels; `field` scaled to the median receiver, unscaled it saturates), truth in `uns['synthetic']`'s format, a model-free
 check. Cluster jobs and their checks: the plan's section "Build".
 
+`evaluation/gene_ranking.py` (E7, 2026-11-22; plan section "E7"): a model is judged by which genes it treats as interacting, not by reconstruction.
+Per receiver group, by intervention (`interpretation.py`'s: receivers keep their rows, only other cells change, the score is a target's centred cosine
+within the group): **responders** (`context_flows`, `all_state`: every other cell's state swapped within type), **drivers** and **pairs**
+(`interpretation.gene_flows`: one sender gene permuted within type), **sender types** (`identity` minus `identity_null`); `responder_cross` takes off
+what the same gene in other cells carries (smoothness, spillover). Truth: `roles_truth` (synth_spot roles; spatial / region / batch / condition genes are
+hard negatives), `programme_truth` (the spiked file); `ranking_metrics`; bars `within_group_moran`, `within_group_variance`, `neighbour_ridge`
+(type-agnostic neighbour means, own neighbour feature left out exactly). Invariants: `targets="all"` (every entry scored, the clean pass) only for a model
+blind to its own cell (`interpretation.blind_to_own`; refused otherwise), with `score_all_cells` switched on for the call; a channel-masked model is read
+in folds (`gene_folds`, `hide_genes` sets `gene_mask` *and* `mask`, which `apply_mask` asserts); only visible entries are ever permuted;
+`gene_flows(targets=)` defaults to the old behaviour and now returns `base`. Cluster: `slurm/November/gene_rank*.py`, `rank_submit.sh`.
+
+`evaluation/attribution.py` (`.claude/attribution_plan.md`, A0-A6, 2026-11-22): `attribute(module, batch, receivers, weights, method, reference=)` for
+`decomposition` / `attention` (read-out models), `grad_input`, `ig`, `deeplift` (secant gradient at the layers' stored ReLU / GELU and `nn.ReLU` /
+`nn.GELU`, restored after), `occlusion`, with references `graph_mean` / `type_mean` / `sampled`; measures `agreement`, `planted_top_k`, `sensitivity_n`,
+`pairwise_interactions`, `distance_profile`, `strengths` / `disc_strengths` / `map_fields`. Invariants: paths run in token space (`gex_embedding`
+replaced for the pass); the receivers' own rows and cells hidden whole never move; targets are fixed gene weights per receiver (linear, so rows add); the
+decomposition's intercept is the decoder bias plus every read layer's output-projection bias through the decoder (sums to the context part, tested); the
+module's mode, parameter flags and the global generators are restored. Cluster: `slurm/November/attr*.py`, `attr_submit.sh synth|cosmx`.
+
 ### Preprocessing / robustness utilities (`interscale.pp`)
 
 `pp.segmentation_noise.apply_segmentation_noise` simulates cell-segmentation errors (used when `cfg.dataset.segmentation_robustness` is set in `main.py`/`main_sweep.py`) for robustness sweeps.
