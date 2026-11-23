@@ -2450,3 +2450,21 @@ What worked:
 What doesn't work / limits:
 - My earlier "dense attention only" for `conservative` and "vannan never preprocessed" were wrong (corrected in the plan and the memory).
 - vannan training time is estimated (2 crops per sample and epoch to stay near J4's epoch cost); RevealCancel not built.
+
+## 2026-11-23 — Anchored SVG targets R1 (synth_spot, flipped task): intermediate read
+
+Job 43841310 finished (4 arms, 300 epochs, read). Full read in svg_targets_plan.md, "R1 read".
+
+What worked:
+- The flipped task learns: ring correlation ~0.67/0.49/0.40 (close/mid/far) vs ~0.01 for the twin; the model's ring curves beat the
+  average-curve bar (0.55-0.57 vs 0.17, 67 % of discs x targets).
+- Planted sources M3, M7, M8 rank 1-2 for their responses with drops 5-10x the twin's; T3'' 6/7 in both arms; ir_ar's far share grows
+  with the planted scale (Spearman 0.92, twin -0.08).
+- The flatness test's null histogram (background genes) is close to flat: calibrated without simulations.
+
+What doesn't work / limits:
+- T1'' fails on detection: 7 / 15 responses become targets (AUROC 0.87); 23 targets in total.
+- Co-responses of the same source (MC7/MC8/MC9, MC10/MC11) rank next to or above the source: collinear inside a disc.
+- Region markers (CM3 0.91) and some SP genes score as responders beyond self: regional extrapolation.
+- MC1 (700 um scale, inside the disc radius) is never read.
+- The `run` row is a stale smoke run; `_slide_names` mislabels identical-lattice slides (curve agreement only).

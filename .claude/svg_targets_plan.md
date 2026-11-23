@@ -769,3 +769,82 @@ and forward pass was refused, rightly: no model runs locally) -> first cluster s
   (the planned second run) for the rest.
 - Spatial genes high in T2'': regional extrapolation; a "beyond position" control (the average-curve bar per target) is the next step.
 - Everything fails including fit: check the draw (key_mask, ring cells) in the smoke log before anything else.
+
+### diffsvg rebased (2026-11-22, later)
+
+origin/main had moved 32 commits (docs restructure, scverse-misc logging, gene-set test, two-stage test, anisotropic slide scales /
+effective df), so local main had diverged. The two commits were rebased onto origin/main 639678a: now **ffa5df1** "Add slide binning without
+a condition" and **1d31e27** "Add flatness test and slide effects for condition-free profiles" (replacing a9f586e / e207005; the branch
+`feature/flatness-test` points at the same). Conflicts: the `sample` docstring (upstream's "biological replicate" wording kept, the
+condition-free sentence appended) and `tl/__init__.__all__` (both `flatness_test` and upstream's `gene_set_test`). The profile slide path
+calls `slide_posterior` without the new optional `slope_prior` (the isotropic slide model). Full suite on the rebased main: 84 passed,
+1 skipped; ruff clean. **Upstream now needs `scverse-misc[datasets]>=0.1.8`** (and pytest >= 9.1 for its tests): pymc_env was upgraded locally
+(0.1.3 -> 0.1.9); the cluster's diffsvg env needs the same before `svg_job.sbatch` (its bridge preflight imports diffsvg).
+
+## R1 read (2026-11-23, intermediate; job 43841310, results 23_11_results/)
+
+Job ran to the end (4 arms x 300 epochs, read written; no error in .err). ir_ar 5.7 s/epoch, ctx_ar 2.7 s/epoch.
+
+**Not a failed run:** the `run` row in svg_read.md is the 2-epoch smoke run (no W&B -> `run_name()` = "run", one graph) left in
+`anchored/`; `svg_read.py` globs every `*_anch_metrics.csv`. Delete `run_anch_*` or filter twin/arm names.
+
+**Bug (curve agreement only):** `svg_synth._slide_names` matches graphs by (cell count, rounded position sum); every full-size synth_spot
+slide is the same lattice, so 4 of the 8 test graphs (A_03, A_13, B_10, B_20) are all named B_20 and 3 of them were compared with B_20's
+diffsvg curve. `names` only labels curve rows: T2/T3/T5 unaffected; curve numbers diluted. Fix: carry the slide name on the graph (obs
+slide of its cells) instead of matching by geometry.
+
+Bridge (T1''): AUROC structured vs noise 0.869 (bar 0.9), MC1-MC15 recall 0.47 (bar 0.7) -> FAIL on detection; 23 targets (7 responses,
+7 SP, 6 sources, 3 CM markers), below the predicted 30-60. Null histogram close to flat (slight excess in the first bin, KS 0.028 at
+n 36k): calibrated, not inflated. Disc regression gain beyond self -0.04 / -0.05 / -0.11 by ring (as predicted: overfits, no bar).
+
+Models (seed mean; twin in brackets): T2'' ir 0.857 (0.70) PASS, ctx 0.821 (0.67) borderline FAIL (+0.150 margin); T3'' both 0.857
+= 6/7 (twins 0.43 / 0.57) PASS; T5'' ir 0.92 (-0.08) PASS, ctx 0.54 (0.75) not above twin; curve corr model 0.55-0.57 vs average curve
+0.17, beats it on 67 % (twins 42-44 %); base corr ring 0/1/2 ~0.67/0.49/0.40 (ir s42), twin ~0.01.
+
+Reading:
+- Senders: M3, M7, M8 rank 1-2 with drops 0.1-0.25 (twin top drops ~0.02-0.05); MC1 / M1 (700 um, shorter than the 817 um disc radius)
+  missed in every run (rank 5-31). Twins put sources in the top 3 for 3-4 / 7 (amplitude), so read drop size, not rank.
+- The co-responses are the competitors: for MC7 the top senders are MC8 / MC9 / M7 together, for MC10 it is M8 then MC11. Inside a disc
+  the source and its other responses are collinear; one-at-a-time replacement cannot separate them (as the 11-04 ranking runs found).
+  "Top 3" is met partly because the competitors are the same programme.
+- Hard negatives: SP genes mostly ~0 beyond self (SP1/2/4/6) but SP3/5/7 0.14-0.23 in the far ring; CM3 0.91 (CM1/2 ~0.2) — CM are the
+  region markers (slide halves), so the disc predicts the ring's region: regional extrapolation, the predicted T2'' risk. The AUROC is
+  carried by the planted responses being strong, not by the negatives being null.
+- ir_ar is the better reader (T5 clean, slightly higher T2); ctx_ar fits a bit better (val SCE 0.207 vs 0.255) — as J1.
+
+Next (proposed): fix the two script issues and re-read from checkpoints (MODE evaluate); a conditional / group knockout (replace the
+whole co-response set except the source) to split source from co-responses; a "beyond region" control (region label or disc mean of CM
+as covariate) for T2''; smaller discs / more rings for MC1-like short programmes (the planned second run).
+
+## R2 design (2026-11-23; the user's requests after the R1 read; built, not run)
+
+The user asked: fix the two bugs, replace a source's whole response group at once, add a "beyond region" control as a covariate, five
+rings (disc size kept), a full rerun (not from R1's checkpoints), and the model's own gene rankings as the final output (csv + plots),
+with sender-receiver pairs and a local / global split. Also asked: global-only? (yes: both arms are GlobalModel, keys = the disc only)
+and why the histogram shows thousands (counts are (gene, disc) fits: 167 null genes x 216 training discs = 36,098).
+
+Built:
+- Bridge `svg_targets.py`: `n_rings` 5 (490 um rings), `disc_rings` 3 (r_disc = R_max / 3 = 817 um, as R1, so the target selection is
+  unchanged), `sender_groups()`: |Pearson| of the training discs' mean expression, average linkage at 0.6 -> `sender_groups.csv` and
+  `meta["sender_groups"]` (multi-gene groups); histogram axes say "fits (one per gene and disc)".
+- `evaluation/anchored.py`: `read_discs(donor_labels={scheme: labels per graph | None}, groups=, batch_size=)`; every intervention per
+  scheme (scheme 0 draws as before, tested); group sets G - {t} and G - {t, m} per target t / kept member m; `rank_tables(tables,
+  local_rings, scheme)` -> rank_pairs / rank_senders / rank_responders / rank_groups (sufficiency = 1 - drop(m kept) / drop(group)).
+  Tests: batched = one at a time, scheme 0 = the single-scheme read, label donors keep their label, group with a constant member ->
+  the group equals the member's single drop and keeping it gives sufficiency 1, target's own gene never replaced (12 passed).
+- `svg_synth.py`: graph names from the cells' slide (`hier_common.graph_names`; refuses duplicates), region donors from `obs['region']`
+  (`ANCHORED["REGION_KEY"]`), groups from the bridge, rings from meta, local = rings within 1000 um of the edge (rings 0-1), metrics per
+  scheme (`_region` suffix) + T3 group metrics (`T3_source_group_top3`, `T3_source_most_sufficient`), T5 on the global share,
+  `<run>_rank_*_<scheme>.csv`; smoke runs write to `anchored_smoke/`; readouts timed. Results in `MA/23_11_results/` (SVG_OUT; changed from 24_11 at the user's request).
+- `svg_read.py`: drops a smoke row, rules per scheme, `ranking/`: per arm and scheme the seed-averaged raw tables ranked by
+  `rank_tables`, twin beside it (`twin_total`, `excess`), seed Spearman; plots `<arm>_senders_<scheme>.png` (local / global bars, twin
+  tick), `<arm>_pairs_<scheme>.png` (top-15 senders x targets, local and global panels), `<arm>_local_global_<scheme>.png` (scatter,
+  synth roles coloured), `<arm>_responders.png` (beyond self vs beyond self and region).
+- `svg_job.sbatch`: SVG_OUT, time 11:55 (readouts ~2.6x R1's passes, batched 8; worst case ~10.5 h).
+Checked locally: toy-model hook end to end (fake AnnData, curves, meta), svg_read on toy outputs (csv + png looked at), yaml from a
+fake meta. Not checked locally: the bridge on data (local run refused, as the rule says): it runs first in the job and stops it on error.
+
+Expectations (before the run): targets unchanged (23); groups {M7, MC7, MC8, MC9}, {M8, MC10, MC11}, {CM1, CM2, CM3} likely (perhaps M3
+with MC3, M1 with MC1); with region donors CM3 / CM1 / CM2 beyond-self near 0 and T2'' up; group top 3 near 1 for the Gaussian sources;
+the source most sufficient within its group uncertain (the model may read a co-response as well as the source); the 5-ring split
+moves short programmes (MC1) into rings 0-1, so MC1 may now be read.
