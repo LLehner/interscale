@@ -234,6 +234,39 @@ def hide_cells(graphs, fraction: float, *, seed: int = 0) -> list:
     return out
 
 
+def tile_graphs(graphs, size: float, *, min_cells: int = 50) -> list:
+    """Each graph cut into square tiles of side ``size`` (units of ``pos``) over its bounding box, by position alone: every cell in exactly one tile, a
+    tile with fewer than ``min_cells`` cells merged into the kept tile whose centroid is nearest. Every per-cell attribute is sliced and the edges among a
+    tile's cells kept (``Data.subgraph``); ``obs_names`` (a list) is sliced too; ``tile_of`` records the source graph's index.
+
+    For readouts on sections too large for the model's attention per pass (exact dense attention on 10^5 cells: ~42 s per pass): read every model on
+    the same tiles, the window it was trained on (crops). A score centred within the receiver group is then centred within (tile, group)."""
+    out = []
+    for g_index, graph in enumerate(graphs):
+        pos = graph.pos[:, :2].double().cpu().numpy()
+        cell = np.floor((pos - pos.min(axis=0)) / float(size)).astype(np.int64)
+        _, tile = np.unique(cell, axis=0, return_inverse=True)
+        tile = np.asarray(tile).ravel()
+        counts = np.bincount(tile)
+        kept = np.flatnonzero(counts >= int(min_cells))
+        if not len(kept):
+            kept = np.array([int(np.argmax(counts))])
+        centres = np.stack([pos[tile == t].mean(axis=0) for t in kept])
+        small = np.isin(tile, kept, invert=True)
+        if small.any():
+            nearest = np.argmin(((pos[small][:, None, :] - centres[None]) ** 2).sum(-1), axis=1)
+            tile[small] = kept[nearest]
+        names = getattr(graph, "obs_names", None)
+        for t in kept:
+            rows = np.flatnonzero(tile == t)
+            sub = graph.subgraph(torch.as_tensor(rows, dtype=torch.long))
+            if names is not None and not torch.is_tensor(names):
+                sub.obs_names = [names[i] for i in rows]
+            sub.tile_of = g_index
+            out.append(sub)
+    return out
+
+
 def show_everything(graphs) -> list:
     """Copies of ``graphs`` with nothing hidden (no ``gene_mask``, an all-False ``mask``): the clean pass for ``targets='all'``."""
     out = []

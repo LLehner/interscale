@@ -414,3 +414,22 @@ def test_hide_cells_and_co_varying_groups():
                          rng.normal(0, 1, len(pos))])  # fmt: skip
     groups = co_varying_groups(x, pos, np.zeros(len(pos)), ["a", "b", "c", "noise"], k=8)
     assert groups == [["a", "b", "c"]]
+
+
+def test_tile_graphs_cover_every_cell_once_and_slice_the_cells():
+    from interscale.evaluation.gene_ranking import tile_graphs
+
+    labels = _labels()
+    graph = _graph(labels, hidden=())
+    graph.obs_names = [f"c{i}" for i in range(graph.num_nodes)]
+    pos = graph.pos.numpy()
+    graph.edge_index = torch.as_tensor(np.array(np.nonzero(_within(pos, 60.0))), dtype=torch.long)
+    tiles = tile_graphs([graph], 300.0, min_cells=20)
+    names = [n for t in tiles for n in t.obs_names]
+    assert sorted(names) == sorted(graph.obs_names) and len(names) == graph.num_nodes  # every cell once
+    assert all(t.num_nodes >= 20 for t in tiles) and len(tiles) > 1
+    for t in tiles:
+        rows = [int(n[1:]) for n in t.obs_names]
+        assert torch.equal(t.x, graph.x[rows]) and torch.equal(t.pos, graph.pos[rows])
+        assert t.edge_index.numel() == 0 or int(t.edge_index.max()) < t.num_nodes
+        assert t.tile_of == 0
