@@ -558,7 +558,13 @@ hard negatives), `programme_truth` (the spiked file); `ranking_metrics`; bars `w
 (type-agnostic neighbour means, own neighbour feature left out exactly). Invariants: `targets="all"` (every entry scored, the clean pass) only for a model
 blind to its own cell (`interpretation.blind_to_own`; refused otherwise), with `score_all_cells` switched on for the call; a channel-masked model is read
 in folds (`gene_folds`, `hide_genes` sets `gene_mask` *and* `mask`, which `apply_mask` asserts); only visible entries are ever permuted;
-`gene_flows(targets=)` defaults to the old behaviour and now returns `base`. Cluster: `slurm/November/gene_rank*.py`, `rank_submit.sh`.
+`gene_flows(targets=)` defaults to the old behaviour and now returns `base`. Cluster: `slurm/November/gene_rank*.py`, `rank_submit.sh`. The fixes (`.claude/comparison.md`, 2026-11-23; all off by default, every draw unchanged): `strata=` in `gene_flows` and `context_flows`
+(permutations within label x stratum, e.g. a region or niche: what the stratum carries is not scored), `gene_flows(sender_sets=)` (sets of genes permuted
+with one shared permutation, a member's own target left out; `co_varying_groups`, `group_sets`, `group_table` with each member's sufficiency,
+`group_pair_scores`), `robust_z` (a drop against the other senders of the same target), `hide_cells` (targets for a model that reads its own cell and was
+trained hiding whole cells: such a model can be read neither on the clean pass nor in channel folds). Niches: `tl._preprocessing.neighbourhood_niches`
+(composition or expression of the k nearest cells, k-means fitted on the training cells). The model side: `optim.aux_loss_weights.sender_sparsity`
+(`train/aux_losses.py`; L1 / L2 of the expression embedding's per-gene column norms over sqrt(G), scale-free because the tokens are layer-normalised; tag `ssp`).
 
 `evaluation/attribution.py` (`.claude/attribution_plan.md`, A0-A6, 2026-11-22): `attribute(module, batch, receivers, weights, method, reference=)` for
 `decomposition` / `attention` (read-out models), `grad_input`, `ig`, `deeplift` (secant gradient at the layers' stored ReLU / GELU and `nn.ReLU` /

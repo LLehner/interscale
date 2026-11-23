@@ -2468,3 +2468,45 @@ What doesn't work / limits:
 - Region markers (CM3 0.91) and some SP genes score as responders beyond self: regional extrapolation.
 - MC1 (700 um scale, inside the disc radius) is never read.
 - The `run` row is a stale smoke run; `_slide_names` mislabels identical-lattice slides (curve agreement only).
+
+## 2026-11-23 — E7 gene rankings read (J5 synth, J6 CosMx, J6b semi)
+
+Results 23_11_results/ranking/rank_{synth,cosmx,semi}/gene_rank.md; rules G1-G3, S1-S3, C1 (ccc_model_plan.md, E7). Full read in the plan, "E7 read".
+
+What worked:
+- synth pairs: ir_ch finds the big Gaussian sources' programmes (M8 -> MC10 / MC11 rank 1-2, M7 -> MC8 / MC9 / MC7 rank 4-11; pair AUPRC 0.21 vs
+  twin 0.01, AUROC 0.92): the learned part of the ranking, the same sources the anchored SVG run (R1) found.
+- CosMx: type keys / no keys give seed-stable rankings (C1 RBO 0.61, drivers Jaccard50 0.66-0.72); expression keys do not (0.49).
+- semi: null programmes stay out of the top 20 % (S2) for amici_like, ir_a, ir_c_rate.
+
+What doesn't work / limits:
+- No arm passes G1-G3 (synth) or S1 / S3 (semi); the ranking model is undecided.
+- synth responders below the neighbour ridge and at Moran (AUPRC 0.33-0.36 vs 0.41 / 0.34) and hard negatives above responders (AUROC_hard 0.32):
+  region markers (CM1-3) and spatial genes rank as responders, as in the SVG R1 read. Drivers barely above the twin (0.37 vs 0.30): amplitude.
+- Channel-masked synth models fit the programme at 0.50-0.52 vs the own+context reference 0.68 (better than 10-23's 0.245, still under the bar).
+- Short-range S -> R pairs (rank 120-2300) and MC1, MC2, MC6, MC13-15, MC25 missed; the model's folds scored 19 of the 31 planted pairs.
+- semi: within-type variance alone ranks the spiked genes best (AUROC 0.94-0.98 vs models 0.75-0.88): the spike-in raises variance, so S1's bar is
+  near unbeatable; the planted sender type is rarely first (rank 2-8); contact programmes (Immune>Ductal@step20) never detected.
+- CosMx: known LR pairs at chance (AUC 0.49-0.50, every arm); top responders are heat-shock, metallothionein, ribosomal and acinar secretory genes
+  in non-acinar types, while the flags mark only 5-26 % of the top 50 (flags look too lenient). typeres (+ twin) not in the results.
+- Cost: 1.5-2.7 h per CosMx / semi readout (gene_flows).
+
+## 2026-11-23 — Fixes 1-3, the prototype comparison and the typeres bug (built, not run)
+
+The user asked to implement the three separation levers (region, co-expression, noise), a step-wise comparison of them, the prototype-vs-global-only
+comparison (synth + CosMx; niche label; prototype + window arm), and to find why the CosMx E7 run lost typeres. Details: comparison.md, "Round 2".
+
+What worked:
+- The typeres loss has a clear cause: TARGETS "all" (the clean pass) refuses a model that reads its own cell, and typeres has the raw own-cell skip; the
+  pre-run toy stand-in had no skip. TARGETS "auto" now picks the clean pass, channel folds or whole hidden cells per model.
+- The readout fixes reuse E7's interventions: strata and sender sets are two arguments of gene_flows, with the old draws unchanged when they are off
+  (tested draw for draw); a one-permutation-per-column mutant of the set permutation was caught.
+- The sender-sparsity term had to be scale-free: the tokens are layer-normalised, so a plain group lasso would be met by shrinking every column.
+- Every arm of both jobs passes apply_sweep_config's validators locally; the hook and the reader ran end to end on a toy planted-dependence module.
+
+What doesn't work / limits:
+- Not checked locally: building the real models (CombinedModel with channel masks; fused attention on CosMx); the smoke run is the first cluster step.
+- synth's region is the generator's annotation (an oracle); fix 1's label part on it is an upper bound. The label part absorbs any field of region
+  size, the longest programmes included.
+- CosMx reads only the 200 most variable senders in one fold partition (cost); the sender-sparsity weight is one value (0.1).
+- `pytest -n` is not available in interscale_env (no xdist): run the suite serially.

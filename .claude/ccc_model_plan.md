@@ -880,3 +880,19 @@ match), `gene_rank_common.py` (the hook), `gene_rank_read.py` (the rules), `make
   standard programme evaluation in the same job shows the fit.
 - On CosMx (clean pass) a responder's neighbours show the same gene, so the model may have learnt to read that instead of other genes; `responder_cross`
   is then a conservative cross-gene score. A channel-masked CosMx arm would remove the shortcut (not written).
+
+### E7 read (2026-11-23)
+
+J5 synth: no G passes. Fit 0.50 / 0.52 (ir_ch / ctx_ch) vs own+context 0.68. Responders AUPRC 0.33 / 0.36 vs ridge 0.41, Moran 0.34, AUROC_hard
+0.32 (CM / SP genes above responders). Drivers 0.37 / 0.33 vs twins 0.30 / 0.31. Pairs ir_ch AUPRC 0.211 (twin 0.013, ridge 0.196), precision@k 0.26:
+M8 -> MC10 / MC11 rank 1 / 2, M7 -> MC8 / MC9 / MC7 rank 4 / 10 / 11, M3 -> MC3 48; short range R1-R4 rank 120-990; 19 of 31 planted pairs scored.
+J6 CosMx (11 of 13 runs; typeres and its twin absent): C1 ir_c 0.486 FAIL, ktype 0.609 / knone 0.610 PASS; LR AUC 0.485-0.503 (null); C2 5-26 %
+flagged though the top lists are stress / ribosomal / acinar genes in other types. J6b semi: S1 FAIL (variance bar 0.98 / 0.94 AUROC), S2 PASS for
+amici_like, ir_a, ir_c_rate (not ir_c), S3 FAIL; detected 2-4 of 8 programmes (exp kernels into Acinar; never Immune>Ductal@step20).
+
+### E7: why typeres was missing from J6, and the re-read (2026-11-23)
+
+typeres reads its own cell (raw own-cell skip); J6 read every CosMx run with TARGETS "all", which `scored_entries` refuses for such a model, so both typeres
+tasks failed in the hook (the toy check had used a stand-in without the skip). Fixed in gene_rank_common: TARGETS "auto" (clean pass when blind to the own
+cell, channel folds when trained with channel masks, else 20 % of the cells hidden whole). Re-read: `RANK_RUNS=typeres bash slurm/rank_submit.sh cosmx`
+(not run). comparison.md "Round 2" has the details.
