@@ -2510,3 +2510,20 @@ What doesn't work / limits:
   size, the longest programmes included.
 - CosMx reads only the 200 most variable senders in one fold partition (cost); the sender-sparsity weight is one value (0.1).
 - `pytest -n` is not available in interscale_env (no xdist): run the suite serially.
+
+## 2026-11-23 — CosMx comparison read on 1 mm tiles (cost of exact dense attention)
+
+The user questioned the fused attention for the CosMx prototype. Details: comparison.md, "Round 3".
+
+What worked:
+- The measured costs settle it: exact dense attention on a 100k-cell section is 127 s per training step and 41.7 s per evaluation pass (5.6 GiB); the
+  routed hierarchy 1.2-2.1 s per step. Training on 1 mm crops was never the problem; reading every arm on whole sections (~2,000 passes x ~42 s =
+  ~23 h for the prototype) was.
+- `gene_ranking.tile_graphs` + `EVAL_TILE_UM`: every arm read on the same 1 mm tiles of the test sections (the training window); tested, and the hook
+  ran end to end on toy tiles.
+
+What doesn't work / limits:
+- My first cost estimate took the global-only arms' J6 time per pass (~8 s) for every arm; the prototype's exact dense pass is ~5x that.
+- Tiles centre every score within (tile, group): between-tile variation of a section is not scored, and no model reads beyond ~1 mm.
+- The toy planted-dependence module of test_gene_ranking (`_Known`) holds its labels for a whole graph and cannot be tiled; the tile check used a
+  label-free stand-in.

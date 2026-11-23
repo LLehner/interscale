@@ -238,3 +238,26 @@ region table), `gene_rank.py` (TARGETS auto for CosMx, `RANK_RUNS`).
 | C2 | compare_rank.py, compare_read.py, sbatch / submit; toy end-to-end | built |
 | C3 | runs: smoke, synth, cosmx; typeres re-read | not run |
 | C4 | read, notes.md | open |
+
+## Round 3 (2026-11-23): CosMx read on tiles, not whole sections (the user's decision)
+
+The user asked why the CosMx prototype uses the fused attention ("100x longer per iteration"; whole slides fit on the GPUs). The measured numbers
+(notes.md, the entry before 2026-10-31): exact dense attention on a whole 100k-cell section takes 127 s per training step and 41.7 s per evaluation
+pass at 5.6 GiB -- memory is not the limit, the quadratic compute is; plain dense attention cannot form the 10^10-entry map at all, and what runs fast
+on whole sections is the routed hierarchy (1.2-2.1 s per step) or the GCN. On the training crops (1 mm) the fused attention computes the same as dense
+(plus a recompute in the backward pass; not measured at crop size), so training was never the problem. **The readout was:** every CosMx arm read on
+whole test sections means ~42 s per pass for the prototype x ~2,000 passes per model (2 reads x 5 folds x 200 senders + groups) = ~23 h, past the
+12 h limit -- my cost estimate had used the global-only arms' ~8 s per pass from J6. Options offered: (1) read every arm on 1 mm tiles of the test
+sections, (2) the routed hierarchy for the prototype (no longer the prototype), (3) whole sections with ~50 senders. **The user chose (1).**
+
+Built: `gene_ranking.tile_graphs(graphs, size, min_cells=)` (square tiles over each graph's bounding box by position alone, every cell in exactly one
+tile, tiles under `min_cells` merged into the nearest kept one, every per-cell attribute and `obs_names` sliced, edges kept within a tile, `tile_of`
+= the source graph; tested) and `EVAL_TILE_UM` / `EVAL_TILE_MIN_CELLS` in gene_rank_common (test graphs only; training graphs for the bars, groups
+and senders stay whole). compare_rank.py, CosMx: `EVAL_TILE_UM` 1000 (the training crops' side, make_cosmx_tiers_yaml.CROP), `EVAL_TILE_MIN_CELLS`
+200. synth is unchanged (whole slides of 2,500 spots, one attention block). The prototype keeps the fused attention for training (exact dense
+attention without the S x S map: crops hold up to ~20k cells, and a dense map with its backward at that size would not fit a 20 GB GPU slice).
+
+What it changes in the reading: every score is centred within (tile, receiver group) instead of (section, receiver group), so variation between
+1 mm tiles of a section (FOV-level offsets, the section's large-scale structure) is not scored; no model sees context beyond ~1 mm at readout, as in
+training. The neighbour ridge and Moran bars on the test cells are computed per tile as well. Toy check: the hook on 2 toy sections read as 18 tiles,
+then compare_read.py, end to end.

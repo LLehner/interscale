@@ -562,7 +562,8 @@ in folds (`gene_folds`, `hide_genes` sets `gene_mask` *and* `mask`, which `apply
 (permutations within label x stratum, e.g. a region or niche: what the stratum carries is not scored), `gene_flows(sender_sets=)` (sets of genes permuted
 with one shared permutation, a member's own target left out; `co_varying_groups`, `group_sets`, `group_table` with each member's sufficiency,
 `group_pair_scores`), `robust_z` (a drop against the other senders of the same target), `hide_cells` (targets for a model that reads its own cell and was
-trained hiding whole cells: such a model can be read neither on the clean pass nor in channel folds). Niches: `tl._preprocessing.neighbourhood_niches`
+trained hiding whole cells: such a model can be read neither on the clean pass nor in channel folds), `tile_graphs` (square tiles by position, every cell
+once, small tiles merged: a readout on the training window when a whole section costs too much per pass; scores then centre within (tile, group)). Niches: `tl._preprocessing.neighbourhood_niches`
 (composition or expression of the k nearest cells, k-means fitted on the training cells). The model side: `optim.aux_loss_weights.sender_sparsity`
 (`train/aux_losses.py`; L1 / L2 of the expression embedding's per-gene column norms over sqrt(G), scale-free because the tokens are layer-normalised; tag `ssp`).
 
