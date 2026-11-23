@@ -1345,3 +1345,44 @@ class ValueL1(AuxLoss):
             return {"value_l1": out.y_pred.new_zeros(())}
         terms = [layer.in_proj_weight.chunk(3)[2].abs().mean() for layer in layers]
         return {"value_l1": torch.stack(terms).mean().to(out.y_pred.dtype)}
+
+
+@register_aux_loss("sender_sparsity")
+class SenderSparsity(AuxLoss):
+    """A scale-free group sparsity on the sender genes (fix 2, ``.claude/comparison.md``): the ratio of the L1 to the L2 norm of the per-gene column
+    norms of the expression embedding (``input_embedding``, the map from a cell's genes to the token every key and value is built from), divided by
+    ``sqrt(G)``, so it lies in ``[1 / sqrt(G), 1]``: 1 when every gene enters the tokens equally, ``1 / sqrt(G)`` when one gene does.
+
+    Why a ratio: the tokens pass the transformer's input LayerNorm, so a plain group lasso is met by shrinking every column alike, which changes no
+    prediction and selects nothing. The ratio is unchanged by any common scale; only concentrating the weight on fewer genes lowers it, which pushes
+    the model to pick among genes that stand in for each other (a source and its co-varying responses) instead of spreading over all of them.
+    """
+
+    def __init__(self, cfg, module=None):
+        super().__init__()
+        params = cfg.model.global_component.get("parameters", {}) or {}
+        if params.get("type_gex_embedding", None) != "Linear":
+            raise ValueError(
+                "optim.aux_loss_weights.sender_sparsity reads the learned expression embedding: set "
+                "model.global_component.parameters.type_gex_embedding Linear (a GlobalModel)."
+            )
+        self._owner = (module,)
+
+    @staticmethod
+    def value(weight: torch.Tensor) -> torch.Tensor:
+        """The penalty of an embedding weight ``[n_embed, G]``."""
+        norms = weight.norm(dim=0)
+        g = norms.numel()
+        return norms.sum() / (norms.norm() * (g**0.5)).clamp_min(1e-12)
+
+    def forward(self, out: StepOutput, batch) -> dict[str, torch.Tensor]:
+        owner = self._owner[0]
+        layer = getattr(owner, "input_embedding", None) if owner is not None else None
+        if layer is None:
+            for child in owner.modules() if owner is not None else []:
+                if isinstance(getattr(child, "input_embedding", None), nn.Linear):
+                    layer = child.input_embedding
+                    break
+        if layer is None:
+            return {"sender_sparsity": out.y_pred.new_zeros(())}
+        return {"sender_sparsity": self.value(layer.weight).to(out.y_pred.dtype)}

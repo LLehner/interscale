@@ -133,6 +133,10 @@ def get_optim_cfg(cfg):
     # weight of the read layers (sparse messages).
     cfg.optim.aux_loss_weights.attn_entropy = 0.0
     cfg.optim.aux_loss_weights.value_l1 = 0.0
+    # Sender sparsity (fix 2, `.claude/comparison.md`): L1 / L2 of the per-gene column norms of the expression embedding over sqrt(G), in
+    # [1 / sqrt(G), 1], scale-free because the tokens are layer-normalised; it makes the model choose among genes that stand in for each other.
+    # GlobalModel with type_gex_embedding Linear only.
+    cfg.optim.aux_loss_weights.sender_sparsity = 0.0
     cfg.optim.attn_entropy = CN()
     cfg.optim.attn_entropy.ramp_epochs = 0
 

@@ -17,7 +17,13 @@ from torch_geometric.data import Data
 
 from interscale.evaluation.gene_ranking import (
     ContextFlows,
+    co_varying_groups,
     context_flows,
+    group_pair_scores,
+    group_sets,
+    group_table,
+    hide_cells,
+    robust_z,
     driver_table,
     gene_folds,
     hide_genes,
@@ -309,3 +315,102 @@ def test_moran_variance_and_spillover_bars():
     assert variance.loc["B", 0] > variance.loc["C", 0]  # only B's g0 carries the planted signal on top of noise
     flags = spillover_flags(data["x"], data["labels"])
     assert flags.loc["B", 7] and flags.loc["C", 7] and not flags.loc["A", 7]
+
+
+# ----------------------------------------------------------------------------------------------- fixes: strata, sender sets, groups, robust z
+
+
+def test_strata_constant_draws_as_before_and_singleton_strata_move_nothing():
+    labels = _labels()
+    module = _Known(labels, blind=True)
+    graphs = show_everything([_graph(labels, seed=s, hidden=()) for s in range(2)])
+    kw = dict(per_type=40, seed=3, targets="all")
+    plain = gene_flows(module, graphs, [labels] * 2, GENES, ["g3", "g4"], **kw)
+    const = gene_flows(module, graphs, [labels] * 2, GENES, ["g3", "g4"], strata=[np.zeros(len(labels))] * 2, **kw)
+    np.testing.assert_allclose(plain.drop, const.drop, equal_nan=True)
+    ctx_plain = context_flows(module, graphs, [labels] * 2, GENES, targets="all", kinds=("all_state",), per_type=40, seed=3)
+    ctx_const = context_flows(module, graphs, [labels] * 2, GENES, targets="all", kinds=("all_state",), per_type=40, seed=3,
+                              strata=[np.zeros(len(labels))] * 2)  # fmt: skip
+    np.testing.assert_allclose(ctx_plain.responder(), ctx_const.responder(), equal_nan=True)
+    # every cell its own stratum: nothing can be permuted, so nothing drops
+    own = [np.arange(len(labels))] * 2
+    alone = gene_flows(module, graphs, [labels] * 2, GENES, ["g3", "g4"], strata=own, **kw)
+    assert np.nanmax(np.abs(alone.drop)) < 1e-9
+    ctx_alone = context_flows(module, graphs, [labels] * 2, GENES, targets="all", kinds=("all_state",), per_type=40, seed=3, strata=own)
+    assert np.nanmax(np.abs(ctx_alone.responder())) < 1e-9
+    assert plain.drop[0, plain.receivers.index("B"), 0] > 0.1  # the planted pair is read without strata
+
+
+def test_sender_sets_share_one_permutation_and_leave_member_targets_out(monkeypatch):
+    from interscale.evaluation import interpretation
+
+    labels = _labels()
+    module = _Known(labels, blind=True)
+    graphs = show_everything([_graph(labels, seed=0, hidden=())])
+    kw = dict(per_type=40, seed=5, targets="all")
+    single = gene_flows(module, graphs, [labels], GENES, ["g3"], **kw)
+    as_set = gene_flows(module, graphs, [labels], GENES, [], sender_sets={"S": ["g3"]}, **kw)
+    assert as_set.senders == ["S"]
+    keep = np.isfinite(as_set.drop[0])
+    np.testing.assert_allclose(as_set.drop[0][keep], single.drop[0][keep])
+    assert np.isnan(as_set.drop[0, :, GENES.index("g3")]).all()  # the member's own column is not read
+    seen = []
+    real = interpretation._predict
+
+    def spy(module_, data_list, **k):
+        seen.append(data_list[0].x.clone())
+        return real(module_, data_list, **k)
+
+    monkeypatch.setattr(interpretation, "_predict", spy)
+    gene_flows(module, graphs, [labels], GENES, [], sender_sets={"S": ["g3", "g5"]}, **kw)
+    original = graphs[0].x
+    changed = seen[-1]
+    before = {(round(float(a), 6), round(float(b), 6)) for a, b in original[:, [3, 5]].tolist()}
+    after = {(round(float(a), 6), round(float(b), 6)) for a, b in changed[:, [3, 5]].tolist()}
+    assert after <= before  # each cell shows another cell's (g3, g5) combination, never a mixed one
+    assert not torch.equal(changed[:, 3], original[:, 3])
+
+
+def test_group_table_sufficiency_and_credited_pairs_by_hand():
+    nan = np.nan
+    senders = ["a", "b", "c", "G0", "G0|keep:a", "G0|keep:b"]
+    genes = ["a", "b", "c", "t"]
+    drop = np.full((6, 1, 4), nan)
+    drop[0, 0, 3], drop[1, 0, 3], drop[2, 0, 3] = 0.05, 0.04, 0.3  # alone, a and b move t little: they stand in for each other
+    drop[3, 0, 3] = 0.4  # the whole group {a, b}
+    drop[4, 0, 3] = 0.0  # a kept: nothing lost, a carries it alone
+    drop[5, 0, 3] = 0.4  # b kept: everything lost, b carries nothing
+    flows = GeneFlows(senders, ["all"], genes, drop, np.zeros((6, 1, 4)), np.ones((1, 4)), np.ones((1, 4)), np.full((1, 4), 0.5))
+    table = group_table(flows, [["a", "b"]], min_expressed=0.0)
+    row = table[(table["group"] == "G0") & (table["target"] == "t")].iloc[0]
+    assert row["drop"] == pytest.approx(0.4) and row["best"] == "a" and row["best_sufficiency"] == pytest.approx(1.0)
+    assert "a:1.00" in row["sufficiency"] and "b:0.00" in row["sufficiency"]
+    assert set(table["group"]) == {"G0", "c"}
+    credited = group_pair_scores(flows, [["a", "b"]])
+    assert credited.senders == ["a", "b", "c"]
+    np.testing.assert_allclose(credited.drop[:, 0, 3], [0.4, 0.0, 0.3])
+    assert group_sets([["a", "b"]]) == {"G0": ["a", "b"], "G0|keep:a": ["b"], "G0|keep:b": ["a"]}
+
+
+def test_robust_z_against_the_other_senders():
+    rng = np.random.default_rng(0)
+    drop = rng.normal(0.0, 0.01, size=(30, 1, 2))
+    drop[0, 0, 1] = 0.2
+    flows = GeneFlows([f"s{k}" for k in range(30)], ["all"], ["x", "y"], drop, np.zeros_like(drop), np.ones((1, 2)), np.ones((1, 2)))
+    z = robust_z(flows, min_expressed=0.0)
+    assert z.drop[0, 0, 1] > 10 and np.nanmax(np.abs(z.drop[1:, 0, 1])) < 5
+
+
+def test_hide_cells_and_co_varying_groups():
+    labels = _labels()
+    graph = _graph(labels, hidden=())
+    hidden = hide_cells([graph], 0.2, seed=0)[0]
+    assert hidden.mask.float().mean().item() == pytest.approx(0.2, abs=0.01)
+    assert torch.equal(hidden.gene_mask.all(dim=1), hidden.mask) and torch.equal(hidden.gene_mask.any(dim=1), hidden.mask)
+    rng = np.random.default_rng(1)
+    pos = _pos()
+    field = np.sin(pos[:, 0] / 200.0)
+    x = np.column_stack([field + rng.normal(0, 0.05, len(pos)), 2 * field + rng.normal(0, 0.05, len(pos)), -field + rng.normal(0, 0.05, len(pos)),
+                         rng.normal(0, 1, len(pos))])  # fmt: skip
+    groups = co_varying_groups(x, pos, np.zeros(len(pos)), ["a", "b", "c", "noise"], k=8)
+    assert groups == [["a", "b", "c"]]

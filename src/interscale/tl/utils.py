@@ -392,7 +392,7 @@ def _training_tag(cfg) -> str:
     weights = {name: float(w) for name, w in dict(cfg.optim.get("aux_loss_weights", {})).items() if float(w) != 0.0}
     if weights:
         # the interaction read-out's penalties go short: the name must stay under 255 characters (older names unchanged)
-        short = {"attn_entropy": "ent", "value_l1": "vl1"}
+        short = {"attn_entropy": "ent", "value_l1": "vl1", "sender_sparsity": "ssp"}
         parts.append("aux-" + "-".join(f"{short.get(name, name)}{w:g}" for name, w in sorted(weights.items())))
     return f"var-{'+'.join(parts)}_" if parts else ""
 

@@ -111,12 +111,14 @@ def context_flows(
     per_type: int = 1000,
     seed: int = 0,
     device="cpu",
+    strata=None,
 ) -> ContextFlows:
     """The perturbations of :func:`interpretation.type_flows` over every graph, pooled, with every target kept (not only the top ones).
 
     ``labels``: one array per graph (a constant array: one group). ``targets``: ``"hidden"`` (the graphs' hidden entries) or ``"all"`` (every entry of
     the receivers; a model blind to its own cell, :func:`interpretation.scored_entries`). ``kinds``: a subset of :data:`CONTEXT_KINDS` (a kind left
-    out costs no prediction). Receivers keep their rows; per graph up to ``per_type`` of them per label (``pick_receivers``).
+    out costs no prediction). Receivers keep their rows; per graph up to ``per_type`` of them per label (``pick_receivers``). ``strata``: one
+    array per graph (e.g. a region or niche): ``all_state`` swaps within label x stratum, so a responder is scored beyond its region.
     """
     genes = [str(g) for g in genes]
     labels = [np.asarray(v).astype(str) for v in labels]
@@ -129,11 +131,12 @@ def context_flows(
     detected, total = np.zeros((n_r, n_g)), np.zeros((n_r, 1))
     readable = np.ones((n_r, n_g), dtype=bool)
     rng = np.random.default_rng(seed)
+    strata = [None] * len(labels) if strata is None else [np.asarray(v).astype(str) for v in strata]
     was_training = module.training
     module.eval()
     try:
         with _rng_untouched(device), torch.no_grad(), _scoring_every_cell(module, targets == "all"):
-            for graph, label in zip(graphs, labels, strict=True):
+            for graph, label, stratum in zip(graphs, labels, strata, strict=True):
                 truth = graph.x.double().cpu().numpy()
                 hidden = _hidden_entries(graph, "gene")
                 target = scored_entries(graph, module, targets)
@@ -153,7 +156,7 @@ def context_flows(
                         count[r] += valid.sum(axis=0)
                         base_sums[r] += centred_sums(base[cells[r]], truth[cells[r]], valid, *centres[t])
                         readable[r] &= variance[t] >= max(1e-3, float(np.nanmedian(variance[t])) * 0.1)
-                for kind, sender, rows, donors in _type_perturbations(label, keep, pos, rng):
+                for kind, sender, rows, donors in _type_perturbations(label, keep, pos, rng, strata=stratum):
                     if kind not in kinds:
                         continue
                     pred = _predict(module, [_changed(graph, visible, rows, donors)], head=head, batch_size=1, device=device)[0]
@@ -208,6 +211,25 @@ def hide_genes(graphs, columns) -> list:
         mask[:, torch.as_tensor(np.asarray(columns, dtype=np.int64))] = True
         copy.gene_mask = mask
         copy.mask = mask.any(dim=1)
+        out.append(copy)
+    return out
+
+
+def hide_cells(graphs, fraction: float, *, seed: int = 0) -> list:
+    """Copies of ``graphs`` with a random ``fraction`` of the cells hidden whole (``mask`` and full ``gene_mask`` rows): the targets for a model that
+    reads its own cell and was trained hiding whole cells (``mask_strategy: node``, e.g. the type-residual reference), which can be read neither on the
+    clean pass (it would copy) nor in channel folds (an input it never saw). One draw per graph from a private generator."""
+    if not 0 < float(fraction) < 1:
+        raise ValueError(f"fraction must lie in (0, 1), got {fraction}.")
+    rng = np.random.default_rng(seed)
+    out = []
+    for graph in graphs:
+        n = int(graph.num_nodes)
+        cells = torch.zeros(n, dtype=torch.bool)
+        cells[torch.as_tensor(rng.choice(n, size=max(1, int(round(float(fraction) * n))), replace=False))] = True
+        copy = graph.clone()
+        copy.mask = cells
+        copy.gene_mask = cells[:, None].expand(n, int(graph.x.shape[1])).clone()
         out.append(copy)
     return out
 
@@ -371,6 +393,155 @@ def pooled_pair_scores(flows: GeneFlows, *, min_expressed: float = 0.1) -> pd.Se
     s, g = np.nonzero(np.isfinite(best))
     index = pd.MultiIndex.from_arrays([np.asarray(flows.senders, dtype=object)[s], np.asarray(flows.genes, dtype=object)[g]], names=["sender", "target"])
     return pd.Series(best[s, g], index=index)
+
+
+# ----------------------------------------------------------------------------------------------- sender groups and the robust z (fixes 2 and 3)
+
+
+def co_varying_groups(x, pos, graphs, genes, *, k: int = 16, corr: float = 0.6, max_cells: int = 20000, seed: int = 0) -> list[list[str]]:
+    """Genes whose local means co-vary: per cell the mean of its ``k`` nearest cells of the same graph, z-scored within each graph, |Pearson| between
+    genes over (up to ``max_cells``) cells, average linkage cut at ``corr``; groups of two or more genes. Model-free and label-free: a source and its
+    responses, or the markers of one region, vary together across neighbourhoods, so permuting one of them leaves the others to stand in for it."""
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import squareform
+
+    x = np.asarray(x, dtype=np.float64)
+    pos = np.asarray(pos, dtype=np.float64)[:, :2]
+    graphs = np.asarray(graphs).astype(str)
+    genes = [str(g) for g in genes]
+    local = np.zeros_like(x)
+    for name in sorted(set(graphs.tolist())):
+        where = np.flatnonzero(graphs == name)
+        kk = min(int(k), len(where))
+        _, near = cKDTree(pos[where]).query(pos[where], k=kk)
+        near = np.asarray(near).reshape(len(where), -1)
+        means = x[where][near].mean(axis=1)
+        sd = means.std(axis=0)
+        local[where] = (means - means.mean(axis=0)) / np.where(sd > 1e-12, sd, 1.0)
+    rng = np.random.default_rng(seed)
+    rows = rng.choice(len(local), size=min(int(max_cells), len(local)), replace=False)
+    varying = np.flatnonzero(local[rows].std(axis=0) > 1e-9)
+    if len(varying) < 2:
+        return []
+    r = np.nan_to_num(np.corrcoef(local[rows][:, varying].T))
+    dist = np.clip(1.0 - np.abs(r), 0.0, 1.0)
+    np.fill_diagonal(dist, 0.0)
+    lab = fcluster(linkage(squareform(dist, checks=False), method="average"), t=1.0 - float(corr), criterion="distance")
+    out = []
+    for c in np.unique(lab):
+        members = [genes[varying[i]] for i in np.flatnonzero(lab == c)]
+        if len(members) > 1:
+            out.append(sorted(members))
+    return sorted(out, key=lambda m: (-len(m), m))
+
+
+def group_sets(groups, *, keep_one: bool = True) -> dict[str, list[str]]:
+    """The sender sets of :func:`interpretation.gene_flows` for ``groups``: ``G<k>`` = the whole group, and with ``keep_one`` ``G<k>|keep:<m>`` = the
+    group without member ``m`` (``m`` kept as it is)."""
+    out = {}
+    for k, members in enumerate(groups):
+        members = [str(m) for m in members]
+        out[f"G{k}"] = members
+        if keep_one:
+            for m in members:
+                rest = [g for g in members if g != m]
+                if rest:
+                    out[f"G{k}|keep:{m}"] = rest
+    return out
+
+
+def split_flows(flows: GeneFlows) -> tuple[GeneFlows, dict[str, int]]:
+    """``(singles, sets)``: the single senders' flows, and the row index of every sender set (names with a ``G`` prefix and no gene of that name)."""
+    genes = set(flows.genes)
+    single = [k for k, s in enumerate(flows.senders) if s in genes]
+    sets = {s: k for k, s in enumerate(flows.senders) if s not in genes}
+    pick = np.asarray(single, dtype=int)
+    return (
+        GeneFlows([flows.senders[k] for k in single], flows.receivers, flows.genes, flows.drop[pick], flows.sum_shift[pick], flows.count,
+                  flows.expressed, flows.base),
+        sets,
+    )  # fmt: skip
+
+
+def group_table(flows: GeneFlows, groups, *, min_expressed: float = 0.1) -> pd.DataFrame:
+    """Per (receiver group, sender group, target): the whole group's drop (``drop``), and per member its ``sufficiency`` = 1 - drop(member kept) /
+    drop(group) (1: the member alone carries the group's effect; 0: the rest carries it without it; read only where the group's drop is positive),
+    ``best`` (the most sufficient member) and ``members``. Single senders that are in no group are rows of their own (sufficiency 1). The target's own
+    gene is never a sender (:func:`interpretation.gene_flows` leaves it out)."""
+    singles, sets = split_flows(flows)
+    drop = np.where((flows.expressed >= float(min_expressed))[None], flows.drop, np.nan)
+    single_drop = _off_diagonal(singles, min_expressed)
+    grouped = {str(m) for G in groups for m in G}
+    rows = []
+    for r, receiver in enumerate(flows.receivers):
+        for k, members in enumerate(groups):
+            name = f"G{k}"
+            if name not in sets:
+                continue
+            whole = drop[sets[name], r]
+            for g in np.flatnonzero(np.isfinite(whole)):
+                suff = {}
+                for m in members:
+                    key = f"{name}|keep:{m}"
+                    if key in sets and whole[g] > 0 and np.isfinite(drop[sets[key], r, g]):
+                        suff[str(m)] = 1.0 - drop[sets[key], r, g] / whole[g]
+                best = max(suff, key=suff.get) if suff else ""
+                rows.append({"receiver": receiver, "group": name, "members": " ".join(map(str, members)), "target": flows.genes[g],
+                             "drop": float(whole[g]), "best": best, "best_sufficiency": suff.get(best, np.nan),
+                             "sufficiency": " ".join(f"{m}:{v:.2f}" for m, v in sorted(suff.items(), key=lambda kv: -kv[1]))})  # fmt: skip
+        for s, sender in enumerate(singles.senders):
+            if sender in grouped:
+                continue
+            for g in np.flatnonzero(np.isfinite(single_drop[s, r])):
+                rows.append({"receiver": receiver, "group": sender, "members": sender, "target": flows.genes[g], "drop": float(single_drop[s, r, g]),
+                             "best": sender, "best_sufficiency": 1.0, "sufficiency": ""})  # fmt: skip
+    out = pd.DataFrame(rows, columns=["receiver", "group", "members", "target", "drop", "best", "best_sufficiency", "sufficiency"])
+    if len(out):
+        out["rank_in_target"] = out.groupby(["receiver", "target"])["drop"].rank(ascending=False, method="min")
+    return out
+
+
+def group_pair_scores(flows: GeneFlows, groups, *, min_expressed: float = 0.1) -> GeneFlows:
+    """Single-gene flows whose drop is credited through the groups (fix 2): a member's drop on a target is the whole group's drop times the member's
+    sufficiency (clipped to [0, 1]); a gene in no group keeps its own drop. Collinear partners thus share what one-at-a-time permutation gives none of
+    them alone, and the member that carries the group's effect alone gets it. Same layout as ``flows``' single senders."""
+    singles, sets = split_flows(flows)
+    drop = singles.drop.copy()
+    for k, members in enumerate(groups):
+        name = f"G{k}"
+        if name not in sets:
+            continue
+        whole = flows.drop[sets[name]]
+        for m in members:
+            if m not in singles.senders:
+                continue
+            key = f"{name}|keep:{m}"
+            if key in sets:
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    suff = np.clip(1.0 - flows.drop[sets[key]] / whole, 0.0, 1.0)
+                credited = np.where(whole > 0, whole * suff, np.minimum(whole, 0.0))
+            else:
+                credited = whole
+            drop[singles.senders.index(m)] = credited
+    return GeneFlows(singles.senders, singles.receivers, singles.genes, drop, singles.sum_shift, singles.count, singles.expressed, singles.base)
+
+
+def robust_z(flows: GeneFlows, *, min_expressed: float = 0.1, min_senders: int = 5) -> GeneFlows:
+    """Flows with each drop replaced by its robust z among the senders read for the same (receiver group, target): (drop - median) / (1.4826 MAD), the
+    MAD floored at the median MAD over targets (fix 3). Most senders move a target by nothing, so the senders themselves are the null: a sender stands out
+    only against what permuting any gene does to that target. Fewer than ``min_senders`` reads: NaN."""
+    import warnings
+
+    drop = _off_diagonal(flows, min_expressed)
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN slices: targets no sender reads
+        med = np.nanmedian(drop, axis=0)
+        mad = 1.4826 * np.nanmedian(np.abs(drop - med[None]), axis=0)
+    floor = np.nanmedian(mad[np.isfinite(mad) & (mad > 0)]) if np.any(np.isfinite(mad) & (mad > 0)) else 1.0
+    scale = np.where(np.isfinite(mad), np.maximum(mad, floor), np.nan)
+    reads = np.isfinite(drop).sum(axis=0)
+    z = np.where((reads >= int(min_senders))[None], (drop - med[None]) / scale[None], np.nan)
+    return GeneFlows(flows.senders, flows.receivers, flows.genes, z, flows.sum_shift, flows.count, flows.expressed, flows.base)
 
 
 # ----------------------------------------------------------------------------------------------- truth and metrics

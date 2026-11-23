@@ -322,8 +322,11 @@ def matched_cells(pos, rows, pool, *, rng: np.random.Generator, k: int = 32) -> 
     return np.asarray(sorted(out), dtype=np.int64)
 
 
-def _type_perturbations(labels, keep, pos, rng):
-    """Yields ``(kind, sender, rows, donors)``: the cells changed and whose visible profile each takes."""
+def _type_perturbations(labels, keep, pos, rng, strata=None):
+    """Yields ``(kind, sender, rows, donors)``: the cells changed and whose visible profile each takes.
+
+    ``strata`` (``[N]``, optional): ``all_state`` swaps only within label x stratum (e.g. a region), so what the stratum carries stays
+    where it is; the other kinds are unchanged. None draws exactly as before."""
     labels = np.asarray(labels).astype(str)
     free = np.flatnonzero(~keep)
     everyone = np.arange(len(labels))
@@ -345,8 +348,9 @@ def _type_perturbations(labels, keep, pos, rng):
             )
         yield "state", sender, rows, rng.permutation(rows)
     within = []
-    for name in sorted(set(labels.tolist())):
-        members = free[labels[free] == name]
+    groups = labels if strata is None else np.char.add(np.char.add(labels, "|"), np.asarray(strata).astype(str))
+    for name in sorted(set(groups.tolist())):
+        members = free[groups[free] == name]
         within.append((members, rng.permutation(members)))
     if within:
         yield "all_state", EVERYONE, np.concatenate([m for m, _ in within]), np.concatenate([d for _, d in within])
@@ -716,6 +720,8 @@ def gene_flows(
     seed: int = 0,
     device="cpu",
     targets: str = "hidden",
+    strata=None,
+    sender_sets: dict | None = None,
 ) -> GeneFlows:
     """Each gene of ``senders`` (those visible in every graph) permuted in the context of the receivers, one pass per sender and graph.
 
@@ -723,6 +729,10 @@ def gene_flows(
     ``far_radius`` (units of ``pos``): above 0, the cells within it of a receiver keep their values too, so only distant cells change (the ``far`` region).
     ``targets`` (:data:`TARGETS`): the hidden entries (default), or ``"all"``, every entry of the receivers, for a model blind to its own cell
     (:func:`scored_entries`); only visible entries are ever permuted either way.
+    ``strata``: one array per graph (e.g. a region): the permutation stays within label x stratum (``within_labels``) or within stratum, so
+    what the stratum carries is not scored. ``sender_sets``: ``{name: [genes]}`` read after the single senders, each set's columns permuted
+    together with one shared permutation (a cell keeps its own combination of them); its row is named ``name``, and a target that is a member
+    is not read where the member was permuted (it would be the target's own gene). None / None: the same draws as before.
     """
     genes = [str(g) for g in genes]
     position = {g: k for k, g in enumerate(genes)}
@@ -732,8 +742,17 @@ def gene_flows(
     scored_masks = [scored_entries(d, module, targets) for d in graphs]
     usable = [str(s) for s in dict.fromkeys(senders) if str(s) in position]
     usable = [s for s in usable if all(not h[:, position[s]].all() for h in hidden)]
-    if not usable:
+    if not usable and not sender_sets:
         raise ValueError("no sender is visible in every graph.")
+    columns_of = {s: [position[s]] for s in usable}
+    for name, members in (sender_sets or {}).items():
+        if str(name) in columns_of:
+            raise ValueError(f"sender set {name!r} has the name of a sender.")
+        cols = [position[str(m)] for m in members if str(m) in position]
+        if any(not h[:, c].all() for h in hidden for c in cols):  # at least one member visible somewhere
+            columns_of[str(name)] = cols
+    usable = list(columns_of)
+    strata = None if strata is None else [np.asarray(v).astype(str) for v in strata]
     shape = (len(usable), len(types), len(genes))
     pred_sums, sum_shift, scored_count = np.zeros((3, *shape)), np.zeros(shape), np.zeros(shape)
     base_sums = np.zeros((3, len(types), len(genes)))
@@ -744,7 +763,7 @@ def gene_flows(
     module.eval()
     try:
         with _rng_untouched(device), torch.no_grad(), _scoring_every_cell(module, targets == "all"):
-            for graph, label, h, target in zip(graphs, labels, hidden, scored_masks, strict=True):
+            for g_index, (graph, label, h, target) in enumerate(zip(graphs, labels, hidden, scored_masks, strict=True)):
                 truth = graph.x.double().cpu().numpy()
                 visible = torch.as_tensor(~h)
                 pos = graph.pos[:, :2].double().cpu().numpy()
@@ -752,7 +771,11 @@ def gene_flows(
                 base = _predict(module, [graph], head=head, batch_size=1, device=device)[0]
                 variance = _type_variance(truth, label, types)
                 free = np.flatnonzero(~keep)
-                groups = [free[label[free] == t] for t in types] if within_labels else [free]
+                if strata is None:
+                    groups = [free[label[free] == t] for t in types] if within_labels else [free]
+                else:
+                    key = np.char.add(np.char.add(label, "|"), strata[g_index]) if within_labels else strata[g_index]
+                    groups = [free[key[free] == k] for k in sorted(set(key[free].tolist()))]
                 cells = {r: receivers[label[receivers] == t] for r, t in enumerate(types)}
                 centres = _type_centres(base, truth, target, label, types)
                 for r, t in enumerate(types):
@@ -766,14 +789,15 @@ def gene_flows(
                     detected[r] += (truth[members] > 0).sum(axis=0)
                     total[r] += members.sum()
                 for s, sender in enumerate(usable):
-                    column = position[sender]
+                    cols = columns_of[sender]
                     x = graph.x.clone()
                     for group in groups:
                         if len(group) > 1:
                             shuffled = rng.permutation(group)
-                            x[group, column] = torch.where(
-                                visible[group, column], graph.x[shuffled, column], graph.x[group, column]
-                            )
+                            for column in cols:  # one shared permutation for a set's columns
+                                x[group, column] = torch.where(
+                                    visible[group, column], graph.x[shuffled, column], graph.x[group, column]
+                                )
                     copy = graph.clone()
                     copy.x = x
                     pred = _predict(module, [copy], head=head, batch_size=1, device=device)[0]
@@ -788,6 +812,11 @@ def gene_flows(
         module.train(was_training)
     base_cos = cosine_from_sums(base_sums, count)
     drop = np.where(readable[None], base_cos[None] - cosine_from_sums(pred_sums, scored_count), np.nan)
+    for s, sender in enumerate(usable):
+        if sender_sets and sender in sender_sets:
+            for c in columns_of[sender]:
+                if any(not h[:, c].all() for h in hidden):  # the member was permuted somewhere: its own target is not read
+                    drop[s, :, c] = np.nan
     return GeneFlows(usable, types, genes, drop, sum_shift, count, detected / np.maximum(total, 1), np.where(readable, base_cos, np.nan))
 
 
