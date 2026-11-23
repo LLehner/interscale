@@ -334,6 +334,12 @@ def _conservative_rules():
 # ----------------------------------------------------------------------------------------------- the interface
 
 
+def _on_module_device(module, batch):
+    """``batch`` on the module's device: a moved copy when they differ (PyG's ``.to`` moves in place; the caller keeps its CPU graph)."""
+    device = next(module.parameters()).device
+    return batch if batch.x.device == device else batch.clone().to(device)
+
+
 def attribute(
     module,
     batch,
@@ -367,6 +373,7 @@ def attribute(
     weights = np.asarray(weights, dtype=np.float64)
     if weights.shape[0] != len(receivers):
         raise ValueError("weights needs one row per receiver.")
+    batch = _on_module_device(module, batch)
     if getattr(batch, "batch", None) is None:
         batch.batch = torch.zeros(batch.num_nodes, dtype=torch.long, device=batch.x.device)
     started = time.time()
@@ -678,6 +685,7 @@ def sensitivity_n(
     ``candidates`` row set to their reference tokens (all receivers in one forward), and the change of its target is correlated over draws
     with the sum of each attribution over the same cells. Returns ``{method: {n: [Q] Pearson r}}`` and ``"_change_sd"`` per n."""
     _check_removal(module, removal)
+    batch = _on_module_device(module, batch)
     rng = np.random.default_rng(seed)
     receivers = np.asarray(receivers, dtype=np.int64)
     with _evaluating(module), torch.no_grad():
@@ -728,6 +736,7 @@ def pairwise_interactions(
     the drop of the target when those cells take their reference tokens; all receivers in one forward per pair index and condition.
     Returns ``interaction``, ``single`` (``|Delta_j| + |Delta_k|``) and ``relative`` (``|I| / single``), each ``[Q, pairs]``."""
     _check_removal(module, removal)
+    batch = _on_module_device(module, batch)
     rng = np.random.default_rng(seed)
     receivers = np.asarray(receivers, dtype=np.int64)
     q = len(receivers)
