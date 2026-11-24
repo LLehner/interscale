@@ -361,3 +361,68 @@ Proposed expansions (nothing built; in order of what they would tell):
 
 Order: E1 and E3 are evaluation-only (existing checkpoints), E2 needs niche labels at several scales (cheap, model-free) and one readout per scale,
 E4 needs the A1 synth job to run first, E5 retrains.
+
+## Expansions 1.x and 2.x (2026-11-24; the user: "implement and commit all of this, take notes, I need plots for all of it")
+
+The user's list after the C3 read: 1.1 IG beyond the region, 1.2 a scale ladder for fix 1, 1.3 IG split by sender gene, 1.4 IG for the prototype
+vs the global-only model, 1.5 the niche scale for the model's label part, 1.6 twin-subtracted maps; 2.1 cell vs gene masking for stability and a
+combined loss, 2.2 1-16 heads for ir_ch and proto_ch, 2.3 a loss rewarding sender fields that correlate with receiver genes. 1.x in one run per
+dataset, 2.x one run each, sequential on one GPU where possible (the user can use 14 GPUs at once), plots for everything.
+
+### Library (fork main; tested)
+
+| Piece | Where | What |
+| --- | --- | --- |
+| IG in expression space | `attribution.attribute(space="expression", gene_senders=)`, `reference_expression` | the path in the visible input entries: any model kind (the prototype's GCN included); `extra["gene_total"]` [Q, G] (each sender gene summed over cells), `extra["gene_near"]` [Q, K, G] (per near sender and gene); references read visible entries only; a `type|niche` label gives the type mean within the niche (1.1). Equals the token path for a linear embedding (tested to 1e-3) |
+| attention rows | `evaluation/attention_rows.py` | each receiver's head-mean attention over the cells for read-out (recorded weights), dense and prototype models (`recording_attention`); `row_summary` (mass, entropy vs uniform, max share, effective keys, mean distance), `row_agreement` (Spearman over the union of top cells, JS divergence) |
+| scale ladder | `gene_ranking.interaction_scales` | per target the scale where the drop within niches reaches half the plain drop (log interpolation; below / within / above the ladder) |
+| twin-subtracted maps | `attribution.subtract_fields` | trained minus twin `out - in`, each scaled to its 99th percentile first (the trained map is orders larger) |
+| combined loss | `optim.dual_mask` (weight, strategy node / channel, rate, channel_fraction); `TrainingPlan._dual_mask_loss` | a second pass per training step with the other kind of mask (private generator; the module's strategy switched for that pass only), same loss and centring, added to `train_loss` only (`val_loss` stays the primary mask's: comparable across arms); GlobalModel; tag `dm<n|c><w>` |
+| field correlation | `optim.aux_loss_weights.field_corr`, `optim.field_corr` (temperature, center_key); `GlobalModule.sender_fields`, `StepOutput.fields`; `evaluation/field_correlation.py` | sender field `f_s(i) = sum_j a_ij x_js` (last layer's head-mean map, visible genes); per graph the Pearson r of every visible gene's field with every hidden gene (channel masks: disjoint sets, no self pairs), centred per graph or per `center_key` label; loss = minus the mean over targets of `sum_s softmax(r^2 / T) r^2`; only the attention carries gradient. Dense attention + channel masking (validated). Readout `field_pairs` (folds; the model's fields and a Gaussian-kernel bar), `pair_table`; tag `fc<w>` |
+| caption | `flow_maps.plot_source_sink(what=, scale_label=)` | (earlier today) |
+
+Tests: expression IG = token IG; the prototype read through its GCN, hidden entries never move; attention rows = the attribution `attention` method
+(another code path), a context query never weighs its own cell; summaries / agreement / interaction scales / subtraction by hand; the dual mask's
+second batch (other kind, shared channels per graph, the global generator untouched), a channel model trained with a cell-mask pass (logged,
+tagged, strategy restored), validators; the field term by hand (r^2 = 1 for a linear sender, gradient only into sender fields), a dense
+context-query model trained with it (the term's gradient reaches the last layer's attention), the readout's unread pairs and its kernel bar on a
+planted neighbour dependence. Mutants caught: the strategy switch removed (dual mask), senders and targets swapped (field term). The bilinear part
+now shares `_attend_values` with the fields (its tests pass unchanged).
+
+### Jobs (`slurm/November/`, flat, not under git): `extra_job.py`, `extra_common.py`, `extra_read.py`, `expand_scale.py`, `make_extra_yaml.py`, `extra_job.sbatch`, `extra_submit.sh`
+
+| Job | GPUs | Steps | Plots (RESULTS/plots/) |
+| --- | --- | --- | --- |
+| `expand_synth` | 1, in turn | evaluate the comparison's 7 synth runs + 2 twins: ladder (folds, all_state swaps within niches k10/k30/k100/k300 + region), IG to every planted receiver's response genes (planted genes hidden in every cell; graph / region / niche_k30 references), IG pairs from the gene totals, the rows' top cells, disc maps (6 discs of 300 µm, 3 slides); `expand_scale.py` -> k*; train + read `ir_ch_f1n` (label part on niche_k*, 2 seeds) | ladder_curves (ratio vs radius, lines coloured by planted length), ladder_scales (scale vs planted length, Spearman), ladder_scale_hist, ig_planted (top-5 by class x reference x model), ig_distance, ig_pairs_pr (IG vs permutation pairs), ig_agreement (models' IG rows), maps/<run>_graph<k>_{trained,twin,minus_twin}, niche_vs_region |
+| `expand_cosmx` | 1, in turn | the same on 4 CosMx runs + 2 twins, on 6 drawn 1 mm tiles: ladder (composition niches), IG to the deviation over a hidden fold with type vs type|niche_k30 references (sender-type shares, distance), the top 3 deviating genes one by one with the 16 nearest senders split by gene (the fold hidden in the receivers only, so neighbours show the target's gene), disc maps (4 x 30 µm per tile); k*; `ir_ch_f1n` (section x type x niche_k*), 1 seed, the comparison's readout | ladder_*, ig_types (type, type|niche, difference), ig_distance, spillover (self share by distance bin and receiver type), maps, niche_vs_region |
+| `maskstab` | 1, in turn | 9 runs (cell / chan / comb x seeds 42-44); per run the light rankings in two read modes (channel folds; 20 % hidden cells), the model reading each with that strategy; attention rows of planted + 100 random receivers per slide | stability (seed agreement: per-gene fit, responders, drivers, pairs, attention rows), tables of AUPRC / AUROC_hard |
+| `heads` | array of 14 | ir_ch_h{1,2,3,4,8,12,16}, proto_ch_h{...} (head width 64 // heads); light rankings (folds), attention statistics, IG planted top-5 | heads (every metric against the head count, two lines) |
+| `fieldcorr` | 1, in turn | ctx_ch with field_corr 0 / 0.1 / 1 / 1 centred within region, seeds 42-43; light rankings, attention, the field pairs (model) and the kernel bar (300 µm) | fieldcorr_bars, fieldcorr_pr (field pairs vs planted, kernel bar), fieldcorr_matrix (|r| drivers x responders, planted boxed) |
+
+Light rankings = E7's responders / drivers / pairs with the senders limited to the planted drivers, the hard negatives and 40 other genes, one fold
+partition (cost); metrics against synth's truth.
+
+Rule for 1.5 (fixed before the run, `expand_scale.py`): k* = the ladder level whose radius is closest (log) to the median interaction scale over
+the trained ir_ch runs' targets with a plain drop >= 0.01; on synth the truth-based best level (AUROC responders vs hard negatives per stratified read)
+is printed beside it, not used.
+
+Checks run (no model on real data): every arm through `apply_sweep_config` (names <= 224 characters); run lists and `configure()` through the
+real `__main__` for all 7 jobs with stand-in yamls written by the yaml makers; every hook end to end on toy GlobalModels / a toy prototype with a
+fake synth truth (planted edges, roles, niches), then the reader on their outputs (all sections; plots drawn, toy maps below the 100-cell
+minimum by design); the ladder preparation on a 1,200-cell toy for both datasets; `expand_scale.py` on toy ladders. Found and fixed on the way:
+the toy cell-masked models read a hidden gene set as whole hidden cells (the IG readouts now switch to gene masks explicitly); with the fold hidden
+in every cell the target's own gene could never contribute (1.3 now hides it in the receivers only); `extra_job.py` overwrote its JOB with
+compare_rank's; empty-table guards in the reader.
+
+### Expectations (before any run)
+
+- 1.1: the region / niche reference lowers the share of region-wide senders; on synth planted top-5 for short / mid unchanged or higher, the
+  dense / sparse classes lower (they live at region scale). On CosMx the Acinar lead shrinks if it is niche composition.
+- 1.2: on synth the interaction scale rises with the planted length (Spearman > 0.5 for ir_ch; lower for proto_ch); many long programmes "above".
+- 1.3: synth IG pairs beat the permutation pairs at the Gaussian sources; CosMx contact push carries a large own-gene share for acinar genes in
+  non-acinar receivers (spillover) if the Acinar signal is segmentation.
+- 1.4: proto_ch_pe's IG rows close to ir_ch's (both read by distance), proto_ch's not.
+- 2.1: channel arms more stable on gene rankings in folds, cell arm more stable on attention; comb in between or above both.
+- 2.2: fewer heads -> lower entropy per head mean? Not necessarily: the head mean averages out; expected flat fit, the attention statistics
+  telling. The prototype without positions likely near-uniform at any count.
+- 2.3: field pairs above the kernel bar for weight 1; region centring removes the region markers' fields.

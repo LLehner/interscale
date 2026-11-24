@@ -2569,3 +2569,22 @@ What doesn't work / limits:
 - My claim that the attribution reader's pairwise table was empty was wrong: my own grep hid the rows.
 - attr_synth remains undiagnosed (no log); its read-out arm runs in one block on synth_spot, so the checkpoint crash cannot explain it.
 - vannan sizes are guesses until the tiled runs report seconds per graph (now printed per graph).
+
+## 2026-11-24 -- Expansions 1.1-1.6 and 2.1-2.3 built (IG beyond region, scale ladder, gene-resolved IG, masking stability, heads, field loss)
+
+The user asked for six readout expansions (1.x, one run per dataset) and three model experiments (2.x, one run each), with plots. Details, jobs
+and expectations: comparison.md, "Expansions 1.x and 2.x".
+
+What worked:
+- IG in expression space reads every model kind, equals the token path for a linear embedding, and splits each sender's contribution by gene;
+  a `type|niche` label is all fix 1 needs on the attribution side.
+- The combined loss is a second pass in the training step with the other mask, its loss added to train_loss only: val_loss stays comparable.
+- The field-correlation term trains only the attention (tested: the gradient reaches the last layer), and channel masks make targets and senders
+  disjoint gene sets, so no self pairs are rewarded.
+- The toy end-to-end checks found three real problems before any cluster run (gene sets read as hidden cells, the target's own gene never visible
+  in 1.3, a JOB overwrite).
+
+What doesn't work / limits:
+- The light rankings limit the senders (planted drivers, hard negatives, 40 others) and use one fold partition: cheaper, not E7's full read.
+- CosMx 1.x reads 6 drawn 1 mm tiles and one gene fold for IG; 1.5's CosMx arm is one seed.
+- Times are estimates until the jobs print theirs; every job writes per-run and per-readout seconds.

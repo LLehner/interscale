@@ -580,6 +580,28 @@ module's mode, parameter flags and the global generators are restored. Gradients
 read-out / fused attention recomputes its query blocks in the backward (activation checkpointing whenever a pass has more than one block: whole
 sections) and must see the forward's functions (tested with a small `chunk_pairs`). Cluster: `slurm/November/attr_*.py`, `attr_submit.sh synth|cosmx|vannan` (`ATTR_RUNS`, tiles, `TIME_BUDGET_H`).
 
+### The combined mask loss and the field-correlation term (`.claude/comparison.md`, "Expansions", 2026-11-24)
+
+`optim.dual_mask` (weight 0 = off; `strategy` node / channel, `rate`, `channel_fraction`): every training step runs a second pass with the
+other kind of mask than the dataset's (cells hidden whole under gene masking, one shared channel set per graph under cell masking), its loss
+times `weight` added to `train_loss` only. Invariants: the second mask comes from the plan's private generator (the global one untouched); the
+module's `mask_strategy` is switched for that pass only and restored; the loss is the plan's own (`centred`, `masked_loss`); `val_loss` stays the
+primary mask's, so arms stay comparable; GlobalModel only (a dual decoder refuses). Tag `dm<n|c><weight>`.
+
+`optim.aux_loss_weights.field_corr` (`optim.field_corr.temperature`, `center_key`): `GlobalModule.sender_fields` (built with the term: the
+model keeps its maps) hands every step `StepOutput.fields` = `sum_j a_ij x_j` over the visible genes (last layer's head-mean map, the bilinear
+part's `_attend_values`); the term correlates, per graph (or graph x `center_key` label), each sender field (genes hidden in no row) with each
+hidden gene (hidden in every row: channel masking), and returns minus the mean over targets of `sum_s softmax(r^2 / T) r^2`. Only the attention
+carries gradient. Dense attention and channel masking only (validated). Tag `fc<weight>`. Readout: `evaluation/field_correlation.py`
+(`field_pairs` in gene folds, with a Gaussian-kernel bar; `pair_table`).
+
+Readouts added the same day: `attribution.attribute(space="expression", gene_senders=)` (the path in the visible input entries: any model
+kind, the prototype included; per-gene totals and per-(near sender, gene) parts; `reference_expression` reads visible entries only; a
+`type|niche` label gives the type mean within the niche), `attribution.subtract_fields` (twin-subtracted maps, each map scaled first),
+`evaluation/attention_rows.py` (each receiver's head-mean attention over the cells for read-out, dense and prototype models; `row_summary`,
+`row_agreement`), `gene_ranking.interaction_scales` (the scale ladder: where a responder's drop within niches reaches half its plain drop).
+Cluster jobs: `slurm/November/extra_*.py`, `extra_submit.sh expand_synth|expand_cosmx|maskstab|heads|fieldcorr`.
+
 ### Preprocessing / robustness utilities (`interscale.pp`)
 
 `pp.segmentation_noise.apply_segmentation_noise` simulates cell-segmentation errors (used when `cfg.dataset.segmentation_robustness` is set in `main.py`/`main_sweep.py`) for robustness sweeps.
