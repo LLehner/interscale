@@ -359,6 +359,8 @@ def attribute(
     spatial_unit_um: float = 1.0,
     removal: str = "reference",
     seed: int = 0,
+    space: str = "token",
+    gene_senders=None,
 ) -> Attribution:
     """Attribute each receiver's target (``weights`` ``[Q, G]`` over the predicted genes) to every cell of the single graph ``batch``.
 
@@ -366,6 +368,12 @@ def attribute(
     references. ``senders`` (occlusion): the cells to remove one at a time (default: every movable cell). ``eval_step`` (decomposition,
     attention): the clean pass (True) or the masked one. The module is put in eval mode and its parameters frozen for the call; the
     global generators are left as found.
+
+    ``space``: ``"token"`` (the path in the tokens the transformer reads; every method) or ``"expression"`` (the path in the input
+    expression's visible entries; ``grad_input`` and ``ig``; any model kind, the prototype's GCN included). The expression path also returns
+    ``extra["gene_total"]`` ``[Q, G]`` (each sender gene's contribution summed over the sender cells) and, with ``gene_senders`` ``[Q, K]``
+    (candidate senders per receiver, -1 padded), ``extra["gene_near"]`` ``[Q, K, G]`` (per candidate and gene). A contribution sums over the
+    genes to the cell's, and over the cells to ``change`` up to the gap.
     """
     if method not in METHODS:
         raise ValueError(f"method must be one of {METHODS}, got {method!r}.")
@@ -377,6 +385,11 @@ def attribute(
     if getattr(batch, "batch", None) is None:
         batch.batch = torch.zeros(batch.num_nodes, dtype=torch.long, device=batch.x.device)
     started = time.time()
+    if space not in ("token", "expression"):
+        raise ValueError(f"space must be 'token' or 'expression', got {space!r}.")
+    if space == "expression":
+        return _expression_attribute(module, batch, receivers, weights, method, labels, reference, head, steps, retry_steps, gap_limit, draws,
+                                     gene_senders, seed, started)  # fmt: skip
     if method in ("decomposition", "attention"):
         return _decomposition(module, batch, receivers, weights, method, eval_step, spatial_unit_um, started)
     if reference != "graph_mean" and labels is None:
@@ -554,6 +567,176 @@ def _decomposition(module, batch, receivers, weights, method, eval_step, unit, s
     with np.errstate(invalid="ignore", divide="ignore"):
         gap = np.abs(np.nansum(contribution, axis=1) - change) / np.maximum(np.abs(change), 1e-12)
     return Attribution(method, None, receivers, contribution.astype(np.float32), change, gap, time.time() - started)
+
+
+# ----------------------------------------------------------------------------------------------- expression space (any model kind, per gene)
+
+#: Methods available on the expression path (``attribute(..., space="expression")``).
+EXPRESSION_METHODS = ("grad_input", "ig")
+
+
+def _visible(module, batch) -> np.ndarray:
+    """``[N, G]`` bool: the entries the model reads (the complement of the batch's hidden entries, by the module's strategy)."""
+    return ~_hidden_entries(batch, str(getattr(module, "mask_strategy", "node")))
+
+
+def reference_expression(x: torch.Tensor, visible: np.ndarray, labels, reference: str, *, rng: np.random.Generator | None = None, usable=None) -> torch.Tensor:
+    """``[N, G]`` reference expression per cell, read from visible entries only.
+
+    ``graph_mean`` / ``type_mean``: each gene's mean over the visible entries of the graph / of the cell's label (``usable`` rows only; a label
+    holding a ``|`` such as ``type|niche`` gives the type mean within the niche, fix 1 for attributions). ``sampled``: a random other cell of the
+    same label, its visible values (where the donor's entry is hidden, the cell keeps its own value). A gene with no visible entry in the pool
+    keeps each cell's own value (no change, so no contribution)."""
+    if reference not in REFERENCES:
+        raise ValueError(f"reference must be one of {REFERENCES}, got {reference!r}.")
+    n = x.shape[0]
+    vis = torch.as_tensor(np.asarray(visible, dtype=bool), device=x.device)
+    usable = np.ones(n, dtype=bool) if usable is None else np.asarray(usable, dtype=bool)
+    labels = np.zeros(n, dtype=object).astype(str) if reference == "graph_mean" or labels is None else np.asarray(labels).astype(str)
+    rng = rng if rng is not None else np.random.default_rng(0)
+    out = x.clone()
+    for t in np.unique(labels):
+        members = np.flatnonzero(labels == t)
+        pool = members[usable[members]]
+        if not len(pool):
+            continue
+        m_idx = torch.as_tensor(members, device=x.device)
+        p_idx = torch.as_tensor(pool, device=x.device)
+        if reference in ("graph_mean", "type_mean"):
+            counts = vis[p_idx].sum(dim=0)
+            means = torch.where(vis[p_idx], x[p_idx], torch.zeros_like(x[p_idx])).sum(dim=0) / counts.clamp_min(1)
+            out[m_idx] = torch.where((counts > 0)[None, :], means[None, :].expand(len(members), -1), x[m_idx])
+            continue
+        picks = rng.choice(pool, size=len(members))
+        if len(pool) > 1:
+            same = picks == members
+            while same.any():
+                picks[same] = rng.choice(pool, size=int(same.sum()))
+                same = picks == members
+        d_idx = torch.as_tensor(picks, device=x.device)
+        out[m_idx] = torch.where(vis[d_idx], x[d_idx], x[m_idx])
+    return out
+
+
+class _ExpressionReader(_Reader):
+    """The receivers' targets for given expression ``x`` of the graph (the step masks it as it masks the batch): any model kind, the prototype
+    (GCN + transformer) included, since nothing below the input is replaced."""
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        self.replay()
+        batch = self.batch.clone()
+        batch.x = x.to(self.batch.x.dtype)
+        out = self.module._common_step(batch, "regression", "node")
+        heads, _, _ = self._heads(self.module, out)
+        if self.head not in heads:
+            raise ValueError(f"no head {self.head!r}; the module has {sorted(heads)}.")
+        pred = heads[self.head]
+        idx = out.view.padded_node_idx
+        if idx is None:
+            idx = torch.arange(self.batch.num_nodes, device=pred.device)
+        position = torch.full((self.batch.num_nodes,), -1, dtype=torch.long, device=pred.device)
+        position[idx] = torch.arange(len(idx), device=pred.device)
+        rows = position[self.receivers.to(pred.device)]
+        value = (pred[rows.clamp_min(0)].double() * self.weights.to(pred.device)).sum(1)
+        return torch.where(rows >= 0, value, torch.full_like(value, float("nan")))
+
+
+def _expression_rows(value, leaf, delta, rows, gene_senders, acc, weight: float) -> None:
+    """Adds ``weight`` x (gradient x delta) to ``acc``: per cell (``cells`` [Q, N]), per sender gene summed over cells (``genes`` [Q, G]) and
+    per (near sender, gene) (``near`` [Q, K, G]) for the receivers ``rows``."""
+    for k in rows:
+        if not torch.isfinite(value[k]) or not value.requires_grad:
+            continue
+        (grad,) = torch.autograd.grad(value[k], leaf, retain_graph=True, allow_unused=True)
+        if grad is None:
+            continue
+        part = (grad.double() * delta).cpu()  # [N, G]
+        acc["cells"][k] += weight * part.sum(1)
+        acc["genes"][k] += weight * part.sum(0)
+        if gene_senders is not None:
+            cand = gene_senders[k]
+            ok = cand >= 0
+            if ok.any():
+                acc["near"][k, torch.as_tensor(np.flatnonzero(ok))] += weight * part[torch.as_tensor(cand[ok])]
+
+
+def _expression_attribute(module, batch, receivers, weights, method, labels, reference, head, steps, retry_steps, gap_limit, draws,
+                          gene_senders, seed, started) -> Attribution:  # fmt: skip
+    """``attribute(..., space="expression")``: the path runs in the input expression (visible entries of movable cells), so a contribution
+    is defined for every model kind and splits over the sender's genes. For a linear expression embedding it equals the token path."""
+    if method not in EXPRESSION_METHODS:
+        raise ValueError(f"the expression path takes {EXPRESSION_METHODS}, got {method!r}.")
+    if reference != "graph_mean" and labels is None:
+        raise ValueError(f"reference {reference!r} needs labels.")
+    rng = np.random.default_rng(seed)
+    q, n, g = len(receivers), int(batch.num_nodes), int(batch.x.shape[1])
+    near = None if gene_senders is None else np.asarray(gene_senders, dtype=np.int64)
+    if near is not None and near.shape[0] != q:
+        raise ValueError("gene_senders needs one row of candidate senders per receiver.")
+    was_training = module.training
+    module.eval()
+    saved = [(p, p.requires_grad) for p in module.parameters()]
+    for p, _ in saved:
+        p.requires_grad_(False)
+    replay_outer = _replayable_rng(batch.x.device)
+    try:
+        x = batch.x.detach().double()
+        visible = _visible(module, batch)
+        fixed = _fixed_rows(batch, receivers)
+        movable = torch.as_tensor(visible & ~fixed[:, None], device=x.device)
+        reader = _ExpressionReader(module, batch, receivers, weights, head)
+        n_ref = int(draws) if reference == "sampled" else 1
+        reads = []
+        for _ in range(n_ref):
+            ref = reference_expression(x, visible, labels, reference, rng=rng, usable=visible.any(axis=1))  # as the token path's pool
+            ref = torch.where(movable, ref, x)
+            delta = (x - ref).double().cpu()
+            with torch.no_grad():
+                change = (reader(x.clone()) - reader(ref.clone())).cpu().numpy()
+
+            def integrate(n_steps, rows):
+                acc = {"cells": torch.zeros(q, n, dtype=torch.float64), "genes": torch.zeros(q, g, dtype=torch.float64),
+                       "near": torch.zeros(q, 0 if near is None else near.shape[1], g, dtype=torch.float64)}  # fmt: skip
+                points, w = ([1.0], [1.0]) if method == "grad_input" else _integration_points(n_steps)
+                for alpha, weight in zip(points, w, strict=True):
+                    leaf = (ref + float(alpha) * (x - ref)).clone().requires_grad_(True)
+                    with torch.enable_grad():
+                        _expression_rows(reader(leaf), leaf, delta.to(leaf.device), rows, near, acc, float(weight))
+                return acc
+
+            everyone = list(range(q))
+            acc = integrate(steps, everyone)
+            used = np.full(q, 1 if method == "grad_input" else int(steps))
+            if method == "ig":
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    gap = np.abs(acc["cells"].sum(1).numpy() - change) / np.maximum(np.abs(change), 1e-12)
+                redo = [k for k in everyone if not gap[k] <= gap_limit]
+                if redo and retry_steps > steps:
+                    again = integrate(retry_steps, redo)
+                    for key in acc:
+                        acc[key][redo] = again[key][redo]
+                    used[redo] = int(retry_steps)
+            reads.append((acc, change, used))
+        cells = np.mean([r[0]["cells"].numpy() for r in reads], axis=0)
+        genes = np.mean([r[0]["genes"].numpy() for r in reads], axis=0)
+        near_genes = np.mean([r[0]["near"].numpy() for r in reads], axis=0)
+        change = np.mean([r[1] for r in reads], axis=0)
+        used = reads[0][2]
+        spread = np.std([r[0]["cells"].numpy() for r in reads], axis=0) if n_ref > 1 else None
+    finally:
+        for p, flag in saved:
+            p.requires_grad_(flag)
+        module.train(was_training)
+        replay_outer()
+    cells[np.arange(q), receivers] = 0.0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        gap = np.abs(np.nansum(cells, axis=1) - change) / np.maximum(np.abs(change), 1e-12)
+    extra = {"gene_total": genes.astype(np.float32)}
+    if near is not None:
+        extra |= {"gene_near": near_genes.astype(np.float32), "gene_senders": near}
+    if spread is not None:
+        extra["spread"] = spread
+    return Attribution(method, reference, np.asarray(receivers), cells.astype(np.float32), change, gap, time.time() - started, used, extra)
 
 
 # ----------------------------------------------------------------------------------------------- choosing receivers
@@ -832,3 +1015,28 @@ def map_fields(pos_um, out, into, visible, *, grid_um: float = 10.0) -> dict:
     np.add.at(cells, (ij[:, 0], ij[:, 1]), 1)
     return {"pos_um": pos, "flow_out": np.asarray(out, dtype=np.float64), "flow_in": np.asarray(into, dtype=np.float64),
             "visible": np.asarray(visible, dtype=np.int8), "flow_grid_um": float(grid_um), "flow_origin": origin, "flow_cells": cells}  # fmt: skip
+
+
+def subtract_fields(trained: dict, twin: dict, *, normalise: bool = True, quantile: float = 0.99) -> dict:
+    """The twin-subtracted map (1.6, ``.claude/comparison.md``): fields as :func:`map_fields` (or ``flow_maps``' npz) writes them, for the
+    same cells, the trained model's ``out - in`` minus the untrained twin's. What both share -- the mask layout, density, the tissue edge -- cancels;
+    what training added stays.
+
+    ``normalise``: each map's ``out - in`` divided first by its ``quantile`` of ``|out - in|`` over the cells (a trained model's attributions
+    are orders of magnitude larger than its twin's, so a raw difference would be the trained map again); the scales are returned as
+    ``scale_trained`` / ``scale_twin``. The result keeps the trained map's grid and positions, the difference as ``flow_out`` with
+    ``flow_in`` 0, so ``plot_source_sink`` draws it as it is."""
+    pos_a, pos_b = np.asarray(trained["pos_um"], dtype=np.float64), np.asarray(twin["pos_um"], dtype=np.float64)
+    if pos_a.shape != pos_b.shape or not np.allclose(pos_a, pos_b):
+        raise ValueError("subtract_fields needs the same cells in the same order in both maps.")
+    net_a = np.asarray(trained["flow_out"], dtype=np.float64) - np.asarray(trained["flow_in"], dtype=np.float64)
+    net_b = np.asarray(twin["flow_out"], dtype=np.float64) - np.asarray(twin["flow_in"], dtype=np.float64)
+    scale_a = scale_b = 1.0
+    if normalise:
+        scale_a = float(np.quantile(np.abs(net_a), quantile)) or 1.0
+        scale_b = float(np.quantile(np.abs(net_b), quantile)) or 1.0
+    out = {key: value for key, value in trained.items()}
+    out["flow_out"] = net_a / scale_a - net_b / scale_b
+    out["flow_in"] = np.zeros_like(out["flow_out"])
+    out["scale_trained"], out["scale_twin"] = scale_a, scale_b
+    return out

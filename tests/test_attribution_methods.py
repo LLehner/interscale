@@ -292,3 +292,165 @@ def test_gradients_through_attention_computed_in_checkpointed_blocks(ir, monkeyp
     finally:
         for m, c in zip(layers, saved, strict=True):
             m.chunk_pairs = c
+
+
+def test_the_expression_path_equals_the_token_path_for_a_linear_embedding_and_splits_over_genes(stream):
+    """With a linear expression embedding the token is W x + b, so the straight path from the type-mean expression to x is the token path from
+    the type-mean token: integrated gradients agree cell by cell. The per-gene parts add up to each cell's contribution (near senders) and to
+    the total over cells (gene totals)."""
+    module, graph, labels = stream
+    receivers = np.array([3, 12, 30])
+    w = gene_targets([0, 2], 3, G)
+    tok = attribute(module, graph, receivers, w, "ig", labels=labels, reference="type_mean", steps=6, retry_steps=6)
+    cand = near_candidates(graph.pos.numpy(), receivers, np.ones(graph.num_nodes, bool), k=5)
+    ex = attribute(module, graph, receivers, w, "ig", labels=labels, reference="type_mean", steps=6, retry_steps=6, space="expression",
+                   gene_senders=cand)  # fmt: skip
+    np.testing.assert_allclose(ex.contribution, tok.contribution, rtol=1e-3, atol=1e-5)
+    np.testing.assert_allclose(ex.change, tok.change, rtol=1e-4, atol=1e-6)  # float32 forward passes
+    np.testing.assert_allclose(ex.extra["gene_total"].sum(1), np.nansum(ex.contribution, axis=1)
+                               + ex.contribution[np.arange(3), receivers], rtol=1e-4, atol=1e-6)  # fmt: skip
+    for k in range(3):
+        for j, c in enumerate(cand[k]):
+            if c >= 0 and c != receivers[k]:
+                assert ex.extra["gene_near"][k, j].sum() == pytest.approx(float(ex.contribution[k, c]), rel=1e-4, abs=1e-6)
+    with pytest.raises(ValueError, match="expression path"):
+        attribute(module, graph, receivers, w, "deeplift", labels=labels, space="expression")
+
+
+def test_reference_expression_reads_visible_entries_only():
+    from interscale.evaluation.attribution import reference_expression
+
+    x = torch.tensor([[1.0, 10.0], [3.0, -1.0], [5.0, 30.0], [7.0, 40.0]], dtype=torch.float64)
+    visible = np.array([[True, True], [True, False], [True, True], [True, True]])
+    labels = np.array(["a|n1", "a|n1", "a|n1", "b|n1"])
+    ref = reference_expression(x, visible, labels, "type_mean")
+    np.testing.assert_allclose(ref[:3].numpy(), [[3.0, 20.0]] * 3)  # the hidden -1 is not in the mean
+    np.testing.assert_allclose(ref[3].numpy(), [7.0, 40.0])
+    sampled = reference_expression(x, visible, labels, "sampled", rng=np.random.default_rng(0))
+    assert not torch.equal(sampled[0], x[0])
+    # a donor's hidden entry is never handed on: where it is hidden the cell keeps its own value
+    for i in range(3):
+        assert sampled[i, 1].item() != -1.0 or i == 1
+
+
+def _prototype(tmp_path):
+    """A toy prototype: CombinedModel (GCN -> dense transformer, dual decoder), gene masking, two genes hidden in every cell of the graph."""
+    import scanpy as sc
+
+    from interscale.config import load_config
+    from interscale.model.combined_model import CombinedModel
+    from interscale.tl import prepare_geome_dataset
+
+    rng = np.random.default_rng(1)
+    per = 60
+    adata = AnnData(X=np.abs(rng.normal(size=(per * 3, G))).astype(np.float32) + 0.05)
+    adata.var_names = [f"g{k}" for k in range(G)]
+    adata.obsm["spatial"] = rng.uniform(0, 300, size=(per * 3, 2)).astype(np.float32)
+    adata.obs["sample"] = pd.Categorical(np.repeat(["s1", "s2", "s3"], per))
+    adata.obs["split"] = pd.Categorical(np.repeat(["train", "val", "test"], per))
+    adata.layers["log1p_norm"] = np.log1p(adata.X)
+    h5 = tmp_path / "proto.h5ad"
+    adata.write_h5ad(h5)
+    path = tmp_path / "proto.yaml"
+    path.write_text(
+        "model:\n  n_embed: 8\n  local_component:\n    name: GCN\n  global_component:\n    name: self-attn-transformer\n    parameters:\n"
+        "      max_seq_len: 256\n      num_layers: 2\n      n_heads: 2\n      long_range_attention: False\n"
+        f"  decoder:\n    type: linear\n    dual_decoder: True\n  save: {tmp_path}/out/\n"
+        "optim:\n  loss: SCELoss\n  sce_gamma: 1.0\n  lr: 0.01\n  seed: 42\n  accelerator: cpu\n  n_epochs: 1\n"
+        f"dataset:\n  h5ad_data: {h5}\n  name: proto\n  prediction_task: regression\n  prediction_level: node\n  layer_key: log1p_norm\n"
+        "  sample_key: ['sample']\n  mask_strategy: gene\n  mask_percentage: 0.3\n  spatial_key: spatial\n  batch_size: 1\n"
+        "  spatial_neigbors_kwargs:\n    radius: 60\n    library_key: sample\n"
+    )
+    cfg = load_config(str(path))
+    data = sc.read_h5ad(cfg.dataset.h5ad_data)
+    CombinedModel._setup_anndata(adata=data, prediction_task="regression", layer_key="log1p_norm", sample_key_list=["sample"], prediction_obs=None)
+    torch.manual_seed(0)
+    net = CombinedModel(data, cfg=cfg)
+    with torch.no_grad():
+        for p in net.module.parameters():
+            p.add_(0.2 * torch.randn_like(p))
+    _, _, test = prepare_geome_dataset(data, cfg)[0]
+    graph = test[0].clone()
+    gene_mask = torch.zeros(graph.num_nodes, G, dtype=torch.bool)
+    gene_mask[:, [1, 4]] = True
+    graph.gene_mask, graph.mask = gene_mask, gene_mask.any(dim=1)
+    graph.batch = torch.zeros(graph.num_nodes, dtype=torch.long)
+    return net.module.eval(), graph
+
+
+def test_the_expression_path_reads_the_prototype_and_never_moves_a_hidden_entry(tmp_path):
+    module, graph = _prototype(tmp_path)
+    receivers = np.array([2, 20, 41])
+    w = gene_targets([1, 4], 3, G)  # the hidden genes: the prototype's targets
+    labels = np.array(["a"] * graph.num_nodes)
+    coarse = attribute(module, graph, receivers, w, "ig", labels=labels, reference="type_mean", steps=2, retry_steps=2, space="expression")
+    fine = attribute(module, graph, receivers, w, "ig", labels=labels, reference="type_mean", steps=24, retry_steps=24, space="expression")
+    assert np.nanmedian(fine.gap) < 0.05 and np.nanmedian(fine.gap) <= np.nanmedian(coarse.gap) + 1e-9
+    assert np.all(fine.extra["gene_total"][:, [1, 4]] == 0.0)  # hidden in every cell: no sender reads them
+    assert np.all(fine.contribution[np.arange(3), receivers] == 0.0)
+    before = graph.x.clone()
+    attribute(module, graph, receivers, w, "grad_input", labels=labels, reference="graph_mean", space="expression")
+    assert torch.equal(graph.x, before)
+
+
+# ----------------------------------------------------------------------------------------------- evaluation.attention_rows
+
+
+def test_readout_rows_equal_the_attention_method(ir):
+    module, graph, labels = ir
+    receivers = np.array([3, 17, 40])
+    from interscale.evaluation.attention_rows import attention_rows
+
+    rows = attention_rows(module, graph, receivers, layer="mean", eval_step=True)
+    att = attribute(module, graph, receivers, gene_targets([0], 3, 6), "attention", eval_step=True)
+    np.testing.assert_allclose(rows, np.nan_to_num(att.contribution), rtol=1e-5, atol=1e-6)
+    last = attention_rows(module, graph, receivers, layer=-1)
+    assert np.all(last >= 0) and np.all(last.sum(1) <= 1 + 1e-5)
+
+
+def test_dense_context_query_rows_never_weigh_the_own_cell(stream):
+    module, graph, _ = stream
+    receivers = np.array([0, 9, 33])
+    from interscale.evaluation.attention_rows import attention_rows
+
+    rows = attention_rows(module, graph, receivers, layer=-1)
+    assert np.all(rows >= 0) and np.all(rows.sum(1) <= 1 + 1e-5) and np.all(rows.sum(1) > 0.5)
+    assert np.all(rows[np.arange(3), receivers] < 1e-7)
+
+
+def test_prototype_attention_rows(tmp_path):
+    module, graph = _prototype(tmp_path)
+    from interscale.evaluation.attention_rows import attention_rows
+
+    rows = attention_rows(module, graph, np.array([1, 5]), layer="mean", eval_step=True)
+    assert rows.shape == (2, graph.num_nodes) and np.all(rows >= 0) and np.all(rows.sum(1) <= 1 + 1e-5)
+
+
+def test_attention_row_summary_and_agreement_by_hand():
+    pos = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]])
+    uniform = np.array([[0.0, 0.25, 0.25, 0.25, 0.25]])
+    from interscale.evaluation.attention_rows import row_agreement, row_summary
+
+    s = row_summary(uniform, pos, [0]).iloc[0]
+    assert s.entropy == pytest.approx(1.0) and s.eff_keys == pytest.approx(4.0) and s.mean_dist_um == pytest.approx(2.5)
+    peaked = np.array([[0.0, 0.9, 0.05, 0.05, 0.0]])
+    assert row_summary(peaked, pos, [0]).iloc[0].max_share == pytest.approx(0.9)
+    same = row_agreement(peaked, peaked, [0], top=3).iloc[0]
+    assert same.spearman == pytest.approx(1.0) and same.js == pytest.approx(0.0, abs=1e-12) and same.top_overlap == pytest.approx(1.0)
+    assert row_agreement(peaked, uniform, [0], top=3).iloc[0].js > 0.05
+
+
+def test_subtract_fields_cancels_what_the_twin_shares():
+    from interscale.evaluation.attribution import map_fields, subtract_fields
+
+    rng = np.random.default_rng(0)
+    pos = rng.uniform(0, 300, size=(200, 2))
+    layout = np.where(np.arange(200) < 20, -1.0, 0.05)  # the discs: sinks in both maps
+    signal = np.where(np.arange(200) % 7 == 0, 1.0, 0.0)  # what training added
+    trained = map_fields(pos, 100.0 * (layout + signal), np.zeros(200), np.ones(200, np.int8))
+    twin = map_fields(pos, 0.01 * layout, np.zeros(200), np.ones(200, np.int8))
+    diff = subtract_fields(trained, twin)
+    net = diff["flow_out"] - diff["flow_in"]
+    assert np.corrcoef(net, signal)[0, 1] > 0.9 and abs(np.corrcoef(net, layout)[0, 1]) < np.corrcoef(trained["flow_out"], layout)[0, 1]
+    with pytest.raises(ValueError, match="same cells"):
+        subtract_fields(trained, map_fields(pos[::-1], layout, np.zeros(200), np.ones(200, np.int8)))
