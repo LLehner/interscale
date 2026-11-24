@@ -460,3 +460,22 @@ def test_a_type_missing_from_one_graph_keeps_its_targets():
     ss = ((x1 - x1.mean(0)) ** 2).sum(0) + ((x2 - x2.mean(0)) ** 2).sum(0)
     np.testing.assert_allclose(acc.variance()[0], ss / 7)
     assert np.isnan(acc.variance()[1]).all() and not acc.readable()[1].any()
+
+
+def test_interaction_scales_by_hand():
+    from interscale.evaluation.gene_ranking import interaction_scales
+
+    plain = np.array([[0.4, 0.4, 0.4, 0.001]])
+    by = {100: np.array([[0.1, 0.3, 0.0, 0.0]]), 1000: np.array([[0.3, 0.4, 0.1, 0.0]])}
+    t = interaction_scales(plain, by, ["A"], ["g0", "g1", "g2", "g3"]).set_index("gene")
+    assert "g3" not in t.index  # nothing to lose
+    # g0: ratio 0.25 at 100, 0.75 at 1000 -> the crossing at 0.5 halfway on log scale: sqrt(100 * 1000)
+    assert t.loc["g0", "scale_um"] == pytest.approx(np.sqrt(1e5)) and t.loc["g0", "where"] == "within"
+    assert t.loc["g1", "where"] == "below" and t.loc["g2", "where"] == "above"
+
+
+def test_interaction_scales_keeps_its_columns_when_nothing_is_read():
+    from interscale.evaluation.gene_ranking import interaction_scales
+
+    t = interaction_scales(np.zeros((1, 2)), {100: np.zeros((1, 2)), 300: np.zeros((1, 2))}, ["A"], ["g0", "g1"])
+    assert not len(t) and {"scale_um", "where", "ratio_100", "ratio_300"} <= set(t.columns)

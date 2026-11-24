@@ -810,3 +810,45 @@ def neighbour_ridge(
         sd_y = y_all.std(axis=0)
         pairs[r] = np.abs(lso[:n_g]) / np.where(sd_y > 1e-12, sd_y, np.inf)[None, :]
     return RidgeRanking(types, genes, responder, pairs, chosen)
+
+
+# ----------------------------------------------------------------------------------------------- the scale ladder (1.2, comparison.md)
+
+
+def interaction_scales(plain: np.ndarray, by_scale: dict, receivers, genes, *, frac: float = 0.5, min_drop: float = 0.01) -> pd.DataFrame:
+    """Each target's interaction scale from a ladder of stratified reads (``context_flows(strata=)`` at niches of growing size).
+
+    ``plain`` ``[R, G]``: the responder drop without strata; ``by_scale`` ``{scale_um: [R, G]}``: the drop when the swaps stay within niches of
+    that scale. A swap within a small niche keeps what varies on scales larger than the niche, so a response to a sender field of length ``L``
+    survives (no drop) in niches finer than ``L`` and is destroyed in coarser ones: the ratio ``drop(s) / plain`` rises with ``s``. The interaction
+    scale is where the ratio crosses ``frac``, interpolated on log scale between the two scales around the crossing. ``where``: ``within`` (a
+    crossing), ``below`` (already ``>= frac`` at the finest scale: shorter than the ladder), ``above`` (never reached: longer than it). Targets
+    whose plain drop is below ``min_drop`` (nothing to lose) are left out."""
+    scales = sorted(float(s) for s in by_scale)
+    if len(scales) < 2:
+        raise ValueError("a ladder needs at least two scales.")
+    stack = np.stack([np.asarray(by_scale[s] if s in by_scale else by_scale[int(s)], dtype=np.float64) for s in scales])  # [S, R, G]
+    plain = np.asarray(plain, dtype=np.float64)
+    rows = []
+    log_s = np.log(np.asarray(scales))
+    for r, receiver in enumerate(receivers):
+        for g, gene in enumerate(genes):
+            base = plain[r, g]
+            if not np.isfinite(base) or base < float(min_drop):
+                continue
+            ratio = stack[:, r, g] / base
+            if not np.isfinite(ratio).all():
+                continue
+            above = np.flatnonzero(ratio >= frac)
+            if not len(above):
+                scale, where = scales[-1], "above"
+            elif above[0] == 0:
+                scale, where = scales[0], "below"
+            else:
+                k = above[0]
+                t = (frac - ratio[k - 1]) / max(ratio[k] - ratio[k - 1], 1e-12)
+                scale, where = float(np.exp(log_s[k - 1] + t * (log_s[k] - log_s[k - 1]))), "within"
+            rows.append({"receiver": receiver, "gene": gene, "plain": base, "scale_um": scale, "where": where}
+                        | {f"ratio_{s:g}": float(v) for s, v in zip(scales, ratio, strict=True)})  # fmt: skip
+    columns = ["receiver", "gene", "plain", "scale_um", "where"] + [f"ratio_{s:g}" for s in scales]
+    return pd.DataFrame(rows, columns=columns)
