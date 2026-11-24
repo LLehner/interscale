@@ -430,9 +430,10 @@ def _one_reference(reader, tokens, ref, method, steps, retry_steps, gap_limit, s
     if method in ("grad_input", "conservative"):
         leaf = tokens.clone().requires_grad_(True)
         rules = _conservative_rules() if method == "conservative" else _no_rules()
-        with torch.enable_grad():
-            with rules:
-                value = reader(leaf)
+        # The backward runs inside the rules too: attention computed a block of queries at a time recomputes its blocks in the backward
+        # (activation checkpointing, whenever a pass has more than one block: whole CosMx sections) and must see the forward's functions.
+        with torch.enable_grad(), rules:
+            value = reader(leaf)
             contribution = _grad_rows(value, leaf, delta).numpy()
         return contribution, change, None
     if method == "deeplift":
@@ -440,9 +441,10 @@ def _one_reference(reader, tokens, ref, method, steps, retry_steps, gap_limit, s
         with torch.no_grad(), _secant_activations(reader.module, "record", store):
             reader(ref.clone())
         leaf = tokens.clone().requires_grad_(True)
+        # The backward inside the secant context, for the same reason as above. A checkpointed block holding an activation would call the
+        # wrapper again in its recompute and run past the recorded inputs (an IndexError, never a silent mix); the attention blocks hold none.
         with torch.enable_grad(), _secant_activations(reader.module, "secant", store):
             value = reader(leaf)
-        with torch.enable_grad():
             contribution = _grad_rows(value, leaf, delta).numpy()
         return contribution, change, None
     if method == "ig":

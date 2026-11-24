@@ -257,3 +257,38 @@ def test_removal_by_the_models_own_mask(stream):
     assert sens["occlusion"][1][0] == pytest.approx(1.0, abs=1e-5)
     with pytest.raises(ValueError, match="node-masked"):
         _check_removal(SimpleNamespace(mask_strategy="gene"), "mask")
+
+
+def test_gradients_through_attention_computed_in_checkpointed_blocks(ir, monkeypatch):
+    """On a whole section the read-out attention runs a block of queries at a time and recomputes each block in the backward pass; every
+    gradient method must give what it gives in one block. Before the fix, ``conservative`` took its backward outside its patches and the
+    recompute ran the real SDPA kernel against the explicit form saved in the forward (CheckpointError on CosMx); toy graphs fit one block."""
+    import interscale.module.global_modules.attention as attention_mod
+
+    module, graph, labels = ir
+    layers = [m for m in module.modules() if hasattr(m, "chunk_pairs")]
+    assert layers
+    receivers = np.array([3, 17, 40])
+    w = gene_targets([0, 2], 3, G)
+    methods = ("grad_input", "conservative", "deeplift", "ig")
+    whole = {m: attribute(module, graph, receivers, w, m, labels=labels, reference="type_mean", steps=4) for m in methods}
+    calls = {"n": 0}
+    real = attention_mod.checkpoint
+
+    def counted(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(attention_mod, "checkpoint", counted)
+    saved = [m.chunk_pairs for m in layers]
+    try:
+        for m in layers:
+            m.chunk_pairs = 64  # a few queries per block: many blocks, each recomputed in the backward
+        for method in methods:
+            before = calls["n"]
+            blocked = attribute(module, graph, receivers, w, method, labels=labels, reference="type_mean", steps=4)
+            assert calls["n"] > before, f"{method}: no block was checkpointed, the test checks nothing"
+            np.testing.assert_allclose(blocked.contribution, whole[method].contribution, rtol=1e-4, atol=1e-6)
+    finally:
+        for m, c in zip(layers, saved, strict=True):
+            m.chunk_pairs = c
