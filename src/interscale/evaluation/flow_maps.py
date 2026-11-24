@@ -345,7 +345,9 @@ class _Tiles:
     and a 100 µm bar. ``axes[k]`` draws block ``k``; ``members[k]`` its cells.
     """
 
-    def __init__(self, data, *, link_um, min_cells, width_in, tile_in, dpi):
+    def __init__(self, data, *, link_um, min_cells, width_in, tile_in, dpi, caption_chars: int = 0):
+        import math
+
         import matplotlib
 
         matplotlib.use("Agg")
@@ -364,9 +366,12 @@ class _Tiles:
         boxes, self.scale, height = tile_layout(
             np.array([h - lo for lo, h in self.boxes_um]), width_in=width_in, tile_in=tile_in
         )
-        self.header = 0.95
-        self.total = height + self.header + 0.06
         self.width = max(float((boxes[:, 0] + boxes[:, 2]).max()), 9.0)
+        # The caption is wrapped to the width left of the colour bar (an 8 pt character ~0.065 in, a line ~0.135 in); the header grows with it.
+        self.chars = max(40, int((self.width - 3.4) / 0.065))
+        lines = 2 + math.ceil(int(caption_chars) / self.chars) if caption_chars else 0
+        self.header = max(0.95, 0.38 + 0.135 * lines + 0.08)
+        self.total = height + self.header + 0.06
         self.fig = plt.figure(figsize=(self.width, self.total), dpi=dpi, facecolor="white")
         self.dpi = dpi
         self.axes = []
@@ -409,6 +414,9 @@ class _Tiles:
 
         fig, total, width = self.fig, self.total, self.width
         fig.text(0.004, 1 - 0.12 / total, title, fontsize=11, weight="bold", va="top", ha="left")
+        import textwrap
+
+        caption = "\n".join(textwrap.fill(part, self.chars) for part in caption.split("\n"))  # never under the colour bar
         fig.text(0.004, 1 - 0.38 / total, caption, fontsize=8, va="top", ha="left", color="#444444")
         right = (width - 3.1) / width
         cax = fig.add_axes([right, 1 - 0.30 / total, 2.9 / width, 0.08 / total])
@@ -562,15 +570,20 @@ def plot_source_sink(
     width_in: float = 16.0,
     tile_in: float = 3.8,
     dpi: int = 120,
+    what: str = "the net attention flow (last layer, head mean): each cell's out - in (how much it is read minus how much it reads)",
+    scale_label: str = "out - in per cell (a.u.): reads more  <-  0  ->  is read more",
 ) -> dict:
     """The net in- and outflow of one slide: every cell coloured by its smoothed ``out - in`` (:func:`smoothed_net`), on one scale
     symmetric about 0 for the slide, hidden cells marked by a dot. Nothing is selected or ringed: no share of cells is called a
     source or a sink by construction; whatever structure there is shows as it is (and noise shows as noise).
+
+    ``what`` names the quantity in the caption and ``scale_label`` labels the colour bar: the defaults describe the attention flow; a caller
+    that draws another out / in pair (attribution to disc targets) must say so.
     """
     from matplotlib.colors import Normalize
 
     data = np.load(source) if isinstance(source, str | Path) else source
-    t = _Tiles(data, link_um=link_um, min_cells=min_cells, width_in=width_in, tile_in=tile_in, dpi=dpi)
+    t = _Tiles(data, link_um=link_um, min_cells=min_cells, width_in=width_in, tile_in=tile_in, dpi=dpi, caption_chars=len(what) + 260)
     _, value, _ = smoothed_net(data, bandwidth_um)
     drawn = np.any(t.members, axis=0)
     limit = float(np.quantile(np.abs(value[drawn]), 0.99)) if drawn.any() else 0.0
@@ -596,7 +609,7 @@ def plot_source_sink(
         )
         t.label(k)
     caption = (
-        "Net in- and outflow of the net attention flow (last layer, head mean): each cell's out - in (how much it is read minus how much it reads), "
+        f"Net in- and outflow of {what}, "
         f"smoothed over {bandwidth_um:g} µm, on a scale symmetric about 0.\nNo cell is selected. Black dots: cells hidden in this pass. "
         f"Read it against the untrained twin's, drawn the same way. {t.drawn:,} cells in {len(t.axes)} blocks."
     )
@@ -605,7 +618,7 @@ def plot_source_sink(
         title,
         caption,
         t.plt.cm.ScalarMappable(norm=norm, cmap=cmap),
-        "out - in per cell (a.u.): reads more  <-  0  ->  is read more",
+        scale_label,
     )
 
 
