@@ -137,6 +137,22 @@ def get_optim_cfg(cfg):
     # [1 / sqrt(G), 1], scale-free because the tokens are layer-normalised; it makes the model choose among genes that stand in for each other.
     # GlobalModel with type_gex_embedding Linear only.
     cfg.optim.aux_loss_weights.sender_sparsity = 0.0
+    # The field-correlation term (2.3, `.claude/comparison.md`): rewards attention whose sender fields (each visible gene's attention-weighted
+    # mean over the cells a receiver reads) correlate with the genes hidden in the receivers; dense attention, channel-style gene masking.
+    cfg.optim.aux_loss_weights.field_corr = 0.0
+    cfg.optim.field_corr = CN()
+    # The soft maximum over senders: per hidden gene, sum_s softmax(r_s^2 / temperature) r_s^2 (small: the best sender alone).
+    cfg.optim.field_corr.temperature = 0.05
+    # An obs column (in dataset.extra_obs_keys) to centre fields and targets within, per graph (e.g. a region: correlation beyond it); "" = per graph.
+    cfg.optim.field_corr.center_key = ""
+    # A second pass with the other kind of mask in every training step (2.1, `.claude/comparison.md`): its loss times `weight` is added to
+    # the objective (0: off). `strategy` node: `rate` of the cells hidden whole; channel: `channel_fraction` of the genes hidden in every cell.
+    # It takes the kind the dataset's own mask does not (cells under gene masking, channels under cell masking). GlobalModel only.
+    cfg.optim.dual_mask = CN()
+    cfg.optim.dual_mask.weight = 0.0
+    cfg.optim.dual_mask.strategy = "node"
+    cfg.optim.dual_mask.rate = 0.2
+    cfg.optim.dual_mask.channel_fraction = 0.2
     cfg.optim.attn_entropy = CN()
     cfg.optim.attn_entropy.ramp_epochs = 0
 

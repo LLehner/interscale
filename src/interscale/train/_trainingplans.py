@@ -341,10 +341,17 @@ class TrainingPlan(pl.LightningModule):
         target_center: torch.Tensor | None = None,
         loss_weights: dict | None = None,
         frozen: tuple[str, ...] = (),
+        dual_mask: dict | None = None,
         **kwargs,
     ):
         super().__init__()
         self.module = module
+        # `optim.dual_mask` (2.1, `.claude/comparison.md`): a second pass per training step with the other kind of mask (cells hidden
+        # whole vs channels), its loss added with `weight`. None: off, nothing drawn. Its masks come from a private generator.
+        self.dual_mask = None if not dual_mask or float(dual_mask.get("weight", 0.0)) == 0.0 else dict(dual_mask)
+        self._dual_generator = None
+        if self.dual_mask is not None:
+            self._dual_generator = torch.Generator().manual_seed(int(self.dual_mask.get("seed", 0)) + 7919)
         # Stage C of .claude/global_plan.md. `loss_weights`: w_local * L_local + w_global * L_global
         # for a dual decoder; None (or the default 0.5 / 0.5) keeps the stacked loss of every run before,
         # which is that mean, computed as it always was. `frozen`: components kept in eval mode at every
@@ -730,6 +737,11 @@ class TrainingPlan(pl.LightningModule):
 
         # Computed before the metrics so that `<mode>_loss` can be logged as the full objective.
         aux_total = self._aux_losses(out, batch, mode, sync_dist)
+        if self.dual_mask is not None and mode == "train":
+            term = self._dual_mask_loss(batch)
+            self._log_scalar(f"{mode}_dual_mask_loss", term, sync_dist)
+            weighted = float(self.dual_mask["weight"]) * term
+            aux_total = weighted if aux_total is None else aux_total + weighted
 
         # Modules that decode twice (DualDecoderCombinedModule) report each half separately --
         # but there are no halves to report when no reconstruction criterion is configured.
@@ -851,6 +863,45 @@ class TrainingPlan(pl.LightningModule):
         ]
         out.views = [out.view, *(o.view for o in extra)]
         return out
+
+    def _dual_masked(self, batch):
+        """``(copy of batch, strategy)``: the same cells under the other kind of mask, drawn from the private generator. ``strategy`` ``node``:
+        ``rate`` of the cells hidden whole (``mask``, no ``gene_mask``); ``channel``: per graph ``round(channel_fraction * G)`` genes hidden in
+        every cell (``gene_mask`` and ``mask``), as ``dataset.mask_channel_fraction`` draws them."""
+        from interscale.tl.masking import sample_channel_columns, sample_node_mask
+
+        dm = self.dual_mask
+        second = batch.clone()
+        n, g = int(batch.x.shape[0]), int(batch.x.shape[1])
+        device = batch.x.device
+        if dm["strategy"] == "node":
+            second.mask = sample_node_mask(n, float(dm["rate"]), self._dual_generator).to(device)
+            if hasattr(second, "gene_mask"):
+                del second.gene_mask
+            return second, "node"
+        graph = getattr(batch, "batch", None)
+        graph = torch.zeros(n, dtype=torch.long, device=device) if graph is None else graph
+        gene_mask = torch.zeros(n, g, dtype=torch.bool, device=device)
+        for b in torch.unique(graph).tolist():
+            columns = sample_channel_columns(g, float(dm["channel_fraction"]), self._dual_generator)
+            rows = graph == b
+            gene_mask[rows.nonzero(as_tuple=True)[0][:, None], torch.as_tensor(columns, device=device)[None, :]] = True
+        second.gene_mask, second.mask = gene_mask, gene_mask.any(dim=1)
+        return second, "gene"
+
+    def _dual_mask_loss(self, batch) -> torch.Tensor:
+        """The reconstruction loss of the second pass (``optim.dual_mask``), centred and restricted as the main one."""
+        from interscale.tl.masking import masked_loss
+
+        second, strategy = self._dual_masked(batch)
+        saved = self.module.mask_strategy
+        self.module.mask_strategy = strategy
+        try:
+            out = self.module._common_step(second, self.prediction_task, self.prediction_level)
+        finally:
+            self.module.mask_strategy = saved
+        y_pred, y_true = self.centred(out.y_pred, out.y_true, out.target_center)
+        return masked_loss(self.loss, self.loss_type, y_pred, y_true, out.entry_mask)
 
     def _aux_losses(self, out, batch, mode: str, sync_dist: bool):
         """Evaluate and log the auxiliary terms; return their weighted total, or None.

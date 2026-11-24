@@ -64,6 +64,11 @@ class NodeMaskingTrainingPlan:
         ``model.global_component.parameters.context_only`` changes the transformer. Any other model has no such
         part, and would train the plain objective.
         """
+        if dual_mask_settings(self._cfg) is not None and hasattr(self.module, "compute_separate_losses"):
+            raise ValueError(
+                "optim.dual_mask adds a second pass with the other kind of mask to a single-head model's loss; a dual-decoder "
+                "CombinedModel weighs two heads' losses (use a GlobalModel)."
+            )
         if regime_loss_on(self._cfg) and getattr(self.module, "regime", None) is None:
             raise ValueError(
                 "optim.regime_loss gives the local and the global head their own hidden cells, but this model has "
@@ -324,6 +329,7 @@ class NodeMaskingTrainingPlan:
             target_center=target_center,
             loss_weights=phase.loss_weights,
             frozen=phase.frozen,
+            dual_mask=dual_mask_settings(self._cfg),
         )
 
         monitor, mode = self._resolve_monitor()
@@ -674,3 +680,12 @@ def _parameter_vector(module) -> torch.Tensor:
 #             )
 #         else:
 #             pass
+
+
+def dual_mask_settings(cfg) -> dict | None:
+    """``optim.dual_mask`` as the training plan takes it, with the run's seed; None when its weight is 0 (off)."""
+    dm = cfg.optim.get("dual_mask", None)
+    if dm is None or float(dm.get("weight", 0.0)) == 0.0:
+        return None
+    return {"weight": float(dm.weight), "strategy": str(dm.strategy), "rate": float(dm.rate), "channel_fraction": float(dm.channel_fraction),
+            "seed": int(cfg.optim.get("seed", 0) or 0)}  # fmt: skip

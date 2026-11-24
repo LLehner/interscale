@@ -1252,6 +1252,67 @@ def _validate_bilinear(cfg):
         raise ValueError("model.decoder.bilinear adds a per-cell reconstruction term: it needs regression at prediction_level node.")
 
 
+def _validate_dual_mask(cfg):
+    """``optim.dual_mask`` (2.1): the other kind of mask than the dataset's, regression at node level, sensible rates."""
+    dm = cfg.optim.get("dual_mask", None)
+    if dm is None:
+        return
+    weight = float(dm.get("weight", 0.0))
+    if weight < 0:
+        raise ValueError(f"optim.dual_mask.weight must be >= 0 (0: off), got {weight}.")
+    if weight == 0:
+        return
+    strategy = str(dm.get("strategy", "node"))
+    if strategy not in ("node", "channel"):
+        raise ValueError(f"optim.dual_mask.strategy must be 'node' or 'channel', got {strategy!r}.")
+    if not 0 < float(dm.get("rate", 0.2)) <= 1:
+        raise ValueError(f"optim.dual_mask.rate must lie in (0, 1], got {dm.rate}.")
+    if not 0 < float(dm.get("channel_fraction", 0.2)) < 1:
+        raise ValueError(f"optim.dual_mask.channel_fraction must lie in (0, 1), got {dm.channel_fraction}.")
+    primary = str(cfg.dataset.mask_strategy)
+    if (strategy == "node") == (primary == "node"):
+        raise ValueError(
+            f"optim.dual_mask.strategy {strategy!r} is the kind of mask the dataset already draws (mask_strategy {primary!r}): the second pass "
+            "takes the other kind (node under gene masking, channel under cell masking)."
+        )
+    if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":
+        raise ValueError("optim.dual_mask adds a reconstruction pass: it needs regression at prediction_level node.")
+    params = cfg.model.global_component.get("parameters", None)
+    if strategy == "channel" and params is not None and params.get("type_gex_embedding", None) == "Precomputed":
+        raise ValueError("optim.dual_mask channel hides single genes; a Precomputed embedding encodes all of them.")
+
+
+def _validate_field_corr(cfg):
+    """``optim.aux_loss_weights.field_corr`` (2.3): a dense attention map (the fields are attention-weighted), channel-style gene masking (the
+    same genes hidden in every cell of a graph: targets and senders are disjoint gene sets), regression at node level."""
+    weight = float((cfg.optim.get("aux_loss_weights", {}) or {}).get("field_corr", 0.0))
+    if weight < 0:
+        raise ValueError(f"optim.aux_loss_weights.field_corr must be >= 0, got {weight}.")
+    if weight == 0:
+        return
+    settings = cfg.optim.get("field_corr", None)
+    if settings is not None and float(settings.get("temperature", 0.05)) <= 0:
+        raise ValueError(f"optim.field_corr.temperature must be > 0, got {settings.temperature}.")
+    params = cfg.model.global_component.get("parameters", None)
+    if params is None or cfg.model.global_component.name != "self-attn-transformer":
+        raise ValueError("optim.aux_loss_weights.field_corr reads the transformer's attention map: it needs the self-attn-transformer.")
+    attention = params.get("attention", None)
+    kind = attention.get("kind", "dense") if attention is not None else "dense"
+    if kind != "dense":
+        raise ValueError(f"optim.aux_loss_weights.field_corr needs the explicit attention map: attention.kind dense, not {kind!r}.")
+    for name in ("pooling", "hierarchy"):
+        block = params.get(name, None)
+        if block is not None and block.get("kind", "none") != "none":
+            raise ValueError(f"optim.aux_loss_weights.field_corr needs one cell-over-cells attention map; {name} has none.")
+    if "regression" not in cfg.dataset.prediction_task or cfg.dataset.prediction_level != "node":
+        raise ValueError("optim.aux_loss_weights.field_corr correlates fields with hidden genes: regression at prediction_level node.")
+    if str(cfg.dataset.mask_strategy) != "gene" or float(cfg.dataset.get("mask_channel_fraction", 0.0) or 0.0) <= 0:
+        raise ValueError(
+            "optim.aux_loss_weights.field_corr needs channel masking (mask_strategy gene, dataset.mask_channel_fraction > 0): the same genes "
+            "hidden in every cell of a graph, so the hidden genes (targets) and the visible ones (senders) are disjoint."
+        )
+
+
 def _validate(cfg):
     """Run every load-time check.
 
@@ -1280,6 +1341,8 @@ def _validate(cfg):
     _validate_section_offset(cfg)
     _validate_group_offset(cfg)
     _validate_bilinear(cfg)
+    _validate_dual_mask(cfg)
+    _validate_field_corr(cfg)
     _validate_sce(cfg)
     _validate_center_targets(cfg)
     _validate_global_residual(cfg)
