@@ -335,9 +335,15 @@ def _conservative_rules():
 
 
 def _on_module_device(module, batch):
-    """``batch`` on the module's device: a moved copy when they differ (PyG's ``.to`` moves in place; the caller keeps its CPU graph)."""
+    """``batch`` on the module's device: a moved copy when they differ (PyG's ``.to`` moves in place; the caller keeps its CPU graph).
+    A single graph without ``batch`` gets an all-zero one: set here, on what is returned, so every entry point has it (a copy made here
+    does not carry back to the caller)."""
     device = next(module.parameters()).device
-    return batch if batch.x.device == device else batch.clone().to(device)
+    if batch.x.device != device:
+        batch = batch.clone().to(device)
+    if getattr(batch, "batch", None) is None:
+        batch.batch = torch.zeros(batch.num_nodes, dtype=torch.long, device=batch.x.device)
+    return batch
 
 
 def attribute(
@@ -382,8 +388,6 @@ def attribute(
     if weights.shape[0] != len(receivers):
         raise ValueError("weights needs one row per receiver.")
     batch = _on_module_device(module, batch)
-    if getattr(batch, "batch", None) is None:
-        batch.batch = torch.zeros(batch.num_nodes, dtype=torch.long, device=batch.x.device)
     started = time.time()
     if space not in ("token", "expression"):
         raise ValueError(f"space must be 'token' or 'expression', got {space!r}.")

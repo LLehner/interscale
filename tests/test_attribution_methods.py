@@ -168,6 +168,23 @@ def test_occlusion_is_the_change_when_one_sender_takes_its_reference_and_sensiti
     assert inter["interaction"].shape == (1, 3) and np.all(inter["single"] >= 0)
 
 
+def test_a6_measures_run_on_a_single_graph_without_a_batch_vector(stream):
+    """The synth attribution job (2026-11-24) handed ``sensitivity_n`` a graph without ``batch``: ``attribute`` set it on its own
+    device copy only, so ``pad_batch`` read ``None``. Every entry point fills it in, the same numbers as with it."""
+    module, graph, labels = stream
+    bare = graph.clone()
+    del bare.batch
+    receivers = np.array([9])
+    w = gene_targets([0, 3], 1, G)
+    cand = near_candidates(graph.pos.numpy(), receivers, np.ones(graph.num_nodes, bool), k=6)
+    occ = attribute(module, graph, receivers, w, "occlusion", senders=cand[0])
+    with_batch = sensitivity_n(module, graph, receivers, w, {"occlusion": occ}, cand, ns=(1,), draws=6, seed=1)
+    without = sensitivity_n(module, bare.clone(), receivers, w, {"occlusion": occ}, cand, ns=(1,), draws=6, seed=1)
+    np.testing.assert_allclose(without["occlusion"][1], with_batch["occlusion"][1])
+    inter = pairwise_interactions(module, bare.clone(), receivers, w, cand, pairs=2, seed=2)
+    assert inter["interaction"].shape == (1, 2)
+
+
 def test_deeplift_runs_puts_activations_back_and_the_secant_is_a_secant(stream):
     module, graph, labels = stream
     before = {id(m): (getattr(m, "activation", None)) for m in module.modules()}
