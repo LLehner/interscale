@@ -436,6 +436,41 @@ def _type_variance(truth, labels, types) -> dict[str, np.ndarray]:
     }
 
 
+class _WithinVariance:
+    """The within-type variance of every gene pooled over graphs: each graph's sum of squares about its own type mean, over the pooled degrees of
+    freedom; :meth:`readable` thresholds it once (a near-constant target has no pattern within the type to lose).
+
+    Replaces a check that every graph had to pass on its own: a graph with at most one cell of a type has variance zero there, so a type missing
+    from any one graph (a 1 mm tile without islets) lost every target. A graph with fewer than two cells of a type now adds nothing to it.
+    """
+
+    def __init__(self, types, n_genes: int):
+        self.types = list(types)
+        self.ss = np.zeros((len(self.types), int(n_genes)))
+        self.dof = np.zeros(len(self.types))
+
+    def add(self, truth: np.ndarray, labels: np.ndarray) -> None:
+        for r, t in enumerate(self.types):
+            x = truth[labels == t]
+            if len(x) > 1:
+                self.ss[r] += ((x - x.mean(axis=0)) ** 2).sum(axis=0)
+                self.dof[r] += len(x) - 1
+
+    def variance(self) -> np.ndarray:
+        """``[types, genes]``; NaN for a type with fewer than two cells in every graph."""
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return np.where(self.dof[:, None] > 0, self.ss / np.maximum(self.dof, 1)[:, None], np.nan)
+
+    def readable(self, *, floor: float = 1e-3, share: float = 0.1) -> np.ndarray:
+        """``[types, genes]`` booleans: the pooled variance at least ``floor`` and ``share`` of the type's median gene variance."""
+        var = self.variance()
+        out = np.zeros(var.shape, dtype=bool)
+        for r in range(len(self.types)):
+            if np.isfinite(var[r]).any():
+                out[r] = var[r] >= max(float(floor), float(np.nanmedian(var[r])) * float(share))
+        return out
+
+
 # ----------------------------------------------------------------------------------------------- interventions: type flows
 
 
@@ -757,7 +792,7 @@ def gene_flows(
     pred_sums, sum_shift, scored_count = np.zeros((3, *shape)), np.zeros(shape), np.zeros(shape)
     base_sums = np.zeros((3, len(types), len(genes)))
     count, detected, total = (np.zeros((len(types), len(genes))) for _ in range(3))
-    readable = np.ones((len(types), len(genes)), dtype=bool)
+    within = _WithinVariance(types, len(genes))
     rng = np.random.default_rng(seed)
     was_training = module.training
     module.eval()
@@ -769,7 +804,7 @@ def gene_flows(
                 pos = graph.pos[:, :2].double().cpu().numpy()
                 receivers, keep = pick_receivers(pos, label, target.any(axis=1), float(far_radius), rng=rng, per_type=int(per_type))
                 base = _predict(module, [graph], head=head, batch_size=1, device=device)[0]
-                variance = _type_variance(truth, label, types)
+                within.add(truth, label)
                 free = np.flatnonzero(~keep)
                 if strata is None:
                     groups = [free[label[free] == t] for t in types] if within_labels else [free]
@@ -783,8 +818,6 @@ def gene_flows(
                         count[r] += target[cells[r]].sum(axis=0)
                         valid = target[cells[r]] & np.isfinite(base[cells[r]])
                         base_sums[:, r] += centred_sums(base[cells[r]], truth[cells[r]], valid, *centres[t])
-                        # A near-constant target has no pattern within the type to lose (as in type_flows).
-                        readable[r] &= variance[t] >= max(1e-3, float(np.nanmedian(variance[t])) * 0.1)
                     members = label == t
                     detected[r] += (truth[members] > 0).sum(axis=0)
                     total[r] += members.sum()
@@ -810,8 +843,9 @@ def gene_flows(
                             sum_shift[s, r] += np.where(scored, pred[rows] - base[rows], 0.0).sum(axis=0)
     finally:
         module.train(was_training)
+    readable = within.readable()  # pooled over graphs (_WithinVariance): a type absent from one graph keeps its targets
     base_cos = cosine_from_sums(base_sums, count)
-    drop = np.where(readable[None], base_cos[None] - cosine_from_sums(pred_sums, scored_count), np.nan)
+    drop = np.where(readable[None],base_cos[None] - cosine_from_sums(pred_sums, scored_count), np.nan)
     for s, sender in enumerate(usable):
         if sender_sets and sender in sender_sets:
             for c in columns_of[sender]:

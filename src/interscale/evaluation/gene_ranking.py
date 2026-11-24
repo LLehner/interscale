@@ -47,7 +47,7 @@ from interscale.evaluation.interpretation import (
     _scoring_every_cell,
     _type_centres,
     _type_perturbations,
-    _type_variance,
+    _WithinVariance,
     centred_sums,
     cosine_from_sums,
     moran_genes,
@@ -129,7 +129,7 @@ def context_flows(
     pred_sums, pcount = np.zeros((n_k, n_s, n_r, 3, n_g)), np.zeros((n_k, n_s, n_r, n_g))
     base_sums, count = np.zeros((n_r, 3, n_g)), np.zeros((n_r, n_g))
     detected, total = np.zeros((n_r, n_g)), np.zeros((n_r, 1))
-    readable = np.ones((n_r, n_g), dtype=bool)
+    within = _WithinVariance(types, n_g)
     rng = np.random.default_rng(seed)
     strata = [None] * len(labels) if strata is None else [np.asarray(v).astype(str) for v in strata]
     was_training = module.training
@@ -144,7 +144,7 @@ def context_flows(
                 pos = graph.pos[:, :2].double().cpu().numpy()
                 receivers, keep = pick_receivers(pos, label, target.any(axis=1), 0.0, rng=rng, per_type=int(per_type))
                 base = _predict(module, [graph], head=head, batch_size=1, device=device)[0]
-                variance = _type_variance(truth, label, types)
+                within.add(truth, label)
                 cells = {r: receivers[label[receivers] == t] for r, t in enumerate(types)}
                 centres = _type_centres(base, truth, target, label, types)
                 for r, t in enumerate(types):
@@ -155,7 +155,6 @@ def context_flows(
                         valid = target[cells[r]] & np.isfinite(base[cells[r]])
                         count[r] += valid.sum(axis=0)
                         base_sums[r] += centred_sums(base[cells[r]], truth[cells[r]], valid, *centres[t])
-                        readable[r] &= variance[t] >= max(1e-3, float(np.nanmedian(variance[t])) * 0.1)
                 for kind, sender, rows, donors in _type_perturbations(label, keep, pos, rng, strata=stratum):
                     if kind not in kinds:
                         continue
@@ -169,6 +168,7 @@ def context_flows(
                             pcount[k, s, r] += scored.sum(axis=0)
     finally:
         module.train(was_training)
+    readable = within.readable()  # pooled over graphs (interpretation._WithinVariance): a type absent from one tile keeps its targets
     base_cos = np.stack([cosine_from_sums(base_sums[r], count[r]) for r in range(n_r)]) if n_r else np.zeros((0, n_g))
     drop = np.full((n_k, n_s, n_r, n_g), np.nan)
     for k in range(n_k):

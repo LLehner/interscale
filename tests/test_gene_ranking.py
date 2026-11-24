@@ -433,3 +433,30 @@ def test_tile_graphs_cover_every_cell_once_and_slice_the_cells():
         assert torch.equal(t.x, graph.x[rows]) and torch.equal(t.pos, graph.pos[rows])
         assert t.edge_index.numel() == 0 or int(t.edge_index.max()) < t.num_nodes
         assert t.tile_of == 0
+
+
+def test_a_type_missing_from_one_graph_keeps_its_targets():
+    """A type with at most one cell in one graph (a 1 mm tile without islets) is read from the graphs it is in. The variance check used to be an
+    AND over graphs with variance 0 for such a graph, so every target of the type was dropped (CosMx comparison: Alpha and Beta read for 0
+    genes); now one within-type variance pooled over graphs is thresholded once."""
+    from interscale.evaluation.interpretation import _WithinVariance
+
+    labels = _labels()
+    module = _Known(labels)
+    sparse = labels.copy()
+    b = np.flatnonzero(sparse == "B")
+    sparse[b[1:]] = "A"  # one B cell left in the second graph
+    graphs = [_graph(labels), _graph(labels, seed=1)]
+    ctx = context_flows(module, graphs, [labels, sparse], GENES, per_type=40, seed=1)
+    assert _at(responder_table(ctx), "B", "g0", "responder") > 0.1
+    flows = gene_flows(module, graphs, [labels, sparse], GENES, ["g3"], per_type=40, seed=1)
+    assert np.isfinite(flows.drop[0, flows.receivers.index("B"), GENES.index("g0")])
+    # The pooled variance by hand: each graph's sum of squares about its own mean over the pooled degrees of freedom; a single cell adds nothing.
+    rng = np.random.default_rng(4)
+    x1, x2 = rng.normal(size=(5, 3)), rng.normal(loc=7.0, size=(4, 3))
+    acc = _WithinVariance(["t", "u"], 3)
+    acc.add(x1, np.array(["t"] * 5))
+    acc.add(np.vstack([x2, rng.normal(size=(1, 3))]), np.array(["t"] * 4 + ["u"]))
+    ss = ((x1 - x1.mean(0)) ** 2).sum(0) + ((x2 - x2.mean(0)) ** 2).sum(0)
+    np.testing.assert_allclose(acc.variance()[0], ss / 7)
+    assert np.isnan(acc.variance()[1]).all() and not acc.readable()[1].any()
