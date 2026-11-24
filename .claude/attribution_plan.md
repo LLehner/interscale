@@ -409,3 +409,83 @@ so the toy maps are skipped with a message, by design). Found and fixed: the dec
   `attr`, so every job started from there would have crashed at import. Found by the configure check.
 - Checks: vannan arms through `_validate` / masking / names (<= 217 characters); `configure()` and run lists for `attr_job.py` / `gene_rank.py` with vannan;
   the attribution hook end to end again (conservative everywhere, three variants on node-masked models, two on gene-masked ones); 90 tests pass.
+
+## First run read (2026-11-24; results MA/22_11_results/attr_{synth,cosmx,vannan}, logs MA/results/logs)
+
+### What ran and what did not
+
+| Job | Arms | Outcome | Cause |
+| --- | --- | --- | --- |
+| cosmx (43841210, 5 tasks) | typeres_s42 + twin | done (12,448 s + 7,498 s in one task) | |
+| cosmx | ir_c_s42, ir_c_ktype_s42/43/44 | crashed in the first section | `conservative` x activation checkpointing (below) |
+| synth | J1 ref, ir2_rate | no tables, no log in the folder | unknown: need the .out/.err |
+| vannan (43840145, 43841271; 4 tasks each) | typeres_s42, ir_c_ktype x3 | all cancelled at the 11 h limit; one A3 map (typeres graph0) | whole samples (1.63 M cells in 45 samples) x 15 receivers per fine type x 7 methods + A6: far past 11 h at CosMx's measured rate |
+
+**The crash (every read-out arm).** `ReadoutAttention` / fused attention run in query blocks and wrap each block in `torch.utils.checkpoint`
+when `torch.is_grad_enabled() and len(starts) > 1` (attention.py:803 / :990). `_one_reference` applies `_conservative_rules()` around the forward
+only and calls `_grad_rows` (the backward) after leaving the context, so the blocks are recomputed with the real SDPA kernel while the forward had
+saved the explicit-form tensors: `CheckpointError: ... saved [4, 22, 9388], recomputed [4, 9388, 16]`. The toy tests have one block (no
+checkpoint), so they never reached this path. typeres survived because the hierarchy checkpoints only in training. grad_input and IG are unaffected
+(no patch); DeepLIFT patches activations only, and the checkpointed blocks hold only SDPA / softmax, so it is unaffected too. Fix (not applied): take
+the gradients inside the patch context (`with rules: value = reader(leaf); contribution = _grad_rows(...)`, the same for `_secant_activations`), or
+switch recompute off while attributing; add a test with `block_rows` forced small.
+
+**vannan.** No progress lines inside the hook, so the time per sample is unknown; the only output is one A3 map. To fit 11 h: tiles (as the
+comparison does on CosMx) or `MAX_GRAPHS`, coarse types or fewer receivers per fine type, IG + occlusion only for a first pass, one arm per task;
+measure on one sample first. The report step also needs vannan in `gene_rank_read.py`'s choices (it rejects `vannan`; attr_read accepts it).
+
+**Reader.** (Corrected the same day: the pairwise table is complete; my `grep -v` that hid the Sensitivity-n rows hid it too, since its first
+column is the variant.) The A3 figure's caption is the attention flow plot's ("net attention flow, last layer, head mean"); it should name IG
+disc targets.
+
+**Receivers.** `separated_receivers` at 150 um gives ~42 receivers per section (2-11 per type and section), not up to 40 per type: the
+type-level tables rest on ~250 receivers per arm.
+
+### typeres on CosMx (the only arm read; one seed; 6 test sections)
+
+- **Completeness (A1 / A6).** IG at 5 steps: median gap 0.13 (19 % of receivers > 0.1) trained, 0.007 twin. grad_input / DeepLIFT /
+  conservative: median gaps 0.9-1.5 trained (0.15-0.9 twin). The trained model is far from linear on the path from the type mean to the actual
+  neighbours; the twin is nearly linear. Agreement with IG5 (Spearman over senders): occlusion 0.65, the gradient methods 0.45-0.51, IG with
+  sampled references 0.53 (twin 0.45-0.82). No cheap method can stand in for IG on this model.
+- **Sensitivity-n.** With type-mean replacement IG predicts the effect of removing 1-16 senders well (median r 0.73-0.95; occlusion 0.89-0.99,
+  trivially at n = 1). With removal by the model's own mask the trained model drops (IG 0.19-0.71; twin 0.75-0.95): hiding a cell is not the same
+  intervention as giving it its type mean, for the trained model only.
+- **Pairwise sender interactions.** Median |I| / (|D_j| + |D_k|) 0.08 trained vs 0.02 twin; 24-29 % of pairs above 0.2 (twin 11-17 %); highest for
+  Beta and Fibroblast receivers (0.11). Same under all three variants. Small at the median, not zero: mostly additive near senders with a tail of
+  interacting pairs.
+- **A2 sender types.** Signed share of each receiver's |contribution|, trained minus within-type permuted: Acinar senders lead for almost every
+  receiver (Acinar 0.23, Endothelial 0.15, Ductal 0.14, Fibroblasts 0.14, Mast 0.13, Immune 0.11); the permuted section's shares are ~0 (they
+  cancel). The real Acinar neighbours push receivers along their predicted deviation; consistent with the acinar-transcript spillover the E7 read
+  suspected (acinar secretory genes as top responders in non-acinar types). Not tested here.
+- **A4 distance.** |contribution| by distance is the same for the real and the permuted section (56 % within 120 um, 85 % within 500 um; the twin
+  84 % within 120 um: training spreads the reach). The signed contribution is not: mean 3.37 in the first bin (< 15 um) vs 0.35 permuted, 0.77 vs
+  0.06 at 15-30 um, ~0 beyond 120 um. The content-dependent push comes from contact distance (also where segmentation spillover lives).
+- **A3 maps.** Both trained and twin maps are dominated by the disc layout (hidden discs = sinks), as the plan warned; not readable without a
+  twin-subtracted map.
+- **Cost.** IG5 ~1.9 s per receiver; DeepLIFT / grad_input ~0.15 s, conservative 0.07 s, occlusion ~1.1 s.
+
+### Next (proposed)
+
+Fix the checkpoint path and rerun CosMx for the four read-out arms (IG / decomposition are what A6 needs on the IR); find the synth log; size
+vannan on one sample and tile it; fix the map caption; a twin-subtracted A3 map; the spillover question on the
+first-bin push (does it survive removing the receiver type's marker genes from the senders?).
+
+### Fixes built (2026-11-24; the user: "implement all the fixes, update the scripts for the remaining runs, commit to main")
+
+- **Library** (`evaluation/attribution.py`): `conservative` and `deeplift` take their gradients inside their patch contexts, so a checkpointed block is
+  recomputed with the forward's functions. Test `test_gradients_through_attention_computed_in_checkpointed_blocks` (read-out model, `chunk_pairs` 64:
+  many blocks, `checkpoint` counted) gives every method the one-block result; the old placement of the backward reproduces the cluster's
+  `CheckpointError` (mutation checked).
+- **Maps** (`flow_maps.plot_source_sink(what=, scale_label=)`; caption wrapped to the width left of the colour bar, header grows with it): the A3 maps
+  say "IG attributions to disc targets (type-mean reference): out = a cell's contributions to discs it is not in, in = what its disc drew from outside".
+  The attention flow maps keep their caption.
+- **Jobs** (`slurm/November/`, not under git): `attr_job.py` `ATTR_RUNS` (a subset of arms or runs; the twins follow), `TIME_BUDGET_H` 4.5 per model
+  (no new graph after it; the tables hold the graphs done), vannan on 1 mm tiles (its training crops), 12 drawn across the test samples (`MAX_GRAPHS`, seeded),
+  `EVAL_TILE_MIN_CELLS` 500; `attr_common.py` per-graph progress lines (cells, receivers, seconds per method) and an `attr_graphs` table; `attr_job.sbatch`
+  11:55. Checked: run lists (`--write-runs`, with and without `ATTR_RUNS`), `configure()` through the real `__main__` (runpy, `sweep_common.main` stubbed),
+  the CosMx / vannan hook end to end on the toy read-out model with tiles, `MAX_GRAPHS` and a budget, a map drawn with the new caption.
+- **Not a bug**: the A6 pairwise table (see the corrected "Reader" paragraph above). **attr_synth** has no log: not diagnosable; resubmit. Its read-out
+  arm runs in one block on synth_spot (2,501 tokens < `chunk_pairs`), so the crash above cannot explain it.
+
+Re-runs: `ATTR_RUNS=ir_c_ktype,ir_c_s42 bash slurm/attr_submit.sh cosmx` (4 tasks; joins 22_11_results/attr_cosmx), `bash slurm/attr_submit.sh synth`
+(send the .out / .err if it fails again), `bash slurm/attr_submit.sh vannan` (4 tasks).

@@ -2527,3 +2527,45 @@ What doesn't work / limits:
 - Tiles centre every score within (tile, group): between-tile variation of a section is not scored, and no model reads beyond ~1 mm.
 - The toy planted-dependence module of test_gene_ranking (`_Known`) holds its labels for a whole graph and cannot be tiled; the tile check used a
   label-free stand-in.
+
+## 2026-11-24 -- Attribution A2-A6 on CosMx (first run), prototype comparison (C3), anchored SVG R2, failed vannan jobs
+
+Results MA/22_11_results/attr_*, 23_11_results/compare_*, 23_11_results/svg_synth; logs MA/results/logs. Details: attribution_plan.md
+"First run read", comparison.md "C3 read", svg_targets_plan.md "R2 read". rank_synth / rank_cosmx / rank_semi in 22_11_results are the E7
+tables already read on 2026-11-23 (rebuilt 11-22); typeres is still missing from them.
+
+What worked:
+- Attribution on typeres (CosMx): IG at 5 steps is complete enough (median gap 0.13); the real neighbours' signed push sits at contact distance
+  (< 15 um: 3.4 vs 0.35 in the within-type permuted section) while |contribution| by distance does not change with content; Acinar senders lead
+  for most receiver types (spillover candidate, untested). Pairwise sender interactions are small at the median (0.08, twin 0.02).
+- synth comparison: ir_ch beats the prototype on pairs (0.156 vs 0.073) but the prototype + distance window closes the gap (0.147): the gain is
+  the positional input. Fix 1 (region) helps every ranking; its readout half alone gives most of it.
+- SVG R2: region donors take the region markers out of the responders (CM3 0.62 -> 0.04); T2'' / T3'' / T5'' pass for both arms.
+
+What doesn't work / limits:
+- Every read-out arm's attribution crashed: `conservative` patches SDPA around the forward only, and the read-out's checkpointed query blocks
+  recompute without the patch in the backward (toy tests have one block). typeres only survived (hierarchy checkpoints only in training).
+- The cheap attribution methods are far from complete on the trained typeres (gaps ~1, Spearman with IG ~0.5): IG is needed for maps;
+  mask removal and type-mean replacement disagree for the trained model only.
+- vannan attribution (2 submissions) and ranking hit the 11 h limit on whole samples; `gene_rank_read.py` rejects `vannan`.
+- attr_synth: no tables, no log.
+- CosMx comparison: tiles + the AND over graphs in the readability check drop every gene of a type that is missing from any tile: Alpha /
+  Beta unread, Mast 2 targets, most other types truncated; the CosMx numbers are Acinar / Ductal numbers. LR support null for every arm.
+- Synth responders beyond region still fail (AUROC_hard <= 0.48 vs bar 0.555); sender sparsity (fix 2, model) hurts pairs and groups; fix 3 adds
+  nothing.
+
+## 2026-11-24 -- Fixes after the attribution / comparison reads: checkpointed gradients, readability over tiles (built, re-runs pending)
+
+The user asked to implement the fixes, prepare the remaining runs and think about what helped. Details: attribution_plan.md "Fixes built",
+comparison.md "Fixes and re-run" and "What helped, and how to expand it".
+
+What worked:
+- Both bugs reproduce on toy models and both fixes are pinned by tests that fail under the old code (the old attribution path gives the cluster's
+  exact CheckpointError; the old AND drops a type with one cell in one graph).
+- The comparison reader now prints a coverage table (targets read per receiver group): Alpha / Beta = 0 shows at a glance.
+- Across three readouts, reading beyond the region is the lever that consistently helps; IG is the attribution that is complete on a trained model.
+
+What doesn't work / limits:
+- My claim that the attribution reader's pairwise table was empty was wrong: my own grep hid the rows.
+- attr_synth remains undiagnosed (no log); its read-out arm runs in one block on synth_spot, so the checkpoint crash cannot explain it.
+- vannan sizes are guesses until the tiled runs report seconds per graph (now printed per graph).

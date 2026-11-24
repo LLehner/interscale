@@ -848,3 +848,12 @@ Expectations (before the run): targets unchanged (23); groups {M7, MC7, MC8, MC9
 with MC3, M1 with MC1); with region donors CM3 / CM1 / CM2 beyond-self near 0 and T2'' up; group top 3 near 1 for the Gaussian sources;
 the source most sufficient within its group uncertain (the model may read a co-response as well as the source); the 5-ring split
 moves short programmes (MC1) into rings 0-1, so MC1 may now be read.
+
+## R2 read (2026-11-24; job 43851287, results MA/23_11_results/svg_synth; the earlier 43851141 was cancelled by SIGTERM)
+
+Against the expectations above: targets unchanged (23; T1'' still FAIL, AUROC 0.869, responses recall 0.47). Groups as expected
+({M7, MC7, MC9}, {M8, MC10, MC11}, {CM1, CM2, CM3}; also {M3, MC3}, {M1, MC1}, {M11, MC14, MC15}). Region donors work as intended: CM3 as a
+responder 0.621 -> 0.037 (ctx_ar), CM1 / CM2 to ~0.03; T2'' 0.80 -> 0.91 (ctx_ar) and 0.84 -> 0.93 (ir_ar). Both arms pass T2'' / T3'' / T5''
+under region donors (T3'' 0.86; T5'' 0.84 / 0.87; twins 0.43-0.57 / ~0). The source is the most sufficient member of its group for ctx_ar (0.90-1.00)
+but not reliably for ir_ar (0.50-0.60): ir_ar credits co-responses (MC7, MC11) as much as M7 / M8. MC1 is now read a little (responder 0.12-0.14,
+twin -0.02). Seed Spearman of the sender totals 0.71-0.78. Model curves beat the average curve in 73 % of disc x target cases (twin 43 %).

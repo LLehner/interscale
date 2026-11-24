@@ -558,7 +558,9 @@ hard negatives), `programme_truth` (the spiked file); `ranking_metrics`; bars `w
 (type-agnostic neighbour means, own neighbour feature left out exactly). Invariants: `targets="all"` (every entry scored, the clean pass) only for a model
 blind to its own cell (`interpretation.blind_to_own`; refused otherwise), with `score_all_cells` switched on for the call; a channel-masked model is read
 in folds (`gene_folds`, `hide_genes` sets `gene_mask` *and* `mask`, which `apply_mask` asserts); only visible entries are ever permuted;
-`gene_flows(targets=)` defaults to the old behaviour and now returns `base`. Cluster: `slurm/November/gene_rank*.py`, `rank_submit.sh`. The fixes (`.claude/comparison.md`, 2026-11-23; all off by default, every draw unchanged): `strata=` in `gene_flows` and `context_flows`
+`gene_flows(targets=)` defaults to the old behaviour and now returns `base`. A target is read only where the type's within-type variance (each graph's sum of squares about its own type mean,
+pooled over graphs: `interpretation._WithinVariance`) passes the threshold once; it used to be an AND over graphs, so with tiles a type missing from
+any one tile lost every target (2026-11-24). Cluster: `slurm/November/gene_rank*.py`, `rank_submit.sh`. The fixes (`.claude/comparison.md`, 2026-11-23; all off by default, every draw unchanged): `strata=` in `gene_flows` and `context_flows`
 (permutations within label x stratum, e.g. a region or niche: what the stratum carries is not scored), `gene_flows(sender_sets=)` (sets of genes permuted
 with one shared permutation, a member's own target left out; `co_varying_groups`, `group_sets`, `group_table` with each member's sufficiency,
 `group_pair_scores`), `robust_z` (a drop against the other senders of the same target), `hide_cells` (targets for a model that reads its own cell and was
@@ -574,7 +576,9 @@ reference or, node-masked models, by the model's own mask), with references `gra
 `pairwise_interactions`, `distance_profile`, `strengths` / `disc_strengths` / `map_fields`. Invariants: paths run in token space (`gex_embedding`
 replaced for the pass); the receivers' own rows and cells hidden whole never move; targets are fixed gene weights per receiver (linear, so rows add); the
 decomposition's intercept is the decoder bias plus every read layer's output-projection bias through the decoder (sums to the context part, tested); the
-module's mode, parameter flags and the global generators are restored. Cluster: `slurm/November/attr_*.py`, `attr_submit.sh synth|cosmx`.
+module's mode, parameter flags and the global generators are restored. Gradients are taken **inside** a method's patch context (`conservative`, `deeplift`): the
+read-out / fused attention recomputes its query blocks in the backward (activation checkpointing whenever a pass has more than one block: whole
+sections) and must see the forward's functions (tested with a small `chunk_pairs`). Cluster: `slurm/November/attr_*.py`, `attr_submit.sh synth|cosmx|vannan` (`ATTR_RUNS`, tiles, `TIME_BUDGET_H`).
 
 ### Preprocessing / robustness utilities (`interscale.pp`)
 

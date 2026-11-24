@@ -261,3 +261,103 @@ What it changes in the reading: every score is centred within (tile, receiver gr
 1 mm tiles of a section (FOV-level offsets, the section's large-scale structure) is not scored; no model sees context beyond ~1 mm at readout, as in
 training. The neighbour ridge and Moran bars on the test cells are computed per tile as well. Toy check: the hook on 2 toy sections read as 18 tiles,
 then compare_read.py, end to end.
+
+## C3 read (2026-11-24; results MA/23_11_results/compare_{synth,cosmx}; jobs 43855175 synth, 43855321 cosmx, both 12 tasks + report, no errors)
+
+### synth_spot (complete)
+
+Fit (centred cosine on hidden entries): ir_ch 0.16-0.17, proto_ch 0.131, proto_ch_pe 0.136, twins ~0. The prototype is **not** at the floor here
+(the expectation from 11-11 was wrong for synth with channel masks).
+
+Rules (proposed, not fixed by the user; applied here as a reading aid):
+- **P1 pairs:** ir_ch R0 0.156 vs proto_ch 0.073 (+0.083, both above their twins 0.010 / 0.018): pass. Against proto_ch_pe 0.147 the gap is 0.009:
+  the gain over the prototype is the positional input, not the redesign. The model-free bar (0.196) is above every model at R0; only
+  `ir_ch R2` (readout fix 2 alone) reaches it (0.195).
+- **P2 responders beyond region (AUROC_hard >= 0.70):** fail everywhere (best 0.476, model-only ir_ch_f1 R0; bar 0.555; the untrained ir_ch twin
+  0.519). Region markers / spatial genes still rank with the responders.
+- **P3 source group in the top 3 for half the programmes:** proto_ch R3 0.556 (pass), proto_ch_pe 0.481, ir_ch R2/R3 0.444, ir_ch_f12 0.259
+  (twins 0.15-0.22).
+
+Step-wise (S0 -> S3): fix 1 helps on every ranking (pairs 0.156 -> 0.174, drivers 0.376 -> 0.404, responders AUPRC 0.338 -> 0.404, AUROC_hard
+0.305 -> 0.399); its readout half alone gives the same responder gain (ir_ch R1 0.453 AUROC_hard). Fix 2's model half (sender sparsity 0.1)
+hurts: pairs 0.174 -> 0.132, drivers 0.404 -> 0.313, source group top 3 0.444 -> 0.259; its readout half alone helps pairs (ir_ch R2 0.195).
+Fix 3 changes nothing measurable (planted pairs stable in 13 % of cases for ir_ch / proto_ch_pe, 7 % proto_ch). Best combination on these
+numbers: ir_ch (no sparsity) read at R1/R2, or ir_ch_f1 read at R2 (not run as such).
+
+### CosMx (incomplete: most receiver types unread)
+
+**Bug: small receiver types are dropped by the tiles.** `readable[r] &= variance[t] >= ...` is an AND over graphs (gene_ranking.context_flows
+line ~158, interpretation.gene_flows line ~787), and `_type_variance` returns zeros for a type with <= 1 cell in a graph. Read on 19 tiles
+(6 sections), any type absent from one tile loses every gene: **Alpha and Beta 0 targets read (alphabetical "top responders" in every arm),
+Mast 2, Endocrine 22-23, Immune 29-33, Fibroblasts 40-53, Endothelial 55-76, vs Acinar 120 / 882 and Ductal 170 / 504** (driver reads /
+responder genes). J6 (whole sections) was hit mildly (Mast 63, Endocrine 394 of 960). Every CosMx number below is therefore an Acinar / Ductal
+number. Fix (not applied): pool the within-type variance over graphs (sums, squares, counts per type) and threshold once, or skip graphs where
+the type has fewer than k cells; then re-read (readouts only, the checkpoints exist: ~2.1 h per ir arm, ~0.65 h per prototype).
+
+What can be read now (Acinar / Ductal):
+- Fit: proto_ch 0.137, proto_ch_pe 0.138 vs ir_ch 0.085-0.090. Not like for like: under channel masks the prototype sees the receiver's own ~80 %
+  visible genes; ir_ch on CosMx has a type-only query and no own-cell skip. Hypothesis: the prototype's lead is within-cell gene-gene prediction.
+- Q1 stability: responders RBO 0.82 (ir_ch) vs 0.73 (proto), drivers 0.70 vs 0.61: pass for all. The fixes lower it (0.82 -> 0.72).
+- Q2 flagged share of the top 50: 0.11-0.13, the same as the twins (0.10-0.15): uninformative.
+- Q3 known LR pairs: AUC 0.46-0.54 for every arm and twin (in rank_lr.csv; compare_read does not report it).
+- Q4 agreement ir_ch vs prototype: RBO 0.46 (twins 0.32-0.35); proto_ch_pe vs proto_ch 0.83.
+- Co-varying sender groups: only 3 among the 200 senders (endocrine hormones, acinar enzymes, MHC-I): type-marker sets, so fix 2 hardly acts here.
+- Reader gaps: no LR table, no sender-type table, no PR plot (no truth, expected), steps.png and the driver rank-rank plot only.
+
+Cost: ir arms ~7,600 s per readout, prototype ~2,300 s, proto_pe ~7,300 s.
+
+## Fixes and re-run (2026-11-24; the user: "implement all the fixes, update the scripts, commit to main")
+
+- **Library**: `interpretation._WithinVariance`, used by `gene_flows` and `gene_ranking.context_flows`: one within-type variance per gene, each graph's sum of
+  squares about its own type mean pooled over graphs, thresholded once (a graph with < 2 cells of a type adds nothing). Test
+  `test_a_type_missing_from_one_graph_keeps_its_targets` (a type with one cell in the second graph keeps its responders and pairs; the pooled variance by
+  hand); the old AND, restored in either function, fails it (mutation checked). Whole sections change little: J6 lost Mast / Endocrine genes the same way.
+- **Jobs**: `compare_job.sbatch STEP=evaluate` + `EVALUATE=1 compare_submit.sh` (readouts only, on the checkpoints in COMPARE_OUT); `compare_read.py`
+  writes a **coverage** table (targets read per receiver group and run: the check that would have caught Alpha / Beta), the **LR** table (Q3), the
+  **sender-type** table (proto, ir_ch, fixes, twins) and `ranking/compare_responders_rank.png` beside the driver rank-rank plot; checked on the downloaded
+  tables of both jobs. `gene_rank_common.EVAL_MAX_TILES` (seeded subset of tiles); `gene_rank.py` vannan: 1 mm tiles, 40 drawn, 200 senders;
+  `gene_rank_read.py` accepts `vannan`; `rank_job.sbatch` 11:55.
+- Re-runs: `EVALUATE=1 bash slurm/compare_submit.sh cosmx` (12 tasks, ~2.1 h per ir arm, ~0.7 h per prototype; same folder, sections replaced),
+  `RANK_RUNS=typeres bash slurm/rank_submit.sh cosmx` (J6's typeres, never read), `bash slurm/rank_submit.sh vannan`. synth needs no re-read (one receiver
+  group per slide; unaffected).
+
+## What helped, and how to expand it (2026-11-24; the user asked after the C3 read)
+
+What the reads of 11-22 to 11-24 say helped, with the evidence:
+
+1. **Reading beyond the region (fix 1)**, in three independent places: E7 permutations within label x region (readout alone: responders against hard
+   negatives 0.305 -> 0.453), the model's label part on the region (0.476, the best value), the anchored task's region donors (CM3 as a responder
+   0.62 -> 0.04; T2'' 0.80 -> 0.91). Same lesson each time: the region carries most of what passed for a response; once it is held fixed, the planted
+   programmes stay and the markers go.
+2. **Integrated gradients** as the effect measure: on the trained typeres the only method close to complete (gap 0.13; grad x input, DeepLIFT,
+   conservative ~1); with the within-type permuted section as control it separates content from geometry (|contribution| by distance unchanged, signed
+   push at contact 3.4 vs 0.35). On synth (2026-10-31) IG found mid-range senders 100 % where attention found 73 %. Caveat: one CosMx model so far; the
+   read-out arms and the synth A1 rule are still to come.
+3. **The distance prior / positional input**: the prototype with the window (proto_ch_pe) reaches ir_ch on pairs (0.147 vs 0.156). Not a fix, but
+   the largest model-side gain in the comparison.
+4. **Matched nulls**: the untrained twin and the within-type permuted section are what make every table readable (flagged share and LR AUC are
+   uninformative exactly because twins score the same).
+
+Did not help: sender sparsity (fix 2, model half: pairs 0.174 -> 0.132), the robust z / ensemble (fix 3), the cheap gradient methods for maps, LR
+databases on CosMx (chance in every arm).
+
+Proposed expansions (nothing built; in order of what they would tell):
+
+- **E1. IG beyond the region.** The two things that helped, combined: IG with a reference of the sender's type **within its region / niche** (type x niche
+  mean; sampled same type x niche donors as the check). The attribution then measures only what lies beyond the region, as fix 1 does for the
+  permutations. Read on synth against truth (planted top-5 by class; pairs via programme targets) and on CosMx beside the plain type-mean IG.
+- **E2. A scale ladder for fix 1.** Strata at several scales (niches from the k = 10, 30, 100, 300 nearest cells; or donors matched by neighbourhood
+  composition at those scales): a responder's drop as a function of the stratum scale is the scale beyond which its signal no longer survives. On synth
+  the planted length scale is the truth (Spearman, as T5''); on CosMx it gives each gene a local / global label from the model's own readout --
+  the local-vs-global separation the thesis asks for, without a disc layout. The anchored task's rings are the same idea on the target side.
+- **E3. Gene-resolved IG.** The sender's contribution split over its genes (`gene_resolved`) for the deviation targets: which sender genes carry the
+  contact-distance push. The same gene in the receiver and its neighbours = spillover / smoothness (the E7 `self` term); a different gene = a candidate
+  interaction. This answers the Acinar-spillover question of the typeres read and gives IG drivers / pairs to set beside the permutation rankings
+  (agreement as a confidence measure).
+- **E4. IG for the comparison.** proto_ch / proto_ch_pe / ir_ch on synth with IG (distance profile, planted top-5): does the redesign read the same senders
+  at the same distances as the prototype + window, or only rank them better?
+- **E5. Fix 1 on the model side at the readout's scale.** On CosMx the label part over section x type x niche (ir_ch_f1) did not change fit or stability;
+  with E2's ladder pick the niche scale per dataset instead of one k-means niche.
+
+Order: E1 and E3 are evaluation-only (existing checkpoints), E2 needs niche labels at several scales (cheap, model-free) and one readout per scale,
+E4 needs the A1 synth job to run first, E5 retrains.
