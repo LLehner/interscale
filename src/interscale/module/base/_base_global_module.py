@@ -35,6 +35,7 @@ class GlobalModule(BaseModule):
         context_only: str = "none",
         bilinear_rank: int = 0,
         bilinear_head: int = -1,
+        field_corr: bool = False,
         context_query_inputs=("position",),
         context_type_attr: str | None = None,
         type_vocab: int = 64,
@@ -92,6 +93,9 @@ class GlobalModule(BaseModule):
         self.pooling = pooling
         self.bilinear_rank = int(bilinear_rank)
         self.bilinear_head = int(bilinear_head)
+        # `optim.aux_loss_weights.field_corr` (2.3, .claude/comparison.md): every step hands out the sender fields (`sender_fields`), which the
+        # term correlates with the hidden genes. Needs the kept attention map, as the bilinear part.
+        self.field_corr = bool(field_corr)
         if self.bilinear_rank < 0:
             raise ValueError(f"bilinear_rank must be >= 0, got {bilinear_rank}.")
         if self.bilinear_rank:
@@ -328,10 +332,28 @@ class GlobalModule(BaseModule):
                 "the bilinear part needs the last encoder layer's attention map, but this pass kept none: the transformer "
                 "must keep its maps (return_attention_maps) and the attention backend must form them (attention.kind dense)."
             )
-        last = attn[-1] if attn.dim() == 4 else attn
         x = batch.x.float()
         visible = self.visible_entries(batch) if masked else torch.ones(x.shape, dtype=torch.bool, device=x.device)
         values = torch.where(visible, x, torch.zeros_like(x)) @ self.bilinear_sender.to(x.dtype)  # [N, r]
+        return self._attend_values(values, batch, attn, index_nodes, src_padding_mask, self.bilinear_head)
+
+    def sender_fields(self, batch, attn, index_nodes, src_padding_mask, masked: bool = True) -> torch.Tensor | None:
+        """``[N, G]`` in batch node order: each cell's sender fields, ``sum_j a_ij x_j`` over the visible genes of the cells it reads (the last
+        layer's head-mean map, as the bilinear part reads it; hidden entries 0); None unless ``field_corr``. Kept with its gradient: the
+        field-correlation term trains the attention through it."""
+        if not self.field_corr:
+            return None
+        if attn is None:
+            raise ValueError("the sender fields need the last encoder layer's attention map, but this pass kept none (attention.kind dense).")
+        x = batch.x.float()
+        visible = self.visible_entries(batch) if masked else torch.ones(x.shape, dtype=torch.bool, device=x.device)
+        return self._attend_values(torch.where(visible, x, torch.zeros_like(x)), batch, attn, index_nodes, src_padding_mask, -1)
+
+    def _attend_values(self, values, batch, attn, index_nodes, src_padding_mask, head: int) -> torch.Tensor:
+        """``[N, D]`` in batch node order: ``sum_j a_ij values_j`` with the last layer's map (``head`` -1: the head mean), CLS dropped from the
+        keys, the weights not renormalised; a cell ``pad_batch`` left out gets a zero row."""
+        last = attn[-1] if attn.dim() == 4 else attn
+        x = values
         graph = getattr(batch, "batch", None)
         graph = torch.zeros(x.shape[0], dtype=torch.long, device=x.device) if graph is None else graph.long()
         n_graphs = len(index_nodes)
@@ -339,14 +361,14 @@ class GlobalModule(BaseModule):
         padded = pad_like(values, graph, index_nodes, seq_len)  # [B, S, r]
         heads = last.shape[0] // n_graphs
         maps = last.view(n_graphs, heads, last.shape[1], last.shape[2])[:, :, :seq_len, :seq_len]  # cell queries over cell keys
-        if self.bilinear_head < 0:
+        if head < 0:
             a = maps.mean(dim=1)
         else:
-            if self.bilinear_head >= heads:
-                raise ValueError(f"bilinear_head {self.bilinear_head} but the map has {heads} heads.")
-            a = maps[:, self.bilinear_head]
-        received = torch.bmm(a.to(padded.dtype), padded)  # [B, S, r], a cell's rows in token layout
-        out = values.new_zeros(x.shape[0], self.bilinear_rank)
+            if head >= heads:
+                raise ValueError(f"bilinear_head {head} but the map has {heads} heads.")
+            a = maps[:, head]
+        received = torch.bmm(a.to(padded.dtype), padded)  # [B, S, D], a cell's rows in token layout
+        out = values.new_zeros(x.shape[0], values.shape[1])
         offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=x.device), torch.bincount(graph, minlength=n_graphs).cumsum(0)[:-1]])
         for b, kept in enumerate(index_nodes):
             rows = torch.as_tensor(kept, dtype=torch.long, device=x.device) + offsets[b]
@@ -842,6 +864,9 @@ class GlobalModule(BaseModule):
         y_pred, *rest = parts.values()
         for part in rest:
             y_pred = y_pred + part
+        fields = self.sender_fields(batch_masked, attn_matrix, pad_index_nodes, src_padding_mask, masked=True)
+        if fields is not None and padded_node_idx is not None:
+            fields = fields[padded_node_idx]
         if padded_node_idx is not None and entry_mask is None:
             # Node-level classification: the masked cells ARE the supervision targets, so
             # both loss and metrics stay restricted to them. Only reconstruction moved to
@@ -860,6 +885,7 @@ class GlobalModule(BaseModule):
             entry_mask=entry_mask,
             parts={"global": parts} if len(parts) > 1 else None,
             target_center=parts["section"].detach() if self.section_offset == "label_mean" else None,
+            fields=fields,
             views=[
                 ViewOutput(
                     global_embedding=global_embedding,
@@ -909,6 +935,7 @@ class GlobalModule(BaseModule):
 
             type_attr = label_attribute(cfg, type_key) if type_key else None
             weights = cfg.optim.get("aux_loss_weights", {}) or {}
+            field_corr = float(weights.get("field_corr", 0.0) or 0.0) > 0
             return TransformerNodeEncoderHook(
                 max_seq_len=params["max_seq_len"],
                 n_heads=params["n_heads"],
@@ -919,7 +946,7 @@ class GlobalModule(BaseModule):
                 long_range_attention=params["long_range_attention"],
                 local_mask_hops=local_mask_hops,
                 # The bilinear part reads the last layer's map in every training step, so the maps are kept for it too.
-                return_attention_maps=cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION or bilinear_rank > 0,
+                return_attention_maps=cfg.optim.get("loss", None) in LOSSES_READING_ATTENTION or bilinear_rank > 0 or field_corr,
                 attention=attention,
                 attention_seed=int(cfg.optim.get("seed", 0) or 0),
                 precomputed_mask_fill=params.get("precomputed_mask_fill", "learned"),
@@ -931,6 +958,7 @@ class GlobalModule(BaseModule):
                 context_only=params.get("context_only", "none"),
                 bilinear_rank=bilinear_rank,
                 bilinear_head=int(bilinear.get("head", -1)) if bilinear is not None else -1,
+                field_corr=field_corr,
                 context_query_inputs=tuple(context_query.get("inputs", ["position"])) if context_query is not None else ("position",),
                 context_type_attr=type_attr,
                 type_vocab=int(context_query.get("type_vocab", 64)) if context_query is not None else 64,

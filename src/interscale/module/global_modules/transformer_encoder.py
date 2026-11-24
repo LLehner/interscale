@@ -895,7 +895,7 @@ class TransformerNodeEncoderHook(GlobalModule):
             attn_mask,
             # A bilinear model keeps its maps (return_attention_maps): None lets this pass keep them too, so the last layer's map is
             # readable afterwards (`last_attention_map`); any other model keeps nothing.
-            register_hook=None if self.bilinear_rank else False,
+            register_hook=None if (self.bilinear_rank or self.field_corr) else False,
             rotary=rotary,
             **self._query_kwargs(given),
         )

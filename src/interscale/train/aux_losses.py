@@ -1386,3 +1386,75 @@ class SenderSparsity(AuxLoss):
         if layer is None:
             return {"sender_sparsity": out.y_pred.new_zeros(())}
         return {"sender_sparsity": self.value(layer.weight).to(out.y_pred.dtype)}
+
+
+@register_aux_loss("field_corr")
+class FieldCorrelation(AuxLoss):
+    """Rewards attention whose sender fields correlate with the hidden genes (2.3, ``.claude/comparison.md``): for every graph, the genes hidden in
+    all its rows (channel masking: the targets ``T``) and those hidden in none (the senders ``S``), the Pearson correlation over the graph's cells
+    between each sender field ``f_s`` (``sum_j a_ij x_js``, ``StepOutput.fields``) and each target ``y_t``, centred per graph (or per
+    ``optim.field_corr.center_key`` label within the graph: correlation beyond a region). The term is minus the mean over targets of a soft maximum
+    over senders, ``sum_s softmax_s(r_st^2 / temperature) r_st^2``: the attention is pushed to read cells whose genes co-vary with what each
+    receiver lacks. Only the attention carries gradient (the expression is data). Reported: ``_field_corr_max`` (mean over targets of the best
+    sender's ``r^2``). Targets and senders are disjoint gene sets, so no gene is rewarded for predicting itself."""
+
+    def __init__(self, cfg, module=None):
+        super().__init__()
+        settings = cfg.optim.get("field_corr", None)
+        self.temperature = float(settings.get("temperature", 0.05)) if settings is not None else 0.05
+        key = str(settings.get("center_key", "") or "") if settings is not None else ""
+        if key:
+            from interscale.tl.geome_utils import label_attribute
+
+            self.center_attr = label_attribute(cfg, key)
+        else:
+            self.center_attr = None
+
+    @staticmethod
+    def _centre(values: torch.Tensor, groups: torch.Tensor) -> torch.Tensor:
+        codes, inverse = torch.unique(groups, return_inverse=True)
+        sums = values.new_zeros(len(codes), values.shape[1]).index_add_(0, inverse, values)
+        counts = torch.bincount(inverse, minlength=len(codes)).clamp_min(1).to(values.dtype)
+        return values - (sums / counts[:, None])[inverse]
+
+    def forward(self, out: StepOutput, batch) -> dict[str, torch.Tensor]:
+        fields = getattr(out, "fields", None)
+        if fields is None:
+            raise ValueError("optim.aux_loss_weights.field_corr needs StepOutput.fields: a GlobalModel built with the term (dense attention).")
+        entry = out.entry_mask
+        if entry is None:
+            raise ValueError("optim.aux_loss_weights.field_corr needs gene masking (an entry mask).")
+        y = out.y_true.detach().to(fields.dtype)
+        idx = out.view.padded_node_idx
+        graph = getattr(batch, "batch", None)
+        n = fields.shape[0]
+        graph = torch.zeros(n, dtype=torch.long, device=fields.device) if graph is None else (graph[idx] if idx is not None else graph)
+        groups = graph.clone()
+        if self.center_attr is not None:
+            label = getattr(batch, self.center_attr, None)
+            if label is None:
+                raise ValueError(f"optim.field_corr.center_key: the graphs carry no {self.center_attr!r} (add it to dataset.extra_obs_keys).")
+            label = label.argmax(dim=1) if label.dim() == 2 else label
+            label = label[idx] if idx is not None else label
+            groups = graph * (int(label.max()) + 1) + label.long()
+        losses, best = [], []
+        for b in torch.unique(graph).tolist():
+            rows = graph == b
+            if int(rows.sum()) < 8:
+                continue
+            e = entry[rows]
+            targets = e.all(dim=0)
+            senders = ~e.any(dim=0)
+            if not bool(targets.any()) or not bool(senders.any()):
+                continue
+            f = self._centre(fields[rows][:, senders], groups[rows])
+            t = self._centre(y[rows][:, targets], groups[rows])
+            r = (f.T @ t) / (f.norm(dim=0)[:, None] * t.norm(dim=0)[None, :]).clamp_min(1e-8)  # [S, T]
+            r2 = r**2
+            weights = torch.softmax(r2 / self.temperature, dim=0)
+            losses.append(-(weights * r2).sum(dim=0).mean())
+            best.append(r2.max(dim=0).values.mean().detach())
+        if not losses:
+            zero = fields.sum() * 0.0
+            return {"field_corr": zero, "_field_corr_max": zero.detach()}
+        return {"field_corr": torch.stack(losses).mean(), "_field_corr_max": torch.stack(best).mean()}
