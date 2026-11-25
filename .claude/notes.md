@@ -2646,3 +2646,25 @@ What doesn't work / limits:
 - vannan: the untrained twin reproduces most top sender-type pairs, so A2 must be read as trained minus twin; top responders are other types'
   markers, and the spillover flag marks ~60 % of them for trained and twin alike (46 fine types: the flag cannot separate).
 - LR support null everywhere (CosMx and vannan, all arms).
+
+## 2026-11-25 -- Local / global split of the gene rankings for the global-only model (built, not run)
+
+The user asked whether the orthogonality losses (D4) make sense for the global-only model and for a split local / global ranking like the dual
+model's, in four variants with a plot each, plus Moran's I (local on the neighbourhood graph vs across the slide). Design, variants and
+expectations: comparison.md, "Local / global split of the gene rankings".
+
+What worked:
+- Orthogonality with one embedding: only three terms still apply (own cell vs context `orth_gene_corr`, readable dimensions, a near / far split if
+  the context were two streams); a penalty would force near and far to explain different genes, so the split is measured, not trained.
+- The read-out's decomposition splits exactly by sender distance for every gene at once (equals the one-hot decomposition, per radius by hand).
+- The per-receiver permutation by distance separates the toy's 150 µm responder (all near, far exactly 0) from its 400 µm partner (all far);
+  batched copies read exactly as one at a time.
+- The whole hook ran on toy read-out and prototype models; every plot drawn and looked at (two fixes from looking: the colour bar sat on a panel;
+  Moran locality of genes without local autocorrelation was meaningless and is now left out, grey).
+
+What doesn't work / limits:
+- near = drop(0) - drop(r) is a difference of two independent permutations: where both remove a gene's whole signal it scatters (toy, 30 receivers:
+  +-0.4 on a drop of 1.0). Read it over many receivers; per-gene shares of weak responders are noise (genes below a drop of 0.01 are greyed).
+- V1 covers the read-out models only; the prototype's reference is its two heads and the permutation.
+- Moran's I is spatial variability, not interaction; it is the axis the user asked for, not a truth.
+- The palette validator (node) is not installed locally; the class colours are the reference palette's first five slots unchanged.

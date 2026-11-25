@@ -602,6 +602,12 @@ kind, the prototype included; per-gene totals and per-(near sender, gene) parts;
 `row_agreement`), `gene_ranking.interaction_scales` (the scale ladder: where a responder's drop within niches reaches half its plain drop).
 Cluster jobs: `slurm/November/extra_*.py`, `extra_submit.sh expand_synth|expand_cosmx|maskstab|heads|fieldcorr`.
 
+The local / global split of a ranking (`.claude/comparison.md`, "Local / global split", 2026-11-25): `attribution.decomposition_by_distance` (a read-out
+model's exact context part of every gene, split by sender distance; sums to the one-hot `decomposition`) and `gene_ranking.distance_flows` /
+`merge_distance_flows` (any model: per receiver and radius only the cells beyond r swap within their label, only that receiver's row is read; one copy
+per receiver and radius, batched copies equal one at a time). `near = drop(0) - drop(r)` is a difference of two independent permutations: read it over
+many receivers. Cluster: `slurm/November/split_common.py`, `split_read.py`, `extra_submit.sh split_synth|split_cosmx eval`.
+
 ### Preprocessing / robustness utilities (`interscale.pp`)
 
 `pp.segmentation_noise.apply_segmentation_noise` simulates cell-segmentation errors (used when `cfg.dataset.segmentation_robustness` is set in `main.py`/`main_sweep.py`) for robustness sweeps.

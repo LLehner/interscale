@@ -454,3 +454,51 @@ tables: `compare_cosmx/compare_rebuilt_2026-11-25.md` (numbers below). Rerun the
 - **Sender -> receiver effects** are within-type first (Mast -> Mast 0.025 on ir_ch_f12, Acinar -> Acinar 0.013-0.016, Ductal -> Ductal 0.006-0.009),
   then Acinar -> Endothelial (0.010-0.012); the prototype's effects are 5-10x smaller; twins ~0.
 - Cost: ~7,500 s per ir arm (plain + region), ~1,500-1,850 s per prototype on 1 mm tiles.
+
+## Local / global split of the gene rankings (2026-11-25; built, not run)
+
+The user asked whether the orthogonality losses make sense for the global-only model (mostly not: one embedding; see notes.md) and for a split
+local / global ranking with the global-only model, "similar as interscale does with the dual-model", in four variants, each a plot to judge, plus
+Moran's I (local on the neighbourhood graph, every cell a centre, vs across the whole slide) as the model-free comparison and colour.
+
+**Library (fork):**
+- `attribution.decomposition_by_distance(module, batch, receivers, radii)`: the interaction read-out's exact context part of every gene at once,
+  split by the senders' distance from the receiver (`within` [Q, K, G], `total` [Q, G]); equals the one-hot-per-gene `decomposition` (tested to 1e-4,
+  per radius by hand; mutants with the wrong origin or radius caught; leaving the receiver in is equivalent: the read-out never attends to it).
+- `gene_ranking.distance_flows(module, graphs, labels, genes, radii)` / `merge_distance_flows`: per receiver and radius, every other cell farther than
+  r swaps its visible entries within its label, only that receiver's row is read (one perturbed copy per receiver and radius, `batch_size` copies per
+  pass, identical to one at a time, tested); `near(k) = drop(0) - drop(k)`, `far(k) = drop(k)`. Toy: the 150 µm responder is all near (far exactly 0),
+  the 400 µm partner all far. **Noise:** near is the difference of two independent permutations; where both remove the whole signal it scatters
+  (toy, 30 receivers: +-0.4 on a drop of 1.0), so read it over many receivers.
+
+**The variants** (cluster `split_common.py`, `split_read.py`; jobs `split_synth`, `split_cosmx` in `extra_job.py`, evaluation only, on the
+comparison's checkpoints; synth: ir_ch s42/s43, proto_ch s42/s43, proto_ch_pe s42 + twins; CosMx: ir_ch s42/s43, proto_ch s42, proto_ch_pe s42 + twins,
+8 tiles of 1 mm; one partition of gene folds at 0.2, every gene hidden in every cell once):
+
+| | what | models | plot |
+| --- | --- | --- | --- |
+| V1 decomposition | spread over receivers (centred within graph x label) of the context part from within / beyond r | read-out (ir_ch) | `v1_decomposition.png` |
+| V2 permutation | responder drop carried within / beyond r (`distance_flows`); for the prototype also each head's responder drop (GCN vs transformer: interscale's own split, the reference) | all | `v2_permutation.png`, `v2_dual_heads.png` |
+| V3 radius profile | V1 and V2 at r = 0, the local reach and RADII_UM (synth 100-1500 µm, CosMx 15-250 µm): share of the effect within r against r, r50 per gene | all | `v3_profiles.png`, `v3_r50.png` |
+| V4 ladder | `extra_common.ladder` (swaps within niches of k = 10 ... 300 nearest cells; synth + region): the scale where the drop is half gone | all | `v4_ladder.png` |
+| Moran | `gene_scales.scale_sets` on the whole test slides: I_local (the dataset's own graph, 1-2 hops, every cell a centre) vs I_global (inverse distance across the slide); CosMx also on the (section, type) residual. locality = (I_local - I_global) / I_local for genes with I_local >= 0.05 (else not spatially variable, grey) | -- | `moran.png`, the colour of every plot |
+| rankings | the global-only model's near / far rankings against the prototype's (by distance, and by its two heads) | ir_ch, proto_ch | `rankrank.png` |
+
+r (the local reach) is Moran's 2-hop neighbourhood in µm (median), so "local" means the same for the model readouts and for Moran. `split.md`: per
+run and variant the median near share, its Spearman with Moran locality (> 0: the model calls Moran-local genes local), r50, on synth the median near
+share per planted class; the prototype heads' table; rank Spearman; the top 15 near / far responders per run.
+
+**Expectations, fixed before the run:**
+- synth: short / mid responders near (share > 0.5 at the reach), dense / sparse / directional far; the twins near by geometry only; V1 and V2
+  agree on ir_ch (same model, two readouts); the prototype's GCN head carries the short responders, its transformer head the rest.
+- CosMx: most of every gene's effect within the reach (A4: 47-56 % of |IG| within 60 µm, ~90 % within 500 µm); far rankings thin and FOV-driven
+  (ceiling audit); Moran locality mostly positive on the raw expression (type markers) and closer to 0 on the residual.
+- Moran vs model: Spearman > 0 but small on CosMx (Moran is spatial variability, not interaction; the user knows and wants the axis anyway).
+
+**Checks run:** library tests (39 in `test_gene_ranking.py` + `test_attribution_methods.py`), the jobs' real `__main__` with `sweep_common.main`
+stubbed (modes, runs, twins, results folder), the hook end to end on the toy read-out model and the toy prototype (every table written), every plot
+drawn from the toy output in both modes (CosMx: Moran colour; synth: planted classes) and looked at. Not run on real data.
+
+**Run:** after syncing the fork's main: `bash slurm/extra_submit.sh split_synth eval` and `... split_cosmx eval` (one GPU each; estimates ~1-2 h synth,
+~2-4 h CosMx; every step prints `[time]`). Results MA/25_11_results/split_<data>/ (split.md, plots/). Files (flat, slurm/November): split_common.py,
+split_read.py, extra_job.py, extra_job.sbatch, extra_submit.sh, plus what extra_job imports.
