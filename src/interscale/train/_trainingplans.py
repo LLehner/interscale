@@ -866,21 +866,34 @@ class TrainingPlan(pl.LightningModule):
 
     def _dual_masked(self, batch):
         """``(copy of batch, strategy)``: the same cells under the other kind of mask, drawn from the private generator. ``strategy`` ``node``:
-        ``rate`` of the cells hidden whole (``mask``, no ``gene_mask``); ``channel``: per graph ``round(channel_fraction * G)`` genes hidden in
-        every cell (``gene_mask`` and ``mask``), as ``dataset.mask_channel_fraction`` draws them."""
-        from interscale.tl.masking import sample_channel_columns, sample_node_mask
+        ``rate`` of the cells hidden whole (``mask``, no ``gene_mask``), at random or, with ``radius`` > 0, in whole discs of that radius (``pos``
+        units) until ``rate`` of each graph's cells is covered (``sample_block_mask``, as ``dataset.mask_block_radius_um`` draws them);
+        ``channel``: per graph ``round(channel_fraction * G)`` genes hidden in every cell (``gene_mask`` and ``mask``), as
+        ``dataset.mask_channel_fraction`` draws them."""
+        from interscale.tl.masking import sample_block_mask, sample_channel_columns, sample_node_mask
 
         dm = self.dual_mask
         second = batch.clone()
         n, g = int(batch.x.shape[0]), int(batch.x.shape[1])
         device = batch.x.device
+        graph = getattr(batch, "batch", None)
+        graph = torch.zeros(n, dtype=torch.long, device=device) if graph is None else graph
         if dm["strategy"] == "node":
-            second.mask = sample_node_mask(n, float(dm["rate"]), self._dual_generator).to(device)
+            radius = float(dm.get("radius", 0.0))
+            if radius > 0:
+                if getattr(batch, "pos", None) is None:
+                    raise ValueError("optim.dual_mask.radius_um draws discs over cell coordinates, but the batch has no `pos`.")
+                mask = torch.zeros(n, dtype=torch.bool)
+                graph_cpu, pos = graph.cpu(), batch.pos.detach().cpu()
+                for b in torch.unique(graph_cpu).tolist():
+                    rows = (graph_cpu == b).nonzero(as_tuple=True)[0]
+                    mask[rows] = sample_block_mask(pos[rows], radius, float(dm["rate"]), self._dual_generator)
+                second.mask = mask.to(device)
+            else:
+                second.mask = sample_node_mask(n, float(dm["rate"]), self._dual_generator).to(device)
             if hasattr(second, "gene_mask"):
                 del second.gene_mask
             return second, "node"
-        graph = getattr(batch, "batch", None)
-        graph = torch.zeros(n, dtype=torch.long, device=device) if graph is None else graph
         gene_mask = torch.zeros(n, g, dtype=torch.bool, device=device)
         for b in torch.unique(graph).tolist():
             columns = sample_channel_columns(g, float(dm["channel_fraction"]), self._dual_generator)

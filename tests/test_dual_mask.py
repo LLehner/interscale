@@ -111,3 +111,60 @@ def test_the_validator_wants_the_other_kind_and_a_single_head_model():
     cfg.optim.dual_mask.strategy = "blocks"
     with pytest.raises(ValueError, match="'node' or 'channel'"):
         _validate_dual_mask(cfg)
+
+
+def test_a_disc_pass_hides_whole_discs_per_graph_from_the_private_generator():
+    from interscale.train._trainingplans import TrainingPlan
+
+    module = torch.nn.Linear(2, 2)
+    module.n_output, module.mask_strategy = G, "gene"
+    radius, rate = 0.2, 0.3
+    plan = TrainingPlan(module, "regression", "node", "SCELoss", False, 1, None, None,
+                        dual_mask={"weight": 1.0, "strategy": "node", "rate": rate, "channel_fraction": 0.5, "radius": radius, "seed": 3})  # fmt: skip
+    batch = _batch()
+    state = torch.random.get_rng_state()
+    disc, kind = plan._dual_masked(batch)
+    assert kind == "node" and not hasattr(disc, "gene_mask")
+    assert torch.equal(state, torch.random.get_rng_state())  # the global generator is not touched
+    for b in range(2):
+        rows = (disc.batch == b).nonzero(as_tuple=True)[0]
+        hidden, pos = disc.mask[rows], batch.pos[rows].double()
+        assert int(hidden.sum()) >= int(np.ceil(rate * len(rows)))  # each graph covered to the rate on its own
+        # whole discs: every hidden cell lies within the radius of a hidden cell whose whole disc is hidden (its centre)
+        dist = torch.cdist(pos, pos)
+        centres = [i for i in hidden.nonzero(as_tuple=True)[0].tolist() if bool(hidden[dist[i] <= radius].all())]
+        assert centres
+        assert bool((dist[hidden][:, centres] <= radius).any(dim=1).all())
+    # a plan without a radius still draws cells at random (the old behaviour, same generator stream)
+    again = TrainingPlan(module, "regression", "node", "SCELoss", False, 1, None, None,
+                         dual_mask={"weight": 1.0, "strategy": "node", "rate": 0.4, "channel_fraction": 0.5, "seed": 3})  # fmt: skip
+    assert torch.equal(again._dual_masked(batch)[0].mask, _plan("node")._dual_masked(batch)[0].mask)
+
+
+def test_the_validator_takes_a_disc_radius_only_for_cells_and_the_tag_names_it():
+    from interscale.config import _validate_dual_mask, get_cfg_defaults
+    from interscale.train._training import dual_mask_settings
+
+    cfg = get_cfg_defaults()
+    cfg.dataset.prediction_task, cfg.dataset.prediction_level = "regression", "node"
+    cfg.dataset.mask_strategy = "gene"
+    cfg.optim.dual_mask.weight, cfg.optim.dual_mask.strategy = 1.0, "node"
+    cfg.optim.dual_mask.radius_um = 300.0
+    _validate_dual_mask(cfg)
+    cfg.dataset.spatial_unit_um = 0.5
+    assert dual_mask_settings(cfg)["radius"] == 600.0  # in the graphs' pos units
+    cfg.optim.dual_mask.radius_um = -1.0
+    with pytest.raises(ValueError, match="radius_um must be >= 0"):
+        _validate_dual_mask(cfg)
+    cfg.dataset.mask_strategy, cfg.optim.dual_mask.strategy, cfg.optim.dual_mask.radius_um = "node", "channel", 300.0
+    with pytest.raises(ValueError, match="needs strategy 'node'"):
+        _validate_dual_mask(cfg)
+    cfg.dataset.mask_strategy, cfg.optim.dual_mask.strategy, cfg.optim.dual_mask.rate = "gene", "node", 1.0
+    with pytest.raises(ValueError, match=r"rate must lie in \(0, 1\)"):
+        _validate_dual_mask(cfg)
+    cfg.optim.dual_mask.rate = 0.2
+    from interscale.tl.utils import _training_tag
+
+    assert "dmn1d300" in _training_tag(cfg)
+    cfg.optim.dual_mask.radius_um = 0.0
+    assert "dmn1" in _training_tag(cfg) and "dmn1d" not in _training_tag(cfg)  # no radius: the old tag

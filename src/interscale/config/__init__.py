@@ -1269,6 +1269,13 @@ def _validate_dual_mask(cfg):
         raise ValueError(f"optim.dual_mask.rate must lie in (0, 1], got {dm.rate}.")
     if not 0 < float(dm.get("channel_fraction", 0.2)) < 1:
         raise ValueError(f"optim.dual_mask.channel_fraction must lie in (0, 1), got {dm.channel_fraction}.")
+    radius = float(dm.get("radius_um", 0.0))
+    if radius < 0:
+        raise ValueError(f"optim.dual_mask.radius_um must be >= 0 (0: cells at random), got {radius}.")
+    if radius > 0 and strategy != "node":
+        raise ValueError("optim.dual_mask.radius_um draws discs of cells: it needs strategy 'node'.")
+    if radius > 0 and not float(dm.get("rate", 0.2)) < 1:
+        raise ValueError(f"optim.dual_mask discs cover a share of the cells: rate must lie in (0, 1), got {dm.rate}.")
     primary = str(cfg.dataset.mask_strategy)
     if (strategy == "node") == (primary == "node"):
         raise ValueError(

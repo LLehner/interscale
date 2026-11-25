@@ -391,7 +391,8 @@ def _training_tag(cfg) -> str:
         parts.append(f"drop{len(dropped)}-{digest}")
     dm = cfg.optim.get("dual_mask", None)
     if dm is not None and float(dm.get("weight", 0.0)) != 0.0:
-        parts.append(f"dm{str(dm.strategy)[0]}{float(dm.weight):g}")
+        disc = float(dm.get("radius_um", 0.0))
+        parts.append(f"dm{str(dm.strategy)[0]}{float(dm.weight):g}" + (f"d{disc:g}" if disc > 0 else ""))
     weights = {name: float(w) for name, w in dict(cfg.optim.get("aux_loss_weights", {})).items() if float(w) != 0.0}
     if weights:
         # the interaction read-out's penalties go short: the name must stay under 255 characters (older names unchanged)

@@ -687,5 +687,7 @@ def dual_mask_settings(cfg) -> dict | None:
     dm = cfg.optim.get("dual_mask", None)
     if dm is None or float(dm.get("weight", 0.0)) == 0.0:
         return None
+    # the disc radius in the graphs' `pos` units, as block_mask_kwargs converts dataset.mask_block_radius_um
+    radius = float(dm.get("radius_um", 0.0)) / float(cfg.dataset.get("spatial_unit_um", 1.0) or 1.0)
     return {"weight": float(dm.weight), "strategy": str(dm.strategy), "rate": float(dm.rate), "channel_fraction": float(dm.channel_fraction),
-            "seed": int(cfg.optim.get("seed", 0) or 0)}  # fmt: skip
+            "radius": radius, "seed": int(cfg.optim.get("seed", 0) or 0)}  # fmt: skip

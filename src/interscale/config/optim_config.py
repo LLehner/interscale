@@ -148,11 +148,14 @@ def get_optim_cfg(cfg):
     # A second pass with the other kind of mask in every training step (2.1, `.claude/comparison.md`): its loss times `weight` is added to
     # the objective (0: off). `strategy` node: `rate` of the cells hidden whole; channel: `channel_fraction` of the genes hidden in every cell.
     # It takes the kind the dataset's own mask does not (cells under gene masking, channels under cell masking). GlobalModel only.
+    # `radius_um` (node only): above 0, the cells are hidden in whole discs of that radius until `rate` of each graph's cells is covered (as
+    # dataset.mask_block_radius_um draws them); 0: `rate` of the cells at random.
     cfg.optim.dual_mask = CN()
     cfg.optim.dual_mask.weight = 0.0
     cfg.optim.dual_mask.strategy = "node"
     cfg.optim.dual_mask.rate = 0.2
     cfg.optim.dual_mask.channel_fraction = 0.2
+    cfg.optim.dual_mask.radius_um = 0.0
     cfg.optim.attn_entropy = CN()
     cfg.optim.attn_entropy.ramp_epochs = 0
 
