@@ -573,6 +573,55 @@ def _decomposition(module, batch, receivers, weights, method, eval_step, unit, s
     return Attribution(method, None, receivers, contribution.astype(np.float32), change, gap, time.time() - started)
 
 
+def decomposition_by_distance(module, batch, receivers, radii, *, eval_step: bool = False, spatial_unit_um: float = 1.0) -> dict:
+    """The interaction read-out's exact context part of every gene, split by the senders' distance from the receiver (local vs global ranking of a
+    global-only model, ``.claude/comparison.md`` "Local / global split").
+
+    Per receiver and gene, each sender's share is ``_decomposition``'s (attention weight times the sender's value through the decoder), for all
+    genes at once. ``radii`` (units of ``batch.pos``, ascending): ``within`` ``[Q, K, G]`` sums the senders at distance ``<= radii[k]``, ``total``
+    ``[Q, G]`` every sender; ``total - within[:, k]`` is the part from beyond ``radii[k]``. The receiver itself is left out, as in
+    ``attribute(..., "decomposition")``, whose one-hot-per-gene result ``total`` equals. NaN rows for receivers the pass did not keep.
+    ``eval_step``: the clean pass (True) or the graph's own masks (False: read hidden genes with their columns hidden).
+    """
+    from interscale.evaluation.interaction_readout import _block_weights, _values, readout_layers, readout_pass
+
+    radii = np.asarray(radii, dtype=np.float64)
+    if radii.ndim != 1 or not len(radii) or np.any(np.diff(radii) < 0) or np.any(radii < 0):
+        raise ValueError(f"radii must be a non-empty ascending list of distances >= 0, got {radii.tolist()}.")
+    if not readout_layers(module):
+        raise ValueError("decomposition_by_distance needs an interaction read-out model (attention.readout); this module has none.")
+    receivers = np.asarray(receivers, dtype=np.int64)
+    batch = _on_module_device(module, batch)
+    pos = batch.pos[:, :2].double().cpu().numpy()
+    was_training = module.training
+    module.eval()
+    try:
+        rp = readout_pass(module, batch, eval_step=eval_step, spatial_unit_um=spatial_unit_um)
+        positions = rp.position_of(receivers)
+        cells_pos = np.arange(rp.offset, rp.offset + len(rp.index_nodes))
+        nodes = np.asarray(rp.index_nodes)
+        with torch.no_grad():
+            values = _values(module, rp)  # [LH, L, E]
+            w_dec = module.decoder.decoder.weight.detach().to(values.dtype)  # [G, E]
+            per_gene = values @ w_dec.T  # [LH, L, G]: each sender's value through the decoder, every gene
+            n_genes = int(w_dec.shape[0])
+            within = np.full((len(receivers), len(radii), n_genes), np.nan)
+            total = np.full((len(receivers), n_genes), np.nan)
+            for k, (node, p) in enumerate(zip(receivers, positions, strict=True)):
+                if p < 0:
+                    continue
+                cells, _ = _block_weights(module, rp, int(p), int(p) + 1)  # [1, LH, L]
+                share = torch.einsum("hl,hlg->lg", cells[0].to(per_gene.dtype), per_gene)[cells_pos].double().cpu().numpy()  # [n, G]
+                share[nodes == node] = 0.0  # the receiver itself, as _decomposition
+                d = np.linalg.norm(pos[nodes] - pos[node], axis=1)
+                total[k] = share.sum(axis=0)
+                for j, r in enumerate(radii):
+                    within[k, j] = share[d <= r].sum(axis=0)
+    finally:
+        module.train(was_training)
+    return {"radii": radii, "receivers": receivers, "within": within, "total": total}
+
+
 # ----------------------------------------------------------------------------------------------- expression space (any model kind, per gene)
 
 #: Methods available on the expression path (``attribute(..., space="expression")``).

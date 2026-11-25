@@ -19,6 +19,7 @@ from interscale.evaluation.attribution import (
     _secant_activations,
     agreement,
     attribute,
+    decomposition_by_distance,
     deviation_targets,
     disc_strengths,
     distance_profile,
@@ -471,3 +472,42 @@ def test_subtract_fields_cancels_what_the_twin_shares():
     assert np.corrcoef(net, signal)[0, 1] > 0.9 and abs(np.corrcoef(net, layout)[0, 1]) < np.corrcoef(trained["flow_out"], layout)[0, 1]
     with pytest.raises(ValueError, match="same cells"):
         subtract_fields(trained, map_fields(pos[::-1], layout, np.zeros(200), np.ones(200, np.int8)))
+
+
+def test_the_distance_split_of_the_decomposition_adds_up_to_the_one_hot_decomposition_of_every_gene(ir):
+    module, graph, labels = ir
+    receivers = np.array([3, 17, 40, 55])
+    pos = graph.pos[:, :2].double().numpy()
+    radii = [0.0, 60.0, 150.0, 1e9]
+    x_before = graph.x.clone()
+    split = decomposition_by_distance(module, graph, receivers, radii, eval_step=True)
+    assert split["within"].shape == (4, 4, G) and split["total"].shape == (4, G)
+    for g in range(G):
+        w = gene_targets([g], len(receivers), G)
+        attr = attribute(module, graph, receivers, w, "decomposition", eval_step=True)
+        np.testing.assert_allclose(split["total"][:, g], attr.contribution.sum(axis=1), rtol=1e-4, atol=1e-5)
+        for k, r in enumerate(radii):  # the senders within each radius, by hand from the per-sender shares
+            near = np.array([attr.contribution[i][np.linalg.norm(pos - pos[q], axis=1) <= r].sum() for i, q in enumerate(receivers)])
+            np.testing.assert_allclose(split["within"][:, k, g], near, rtol=1e-4, atol=1e-5)
+    # radius 0 holds only the receiver itself, which is left out; an infinite radius holds every sender
+    np.testing.assert_allclose(split["within"][:, 0], 0.0, atol=1e-6)
+    np.testing.assert_allclose(split["within"][:, -1], split["total"], rtol=1e-6, atol=1e-7)
+    assert torch.equal(graph.x, x_before) and not module.training
+    with pytest.raises(ValueError, match="ascending"):
+        decomposition_by_distance(module, graph, receivers, [100.0, 50.0])
+
+
+def test_distance_flows_read_the_same_in_batches_as_one_copy_at_a_time(ir):
+    from interscale.evaluation.gene_ranking import distance_flows, hide_genes
+
+    module, graph, labels = ir
+    hidden = hide_genes([graph], [0, 1])[0]
+    hidden.batch = graph.batch
+    saved, module.mask_strategy = module.mask_strategy, "gene"  # folds are read as gene masks, as the cluster readouts do
+    try:
+        one = distance_flows(module, [hidden], [labels], [f"g{k}" for k in range(G)], [0.0, 80.0], per_type=6, seed=1, batch_size=1)
+        many = distance_flows(module, [hidden], [labels], [f"g{k}" for k in range(G)], [0.0, 80.0], per_type=6, seed=1, batch_size=4)
+    finally:
+        module.mask_strategy = saved
+    np.testing.assert_allclose(np.nan_to_num(one.drop), np.nan_to_num(many.drop), rtol=1e-5, atol=1e-7)
+    assert np.isfinite(one.drop[0][:, :2]).any() and np.isnan(one.drop[0][:, 2:]).all()  # only the hidden genes are read

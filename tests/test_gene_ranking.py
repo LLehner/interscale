@@ -19,7 +19,9 @@ from interscale.evaluation.gene_ranking import (
     ContextFlows,
     co_varying_groups,
     context_flows,
+    distance_flows,
     group_pair_scores,
+    merge_distance_flows,
     group_sets,
     group_table,
     hide_cells,
@@ -479,3 +481,28 @@ def test_interaction_scales_keeps_its_columns_when_nothing_is_read():
 
     t = interaction_scales(np.zeros((1, 2)), {100: np.zeros((1, 2)), 300: np.zeros((1, 2))}, ["A"], ["g0", "g1"])
     assert not len(t) and {"scale_um", "where", "ratio_100", "ratio_300"} <= set(t.columns)
+
+
+def test_distance_flows_put_the_150_um_responder_near_and_the_400_um_partner_far():
+    labels = _labels()
+    module, graph = _Known(labels), _graph(labels)
+    before = graph.x.clone()
+    torch_state, np_state = torch.random.get_rng_state(), np.random.get_state()[1].copy()
+    # the toy reads one graph at a time (batch_size 1); every B cell the share allows is a receiver
+    flows = distance_flows(module, [graph], [labels], GENES, [0.0, 250.0, 1e9], per_type=200, seed=2, batch_size=1)
+    assert torch.equal(torch_state, torch.random.get_rng_state()) and np.array_equal(np_state, np.random.get_state()[1])
+    assert torch.equal(graph.x, before)
+    b = flows.receivers.index("B")
+    # g0 reads A neighbours within 150 um: swapping the cells beyond 250 um changes nothing, exactly
+    assert flows.drop[0, b, 0] > 0.3 and abs(flows.far(1)[b, 0]) < 1e-9
+    # g2 reads the partner 400 um away: swapping beyond 250 um loses it as swapping everything does (two independent draws: equal up to noise)
+    assert flows.far(1)[b, 2] > 0.5 and abs(flows.near(1)[b, 2]) < 0.25 * flows.drop[0, b, 2]
+    assert flows.near(1)[b, 0] > 0.3
+    # beyond every distance nothing moves; the cell's own gene never moves
+    np.testing.assert_allclose(np.nan_to_num(flows.far(2)), 0.0, atol=1e-9)
+    assert abs(flows.drop[0, b, 1]) < 1e-9
+    merged = merge_distance_flows([flows, flows])
+    np.testing.assert_allclose(np.nan_to_num(merged.drop), np.nan_to_num(flows.drop))
+    np.testing.assert_array_equal(merged.count, 2 * flows.count)
+    with pytest.raises(ValueError, match="start at 0"):
+        distance_flows(module, [graph], [labels], GENES, [100.0, 200.0])

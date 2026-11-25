@@ -320,6 +320,149 @@ def merge_context_flows(parts: list[ContextFlows]) -> ContextFlows:
     )  # fmt: skip
 
 
+# ----------------------------------------------------------------------------------------------- responders split by sender distance
+
+
+@dataclass
+class DistanceFlows:
+    """``drop`` ``[K, R, G]``: a target's centred cosine within the receiver group, unchanged minus changed, when every cell farther than ``radii[k]`` from
+    the receiver takes the visible profile of another such cell of its label (``radii[0]`` = 0: every other cell, the responder score). ``base``,
+    ``count``, ``expressed`` ``[R, G]`` as in :class:`ContextFlows`. ``near(k)`` = ``drop[0] - drop[k]`` is what the cells within ``radii[k]`` carry,
+    ``far(k)`` = ``drop[k]`` what the cells beyond carry."""
+
+    radii: list[float]
+    receivers: list[str]
+    genes: list[str]
+    drop: np.ndarray
+    base: np.ndarray
+    count: np.ndarray
+    expressed: np.ndarray
+
+    def near(self, k: int) -> np.ndarray:
+        return self.drop[0] - self.drop[int(k)]
+
+    def far(self, k: int) -> np.ndarray:
+        return self.drop[int(k)]
+
+
+def distance_flows(
+    module,
+    graphs,
+    labels,
+    genes,
+    radii,
+    *,
+    targets: str = "hidden",
+    head: str = "global",
+    per_type: int = 100,
+    seed: int = 0,
+    device="cpu",
+    batch_size: int = 8,
+) -> DistanceFlows:
+    """Responders split by the distance of the cells that carry them (the model-agnostic local / global ranking; ``.claude/comparison.md``,
+    "Local / global split").
+
+    Per receiver and radius ``r`` (``radii``, units of ``pos``, ascending, starting at 0): every other cell farther than ``r`` from the receiver takes
+    the visible entries of another such cell of its label (a permutation within label of exactly those cells), and only that receiver's row is read.
+    One perturbed copy per receiver and radius, so receivers never share a perturbation and the near / far split is exact for each of them; every
+    radius reads the same receivers. Scores as :func:`context_flows` (centred cosine within the receiver group, pooled over graphs); ``r`` = 0 is
+    ``all_state`` with the receiver's own row the only one kept. Hidden entries never move; the graphs and the global generators are left as found.
+    """
+    radii = [float(r) for r in radii]
+    if not radii or radii[0] != 0.0 or any(b < a for a, b in zip(radii, radii[1:], strict=False)):
+        raise ValueError(f"radii must be ascending and start at 0 (every other cell), got {radii}.")
+    genes = [str(g) for g in genes]
+    labels = [np.asarray(v).astype(str) for v in labels]
+    types = sorted(set().union(*[set(v.tolist()) for v in labels]))
+    n_k, n_r, n_g = len(radii), len(types), len(genes)
+    pred_sums, pcount = np.zeros((n_k, n_r, 3, n_g)), np.zeros((n_k, n_r, n_g))
+    base_sums, count = np.zeros((n_r, 3, n_g)), np.zeros((n_r, n_g))
+    detected, total = np.zeros((n_r, n_g)), np.zeros((n_r, 1))
+    within = _WithinVariance(types, n_g)
+    rng = np.random.default_rng(seed)
+    was_training = module.training
+    module.eval()
+    try:
+        with _rng_untouched(device), torch.no_grad(), _scoring_every_cell(module, targets == "all"):
+            for graph, label in zip(graphs, labels, strict=True):
+                truth = graph.x.double().cpu().numpy()
+                hidden = _hidden_entries(graph, "gene")
+                target = scored_entries(graph, module, targets)
+                visible = torch.as_tensor(~hidden)
+                pos = graph.pos[:, :2].double().cpu().numpy()
+                receivers, _ = pick_receivers(pos, label, target.any(axis=1), 0.0, rng=rng, per_type=int(per_type))
+                base = _predict(module, [graph], head=head, batch_size=1, device=device)[0]
+                within.add(truth, label)
+                centres = _type_centres(base, truth, target, label, types)
+                members = {t: np.flatnonzero(label == t) for t in types}
+                for r, t in enumerate(types):
+                    detected[r] += (truth[members[t]] > 0).sum(axis=0)
+                    total[r] += len(members[t])
+                    rows_r = receivers[label[receivers] == t]
+                    if len(rows_r):
+                        valid = target[rows_r] & np.isfinite(base[rows_r])
+                        count[r] += valid.sum(axis=0)
+                        base_sums[r] += centred_sums(base[rows_r], truth[rows_r], valid, *centres[t])
+                for k, radius in enumerate(radii):
+                    pred = np.full_like(base, np.nan)
+                    copies, owners = [], []
+
+                    def flush():
+                        if copies:
+                            out = _predict(module, copies, head=head, batch_size=int(batch_size), device=device)
+                            for q, p in zip(owners, out, strict=True):
+                                pred[q] = p[q]
+                            copies.clear()
+                            owners.clear()
+
+                    for q in receivers:
+                        far = np.linalg.norm(pos - pos[q], axis=1) > radius
+                        far[q] = False
+                        rows, donors = [], []
+                        for t in types:
+                            cells = members[t][far[members[t]]]
+                            if len(cells) >= 2:
+                                rows.append(cells)
+                                donors.append(rng.permutation(cells))
+                        if rows:
+                            copies.append(_changed(graph, visible, np.concatenate(rows), np.concatenate(donors)))
+                        else:
+                            copies.append(graph)
+                        owners.append(int(q))
+                        if len(copies) >= int(batch_size):
+                            flush()
+                    flush()
+                    for r, t in enumerate(types):
+                        rows_r = receivers[label[receivers] == t]
+                        if len(rows_r):
+                            scored = target[rows_r] & np.isfinite(pred[rows_r]) & np.isfinite(base[rows_r])
+                            pred_sums[k, r] += centred_sums(pred[rows_r], truth[rows_r], scored, *centres[t])
+                            pcount[k, r] += scored.sum(axis=0)
+    finally:
+        module.train(was_training)
+    readable = within.readable()
+    base_cos = np.stack([cosine_from_sums(base_sums[r], count[r]) for r in range(n_r)]) if n_r else np.zeros((0, n_g))
+    drop = np.full((n_k, n_r, n_g), np.nan)
+    for k in range(n_k):
+        for r in range(n_r):
+            if pcount[k, r].any():
+                drop[k, r] = np.where(readable[r], base_cos[r] - cosine_from_sums(pred_sums[k, r], pcount[k, r]), np.nan)
+    return DistanceFlows(radii, types, genes, drop, np.where(readable, base_cos, np.nan), count, detected / np.maximum(total, 1))
+
+
+def merge_distance_flows(parts: list[DistanceFlows]) -> DistanceFlows:
+    """One :class:`DistanceFlows` from several runs on the same radii, labels and genes (the folds): reads averaged where read, counts added."""
+    if not parts:
+        raise ValueError("nothing to merge.")
+    first = parts[0]
+    if any((p.radii, p.receivers, p.genes) != (first.radii, first.receivers, first.genes) for p in parts):
+        raise ValueError("the parts read different radii, labels or genes.")
+    return DistanceFlows(
+        first.radii, first.receivers, first.genes, _nanmean_stack([p.drop for p in parts]), _nanmean_stack([p.base for p in parts]),
+        np.sum([p.count for p in parts], axis=0), first.expressed,
+    )  # fmt: skip
+
+
 # ----------------------------------------------------------------------------------------------- the three rankings
 
 
