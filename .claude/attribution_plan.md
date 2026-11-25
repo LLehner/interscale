@@ -489,3 +489,69 @@ first-bin push (does it survive removing the receiver type's marker genes from t
 
 Re-runs: `ATTR_RUNS=ir_c_ktype,ir_c_s42 bash slurm/attr_submit.sh cosmx` (4 tasks; joins 22_11_results/attr_cosmx), `bash slurm/attr_submit.sh synth`
 (send the .out / .err if it fails again), `bash slurm/attr_submit.sh vannan` (4 tasks).
+
+## Re-run read (2026-11-25; results MA/22_11_results/attr_{synth,cosmx,vannan}, synced 2026-11-25; logs MA/results/logs)
+
+### What ran
+
+| Job | Runs | Coverage | Seconds |
+| --- | --- | --- | --- |
+| synth (43894205, 4 tasks + report) | J1 `ref` s42/s43 + twin, `ir2_rate` s42/s43 + twin | 18 receivers per run, all classes | ref ~1,270 s, ir2_rate ~6,400 s per run |
+| cosmx (re-run, ATTR_RUNS) | ir_c_s42, ir_c_ktype s42/43/44 (+ typeres_s42 + twin from the first run) | **3 of 6 test sections** per read-out arm (4.5 h budget); ~49 receivers per section | 16,200-17,900 s per arm |
+| vannan (tiled) | ir_c_ktype s42/43/44 + twin, typeres_s42 + twin | 12 tiles of 1 mm each; ~1.5 receivers per fine type and tile | ktype ~20,000 s, typeres ~6,000 s |
+
+Missing: the **untrained twins of ir_c / ir_c_ktype on CosMx** (no tables; ATTR_RUNS should have taken them along). Without them the CosMx
+read-out arms have no trained-vs-twin contrast in A2 / A6.
+
+### A1 on synth_spot (the method decision)
+
+- **Planted sender in the top 5:** both trained models find short (0.96-1.0) and mid (1.0) senders with every method except raw attention (ir2_rate mid
+  0.76); the twins find short senders too (0.56-0.68; attention 1.0: geometry) but not mid (0.02-0.06). dense: only J1 `ref` (0.22-0.29 vs twin
+  ~0.01); directional and sparse at twin level for both (<= 0.10).
+- **Completeness:** IG is complete on both (ir2_rate median gap 0.023 at 5 steps, 0.003 at 50; ref 0.11 / 0.02). grad_input / DeepLIFT / conservative
+  0.8-1.5. decomposition is exact by construction (gap 0) but agrees poorly with IG (Spearman 0.34).
+- **Rule (fixed before the run): fails for every cheap method on the trained models** (gap > 0.1, Spearman with IG50 0.66-0.82 < 0.9). Only the
+  untrained ir2_rate twin's grad_input passes. Maps stay on IG for sampled receivers and disc targets, as planned.
+
+### A6 (linearity) -- the synth controls are weak
+
+- **Pairwise sender interactions are small everywhere on synth** (median |I| / (|D_j| + |D_k|) 0.02-0.07), including the learned thresholded programme
+  MC23 on `ref` (0.059 with the graph-mean reference, 0.032 sampled), where the target clearly moves (median |change| 1.49). MC20 (unlearned) is
+  trivially small (|change| 0.004-0.007). ir2_rate hardly moves MC23 (|change| 0.059): it did not learn the threshold.
+- Sensitivity-n with the graph-mean reference stays high for the trained models (IG50 r 0.70-0.96 at n = 1 and 16; ref MC20 0.28-0.43 is trivial);
+  with sampled references (large perturbations) it collapses for the trained models (0.01-0.47, short senders at n = 16 the exception: 0.91-0.95)
+  while the twins hold 0.50-0.72. Large perturbations show non-additive responses; the first-order (graph-mean) read does not.
+- **Consequence for the CosMx claim:** the measure separates the learned nonlinear rule only weakly on synth at the median (MC23 0.059 vs M11 0.024
+  on ref, 2.5x), and typeres on CosMx (0.078-0.092) sits *above* that learned threshold programme. So the 11-21 hypothesis ("CosMx uses its
+  neighbourhood as an approximately additive function") is not supported for typeres; for the read-out arms additivity is built in. A positive control
+  with a large planted interaction is needed before the median is read either way.
+
+### CosMx (ir_c, ir_c_ktype on 3 sections; typeres as before)
+
+- **Completeness:** IG5 complete on the read-out arms (ir_c 0.022, ir_c_ktype 0.081; ig5_sampled 0.02-0.03); cheap methods 0.6-2.1. No cheap method
+  can stand in for IG (agreement 0.54-0.72; occlusion 0.81-0.85).
+- **Pairwise interactions (A6), median over receiver types and sections:** ir_c 0.007-0.010, ir_c_ktype 0.006-0.010 under all three variants (type
+  mean / reference, type mean / mask, sampled) vs typeres 0.078-0.092 (twin 0.018-0.020). The interaction read-out models are additive in their senders;
+  part of that is the architecture (additive read-out; on vannan its twin is as additive), so it says nothing about the tissue. typeres, the dense
+  hierarchical transformer, is ~4x its twin on both datasets.
+- **A2 sender types (trained minus within-type permuted):** Acinar senders lead again for every model kind (ir_c_ktype: Acinar -> Acinar 0.34,
+  -> Endothelial 0.31, -> Ductal 0.22, -> Immune 0.19). New: **Beta senders -> Alpha receivers +0.24 (ir_c_ktype) / +0.21 (ir_c)**, and Acinar ->
+  Alpha negative (-0.16 / -0.09): the islet neighbourhood pushes Alpha cells, the exocrine one pulls them. Islet co-location or INS / GCG spillover
+  between neighbouring endocrine cells: not separable here (Item: test with the receiver's own type markers removed from the senders).
+- **A4 distance:** |contribution| by distance is the same in the real and the permuted section for every arm (ir_c 47 % within 60 um vs 45 %
+  permuted, 91 % within 500 um): the reach is geometry; content changes the sign, not the reach (as typeres on 11-24).
+
+### vannan (12 tiles)
+
+- IG complete on ir_c_ktype (0.006) and its twin; typeres 0.33 (cheap methods 1.8-3.3). Pairwise: ir_c_ktype 0.003-0.009 (twin 0.000-0.009), typeres
+  0.083-0.095 (twin 0.020-0.034): the same split as CosMx.
+- **A2 needs the twin:** the untrained ir_c_ktype reproduces most top sender -> receiver pairs (Secretory <- Basal 0.26 twin vs 0.47 trained; RASC <-
+  Basal 0.29 vs 0.36; Interstitial macrophages <- Alveolar FBs 0.25 vs 0.37; Alveolar FBs <- Alveolar FBs 0.25 vs 0.38). What training adds is the
+  difference (e.g. Adventitial FBs <- Alveolar FBs 0.41, absent from the twin's top), not the table.
+- A4: trained vs permuted differ by <= 0.05 per bin; ir_c_ktype puts 52 % of |IG| within 30 um (twin 41 %).
+- ~1.5 receivers per fine type and tile: the per-type tables rest on ~18 receivers per type.
+
+### Next (proposed)
+
+Rerun the CosMx read-out twins (ATTR_RUNS=ir_c_s42_untrained,ir_c_ktype_s42_untrained) and sections 4-6; a synth positive control where
+pairwise interaction must be large (a planted AND of two senders) before A6 is used as a linearity argument; A2 tables as trained minus twin.

@@ -896,3 +896,20 @@ typeres reads its own cell (raw own-cell skip); J6 read every CosMx run with TAR
 tasks failed in the hook (the toy check had used a stand-in without the skip). Fixed in gene_rank_common: TARGETS "auto" (clean pass when blind to the own
 cell, channel folds when trained with channel masks, else 20 % of the cells hidden whole). Re-read: `RANK_RUNS=typeres bash slurm/rank_submit.sh cosmx`
 (not run). comparison.md "Round 2" has the details.
+
+### E7 additions read 2026-11-25 (typeres on CosMx, first vannan rankings; MA/22_11_results/rank_{cosmx,vannan}, synced 2026-11-25)
+
+**CosMx typeres** (read on hidden cells, as it was trained; 3 seeds + twin, ~600 s per run):
+- C1 seed stability: responders RBO 0.553 -> PASS (ir_c 0.486 FAIL, ir_c_knone / ktype 0.610 / 0.609 PASS); drivers 0.556, pairs 0.418.
+- LR support null (AUC 0.497-0.505, twin 0.499), as every other arm.
+- C2 flagged share: spillover highest for Mast receivers (0.29; twin 0.24), handling flags low (0.01-0.05 except Acinar 0.21).
+
+**vannan** (1 mm tiles, 40 drawn, 200 senders; ir_c_ktype x 3 + twin, typeres x 3 + twin; 460-2,700 s per run):
+- C1: ir_c_ktype 0.446 FAIL, typeres 0.551 PASS (drivers 0.33 / 0.16: driver rankings are not seed-stable on vannan).
+- LR support null (AUC 0.49-0.52); the only nominal hit is the untrained ir_c_ktype twin (AUC 0.515, p_independent 0.033): a reminder that the
+  LR test's independent p is not a discovery on its own.
+- **Top responders are mostly other types' markers**: COL1A1 / COL3A1 / LUM / PTGDS in T cells, NK, macrophages and neutrophils; SFTPC in mast cells
+  and myofibroblasts; SCGB1A1 in alveolar macrophages and PNEC. C2 flags ~60 % of every type's top 50 as spillover -- and the untrained twins 66-68 %.
+  With 46 fine types nearly every gene is some type's marker, so the flag cannot separate on vannan; the responders look like segmentation /
+  neighbour contamination, not communication. A vannan-specific control is needed (coarse-type markers only, or the receiver's neighbours' own
+  types' markers taken out, as the CosMx spillover idea).

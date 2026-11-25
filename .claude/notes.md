@@ -2623,3 +2623,26 @@ Changes (user's choices: discs for 2.1, drop heads 3 and 12, eval-only with time
 What doesn't work / limits:
 - The hang's exact cause is not reproduced (that needs a cluster run); the separate process sidesteps it, threadpool_limits is a guard only.
 - The evaluation's own cost on synth is still unmeasured for the sweep jobs; the new [time] lines will give it.
+
+## 2026-11-25 -- Re-runs from 22/23 Nov read: attribution (synth, CosMx, vannan), CosMx comparison re-read, typeres and vannan rankings
+
+Results synced 2026-11-25 into MA/22_11_results and 23_11_results. Details: attribution_plan.md "Re-run read", comparison.md "CosMx re-read",
+ccc_model_plan.md "E7 additions read 2026-11-25". svg_* and compare_synth hold the runs already read on 11-24 (R2, C3).
+
+What worked:
+- attr_synth ran for the first time: IG is complete on both synth models (ir2_rate gap 0.02 at 5 steps); every method finds short and mid planted
+  senders, only J1 ref finds dense ones (0.29 vs twin 0.01); the A1 rule fails for every cheap method, so maps stay on IG.
+- The CosMx readability fix worked: all 9 receiver groups read with 960 targets. Prototype fits better (0.111 vs 0.065), global-only ranks more
+  stably (responders RBO 0.64 vs 0.47); the two families agree little (RBO 0.14-0.18).
+- Beta senders push Alpha receivers in both read-out arms (+0.21 / +0.24 over the permuted section); Acinar senders lead everywhere, as before.
+- typeres's CosMx ranking passes C1 (0.553); on vannan typeres passes C1 (0.551), ir_c_ktype fails (0.446).
+
+What doesn't work / limits:
+- The cluster's compare_cosmx/compare.md is stale for ir_ch_f12_s44 (written before that task's re-read); rebuilt locally as
+  compare_rebuilt_2026-11-25.md: fix 2 costs responder stability 0.09, not 0.18.
+- A6: the synth control is weak (learned threshold MC23 0.059 vs mid M11 0.024 at the median); typeres on CosMx sits above it (0.078-0.092), so the
+  "CosMx is read additively" hypothesis is not supported for typeres; the read-out arms are additive by construction (twins as additive).
+- CosMx read-out arms: 3 of 6 sections (4.5 h budget) and no untrained twins.
+- vannan: the untrained twin reproduces most top sender-type pairs, so A2 must be read as trained minus twin; top responders are other types'
+  markers, and the spillover flag marks ~60 % of them for trained and twin alike (46 fine types: the flag cannot separate).
+- LR support null everywhere (CosMx and vannan, all arms).

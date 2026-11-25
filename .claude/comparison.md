@@ -426,3 +426,31 @@ compare_rank's; empty-table guards in the reader.
 - 2.2: fewer heads -> lower entropy per head mean? Not necessarily: the head mean averages out; expected flat fit, the attention statistics
   telling. The prototype without positions likely near-uniform at any count.
 - 2.3: field pairs above the kernel bar for weight 1; region centring removes the region markers' fields.
+
+## CosMx re-read (2026-11-25; `EVALUATE=1 compare_submit.sh cosmx`, results MA/23_11_results/compare_cosmx, synced 2026-11-25)
+
+The readability fix (pooled within-type variance) worked: every run reads all 960 targets in all 9 receiver groups. **The cluster's compare.md is
+stale for ir_ch_f12_s44**: it shows the old dropout (Alpha / Beta 0, Mast 2) although the synced arrays of s44 are complete (identical coverage to
+s43) -- the report ran before s44's re-read landed (likely a GPU-check resubmit outliving the report's afterany). Rebuilt locally from the synced
+tables: `compare_cosmx/compare_rebuilt_2026-11-25.md` (numbers below). Rerun the report on the cluster before quoting the folder's own compare.md.
+
+| | responders seed RBO | drivers seed RBO | flagged top 50 |
+| --- | --- | --- | --- |
+| S0 ir_ch R0 | 0.637 | 0.647 | 0.207 |
+| S1 ir_ch_f1 R1 | 0.612 | 0.641 | 0.209 |
+| S2 ir_ch_f12 R2 | 0.522 (stale report 0.433) | 0.650 | 0.207 |
+| S3 ir_ch_f12 R3 | 0.522 | 0.614 | 0.207 |
+| readout only ir_ch R3 | 0.591 | 0.752 | 0.207 |
+| proto_ch R0 / R3 | 0.465 / 0.489 | 0.573 / 0.482 | 0.189 |
+| proto_ch_pe R0 / R3 | 0.465 / 0.475 | 0.507 / 0.468 | 0.218 / 0.227 |
+
+- **Fit** (centred cosine within the receiver group, all types now): proto_ch 0.111, proto_ch_pe 0.111, ir_ch 0.065, ir_ch_f1 0.063, ir_ch_f12 0.061;
+  twins ~0. The prototype still fits CosMx better (the first read's 0.137 vs 0.09 were Acinar / Ductal only).
+- **Stability:** the global-only model's responder rankings are the most seed-stable (0.64); fix 1 changes nothing on CosMx, fix 2 (sender sparsity)
+  costs 0.09; the readout's R3 (ensemble + robust z) raises driver stability (0.65 -> 0.75), not responders. The prototype is less stable (0.47-0.49).
+- **The two model families find different responders:** RBO with the prototype's ranking 0.14-0.18 for every ir_ch variant (twins 0.03-0.05;
+  proto_ch_pe vs proto_ch 0.66). Fitting better (prototype) and ranking stably (global-only) do not point to the same genes.
+- **LR support null for every arm** (AUC 0.48-0.51; the untrained ir_ch 0.545, p 0.18, highest).
+- **Sender -> receiver effects** are within-type first (Mast -> Mast 0.025 on ir_ch_f12, Acinar -> Acinar 0.013-0.016, Ductal -> Ductal 0.006-0.009),
+  then Acinar -> Endothelial (0.010-0.012); the prototype's effects are 5-10x smaller; twins ~0.
+- Cost: ~7,500 s per ir arm (plain + region), ~1,500-1,850 s per prototype on 1 mm tiles.
