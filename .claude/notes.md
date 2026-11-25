@@ -2588,3 +2588,38 @@ What doesn't work / limits:
 - The light rankings limit the senders (planted drivers, hard negatives, 40 others) and use one fold partition: cheaper, not E7's full read.
 - CosMx 1.x reads 6 drawn 1 mm tiles and one gene fold for IG; 1.5's CosMx arm is one seed.
 - Times are estimates until the jobs print theirs; every job writes per-run and per-readout seconds.
+
+## 2026-11-25 -- Expansion jobs (first run): evaluations hung after training; discs for 2.1, heads 1/2/4/8/16, eval-only steps
+
+Logs: results/logs (extra_x_*, attr_*). The attribution re-runs (attr_synth tasks 0-3 and the synth / cosmx / vannan reports) ended cleanly.
+Every expansion job failed or stopped early:
+- expand_cosmx: all evaluations, the ladder (k* = 10) and the niche arm ran; extra_read crashed drawing maps (plots/maps never created).
+- expand_synth: 9 evaluations done (~2 h); the niche arm s42 trained, then hit the 12 h limit in its evaluation; s43 and the read never ran.
+- maskstab: nothing trained: sweep_common.check_masking refused the cell arm (random single spots hide a receiver's receptor with its response);
+  extra_read then crashed on the empty stability table.
+- heads: h3 / h12 cannot be built (torch's TransformerEncoderLayer, which the layer extends, asserts width % heads == 0 before any
+  attention backend is chosen; attention.head_dim does not get past it). Three tasks landed on supergpu40 (no kernel image, like the B300s).
+  All 10 trained runs (<= 11.5 s / epoch, <= 1 h) were then killed by the limit in their evaluation.
+- fieldcorr: ctx_ch_s42 trained, killed in its evaluation; 7 runs never started.
+
+Why the evaluations took 10+ h: they did not run slowly, they hung. In every killed job the log stops between "Nr. of zero expression cells"
+and "ladder radii", which on synth is only extra_job.prepare's four niche fits (neighbourhood_niches: kNN means, TruncatedSVD, MiniBatchKMeans).
+The same fits took seconds before training and in the eval-only expand jobs; compare_rank's synth evaluations after training (11-24) had no
+niche fit; the CosMx niche fit (composition, no SVD) ran fine after training. So: the synth SVD / k-means hangs when it follows Lightning
+training in the same process, most likely a BLAS / OpenMP thread-pool deadlock (not proven; the fixes below avoid it either way).
+
+Changes (user's choices: discs for 2.1, drop heads 3 and 12, eval-only with times):
+- Fork: optim.dual_mask.radius_um (node only; discs until `rate` of each graph is covered, sample_block_mask from the private generator;
+  tag dmn<w>d<radius>; validator + tests incl. a mutant check).
+- make_extra_yaml: HEADS 1, 2, 4, 8, 16 (a non-divisor is refused; the kept arms' checkpoint names are unchanged, so the trained ones are
+  reused); maskstab cell = node masking with discs of 300 um over 0.2 of the cells (mask_percentage 0), comb = channels + a disc pass of the
+  same discs; extra_common's "cells" read mode hides the same discs.
+- extra_job: EVALUATE_AFTER_TRAINING off (EXTRA_EVAL_AFTER_TRAINING=1 restores it); niches only for expand_* / niche_*, under
+  threadpool_limits(1), each fit timed. extra_job.sbatch trains and evaluates in separate processes; new STEP=eval (from checkpoints; arrays
+  evaluate one run per task) and STEP=read; extra_submit.sh <job> eval|read. sweep_common.evaluate_arm and every extra_common step print
+  "[time] ..." lines as they end (light rankings per fold: context and senders separately).
+- extra_read: the maps folder is created; an empty stability table no longer crashes. supergpu40 joined every InterScale --exclude list.
+
+What doesn't work / limits:
+- The hang's exact cause is not reproduced (that needs a cluster run); the separate process sidesteps it, threadpool_limits is a guard only.
+- The evaluation's own cost on synth is still unmeasured for the sweep jobs; the new [time] lines will give it.
