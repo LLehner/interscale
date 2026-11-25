@@ -2668,3 +2668,17 @@ What doesn't work / limits:
 - V1 covers the read-out models only; the prototype's reference is its two heads and the permutation.
 - Moran's I is spatial variability, not interaction; it is the axis the user asked for, not a truth.
 - The palette validator (node) is not installed locally; the class colours are the reference palette's first five slots unchanged.
+
+## 2026-11-25 -- Legnini variant of the local / global split (built, not run)
+
+Details: comparison.md, "Legnini variant".
+
+What worked:
+- The comparison's three arms (proto_ch, proto_ch_pe, ir_ch) at legnini's scale pass the validators; the split job trains them first and reads them
+  in a fresh process; synth_spot and CosMx keep their run lists and settings.
+- Reading the configuration back found a second path to the hang: the sweep re-prepares the data before every run, so a niche fit followed the
+  previous run's training in the same process. Every sweep run outside an array now trains in a process of its own.
+
+What doesn't work / limits:
+- Two test sections (one control, one SHH organoid) and no cell types: one receiver group, small differences between arms are not readable.
+- Width 32 and 300 epochs are choices (small panel; the comparison's count), not tuned on legnini.

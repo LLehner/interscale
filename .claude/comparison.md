@@ -502,3 +502,31 @@ drawn from the toy output in both modes (CosMx: Moran colour; synth: planted cla
 **Run:** after syncing the fork's main: `bash slurm/extra_submit.sh split_synth eval` and `... split_cosmx eval` (one GPU each; estimates ~1-2 h synth,
 ~2-4 h CosMx; every step prints `[time]`). Results MA/25_11_results/split_<data>/ (split.md, plots/). Files (flat, slurm/November): split_common.py,
 split_read.py, extra_job.py, extra_job.sbatch, extra_submit.sh, plus what extra_job imports.
+
+### Legnini variant (2026-11-25; the user: "add a variant for Legnini"; built, not run)
+
+No comparison checkpoints exist on legnini, so `split_legnini` trains first: `make_compare_yaml.py legnini` writes three arms (synth_spot's recipe,
+channel masks 0.2): `proto_ch`, `proto_ch_pe` and `ir_ch` (J5's: own-gene query, 2 read layers, content rate, raw own-cell skip), two seeds each, twins
+of proto_ch_s42 and ir_ch_s42. Base `legnini_compare.yaml` (from the 2026-10-24 legnini split config): the radius-200 graph (27.6 µm; the prototype's
+GCN reads it), 0.138 µm per pixel, the preprocessed file `legnini23_split_pp.h5ad` (split by sample: 10 / 5 / 2), **width 32** (88 genes: a small
+panel), 4 heads, 2 layers, **300 epochs**, distance window **15-1000 µm** (cells ~11 µm apart, sections ~1.3 mm; CosMx J4's range). Base job
+`ir_legnini.py`; `compare_rank.py` accepts COMPARE_JOB=legnini (one receiver group, no truth, no strata). Checkpoints MA/25_11_results/compare_legnini.
+
+The split reads the two test sections whole (slide4_A2-3 control, slide4_B2-2 SHH), one receiver group (no cell types), 150 receivers per section
+for V2, 300 for V1, radii 15 / 30 / 60 / 120 / 250 / 500 µm plus the 2-hop reach (~50 µm expected), the ladder on expression niches (k 10 ... 300),
+Moran's I with every cell a centre on both scales.
+
+**Expectations:** most of every gene's effect within ~60 µm (ceiling run 4: the nearest band is best, no far gain on legnini); the far rankings thin;
+the SHH readouts (PTCH1, GLI1, HHIP) and the ventral identity code (NKX6.1, NKX2.2, OLIG2, FOXA2) the candidates for a far share, if any (the
+organoids were induced locally); two test sections: a few hundredths between arms is within what swapping them could move.
+
+**Every sweep run now trains in its own process** (extra_job.sbatch `train_then_evaluate`, outside arrays): the sweep re-prepares the data before each
+run, and a niche fit after the previous run's training in the same process is the hang of 2026-11-25 (also the niche arm's second seed). Simulated
+with a stub (one process per run, INTERSCALE_RUNS respected, arrays unchanged).
+
+**Checks run:** the arms through the validators against legnini_compare.yaml (names 81-170 characters); `split_legnini`'s real `__main__` (sweep mode,
+no in-process evaluation, legnini config and sweep, slide key `sample`, radius graph allowed, twins) and its run list (6); split_synth / split_cosmx
+unchanged after the compare_rank change. Not run.
+
+**Run:** `bash slurm/extra_submit.sh split_legnini` (one GPU: ~1.5-2 h training, ~1 h readouts, estimates). Copy legnini_compare.yaml to MA/yaml and
+ir_legnini.py, make_compare_yaml.py, compare_rank.py with the other files.
