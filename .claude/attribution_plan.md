@@ -711,3 +711,24 @@ to `MA/slurm/`: attr_submit.sh, attr_job.sbatch. Then `bash slurm/attr_submit.sh
   only beyond the twin's; the sampled reference must agree in rank (Spearman of net >= 0.5) before a map is described. Cost: one forward + backward
   per IG step on a whole section (as a training step), x (5-20 steps) x (1 + 3 sampled draws): minutes per section; 5 h budget per model.
 - **Run:** `bash slurm/attr_submit.sh allmap_cosmx`, `bash slurm/attr_submit.sh allmap_synth`; results `MA/27_11_results/allmap_{cosmx,synth}/`.
+
+### legnini variant (2026-11-27; the user: "add a legnini variant of the IG script; if it requires cell types use spatial patches (8x8)")
+
+- `ATTR_JOB=allmap_legnini` (`attr_submit.sh allmap_legnini`; results `MA/27_11_results/allmap_legnini`): split_legnini's **ir_ch** x 2 seeds + twin
+  at s42 (checkpoints `MA/25_11_results/compare_legnini`; the submit writes `compare_legnini_sweep.yaml` again with make_compare_yaml). proto_ch /
+  proto_ch_pe read their own cell (GCN): refused by `token_blind`, not readable this way.
+- **Cell types replaced by spatial patches** (`PATCH_GRID: 8`, `attr_common._patch_labels`): each section's bounding box cut 8 x 8, positions only
+  (~65 cells per patch at ~4,300 cells). The patch is the label of the reference (patch mean token; sampled: a cell of the same patch) and of
+  the target (deviation from the patch's mean prediction, over the hidden entries). A first concrete piece of A7 (attribution without annotation):
+  a label-free reference that keeps "a cell like this one" local.
+- **Read as trained** (`MAP_FOLDS: 0.2`): ir_ch was trained with 20 % of the genes hidden in every cell, so 5 gene folds (`gene_ranking.gene_folds`,
+  `hide_genes`), each hidden in every cell; every gene a target once; the five maps summed into one (IG is linear in the target; each fold's own
+  completeness gap is reported). **Named map** (`MAP_NAMED`): the SHH readouts PTCH1, GLI1, HHIP hidden alone in every cell and mapped on their
+  own (legnini_plan.md's positive control): which cells drive the SHH response; 3 hidden genes vs 18 in training, a milder input than trained.
+- Report (`attr_read.py allmap`): per reading (`all`, `named_SHH_readouts`) and reference the gap, self share, seconds; references' agreement;
+  per patch the spread (min / median / max) of the per-cell means within each section, then the mean over sections (patch names repeat across
+  the two test sections, control and SHH, which must not be pooled). Maps `graph<k>.png`, `graph<k>_named_SHH_readouts.png` and both minus twin.
+- Smoke (toy read-out model, 4 x 4 patches, folds 0.2, one named set and one with no gene in the data): tables, maps and report written; the
+  missing set skipped with a message; `configure` and the run list (ir_ch_s42, ir_ch_s43) checked.
+- Read: the two test sections are slide4_A2-3 (control) and slide4_B2-2 (SHH): the SHH readouts' map should differ between them (senders near
+  the induced region in the SHH section); a map counts only beyond the twin's and where type_mean and sampled agree (Spearman of net >= 0.5).
