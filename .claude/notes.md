@@ -2682,3 +2682,129 @@ What worked:
 What doesn't work / limits:
 - Two test sections (one control, one SHH organoid) and no cell types: one receiver group, small differences between arms are not readable.
 - Width 32 and 300 epochs are choices (small panel; the comparison's count), not tuned on legnini.
+
+## 2026-11-26 -- Expansions (24_11_results) and local / global split (25_11_results) read
+
+Details: comparison.md, "Expansions and split read (2026-11-26)". Runs: heads 10/10, expand_synth + niche (ir_ch_f1n s42/s43), expand_cosmx + niche
+(s42), split_synth, split_cosmx. Not run: maskstab (2.1), fieldcorr (2.3; one arm trained, nothing evaluated), split_legnini (third submission running).
+
+What worked:
+- 2.2 heads: ir_ch needs 4 heads for its attention to find the planted short senders (head-mean top-5 short 0.04 at 1 head, 0.57 at 2, 0.97 at 4,
+  0.93-0.99 at 8-16; IG top-5 short 0.50 -> 0.90 at 4). Fit flat (0.159-0.163); responders AUROC_hard rises 0.24 -> 0.32 (8 heads). proto_ch
+  attention uniform at every count (entropy 0.98-0.99, ~2,000 effective keys), as expected; its fit flat at 0.13.
+- Split, synth, far ranking: ir_ch's far top 15 starts with the planted band responses MC10, MC8, MC11, MC9 (M7/M8 bands at 1-4 mm) in BOTH seeds;
+  the 0-1 mm band MC7 sits in the near list. proto_ch_pe gets the same band genes far; proto_ch (no positions) and both twins list noise genes.
+- Split, synth, V1 decomposition: directional programmes are read far (near share 0.24 / 0.27 vs twin 0.62), short near (0.81 / 0.61 vs twin 0.43).
+- The prototype's own head split carries no distance: on CosMx every prototype (twin included) has a local-head share of 0.48-0.50 and no
+  correlation with Moran locality; on synth the twin's head shares look like the trained ones' and the seeds disagree (0.65 vs 0.89). This supports
+  point 1 of the hypothesis (dual heads are module labels, not distances).
+- CosMx IG by distance: the signed effect per cell is local (ir_ch 0.29 within 15 µm, 0.07 at 30, 0.015 at 60, 0 beyond 120 µm) and ~6x its twin;
+  the prototype's ~1.7x its twin. The cumulative |IG| share is geometry (trained = twin): far cells add many small unsigned contributions.
+- Rankings are seed-stable where they are readable: ir_ch near top 15 share 8 genes across seeds on CosMx (CD59, CCND1, TPM1, MZT2A, PARP1, CXCL3,
+  ERBB2, CD81), far 5 (ADGRF3, IL1A, CD3G, GPR183, TNFAIP6: immune genes, plausibly lymphoid aggregates at FOV scale); on synth the near / far
+  programme genes repeat across seeds.
+- The device fix for the readout path, and every job of the evening of 25 Nov, ran clean.
+
+What doesn't work / limits:
+- 1.2 / V4 scale ladder: uninformative on both datasets. The smallest rung (k10) is already 200 µm on synth and 20 µm on CosMx, and most targets'
+  drop halves below it (share_below 0.55-0.75); median scale = the bottom rung for every trained model; the drop ratio is flat across rungs
+  (ladder_curves). Synth Spearman scale vs planted length -0.15 / -0.20 for ir_ch (expected > 0.5), +0.31 for its twin. 1.5's rule therefore
+  picked k10 by construction.
+- 1.5 niche label part: no gain. synth: ir_ch_f1n AUROC_hard 0.36 / 0.33 vs region label (ir_ch_f1) 0.48 / 0.46, fit equal (0.17); CosMx: fit
+  0.062 vs 0.063 vs 0.065 (none), LR AUC ~0.48-0.49 everywhere (null). Region is the better label part on synth.
+- 1.1 reference: graph / region / niche references move the planted top-5 by <= 0.05; short top-5 (ir_ch 0.64-0.72) is mostly geometry (twin
+  0.56-0.64); dense / sparse / directional / mid ~0 at any reference. CosMx type vs type|niche: changes within twin-level noise (Alpha <- Ductal
+  +0.24 trained, -0.20 twin); no Acinar effect.
+- 1.3 IG pairs vs permutation pairs: not comparable as computed (IG scores 3,792 pairs, base rate 0.004, AUPRC 0.009-0.012, AUROC 0.70-0.72;
+  permutation 151-167 candidate pairs, base 0.11-0.13, AUPRC 0.26-0.33, AUROC 0.46-0.58). Needs the same candidate set.
+- 1.3 CosMx spillover: own-gene share of near |IG| 1-2 % (twin 0.1-0.2 %; uniform over 960 genes would be 0.1 %): no large contact spillover.
+- 1.4 IG agreement: models' IG rows agree poorly; ir_ch's two seeds 0.04 (!), prototypes 0.23-0.30 among themselves; proto_ch_pe agrees with
+  proto_ch (0.25), not with ir_ch (0.01): the expectation (pe brings it close to ir_ch) is refuted. ir_ch's per-receiver IG rows are not seed-stable
+  although its gene rankings are.
+- 1.6 synth maps: none drawn ("no tissue block of at least 100 cells to draw" for every graph; the npz files exist). The tissue-block finder does
+  not suit the synth spot lattice. CosMx maps drawn (54).
+- V2 permutation per-class shares are noise (values > 1 and < 0, seeds disagree: short 0.52 vs -0.18); only medians over many genes are readable.
+- V1 near and far parts scale together (points on the diagonal over 3 orders of magnitude): the split is dominated by each gene's amplitude; dense /
+  sparse are read near (0.74 / 0.76), not far as expected.
+- CosMx near share at the 35 µm reach is 0.82-0.87 trained vs 0.84-0.99 twins and r50 = 15 µm (the smallest radius) for everything: the radius
+  grid starts too coarse, and the near share is geometry. Moran thirds give the same profiles (v3_profiles).
+- Moran sets reported as 0 / 0 in split.md: a reader bug (column `scale_set`, read as `set`), fixed in split_read.py; the sets exist (20 / 20 on
+  both data) and the locality correlations used the 97 (CosMx) / 53 (synth) spatially variable genes correctly.
+- Family agreement: ir_ch vs prototype rankings Spearman 0.20 / 0.23 (synth near), ~0 on CosMx.
+- Synth near ranking of ir_ch is led by the region markers CM1-CM3 and spatial-only SP genes (negatives) in both seeds: the known region confound,
+  now in the near list. Far list: also SP1 / SP3.
+- 2.2: proto_ch has the higher responders AUROC_hard at every head count (0.35-0.43 vs 0.24-0.32) but AUROC ~0.43-0.56 (chance) overall; neither
+  model finds mid-range senders (top-5 mid <= 0.11).
+
+## 2026-11-26 -- The Moran locality colour of the split plots is wrong by construction (to redo with the user's definition)
+
+The user, on v1_decomposition.png: "it seems like there are only locally variable genes but that cannot be". Correct. The colour is
+locality = (I_local - I_global) / I_local (I_local: Moran's I within the 2-hop reach; I_global: inverse-distance Moran's I across the slide). Moran's I
+over the whole slide is almost always smaller than within the reach, so locality is positive for nearly every spatially variable gene: synth min 0.63
+(53 genes), CosMx raw min 0.03, none negative (97 genes), CosMx type residual one negative of 47. Every coloured point is red; no gene can show as
+global. The 20 / 20 sets of scale_sets exist only because its rule is relative (the two ends of the ranking), not because any gene is global.
+
+What the user means (their definition): follow each gene's variability (autocorrelation) as the neighbourhood size grows. Genes whose variability
+drops with neighbourhood size are local; genes where it stagnates, stays the same or even rises are global. That is a curve over neighbourhood sizes,
+not a two-point ratio. The user will look for the exact code that produced the splits and figures they have in mind; rebuild the colour (and the
+local / global sets) from that code, not from the current locality. Until then, the Moran colour and the "Spearman with locality" columns of
+split.md are not readable.
+
+## 2026-11-26 -- Correction to the entry above: the Moran locality is right as a ranking; only the colour scale was wrong
+
+The user: no curve is needed, and all genes may well share the sign of the drop; the genes with the smallest change are global, the ones with the
+largest drop are local. So the definition is the RANK of (I_local - I_global) / I_local among the spatially variable genes, as scale_sets' relative rule
+already uses (20 / 20 sets on both data). Consequences:
+- The "Spearman with locality" columns of split.md were right all along (rank-based, sign-free).
+- Only the colour was wrong (absolute diverging scale centred on 0). split_read.py now colours by the rank scaled to -1 (smallest drop: global,
+  blue) ... +1 (largest drop: local, red); the ratio is kept as `locality_ratio` (shown in the Moran histogram). The r50 / ladder x-axes are the rank.
+- Re-read locally on copies (scratchpad, no model): synth v1_decomposition now shows that the genes with the largest context parts (upper right:
+  band responses, region markers, SP genes) are Moran-global, the Moran-local ones smaller; several global genes lie below the diagonal (read more
+  from near senders), as expected for slide-smooth genes whose nearest cells already carry the slide-level value.
+The previous entry's request (rebuild from the user's own code) is withdrawn unless the user finds a different definition there.
+
+## 2026-11-26 -- Masking vs stability (2.1 maskstab), field-correlation loss (2.3 fieldcorr), legnini local / global split, split re-reads
+
+Results: MA/24_11_results/{maskstab,fieldcorr} (jobs 44018266, 44018286), MA/25_11_results/split_{synth,cosmx,legnini} (44018003, 44018194,
+44010179), legnini checkpoints MA/25_11_results/compare_legnini. All jobs ran clean (the only warnings: docrep, and `Mean of empty slice` in
+extra_read.py `_orders` from the same 49-50 of 253 genes that are unread in every run and mode -> harmless, seed comparisons are like for like).
+Details and tables: comparison.md, "maskstab, fieldcorr and legnini split read (2026-11-26, evening)".
+
+What worked:
+- 2.1 stability follows the training mask: each arm is most seed-stable in the read mode it was trained on. Channel folds: chan fit Spearman 0.97,
+  responders / drivers / pairs RBO 0.91 / 0.89 / 0.87 (cell 0.88 / 0.56 / 0.73 / 0.70). Hidden discs: cell 0.96 / 0.75 / 0.80 / 0.80 (chan 0.63 /
+  0.65 / 0.76 / 0.53). Attention rows: cell 0.80 Spearman, top-5 overlap 0.77 (chan 0.45 / 0.59). The expectation (channel more stable on gene
+  rankings in folds, cell more stable on attention) holds.
+- 2.1 the cell arm read on hidden cells has the best drivers / pairs against the truth (drivers AUPRC 0.70, pairs AUPRC 0.28, pairs AUROC 0.89) and
+  the best fit in its own mode (0.192).
+- 2.3 the field term does what it optimises: field-pair AUPRC 0.016 (no term) -> 0.15 / 0.19 at weight 0.1 (both seeds above the Gaussian-kernel
+  bar 0.137), 0.07 / 0.18 at weight 1. The matrix plot (fc01) shows the planted diagonal S1-M11 -> R1-MC15.
+- 2.3 at weight 1 the gene rankings improve in both seeds: drivers AUPRC 0.51 -> 0.59 (0.592 / 0.585 vs 0.523 / 0.500), pairs AUPRC 0.14 -> 0.20
+  (0.199 / 0.210 vs 0.129 / 0.153). Fit unchanged (0.164-0.167), cost +15 % per epoch.
+- Split re-reads (split_synth, split_cosmx, 22:00): Moran sets now 20 / 20 on both, colour = locality rank; numbers identical to the morning read.
+- legnini split (first run): ir_ch fits slightly better than the prototypes (val SCE 0.140, seeds 0.148 / 0.133, vs proto_ch 0.146, proto_ch_pe
+  0.146; within seed spread). ir_ch's decomposition reads farther than its twin: V1 near share at the 50 um reach 0.64 / 0.45 vs twin 0.82, r50
+  41 / 75 um vs 25 um (on CosMx trained = twin). V2 near share vs Moran locality Spearman +0.32 / +0.44 in both seeds (twin -0.18): the only
+  dataset where the permutation split agrees with Moran locality, on 28-38 readable genes.
+- legnini far lists are seed-stable for ir_ch (8 of 15 shared: NKX6.1, PAX7, MSX2, DBX1, DBX2, AQP4, ALDH1L1, FOS) and contain the expected
+  dorso-ventral / SHH genes (s43 also GLI1, HHIP, OLIG2). Near lists share only 4 of 15 (PAX7, ALDH1L1, DBX1, DBX2).
+- legnini families agree more than elsewhere: ir_ch near vs proto_ch near (distance) Spearman 0.53 (synth 0.20, CosMx ~0).
+
+What doesn't work / limits:
+- 2.1 comb (channel masks + a disc-mask pass, weight 1) is not "above both": its gene rankings in folds sit just below chan (0.96 / 0.85 / 0.86 /
+  0.87), in discs at chan's level (fit 0.65), and its attention rows are not seed-stable at all (Spearman 0.019, top-5 0.34; effective keys
+  18 / 32 / 82 over seeds). Val SCE on its primary channel task 0.307 vs chan 0.274; twice the training time (10.8 vs 5.6 s/epoch). Drop it.
+- 2.1 stable is not correct: chan in folds is the most stable but not the best against the truth (responders AUROC 0.645, AUROC_hard 0.285 vs cell
+  read in folds 0.734 / 0.345). AUROC_hard < 0.5 for every arm and mode (cell read on cells 0.12): hard negatives (region / spatial-only genes)
+  still rank above responders. 3 seeds.
+- 2.3 the responders do not move (AUROC_hard 0.30-0.35 in every arm, within seed spread); region centring (fc1_reg) changes nothing against fc1
+  (field AUPRC 0.129 vs 0.126, rankings equal) -> the expectation "centring removes the region markers' fields" is not supported. Weight 1 is
+  seed-unstable on the field readout (0.07 vs 0.18). Attention drifts away from the planted senders as the weight rises (attention planted top-5
+  0.09-0.12 baseline, 0.14-0.16 at 0.1, 0.05-0.08 at 1; mean distance 952 -> 1000 um). Caveat: the field readout measures what the term trains;
+  read the rankings, not the field AUPRC, as the evidence. In the fc01 matrix (the only one drawn) the planted pairs M12-M21 -> MC16-MC25 stay unread.
+- 2.3 plot: fieldcorr_pr.png draws all five curves in the same grey (legend unusable). Fix the colour in extra_read.py.
+- legnini split: the prototype heads again carry no locality (local-head share 0.37-0.44 trained, twin 0.65; Spearman with locality -0.10 ... 0.19).
+  V2 near shares ~ twin (0.78-0.93 vs 0.87-0.99), V1 Spearman with locality -0.20 / 0.02 (disagrees with V2), V4 ladder 13-46 genes, noisy.
+  The two ir_ch seeds differ much (V1 near 0.64 vs 0.45); 2 test sections. Near and far top lists overlap heavily (ir_ch_s42: 9 of 15 genes in
+  both): the lists rank amplitude more than distance, as on synth.
+- v3_profiles.png (all three datasets): the log x-axis labels its minor ticks ("2x10^1 4x10^1 ..." overlap) and the 8-panel row is too wide to read.

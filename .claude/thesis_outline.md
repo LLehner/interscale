@@ -445,3 +445,6 @@ One master ablation table, then the five findings:
 | S13 | **must pursue (user, 2026-11-21):** is the learned neighbourhood function linear? Attribution agreement, Sensitivity-n and pairwise sender interactions on the retrained CosMx model, synth_spot's thresholded MC23 as the positive control (attribution_plan.md A6); novelty unchecked (NCEM's linear vs nonlinear comparison first) | proposed | 4.7, 5.2 | after the retrain + A0 |
 
 Writing from the start in parallel: chapters 1-3 and 4.1-4.5 depend on no slot.
+
+**2026-11-26 note on S13:** state and how to close it (planted-AND control, CosMx read-out twins, NCEM check), plus the all-cell IG map that
+replaces the disc-dominated A3 maps: attribution_plan.md, section "S13 status and the all-cell IG map". To pursue from 2026-11-27.

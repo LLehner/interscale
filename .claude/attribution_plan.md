@@ -28,7 +28,7 @@ wants this for newer models on the more relevant data (the flow pipeline waits f
 | A4 | Item 3: influence against distance (trained, twin, permuted; attention next to it) | in both jobs (`attr_distance`), **not run** | 2026-11-22 |
 | A5 | Optional: positive / negative split (RevealCancel idea), multi-reference DeepLIFT (DeepSHAP), conservative transformer propagation | signs kept everywhere; `deeplift` with `reference="sampled"` is the DeepSHAP-like average; `conservative` built; RevealCancel not built (only if a model learns an AND-type programme) | 2026-11-22 |
 | A7 | **Later (user, 2026-11-21):** the attribution methods on data without cell-type annotation (legnini the candidate): what replaces the type-mean reference and the deviation target there | to note, not planned in detail | 2026-11-21 |
-| A6 | **Must pursue (user, 2026-11-21):** is the learned neighbourhood function linear? Method agreement, Sensitivity-n and pairwise sender interactions on real data, with synth_spot's thresholded programme as the positive control | measures built (`sensitivity_n`, `pairwise_interactions`, `agreement`) with small and large perturbations (type mean, sampled cells, the model's mask), in all jobs (MC23 / MC20 / M11 named on synth), **not run**; NCEM novelty check still to do | 2026-11-22 |
+| A6 | **Must pursue (user, 2026-11-21):** is the learned neighbourhood function linear? Method agreement, Sensitivity-n and pairwise sender interactions on real data, with synth_spot's thresholded programme as the positive control | measures built (`sensitivity_n`, `pairwise_interactions`, `agreement`) with small and large perturbations (type mean, sampled cells, the model's mask), in all jobs (MC23 / MC20 / M11 named on synth); run 2026-11-24/25 (read: synth control weak, typeres ~4x twin); **S13 built 2026-11-27**: planted-AND control (`attr_submit.sh and`, trains + reads), CosMx read-out twins + sections 4-6 (`attr_submit.sh cosmx_s13`), NCEM check done (section "S13 build 2026-11-27"); not run | 2026-11-27 |
 | M | Retrain one model per dataset with the best settings so far (CosMx, synth_spot, vannan; legnini skipped, user 2026-11-21) | recipes proposed below, to confirm | 2026-11-21 |
 | check | Status check after the CCC runs (J1 / J3 / J4 read; section "Status check 2026-11-22" at the end): nothing of A0-A6 built; Stage M answered by J1 / J4 for synth_spot and CosMx with checkpoints that exist (no retraining), vannan untrained; A6 has its first architecture-level evidence | **done**; building waits for the user | 2026-11-22 |
 
@@ -555,3 +555,129 @@ read-out arms have no trained-vs-twin contrast in A2 / A6.
 
 Rerun the CosMx read-out twins (ATTR_RUNS=ir_c_s42_untrained,ir_c_ktype_s42_untrained) and sections 4-6; a synth positive control where
 pairwise interaction must be large (a planted AND of two senders) before A6 is used as a linearity argument; A2 tables as trained minus twin.
+
+## S13 status and the all-cell IG map (2026-11-26; the user: "note these things down", pursue from 2026-11-27)
+
+### S13 / A6 in one paragraph (as explained to the user)
+
+S13 asks, from inside the trained model, whether CosMx's neighbourhood is used as an additive (linear) function: the third line next to the
+score level (models tie the linear k-NN smoother) and the data level (ceiling audit: the linear neighbourhood signal is small and within ~100 µm).
+Measures: pairwise sender interaction I_jk (hide j, k, both: 0 for an additive function), agreement between attribution methods (Ancona Prop. 4),
+Sensitivity-n. State after the 2026-11-25 re-run: the read-out arms (ir_c, ir_c_ktype) are additive (0.007-0.010) by construction, so nothing about
+the tissue; typeres (dense hierarchical transformer) is not (0.078-0.092, ~4x its twin, CosMx and vannan); the synth positive control is weak (the
+learned threshold programme MC23 0.059, below typeres). Hypothesis not supported, instrument not validated.
+**To close it:** (1) a planted AND of two senders on synth_spot (an interaction that must be large) as the positive control; (2) the CosMx read-out
+twins (ATTR_RUNS=ir_c_s42_untrained,ir_c_ktype_s42_untrained) and sections 4-6; (3) the NCEM novelty check. **Fallback if time runs out:** one
+paragraph in thesis 5.2 (read-out additive by construction, the free transformer ~4x its twin, the measure unvalidated -> future work).
+
+### Why the A3 / 1.6 IG maps show the discs, and the all-cell map
+
+The CosMx maps are already on a clean pass (nothing hidden). The discs dominate because only the cells of ~30 discs of 30 µm per section (4 per tile
+in 1.6) are receivers: `disc_strengths` divides a disc's whole received total over its ~10-30 cells ("in" concentrated) while "out" is spread over
+thousands of senders, and the plot marks disc cells as hidden (`visible[members] = 0`). The layout of the receivers, not the model; the twin shares
+it, so subtracting the twin does not remove it (A3's stated caveat).
+
+**Every cell a receiver, for models blind to their own cell** (`interpretation.blind_to_own`: ir_c, ir_c_ktype, any context-query model without the
+own-cell skip; ir_ch if only its context part is the target, its raw skip being a separate additive part). IG is linear in the target and the path
+depends on the inputs only, so:
+- out(j) for every cell = ONE IG with the summed target sum_i w_i f_i (the deviation targets of all cells); a blind model's self-term c_jj is 0.
+- in(i) for every cell = completeness: w_i f_i(x) - w_i f_i(x_ref) (two forward passes, all rows at the type-mean reference), minus the gap.
+- Cost per section ~ IG steps x one forward + backward of the whole section (fused attention with checkpointing, as in training): seconds to minutes,
+  vs hours for ~50 receivers per section now.
+- Code change: `attribute()` keeps the receivers' own rows fixed; with every cell a receiver nothing would move -> a path where every row moves to
+  the reference (equivalent for a blind model). Test: the summed IG equals the sum of per-receiver IGs on a toy blind model; the completeness in(i)
+  equals the row sums.
+- Run: evaluation only on existing checkpoints: CosMx ir_c / ir_c_ktype + twins, synth ir_ch (context part) + twin; maps in `plot_source_sink`'s layout,
+  twin-subtracted.
+
+**Models that read their own cell** (typeres, the prototype, ir_ch's full prediction): a clean pass measures copying (they were never trained to
+predict visible cells). There the original A3 design: random cell folds matching the training mask (not discs), one summed IG per fold, every cell a
+receiver once; the mask layout averages out over folds. Cost: one IG per fold.
+
+Estimate: ~0.5 day build + tests, one short eval-only job. Worth it only if IG maps go into thesis 4.7; otherwise caption the disc layout.
+
+
+## S13 build 2026-11-27 (the user: "proceed to implement everything needed for point 2, S13 / A6 linearity")
+
+### NCEM novelty check (Fischer, Schaar & Theis, Nat. Biotechnol. 41, 332-336, 2023; read from the PDF, main text + Methods + Ext. Data Fig. 8)
+
+- **What they did.** Node-centric expression models: predict a cell's expression vector from its own type label and its niche. The
+  linear NCEM's design matrix is the receiver type, the binary presence of each sender type within a radius (an indicator, not a count) and
+  their outer product (receiver type x sender type interaction terms), plus batch covariates; coefficients by OLS, a Wald test per
+  coefficient, "type coupling" = the number of significant genes per sender-receiver pair. Nonlinear NCEMs: a GNN encoder (an indicator
+  kernel over the niche, "IND", or a one-layer GCN) and a nonlinear decoder; also a CVAE and a ligand-receptor graph kernel (NL-NCEM LR).
+- **The linearity result** (Ext. Data Fig. 8b, MERFISH brain, chip cytometry colon, MIBI-TOF cancer): held-out R^2 by niche radius; "the
+  nonlinear models did not outperform linear models in gene expression prediction, which suggests that the spatial dependencies in the
+  given datasets are well described by linear models". Score level only. Their single model-internal readout is gradient saliency of the
+  nonlinear model aggregated per sender type x receiver type (Ext. Data Fig. 8c), with no linearity or interaction test.
+- **What it means for S13.** The question (is the learnable cell-cell dependency linear?) is NCEM's, and must be cited as such: our
+  score-level line (models tie the linear k-NN smoother, the ceiling audit) repeats their kind of argument on CosMx. What I have not found
+  in NCEM: a test of what a *trained* model computes (pairwise sender interactions, method agreement by Ancona Prop. 4, Sensitivity-n),
+  and a positive control showing the instrument sees an interaction where one is planted. Score-level ties cannot tell "the tissue is
+  additive" from "the nonlinear model underfits" (their own MIBI-TOF nonlinear models sit ~0.10 R^2 below the linear one, Fig. 8b), which
+  is exactly what a model-side test with a planted AND separates. Wording for the thesis: "NCEM found at the score level that nonlinear
+  models do not beat linear ones; we test inside the trained model, with a positive control." Never "novel" without the LRP-for-
+  transformers / attribution literature check, which is still open (Chefer et al., Ali et al. 2022 conservative propagation; interaction
+  attributions: Integrated Hessians, Shapley-Taylor / Faith-Shap; Tsang et al. NID / Archipelago); those test feature interactions in
+  general, not sender-sender interactions of a spatial cell model, as far as I know.
+- Also from NCEM, useful for 4.7 / 5.2: their linear model uses sender-type *presence* indicators, so its "linear" already saturates in the
+  number of senders of a type (an OR within type); the pairwise test here (one sender of each of two types) is outside what an indicator
+  model can express only for pairs of different types (their interaction terms are receiver x sender, never sender x sender).
+
+### (1) The planted-AND positive control
+
+- **Data** (`evaluation/synth_spot.py`, `make_synth_spot(and_programme=True)`, CLI `--and-programme`; opt-in, default unchanged): senders S5,
+  S6 (8 % of spots each, disjoint), responses R5 = **AND** (base mean 2.5 with neither or one sender type among the 4 neighbours, 10 with both)
+  and R6 = the **matched additive control** (2.5 -> 5 -> 10: doubling counts is a constant step in the log-normalised space the models
+  predict; a sum in counts, 0 -> 5 -> 10, would be strongly non-additive after log1p at a zero baseline: relative interaction ~2, more than the
+  AND's 0.5). Same receivers, same senders, same endpoints: only the rule differs. Roles `sender` / `receiver`, so programme masking hides
+  R5 / R6 in every spot. Appended last with their own keyed stream: every J1 gene is count for count the default dataset's (tested; checked on
+  the full design locally). Truth: obs `is_S5`, `is_S6`, `n_S5_nbrs`, `n_S6_nbrs`, `R56_state`; edges `S5&S6>R5`, `S5+S6>R6`. Full design:
+  ~131 receivers per slide with exactly one S5 and one S6 neighbour, 1,060 on the 8 test slides; X by state (log-normalised) R5 2.77 / 2.77 /
+  4.08, R6 2.77 / 3.43 / 4.08.
+- **Library** (`attribution.pairwise_interactions(given_pairs=)`): `[Q, P, 2]` named pairs instead of random near pairs (tested by hand
+  against the definition; a mutant reading k as j is caught).
+- **Job** (`attr_job.py` `ATTR_JOB=and`, `make_and_synth_yaml.py`, `attr_submit.sh and`): a CPU prep job makes `MA/synth_spot_and.h5ad`,
+  checks it (`--check-and-data`: levels, test receivers, J1 genes identical to `MA/synth_spot.h5ad`) and preprocesses it (MODE list); then an
+  array trains J1's `ref` (lin_dist_skipraw) and `ir2_rate` (additive read-out: the architecture control that cannot express an AND)
+  x seeds 42, 43, 300 epochs, programme masking, twins at s42, checkpoints in `27_11_results/attr_and` (J1's never touched); evaluation =
+  the standard programme evaluation (R5 / R6 by interaction group; `ref_oracle` with `R56_state`) + the attribution hook as `synth` + the AND
+  block (`attr_common._and_control`): receivers with exactly one S5 and one S6 neighbour, 400 um apart, <= 40 per graph; per response:
+  IG20 / grad x input / DeepLIFT (agreement, planted pair in the top 2 / 5), pairwise interaction of the **planted pair** and of random near
+  pairs, Sensitivity-n, under graph_mean and sampled references; `and_learned` = prediction and truth by exposure state over every cell.
+  Estimated per task: ref ~2-3 h, ir2_rate ~6 h with its twin (J1 timings + attr_synth's 1.75 h per ir2_rate model).
+- **Rule, fixed before the run** (`attr_read.py`): the instrument is validated if a model that learned the AND (AND index (both - one) /
+  (both - none) within 0.2 of the truth: ~1 for R5, ~0.5 for R6) shows a planted-pair median |I| / (|D_j| + |D_k|) >= 0.25 on R5 and <= 0.1 on
+  R6 (graph-mean reference), its twin <= 0.1 on both. Expected for a perfect AND: 0.5 (D_j = D_k = D_jk). If random near pairs stay near 0 on
+  R5 while the planted pair passes, the CosMx protocol (random near pairs) cannot see a sparse AND: then the CosMx read is "no dense
+  interaction among near senders", not "additive".
+
+### (2) CosMx read-out twins and sections 4-6 (`ATTR_JOB=cosmx_s13`, `attr_submit.sh cosmx_s13`)
+
+- The 11-24 re-run stopped the read-out arms after 3 of 6 sections (4.5 h budget) and left no twin tables for them: `ir_c_ktype` was not in
+  `UNTRAINED_ARMS`; `ir_c` was, but `ir_c_s42_untrained` has no tables or section (why is in the task's log, not synced here: the 11:55 limit
+  after a 4.6 h trained read is a guess). The plan's `ATTR_RUNS=..._untrained` would not have selected them (the array lists trained runs;
+  a twin is evaluated inside its run's task). typeres and its twin already have all 6 sections.
+- New settings in `attr_common`: `GRAPH_START` / `TWIN_GRAPH_START` (absolute graph index kept), `TWIN_ONLY` (no tables written for the
+  trained model), `A6_ONLY` (skips occlusion, the permuted section, named targets, the A3 discs: what A6 does not read, ~half a graph's time);
+  env overrides `ATTR_GRAPH_START`, `ATTR_TWIN_GRAPH_START`, `ATTR_TWIN_ONLY`, `ATTR_A6_ONLY`.
+- The job: ir_c_ktype x 3 seeds and ir_c_s42 on sections 4-6 (trained), twins of ir_c_ktype_s42 and ir_c_s42 on all 6, A6 only, 5 h per model,
+  own folder `22_11_results/attr_cosmx_s13`; the report reads it with `attr_cosmx` (`attr_read.py cosmx --also`), and adds an A6 table per run
+  (each seed must agree).
+- Read it for: twin vs trained interaction of the read-out arms (architecture: both ~0 expected), the 3 seeds' agreement, and agreement /
+  Sensitivity-n with all 6 sections. typeres stays the model the CosMx claim rests on (its 6 sections + twin exist).
+
+### Checks run (no model run locally)
+
+- Tests: `tests/test_synth_spot_and.py` (3; mutants: R5 additive, S5 / S6 overlapping, both caught), `test_attribution_methods.py` +
+  `test_attribution.py` (21, incl. the given-pairs definition test).
+- A toy smoke (14 x 14 lattice, untrained 8-dim GlobalModel on CPU, programme mask as the evaluation draws it): `_and_control`, `_synth` and
+  `attr_read.py and` end to end (tables and report written). `sweep_common.configure` accepts both new jobs; `--write-runs` gives
+  ref_s42, ref_s43, ir2_rate_s42, ir2_rate_s43.
+- The local `data/synth_spot.h5ad` is from 2026-10-10 (before `signal_scale`): stale, not the cluster's file; the prep job compares the
+  AND file with the cluster's `MA/synth_spot.h5ad`.
+
+### To run (the user submits)
+
+Sync the fork (synth_spot.py, attribution.py) and copy to `MA/scripts/`: attr_job.py, attr_common.py, attr_read.py, make_and_synth_yaml.py;
+to `MA/slurm/`: attr_submit.sh, attr_job.sbatch. Then `bash slurm/attr_submit.sh and` and `bash slurm/attr_submit.sh cosmx_s13`.

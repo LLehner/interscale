@@ -530,3 +530,104 @@ unchanged after the compare_rank change. Not run.
 
 **Run:** `bash slurm/extra_submit.sh split_legnini` (one GPU: ~1.5-2 h training, ~1 h readouts, estimates). Copy legnini_compare.yaml to MA/yaml and
 ir_legnini.py, make_compare_yaml.py, compare_rank.py with the other files.
+
+### Hypothesis: the global-only model separates local and global genes more cleanly than the dual model (2026-11-25; to test with the split jobs)
+
+The user asked why I expected this. My reasoning, as given; not a result yet.
+
+1. **In the dual model, local / global are labels on modules, not on distances.**
+   - The transformer reads the GCN's output (its tokens are built from the local embeddings), so the "global" head sees the near neighbourhood
+     too. decoder_plan.md / CLAUDE.md: the dual split "separates nothing by itself".
+   - Both heads are trained to predict every gene in full (default loss weights 0.5 / 0.5), so they tend to learn the same function: in October all
+     34 dual runs converged to one function, and under cell masking the global part carried almost none of the genes, the long-range ones included
+     (K14).
+   - The head split therefore mostly says which module the optimiser leaned on: a gene can sit on the "global" head through a 30 µm effect, and the
+     GCN head can carry signal correlated with far patterns.
+2. **The global-only model with the additive read-out can be split by distance exactly.** Its context part is a sum over senders, each at a known
+   distance from the receiver; cutting the sum at any radius gives a near and a far part that add up exactly to the prediction (V1). That is a
+   measurement on one prediction: no two heads share a signal and divide it arbitrarily. The radius is a choice, not fixed by the GCN's 2-hop reach,
+   and the profile over radii (V3) shows where each gene's effect builds up instead of forcing a binary answer.
+3. **"Local" then means the same for the model and for Moran's I:** within the same reach on the same graph.
+
+**Caveats that cut the other way.**
+- Most of the advantage is in the readout, not the model: the permutation split (V2) reads any model by distance, the prototype included. That is why
+  the job computes both the prototype's head split and its distance split; comparing them is the real test of point 1.
+- Additivity is built in: the read-out cannot represent a gene that responds to a near and a far sender jointly (A6: its pairwise interactions
+  ~0.007, the same as its untrained twin). Such a gene's effect is split additively, which may misdescribe it.
+- Splitting cleanly is not ranking well: on CosMx the prototype fits clearly better (0.111 vs 0.065) and the two families agree little on which genes
+  respond (RBO 0.14-0.18). A clean split of a weaker model's ranking is not automatically the more useful result.
+- The permutation split is noisy for weak responders (a difference of two independent permutations).
+
+**What would support or refute it.**
+- Support: on the prototype, the GCN head's share agrees poorly with its own distance near share (`v2_dual_heads.png` vs `v2_permutation.png`,
+  split.md's dual-head table); on synth, ir_ch's distance split puts short / mid programmes near and dense / sparse / directional far more cleanly
+  than the prototype's heads do (split.md's per-class shares).
+- Refute: the prototype's two heads line up with distance as well as ir_ch's decomposition does.
+
+## Expansions and split read (2026-11-26; results MA/24_11_results/{heads,expand_synth,expand_cosmx}, MA/25_11_results/split_{synth,cosmx})
+
+Full list of what worked and what did not: notes.md, entry of 2026-11-26. Against the expectations fixed before the runs:
+
+| item | expectation | result |
+| --- | --- | --- |
+| 1.1 reference | region / niche lowers region-wide senders; CosMx Acinar lead shrinks | references move top-5 by <= 0.05; short top-5 mostly geometry (twin within 0.1); no Acinar effect. Not supported |
+| 1.2 ladder | scale rises with planted length (Spearman > 0.5) | -0.15 / -0.20 (ir_ch); median scale = bottom rung everywhere; flat ratio curves. Instrument too coarse (k10 = 200 µm synth, 20 µm CosMx) |
+| 1.3 IG pairs | beat permutation pairs at Gaussian sources | not comparable (different candidate sets / base rates); redo on one candidate set |
+| 1.3 spillover | large own-gene share for acinar genes | 1-2 % (twin 0.1-0.2 %). Not supported |
+| 1.4 IG rows | proto_ch_pe close to ir_ch | proto_ch_pe ~ proto_ch (0.25), ~ir_ch (0.01); ir_ch's seeds 0.04. Refuted |
+| 1.5 niche label | (rule: k* by median scale) | k10 by construction; no gain over the region label (synth AUROC_hard 0.35 vs 0.47) or none (CosMx) |
+| 1.6 maps | twin-subtracted maps | CosMx drawn; synth none (tissue-block finder vs the lattice) |
+| 2.1 maskstab | | not run |
+| 2.2 heads | flat fit, attention statistics telling; proto uniform | as expected; ir_ch's attention finds short senders from 4 heads on (0.04 -> 0.97) |
+| 2.3 fieldcorr | | not run (one arm trained, nothing evaluated) |
+| split synth | short / mid near, dense / sparse / directional far; heads: GCN short | V1: short near, directional far, dense / sparse near; far ranking = planted bands MC8-MC11 (both seeds); heads uninformative (twin alike) |
+| split CosMx | most effect within reach; far thin | 0.82-0.87 within 35 µm but twins as high; r50 at the grid floor (15 µm); far list immune genes (CD3G, GPR183, IL1A), seed-stable in part |
+| hypothesis | prototype heads disagree with distance | supported negatively: the heads carry no distance (CosMx 0.48-0.50 incl. twin, no locality correlation); the distance split of ir_ch is readable for the bands but its near share is largely geometry |
+
+Fixed after the read: split_read.py reads the Moran set column `scale_set` (split.md showed 0 / 0). Open: synth maps (tissue-block finder), the
+ladder's bottom rung (k < 10 or radius-based rungs), radii below 15 µm on CosMx, one candidate set for 1.3, maskstab and fieldcorr runs.
+
+**Moran locality, 2026-11-26 (the user):** the colour of the split plots, (I_local - I_global) / I_local, is positive for nearly every variable gene
+(synth min 0.63; CosMx raw no negative), so every gene shows as local. The user's definition is a curve: variability against neighbourhood size,
+dropping = local, flat or rising = global. The user is looking for the exact code behind the splits and figures they have in mind; rebuild the
+colour, the sets and the "Spearman with locality" columns from it. Until then those are not readable.
+**Correction (same day, the user):** the ranking is the definition: smallest drop = global, largest = local, same sign allowed. The Spearman columns
+stand; only the colour was wrong and is now the rank (split_read.py, `locality_ratio` keeps the ratio). The cluster read must be redone to update
+split.md / plots (`extra_submit.sh split_<data> read`).
+
+## maskstab, fieldcorr and legnini split read (2026-11-26, evening; MA/24_11_results/{maskstab,fieldcorr}, MA/25_11_results/split_{synth,cosmx,legnini})
+
+Verdicts in notes.md (entry of the same date). Against the expectations fixed before the runs:
+
+| item | expectation | result |
+| --- | --- | --- |
+| 2.1 maskstab | channel arms more stable on gene rankings in folds, cell arm more stable on attention; comb between or above both | first two hold: stability follows the training mask (folds: chan 0.97 / 0.91 / 0.89 / 0.87 fit / resp / drv / pairs; discs: cell 0.96 / 0.75 / 0.80 / 0.80; attention: cell 0.80, chan 0.45). comb: genes ~chan, attention 0.02 (worst), 2x time, val SCE 0.307 vs 0.274. Not above both |
+| 2.3 fieldcorr | field pairs above the kernel bar at weight 1; region centring removes the region markers' fields | above the bar at weight 0.1 (0.15 / 0.19 vs 0.137), weight 1 seed-dependent (0.07 / 0.18); drivers 0.51 -> 0.59 and pairs 0.14 -> 0.20 at weight 1 (both seeds); responders, fit flat; centring no effect |
+| split legnini | most effect within ~60 µm; far thin; SHH readouts / ventral code the far candidates | V2: 0.78-0.93 within 50 µm (twins 0.87-0.99, geometry); V1 ir_ch 0.64 / 0.45 vs twin 0.82 (reads farther than geometry, r50 41 / 75 µm); far lists seed-stable (8/15) with NKX6.1, PAX7, MSX2, DBX1/2 (+ GLI1, HHIP, OLIG2 in s43); near and far lists overlap (amplitude) |
+| hypothesis | prototype heads disagree with distance | holds on legnini too: local-head share 0.37-0.44, twin 0.65, no locality correlation |
+
+**2.1 tables (seed means, 3 seeds).** Stability:
+
+| arm | mode | fit_spearman | responders_rbo | drivers_rbo | pairs_rbo | attention_spearman | attention_top5 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cell | folds | 0.880 | 0.556 | 0.727 | 0.696 | 0.802 | 0.765 |
+| chan | folds | 0.973 | 0.912 | 0.893 | 0.868 | 0.449 | 0.586 |
+| comb | folds | 0.962 | 0.851 | 0.858 | 0.868 | 0.019 | 0.338 |
+| cell | cells | 0.958 | 0.745 | 0.795 | 0.799 | | |
+| chan | cells | 0.626 | 0.651 | 0.756 | 0.528 | | |
+| comb | cells | 0.653 | 0.742 | 0.690 | 0.503 | | |
+
+Against the truth: cell / cells drivers AUPRC 0.70, pairs 0.28 / AUROC 0.89, fit 0.192, responders AUROC_hard 0.12; cell / folds AUROC 0.73,
+hard 0.35; chan / folds 0.65 / 0.29, fit 0.161; comb / folds 0.61 / 0.30. Attention rows (1,109 receivers): cell mean distance 590-700 µm,
+effective keys 28-40; chan 790-880 µm, 36-82; comb 750-940 µm, 18-82 (seeds disagree).
+
+**2.3 per seed (s42 / s43).** Field AUPRC: none 0.017 / 0.014; fc0.1 0.152 / 0.193; fc1 0.073 / 0.179; fc1_reg 0.067 / 0.192; kernel 0.137 (AUROC
+0.93-0.95 for all, kernel included). Drivers AUPRC: 0.523 / 0.500, 0.500 / 0.528, 0.592 / 0.585, 0.596 / 0.586. Pairs AUPRC: 0.129 / 0.153,
+0.143 / 0.162, 0.199 / 0.210, 0.196 / 0.204. Responders AUROC_hard 0.30-0.36 everywhere. Attention planted top-5: 0.09 / 0.12, 0.16 / 0.14,
+0.08 / 0.05, 0.06 / 0.07. val_loss is not comparable across weights (it includes the term); val SCE 0.243-0.256 for all.
+
+**legnini training (300 epochs, 2 seeds).** val SCE: proto_ch 0.146 (0.146 / 0.145), proto_ch_pe 0.146, ir_ch 0.140 (0.148 / 0.133). Moran on the two
+test sections: median I_local 0.20, I_global 0.03 (strongly variable panel, unlike synth / CosMx at 0.002-0.009).
+
+Open after this read: fieldcorr_pr colours, v3_profiles tick labels; whether to keep the field term (weight 1) for the next ranking runs; comb dropped;
+legnini has no E7 readout yet (compare_rank not run on compare_legnini's checkpoints; no truth, controls only).
