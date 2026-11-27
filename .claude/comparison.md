@@ -631,3 +631,18 @@ test sections: median I_local 0.20, I_global 0.03 (strongly variable panel, unli
 
 Open after this read: fieldcorr_pr colours, v3_profiles tick labels; whether to keep the field term (weight 1) for the next ranking runs; comb dropped;
 legnini has no E7 readout yet (compare_rank not run on compare_legnini's checkpoints; no truth, controls only).
+
+
+## Small fixes, 2026-11-27 (the follow-ups of the 11-26 read)
+
+- `fieldcorr_pr.png` (extra_read.py): every curve was grey because `compare_read.plot_pr` looked colours up in its own arm table, which has no
+  fieldcorr arms. `plot_pr(colours=, dashed=)` (default unchanged; a name missing from the table now takes a distinct colour from a cycle, never
+  the shared grey); extra_read passes its `COLOURS` and draws the kernel bar dashed. Redrawn from the synced 24_11_results/fieldcorr tables:
+  ctx_ch_fc01 0.15, kernel 0.14, fc1 / fc1_reg 0.07, ctx_ch 0.02 AUPRC, each distinguishable.
+- `v3_profiles.png` (split_read.py): ticks at the measured radii only (a radius within 25 % of the last one skipped: synth's 283 = the reach vs
+  300), whole-µm labels, no minor labels; at most 4 panels a row; panels without a group blanked. Redrawn from 25_11_results/split_{synth,cosmx}.
+- legnini E7: `compare_submit.sh legnini` (readouts only, `EVALUATE` by default; `TRAIN=1` retrains) on split_legnini's checkpoints in
+  `MA/25_11_results/compare_legnini` (proto_ch, proto_ch_pe, ir_ch x 2; twins of proto_ch and ir_ch); `compare_job.sbatch` / `compare_read.py`
+  take `legnini` (no truth: read as CosMx). Run list checked (6 runs).
+- S8 (anisotropic Fourier bias on the windowed model): the bias exists (`pe.bias: [fourier]`, anisotropic variant), no job file; not built
+  (the 11-26 advice: no new experiments). One job if the user wants it.

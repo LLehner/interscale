@@ -681,3 +681,33 @@ Estimate: ~0.5 day build + tests, one short eval-only job. Worth it only if IG m
 
 Sync the fork (synth_spot.py, attribution.py) and copy to `MA/scripts/`: attr_job.py, attr_common.py, attr_read.py, make_and_synth_yaml.py;
 to `MA/slurm/`: attr_submit.sh, attr_job.sbatch. Then `bash slurm/attr_submit.sh and` and `bash slurm/attr_submit.sh cosmx_s13`.
+
+
+## The all-cell IG map, built 2026-11-27 (the user: "move on to the all-cell IG map")
+
+- **Library** (`evaluation/attribution.py`): `all_cell_map(module, batch, weights [N, G], reference=, part=, steps=, ...)`: one IG of the summed target
+  `S = sum_i w_i . f_i` on a path where every movable row moves (no receiver row fixed). `out[j]` = what cell j sends to all others (signed);
+  `in[i]` = `w_i . (f_i(x) - f_i(x_ref))` from the two end passes (= what i drew, by completeness); `gap`, retry at more steps. Guards: `token_blind`
+  (context query; an own-cell skip only on the raw input, which is constant along a token path; no visible-mean / group offset) and an empirical one
+  (the gradient of `check_cells` cells' own targets on their own rows; raises above 1e-6 of the row terms). `part_prediction(module, batch, part=)`
+  gives the profile the targets are made from (`part="context"`: a model with a raw skip). `_PartReader` reads a head or one named part.
+- **Tests** (`test_attribution_methods.py`, 3 new): on the read-out (`ir`) and the dense context query (`stream`) toy models, `out` equals the
+  per-receiver IGs (one receiver at a time) summed over receivers (rtol 1e-3, float32 contributions), `in` equals each receiver's change, out and
+  in add up; a plain encoder is refused by the static check and, with that check patched away, by the empirical one. Mutant (no quadrature
+  weights) caught.
+- **Jobs** (`attr_job.py`, `attr_common._all_cell`, `ALL_CELL_MAP`): `allmap_cosmx` = J4's ir_c_ktype x 3 + ir_c_s42, twins of both at s42, the clean
+  pass with every cell scored, targets = each cell's deviation from its type mean (`deviation_targets`), references type mean (maps) and sampled
+  cells x 3 (Spearman of out / in / net as the check); tables per graph (gap, steps, self share, seconds), by cell type (mean out, in, net, share of
+  |out|). `allmap_synth` = J1's ir2_rate x 2 + twin **under its programme mask** (in distribution: it was trained with the responses hidden
+  everywhere), `part="context"` (the raw skip excluded), the deviation over the hidden response genes only, references graph mean and sampled;
+  AUROC of out for the planted senders and of in for the planted receivers, by range class, trained vs twin. I chose J1's ir2_rate over the
+  plan's ir_ch: ir_ch is channel-trained and the clean pass would be off its training distribution. Maps per graph (npz + png) for the run and
+  its twin, and **trained minus twin** (`subtract_fields`, each scaled to its 99th percentile) in the twin's pass (the trained map is written first
+  in the same task). `plot_source_sink` cannot draw synth_spot's lattice (1.6's "no tissue block"): a plain per-cell scatter is drawn instead
+  (`_scatter_map`, symmetric scale, nothing smoothed or selected). `attr_read.py allmap` writes the tables.
+- **Smoke** (toy lattice, untrained read-out model with the raw skip, programme mask; CPU): both jobs' paths end to end, report and maps written;
+  the clean path's `show_everything` refuses a gene-masked toy model (expected: the CosMx read-out models are node-masked, as in `_cosmx`).
+- **Read rules (fixed before the run):** a map is read only where the gap <= 0.05 and the self share ~0; a type's or planted class's value counts
+  only beyond the twin's; the sampled reference must agree in rank (Spearman of net >= 0.5) before a map is described. Cost: one forward + backward
+  per IG step on a whole section (as a training step), x (5-20 steps) x (1 + 3 sampled draws): minutes per section; 5 h budget per model.
+- **Run:** `bash slurm/attr_submit.sh allmap_cosmx`, `bash slurm/attr_submit.sh allmap_synth`; results `MA/27_11_results/allmap_{cosmx,synth}/`.
