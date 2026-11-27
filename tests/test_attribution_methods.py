@@ -18,6 +18,7 @@ from interscale.evaluation.attribution import (
     _SecantFn,
     _secant_activations,
     agreement,
+    all_cell_map,
     attribute,
     decomposition_by_distance,
     deviation_targets,
@@ -27,6 +28,7 @@ from interscale.evaluation.attribution import (
     map_fields,
     near_candidates,
     pairwise_interactions,
+    part_prediction,
     planted_top_k,
     reference_tokens,
     sensitivity_n,
@@ -45,6 +47,11 @@ ARMS = {
     ),
     "stream": (
         "      context_only: query\n      context_query:\n        inputs: [position]\n" + SCALES + "      attention:\n        kind: dense\n        center_qk: False\n",
+        "",
+        "  mask_strategy: node\n  mask_percentage: 0.2\n  extra_obs_keys: ['cell_type']\n",
+    ),
+    "plain": (  # an encoder: every cell reads its own token
+        SCALES + "      attention:\n        kind: dense\n        center_qk: False\n",
         "",
         "  mask_strategy: node\n  mask_percentage: 0.2\n  extra_obs_keys: ['cell_type']\n",
     ),
@@ -544,3 +551,38 @@ def test_distance_flows_read_the_same_in_batches_as_one_copy_at_a_time(ir):
         module.mask_strategy = saved
     np.testing.assert_allclose(np.nan_to_num(one.drop), np.nan_to_num(many.drop), rtol=1e-5, atol=1e-7)
     assert np.isfinite(one.drop[0][:, :2]).any() and np.isnan(one.drop[0][:, 2:]).all()  # only the hidden genes are read
+
+
+@pytest.mark.parametrize("fixture", ["ir", "stream"])
+def test_the_all_cell_map_is_the_sum_of_per_receiver_ig_and_in_is_each_receivers_change(fixture, request):
+    """One IG of the summed target = the per-receiver IGs summed over receivers (IG is linear in the target, the points are the same, and a
+    blind model's receiver row does not move its own target, so attribute's fixed receiver row changes nothing); ``in`` = each receiver's
+    change; out and in add up to the total (completeness)."""
+    module, graph, labels = request.getfixturevalue(fixture)
+    n = graph.num_nodes
+    pred = part_prediction(module, graph.clone())
+    assert pred.shape == (n, G) and np.isfinite(pred).all()
+    w = deviation_targets(pred, labels, np.arange(n))
+    m = all_cell_map(module, graph.clone(), w, labels=labels, reference="type_mean", steps=8, retry_steps=8, check_cells=3)
+    assert m["self_share"] < 1e-9
+    # one receiver at a time (attribute fixes every receiver's row: all cells at once would move nothing)
+    total, change = np.zeros(n), np.zeros(n)
+    for i in range(n):
+        one = attribute(module, graph.clone(), np.array([i]), w[i : i + 1], "ig", labels=labels, reference="type_mean", steps=8, retry_steps=8)
+        total += np.nan_to_num(one.contribution[0].astype(np.float64))
+        change[i] = one.change[0]
+    np.testing.assert_allclose(m["out"], total, rtol=1e-3, atol=1e-5)
+    np.testing.assert_allclose(m["in"], change, rtol=1e-6, atol=1e-8)
+    assert abs(m["out"].sum() - m["in"].sum()) <= 0.05 * abs(m["in"].sum()) + 1e-8
+
+
+def test_the_all_cell_map_refuses_a_model_that_reads_its_own_token(tmp_path, monkeypatch):
+    import interscale.evaluation.attribution as attribution
+
+    module, graph, labels = _model(tmp_path, "plain")
+    w = gene_targets([0, 2], graph.num_nodes, G)
+    with pytest.raises(ValueError, match="own token never reaches"):
+        all_cell_map(module, graph.clone(), w, reference="graph_mean")
+    monkeypatch.setattr(attribution, "token_blind", lambda module: True)  # past the static check: the empirical one must catch it
+    with pytest.raises(ValueError, match="not blind"):
+        all_cell_map(module, graph.clone(), w, reference="graph_mean", steps=2, retry_steps=2)

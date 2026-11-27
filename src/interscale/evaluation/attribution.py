@@ -1075,6 +1075,175 @@ def disc_strengths(attr: Attribution, groups, n: int, *, keep=None) -> dict:
     return {"out": out, "in": into}
 
 
+def token_blind(module) -> bool:
+    """Whether no cell's own *token* reaches its own prediction, so that on a path in token space every cell can be a sender and a
+    receiver at once (:func:`all_cell_map`): a context query (``context_only: query``) with no section / group offset over the cell's own
+    entries and, if it has the own-cell skip, one that reads the raw input (``own_cell_skip_input: raw``: constant along a token path, so
+    it adds nothing to a gradient and cancels in the change). Stricter models: ``interpretation.blind_to_own``."""
+    return (
+        getattr(module, "context_only", "none") == "query"
+        and (not bool(getattr(module, "own_cell_skip", False)) or getattr(module, "own_cell_skip_input", "embedding") == "raw")
+        and getattr(module, "section_offset", "none") != "visible_mean"
+        and getattr(module, "group_offset", "none") == "none"
+    )
+
+
+class _PartReader:
+    """Every cell's target ``[N]`` (``weights`` ``[N, G]`` over a head or one named part of it) for given tokens; NaN where not predicted."""
+
+    def __init__(self, module, batch, weights, head: str, part: str | None):
+        from interscale.evaluation.masked_probing import _model_heads
+
+        self.module, self.batch, self.head, self.part, self._heads = module, batch, head, part, _model_heads
+        self.weights = torch.as_tensor(np.asarray(weights, dtype=np.float64))
+        self.replay = _replayable_rng(batch.x.device)
+        self.holder: dict = {}
+
+    def rows(self, tokens: torch.Tensor) -> torch.Tensor:
+        """``[N, G]`` the head's (or part's) prediction per cell in graph order (NaN rows where not predicted)."""
+        self.holder["tokens"] = tokens
+        self.replay()
+        with _given_tokens(self.module, self.holder):
+            out = self.module._common_step(self.batch, "regression", "node")
+        heads, _, _ = self._heads(self.module, out)
+        if self.head not in heads:
+            raise ValueError(f"no head {self.head!r}; the module has {sorted(heads)}.")
+        pred = heads[self.head]
+        if self.part is not None:
+            parts = (out.parts or {}).get(self.head)
+            if parts is None and self.part == "context":
+                pass  # a single-part prediction is its context part
+            elif parts is None or self.part not in parts:
+                raise ValueError(f"no part {self.part!r} in head {self.head!r}; parts: {sorted(parts or {})}.")
+            else:
+                pred = parts[self.part]
+        idx = out.view.padded_node_idx
+        if idx is None:
+            idx = torch.arange(self.batch.num_nodes, device=pred.device)
+        full = torch.full((self.batch.num_nodes, pred.shape[1]), float("nan"), dtype=pred.dtype, device=pred.device)
+        full = full.index_put((idx,), pred)
+        return full
+
+    def __call__(self, tokens: torch.Tensor) -> torch.Tensor:
+        rows = self.rows(tokens)
+        value = (rows.double() * self.weights.to(rows.device)).sum(1)
+        return torch.where(torch.isfinite(value), value, torch.zeros_like(value))
+
+
+def part_prediction(module, batch, *, head: str = "global", part: str | None = None) -> np.ndarray:
+    """``[N, G]`` one step's prediction of ``head`` (or its named ``part``, e.g. ``context``) per cell, graph order, NaN where not predicted:
+    the profile :func:`deviation_targets` turns into the targets of :func:`all_cell_map`."""
+    batch = _on_module_device(module, batch)
+    with _evaluating(module), torch.no_grad():
+        tokens = _actual_tokens(module, batch)
+        reader = _PartReader(module, batch, np.zeros((batch.num_nodes, int(batch.x.shape[1]))), head, part)
+        return reader.rows(tokens).double().cpu().numpy()
+
+
+def all_cell_map(
+    module,
+    batch,
+    weights,
+    *,
+    labels=None,
+    reference: str = "type_mean",
+    head: str = "global",
+    part: str | None = None,
+    steps: int = 5,
+    retry_steps: int = 20,
+    gap_limit: float = 0.05,
+    draws: int = 3,
+    check_cells: int = 3,
+    seed: int = 0,
+) -> dict:
+    """Every cell a sender and a receiver at once (attribution_plan.md, "the all-cell map"): ONE integrated-gradients pass of the summed
+    target ``S = sum_i w_i . f_i`` on a path where every movable row goes from its reference to its token.
+
+    IG is linear in the target, so ``out[j]`` = sum over receivers of cell j's contribution (what j sends, signed); for a model blind to its
+    own token (:func:`token_blind`, checked empirically on ``check_cells`` cells: the gradient of a cell's own target on its own row) cell j's
+    term in its own target is 0, so ``out`` has no self part. ``in[i]`` = ``w_i . (f_i(x) - f_i(x_ref))``, the change of cell i's target
+    between the two ends, which by completeness is everything it drew from the others. ``sum(out)`` = ``sum(in)`` up to the gap. Replaces the
+    disc-receiver maps (``disc_strengths``), whose "in" sat on ~30 discs per section.
+
+    ``weights`` ``[N, G]`` per cell (zero rows: no target), e.g. :func:`deviation_targets` of :func:`part_prediction` for every cell. ``part``:
+    read one named part of the head (``context`` for a model with a raw own-cell skip). References as :func:`attribute` (``sampled``: mean
+    over ``draws``). Returns ``out``, ``in``, ``total_change``, ``gap`` (``|sum out - total| / |total|``), ``steps`` used, ``self_share``
+    (median over the checked cells of |own-row term| / sum |row terms|; ~0 when blind), ``seconds``.
+    """
+    if not token_blind(module):
+        raise ValueError(
+            "all_cell_map needs a model whose own token never reaches its own prediction (a context query; an own-cell skip only on the raw "
+            "input): otherwise every cell's out holds a self term. Read such a model with receivers in folds (attribute, disc / fold targets)."
+        )
+    if reference != "graph_mean" and labels is None:
+        raise ValueError(f"reference {reference!r} needs labels.")
+    started = time.time()
+    batch = _on_module_device(module, batch)
+    weights = np.asarray(weights, dtype=np.float64)
+    n = int(batch.num_nodes)
+    if weights.shape[0] != n:
+        raise ValueError(f"weights needs one row per cell ({n}), got {weights.shape[0]}.")
+    rng = np.random.default_rng(seed)
+    was_training = module.training
+    module.eval()
+    saved = [(p, p.requires_grad) for p in module.parameters()]
+    for p, _ in saved:
+        p.requires_grad_(False)
+    replay_outer = _replayable_rng(batch.x.device)
+    try:
+        tokens = _actual_tokens(module, batch)
+        whole = _hidden_entries(batch, "gene").all(axis=1)
+        movable = torch.as_tensor(~whole, device=tokens.device)[:, None]
+        reader = _PartReader(module, batch, weights, head, part)
+        outs, ins, totals, gaps, used = [], [], [], [], []
+        for _ in range(int(draws) if reference == "sampled" else 1):
+            ref = reference_tokens(tokens, labels if labels is not None else np.zeros(n), reference, rng=rng, usable=~whole)
+            ref = torch.where(movable, ref, tokens)
+            delta = (tokens - ref).double()
+            with torch.no_grad():
+                into = (reader(tokens.clone()) - reader(ref.clone())).cpu().numpy()
+            total = float(into.sum())
+
+            def integrate(n_steps, ref=ref, delta=delta):
+                points, w = _integration_points(n_steps)
+                acc = torch.zeros(n, dtype=torch.float64)
+                for alpha, weight in zip(points, w, strict=True):
+                    leaf = (ref + float(alpha) * (tokens - ref)).requires_grad_(True)
+                    with torch.enable_grad():
+                        (grad,) = torch.autograd.grad(reader(leaf).sum(), leaf)
+                    acc += float(weight) * (grad.double() * delta).sum(1).cpu()
+                return acc.numpy()
+
+            out, k = integrate(int(steps)), int(steps)
+            gap = abs(out.sum() - total) / max(abs(total), 1e-12)
+            if gap > gap_limit and retry_steps > steps:
+                out, k = integrate(int(retry_steps)), int(retry_steps)
+                gap = abs(out.sum() - total) / max(abs(total), 1e-12)
+            outs.append(out), ins.append(into), totals.append(total), gaps.append(gap), used.append(k)
+        # The empirical blindness check: a cell's own target against its own row (at the input).
+        scored = np.flatnonzero(np.abs(weights).sum(1) > 0)
+        shares = []
+        for i in rng.choice(scored, size=min(int(check_cells), len(scored)), replace=False) if len(scored) else []:
+            one = np.zeros_like(weights)
+            one[i] = weights[i]
+            single = _PartReader(module, batch, one, head, part)
+            leaf = tokens.clone().requires_grad_(True)
+            with torch.enable_grad():
+                (grad,) = torch.autograd.grad(single(leaf).sum(), leaf)
+            terms = (grad.double() * (tokens - ref).double()).sum(1).abs().cpu().numpy()
+            shares.append(terms[i] / max(terms.sum(), 1e-30))
+        self_share = float(np.median(shares)) if shares else np.nan
+        if np.isfinite(self_share) and self_share > 1e-6:
+            raise ValueError(f"a cell's own token moves its own target (median self share {self_share:.2e}): the model is not blind to it.")
+    finally:
+        for p, flag in saved:
+            p.requires_grad_(flag)
+        module.train(was_training)
+        replay_outer()
+    return {"out": np.mean(outs, axis=0), "in": np.mean(ins, axis=0), "total_change": float(np.mean(totals)), "gap": float(np.max(gaps)),
+            "steps": int(max(used)), "self_share": self_share, "seconds": time.time() - started}  # fmt: skip
+
+
 def map_fields(pos_um, out, into, visible, *, grid_um: float = 10.0) -> dict:
     """The fields :func:`flow_maps.plot_source_sink` reads, from per-cell out / in strengths (attribution in place of attention flow)."""
     pos = np.asarray(pos_um, dtype=np.float64)[:, :2]
