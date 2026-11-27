@@ -184,6 +184,17 @@ SPARSE = (
     _SparseProgramme("M20", "MC24", (1, 1), (200, 500), start=25.0, step=0.0, threshold=3000.0),  # (ix)
     _SparseProgramme("M21", "MC25", (1, 3), (200, 500), start=10.0, step=0.0, threshold=1000.0),  # (x)
 )
+#: The planted-AND positive control (opt-in, ``and_programme=True``; attribution_plan.md S13 / A6, 2026-11-27). Disjoint senders S5 and
+#: S6 (8 % of spots each). Both responses are read at the same receivers from the same two senders and share their endpoints (2.5 with
+#: neither sender, 10 with both, base means); only the middle differs:
+#: R5 (AND) stays at 2.5 with one sender and jumps to 10 only with both; R6 (the matched additive control) doubles per sender type
+#: (2.5 -> 5 -> 10). Doubling counts is a constant step in the log-normalised space the models predict, so R6 is additive where it is
+#: read, and a pairwise interaction there should vanish while R5's is half of the two single effects. A sum in counts (0 -> 5 -> 10)
+#: would not be: log1p makes it strongly non-additive at a zero baseline.
+AND_RATE = 0.08
+AND_LEVELS = {"R5": (2.5, 2.5, 10.0), "R6": (2.5, 5.0, 10.0)}  # base mean with 0, 1 or 2 of the sender types next to the spot
+AND_PROGRAMMES = {"R5": "S5&S6>R5", "R6": "S5+S6>R6"}
+
 #: Source clusters are compact on purpose: M is down to ~0.1 counts at 600 µm, so a receiver past
 #: the first band has no trace of the source at its own spot or its neighbours'.
 SPARSE_SIGMA = 200.0
@@ -205,7 +216,9 @@ def _rng(seed: int, *keys: str) -> np.random.Generator:
 # ------------------------------------------------------------------------------------------------
 
 
-def _gene_table(spacing: float, n_hv: int, n_nb: int, n_zinb: int, n_poi: int, n_hk: int) -> pd.DataFrame:
+def _gene_table(
+    spacing: float, n_hv: int, n_nb: int, n_zinb: int, n_poi: int, n_hk: int, and_programme: bool = False
+) -> pd.DataFrame:
     """One row per gene: programme, role, which genes it interacts with, and its length scale.
 
     ``length_scale_um`` is the distance over which the gene's expected value changes under its
@@ -289,6 +302,11 @@ def _gene_table(spacing: float, n_hv: int, n_nb: int, n_zinb: int, n_poi: int, n
         add(p.source, "sparse_response", "source", "low_noise", label, SPARSE_SIGMA)
         add(p.response, "sparse_response", "response", "low_noise", label, p.threshold or SPARSE_BAND)
         add(p.receptor, "sparse_response", "receptor", "low_noise", label)
+    if and_programme:  # last, so every other gene keeps its column
+        for gene in ("S5", "S6"):
+            add(gene, "short_range", "sender", "low_noise", "S5/S6>R5/R6", spacing)
+        for gene, label in AND_PROGRAMMES.items():
+            add(gene, "short_range", "receiver", "low_noise", label, spacing)
 
     genes = pd.DataFrame(rows).set_index("gene")
     genes.index.name = None
@@ -619,6 +637,54 @@ def _short_range(r: np.random.Generator, grid: _Grid, rates: dict[str, float]):
                 }
             )
         )
+    return mean, obs, frames
+
+
+def _and_programme(r: np.random.Generator, grid: _Grid, rate: float = AND_RATE):
+    """The planted AND and its matched additive control (see :data:`AND_LEVELS`), on the 4-neighbourhood as items 8.
+
+    S5 and S6 are disjoint (one draw per spot), so hiding one spot never removes both signals. A spot's state counts the sender
+    *types* next to it, not the senders: two S5 neighbours expose it to S5 no more than one does (as R1). Edges: every S5 / S6
+    neighbour of an R5 spot at 10 (both types present) under ``S5&S6>R5``; every S5 / S6 neighbour of an exposed spot under
+    ``S5+S6>R6``. ``n_S5_nbrs`` / ``n_S6_nbrs`` in obs let a readout pick receivers with exactly one sender of each type.
+    """
+    n = len(grid.pos)
+    u = r.random(n)
+    s5 = u < rate
+    s6 = (u >= rate) & (u < 2 * rate)
+    has = grid.nbr >= 0
+    safe = np.where(has, grid.nbr, 0)
+    n5 = (has & s5[safe]).sum(1)
+    n6 = (has & s6[safe]).sum(1)
+    k = (n5 > 0).astype(int) + (n6 > 0).astype(int)
+    high = LEVELS["high"]
+    mean = {"S5": high * s5, "S6": high * s6}
+    for gene, levels in AND_LEVELS.items():
+        mean[gene] = np.asarray(levels)[k]
+    obs = {
+        "is_S5": s5,
+        "is_S6": s6,
+        "n_S5_nbrs": n5,
+        "n_S6_nbrs": n6,
+        "R56_state": np.select([(n5 > 0) & (n6 > 0), n5 > 0, n6 > 0], ["both", "S5", "S6"], default="none"),
+    }
+    frames = []
+    for gene, program in AND_PROGRAMMES.items():
+        rcv = np.flatnonzero(((n5 > 0) & (n6 > 0)) if gene == "R5" else (k > 0))
+        for flag in (s5, s6):
+            nb = grid.nbr[rcv]
+            ok = (nb >= 0) & flag[np.where(nb >= 0, nb, 0)]
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "sender": nb[ok],
+                        "receiver": np.repeat(rcv, 4).reshape(-1, 4)[ok],
+                        "weight": 1.0,
+                        "range_class": "short",
+                        "program": program,
+                    }
+                )
+            )
     return mean, obs, frames
 
 
@@ -961,6 +1027,7 @@ def _simulate_slide(
     signal_scale,
     sender_rates,
     cutoff,
+    and_programme=False,
 ):
     """Simulate one slide: lattice, every programme, counts, and its ground-truth records."""
     slide = info.slide
@@ -980,6 +1047,10 @@ def _simulate_slide(
     rg_mean, region, region_split, cm1_side = _region(seed, slide, grid)
     sp_mean, sp_obs, sp_sources, sp_edges = _sparse_responses(seed, slide, grid)
     mean |= sr_mean | lr_mean | sv_mean | rg_mean | sp_mean
+    and_obs, and_edges = {}, []
+    if and_programme:  # its own keyed stream: every other gene is unchanged
+        and_mean, and_obs, and_edges = _and_programme(_rng(seed, slide, "and_programme"), grid)
+        mean |= and_mean
     sources += sp_sources
     # Every structured gene, before its counts are drawn; the background genes below are untouched.
     mean = {gene: mu * signal_scale for gene, mu in mean.items()}
@@ -1007,10 +1078,11 @@ def _simulate_slide(
             **sr_obs,
             **lr_obs,
             **sp_obs,
+            **and_obs,
         },
         index=[f"{slide}_r{rr:02d}_c{cc:02d}" for rr, cc in zip(grid.row, grid.col, strict=True)],
     )
-    edges = pd.concat(sr_edges + lr_edges + sp_edges, ignore_index=True)
+    edges = pd.concat(sr_edges + lr_edges + sp_edges + and_edges, ignore_index=True)
     record = {
         "n_spots": n,
         "n_rows": int(keep.any(1).sum()),
@@ -1055,6 +1127,7 @@ def make_synth_spot(
     n_test_per_condition: int = 4,
     graph_radius: float | None = None,
     edge_weight_cutoff: float = 0.1,
+    and_programme: bool = False,
     seed: int = 0,
 ) -> AnnData:
     """Simulate the full synth_spot dataset.
@@ -1090,6 +1163,9 @@ def make_synth_spot(
         graph from ``cfg.dataset.spatial_neigbors_kwargs`` -- so set the config to match.
     edge_weight_cutoff
         Response strength above which a directional pair enters the ground-truth edge list.
+    and_programme
+        Add the planted-AND positive control (:data:`AND_LEVELS`: senders S5 / S6, responses R5 = AND, R6 = the matched
+        log-additive control) as the last four genes. Off by default: the dataset is then the one made before 2026-11-27.
     seed
         Root seed; every slide and programme derives its own generator from it.
 
@@ -1112,7 +1188,7 @@ def make_synth_spot(
     # compared against this value exactly.
     graph_radius = round(1.1 * spacing, 6) if graph_radius is None else float(graph_radius)
 
-    genes = _gene_table(spacing, n_hv, n_nb, n_zinb, n_poi, n_hk)
+    genes = _gene_table(spacing, n_hv, n_nb, n_zinb, n_poi, n_hk, and_programme)
     _draw_gene_params(seed, genes)
     design = _design(
         seed,
@@ -1138,6 +1214,7 @@ def make_synth_spot(
             signal_scale=signal_scale,
             sender_rates=rates,
             cutoff=edge_weight_cutoff,
+            and_programme=and_programme,
         )
         # Edges refer to cells by position in the final object, which survives the obs_names
         # renaming prepare_geome_dataset does.
@@ -1166,6 +1243,8 @@ def make_synth_spot(
         "region": ["CM1", "CM2"],
         "R34_state": ["none", "S3", "S4", "both"],
     }
+    if and_programme:
+        categories["R56_state"] = ["none", "S5", "S6", "both"]
     for col, cats in categories.items():
         obs[col] = pd.Categorical(obs[col], categories=cats)
 
@@ -1220,6 +1299,7 @@ def make_synth_spot(
             "graph_radius": graph_radius,
             "edge_weight_cutoff": edge_weight_cutoff,
             "seed": seed,
+            **({"and_programme": True, "and_rate": AND_RATE, "and_levels": {g: np.asarray(v) for g, v in AND_LEVELS.items()}} if and_programme else {}),
         },
         "slides": slides,
         "holes": pd.DataFrame(holes, columns=["slide", "row", "col", "n_rows", "n_cols"]),
@@ -1391,6 +1471,7 @@ def main() -> None:
     parser.add_argument("--signal-scale", type=float, default=SIGNAL_SCALE)
     parser.add_argument("--graph-radius", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--and-programme", action="store_true", help="add the planted-AND control S5/S6 -> R5 (AND), R6 (additive)")
     parser.add_argument("--plot-slide", type=str, default=None, help="slide to map; default: the most damaged one")
     parser.add_argument("--no-plot", action="store_true", help="skip the per-gene maps")
     args = parser.parse_args()
@@ -1401,6 +1482,7 @@ def main() -> None:
         noise_scale=args.noise_scale,
         signal_scale=args.signal_scale,
         graph_radius=args.graph_radius,
+        and_programme=args.and_programme,
         seed=args.seed,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
