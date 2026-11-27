@@ -186,6 +186,39 @@ def test_a6_measures_run_on_a_single_graph_without_a_batch_vector(stream):
     assert inter["interaction"].shape == (1, 2)
 
 
+def test_pairwise_interactions_on_given_pairs_are_the_definition(stream):
+    """``given_pairs`` (the planted-AND control, S13): I = D_jk - D_j - D_k for exactly the named pair, by hand through the same
+    removal; a row of -1 is skipped (NaN), a pair naming one cell twice or a wrong shape is refused."""
+    from interscale.evaluation.attribution import _actual_tokens, _evaluating, _on_module_device, _perturbed_targets
+
+    module, graph, labels = stream
+    receivers = np.array([9, 30])
+    w = gene_targets([0, 3], 2, G)
+    cand = near_candidates(graph.pos.numpy(), receivers, np.ones(graph.num_nodes, bool), k=6)
+    given = np.array([[[cand[0][0], cand[0][1]], [cand[0][2], cand[0][3]]], [[-1, -1], [cand[1][0], cand[1][2]]]])
+    inter = pairwise_interactions(module, graph.clone(), receivers, w, None, given_pairs=given, seed=3)
+    assert inter["interaction"].shape == (2, 2) and np.isnan(inter["interaction"][1, 0]) and np.isfinite(inter["interaction"][1, 1])
+    batch = _on_module_device(module, graph.clone())
+    with _evaluating(module), torch.no_grad():
+        tokens = _actual_tokens(module, batch)
+        ref = reference_tokens(tokens, np.zeros(len(tokens)), "graph_mean")
+        one = receivers[:1]
+        base = _perturbed_targets(module, batch, one, w[:1], "global", tokens, ref, [])
+        j, k = given[0, 1]
+        d_j = base - _perturbed_targets(module, batch, one, w[:1], "global", tokens, ref, [j])
+        d_k = base - _perturbed_targets(module, batch, one, w[:1], "global", tokens, ref, [k])
+        d_jk = base - _perturbed_targets(module, batch, one, w[:1], "global", tokens, ref, [j, k])
+    # receiver 9 alone by hand vs both receivers in one pass: the other receiver's pair moves too, so only approximately equal at toy
+    # size; with one receiver it is exact
+    solo = pairwise_interactions(module, graph.clone(), one, w[:1], None, given_pairs=given[:1, 1:], seed=3)
+    np.testing.assert_allclose(solo["interaction"][0, 0], (d_jk - d_j - d_k)[0], rtol=1e-5, atol=1e-7)
+    np.testing.assert_allclose(solo["single"][0, 0], (np.abs(d_j) + np.abs(d_k))[0], rtol=1e-5, atol=1e-7)
+    with pytest.raises(ValueError, match="twice"):
+        pairwise_interactions(module, graph.clone(), one, w[:1], None, given_pairs=np.array([[[j, j]]]))
+    with pytest.raises(ValueError, match="must be"):
+        pairwise_interactions(module, graph.clone(), receivers, w, None, given_pairs=given[:1])
+
+
 def test_deeplift_runs_puts_activations_back_and_the_secant_is_a_secant(stream):
     module, graph, labels = stream
     before = {id(m): (getattr(m, "activation", None)) for m in module.modules()}

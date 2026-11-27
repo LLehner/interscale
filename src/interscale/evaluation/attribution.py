@@ -969,31 +969,48 @@ def pairwise_interactions(
     head: str = "global",
     removal: str = "reference",
     seed: int = 0,
+    given_pairs: np.ndarray | None = None,
 ) -> dict:
     """``I_jk = Delta_jk - Delta_j - Delta_k`` for ``pairs`` random pairs from each receiver's ``candidates`` (its nearby cells), ``Delta``
     the drop of the target when those cells take their reference tokens; all receivers in one forward per pair index and condition.
-    Returns ``interaction``, ``single`` (``|Delta_j| + |Delta_k|``) and ``relative`` (``|I| / single``), each ``[Q, pairs]``."""
+    Returns ``interaction``, ``single`` (``|Delta_j| + |Delta_k|``) and ``relative`` (``|I| / single``), each ``[Q, pairs]``.
+
+    ``given_pairs`` (``[Q, P, 2]`` cell indices, ``-1`` for none) replaces the random draw: e.g. a receiver's two planted senders (the
+    planted-AND control, attribution_plan.md S13); ``candidates`` and ``pairs`` are then not read. The reference draw is the same."""
     _check_removal(module, removal)
     batch = _on_module_device(module, batch)
     rng = np.random.default_rng(seed)
     receivers = np.asarray(receivers, dtype=np.int64)
     q = len(receivers)
+    if given_pairs is not None:
+        given_pairs = np.asarray(given_pairs, dtype=np.int64)
+        if given_pairs.ndim != 3 or given_pairs.shape[0] != q or given_pairs.shape[2] != 2:
+            raise ValueError(f"given_pairs must be [Q={q}, P, 2], got {given_pairs.shape}.")
+        if ((given_pairs[..., 0] == given_pairs[..., 1]) & (given_pairs[..., 0] >= 0)).any():
+            raise ValueError("a given pair names one cell twice.")
+        pairs = given_pairs.shape[1]
     inter, single = np.full((q, pairs), np.nan), np.full((q, pairs), np.nan)
     with _evaluating(module), torch.no_grad():
         tokens = _actual_tokens(module, batch)
         ref = reference_tokens(tokens, labels if labels is not None else np.zeros(len(tokens)), reference, rng=rng)
         base = _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, [], removal)
         for p in range(pairs):
-            js, ks = [], []
-            for row in candidates:
-                pool = row[row >= 0]
-                if len(pool) >= 2:
-                    j, k = rng.choice(pool, size=2, replace=False)
-                else:
-                    j = k = -1
-                js.append(j), ks.append(k)
-            js, ks = np.asarray(js), np.asarray(ks)
-            ok = js >= 0
+            if given_pairs is not None:
+                js, ks = given_pairs[:, p, 0], given_pairs[:, p, 1]
+                ok = (js >= 0) & (ks >= 0)
+            else:
+                js, ks = [], []
+                for row in candidates:
+                    pool = row[row >= 0]
+                    if len(pool) >= 2:
+                        j, k = rng.choice(pool, size=2, replace=False)
+                    else:
+                        j = k = -1
+                    js.append(j), ks.append(k)
+                js, ks = np.asarray(js), np.asarray(ks)
+                ok = js >= 0
+            if not ok.any():
+                continue
             d_j = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(js[ok]), removal)
             d_k = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(ks[ok]), removal)
             d_jk = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(np.concatenate([js[ok], ks[ok]])), removal)
