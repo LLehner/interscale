@@ -760,3 +760,14 @@ twin |median| < 0.05. The frozen reading is reported beside it and decides nothi
 
 Read locally 2026-11-28 (notes.md): A3 R5 - R6 = 0.000 +- 0.005 on the 11-27 tables; maps: synth and CosMx seed-stable, legnini not; CosMx
 Alpha / Beta / Immune / Endothelial draw beyond a within-100-um label null in all 3 seeds; the legnini SHH map's sender block is not at the source.
+
+
+## 2026-11-28, later: frozen A6 on CosMx and the pair-draw fix
+
+- `ATTR_JOB=cosmx_frozen` (`attr_submit.sh cosmx_frozen`; 28_11_results/attr_cosmx_frozen): `PAIRS_ONLY` + `A6_FROZEN` on every CosMx section for typeres_s42
+  and ir_c_ktype x 3 (+ twins); per-receiver pairs (`pairwise_receivers`) and attr_read.py's paired free - frozen table. The tape holds typeres' routed
+  candidates (tested). Read: free minus frozen = the softmax's (and the routing's) re-weighting; frozen = token-wise non-linearity. If typeres' frozen
+  interaction falls to its twin's level, its ~4x-twin reading was attention re-weighting, not a non-additive use of the neighbourhood.
+- `A6_FROZEN` also on the synth path (variant `.../frozen`).
+- `pairwise_interactions` random draws: no cell shared between receivers of one pass, no receiver as a sender (a false interaction otherwise; notes.md
+  2026-11-28); given pairs that overlap are refused.

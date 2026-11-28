@@ -16,6 +16,8 @@
 | C10 SHH truth scaffold | BUILT; list extracted from Legnini et al. 2023 (slurm/November/shh_targets.txt, user to confirm) and scored on the 25_11 rankings (notes.md 2026-11-28) | legnini_truth.py; compare_job.sbatch report step (copy the list to MA/shh_targets.txt) |
 | C11 SHH region | BUILT + read locally: the map's block is not at the source | legnini_shh_region.py |
 | C12 semi-synthetic legnini | NOT BUILT (~1 day; user decides after the SHH list) | - |
+| new 1: condition split of the rankings | BUILT 2026-11-28 (legnini Ctrl/SHH, CosMx ND/T1D); not run | gene_rank_common SPLIT_KEY; compare_submit.sh SPLIT=condition; condition_split_read.py |
+| new 2: frozen A6 on CosMx | BUILT 2026-11-28 (typeres routed: tested); not run; pair-draw bug fixed on the way | attr_common A6_FROZEN / PAIRS_ONLY; attr_submit.sh cosmx_frozen |
 
 Results of the local reads: notes.md, 2026-11-28.
 

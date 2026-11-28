@@ -3037,3 +3037,30 @@ What doesn't work:
   mid-distance genes are (0.58 / 0.69 / 0.77). FOXA1 is cell-autonomous to SHH+ cells (p. 1548), so a context model should not read it.
 - 2 seeds, 2 test sections (one control, one SHH), no per-section split of the ranking; the induced set overlaps the identity code the model was
   trained to reconstruct (channel folds), so "ranks the induced genes" partly means "they vary most between sections".
+
+## 2026-11-28 -- Condition split of the gene rankings (legnini Ctrl / SHH, CosMx ND / T1D) and frozen-attention A6 on CosMx: built; a pair-draw bug in A6
+
+Built (not run; the user submits): `SPLIT=condition bash slurm/compare_submit.sh legnini|cosmx` (gene_rank_common SPLIT_KEY / SPLIT_ONLY: the same plain
+read repeated on each condition's test sections, results MA/28_11_results/split_<job>; condition_split_read.py: per-condition rankings, the
+difference SHH - Ctrl / T1D - ND, the twin's difference, seed agreement on the difference, per cell type for CosMx, legnini against shh_targets.txt);
+`bash slurm/attr_submit.sh cosmx_frozen` (A6 pairs only, free and with the attention held, typeres_s42 and ir_c_ktype x 3 + twins; minutes per
+model). Why the split matters: on legnini the pooled ranking cannot tell "a gene responds to SHH" from "a gene differs between the two sections";
+the difference with its twin and seed agreement can. On CosMx each section is one donor (section = slide x condition); every test graph / tile is
+one condition (purity reported).
+
+What worked:
+- The tape also freezes a routed hierarchy (typeres): routing picks top-k parents from the previous level's (replayed) attention, so the candidates
+  replay with it. Tested on a typeres-like toy (prior none, readout concat, routed top-1): the perturbation changes the candidates unfrozen, the
+  tape restores them exactly.
+- Toy smoke of cosmx_frozen's path: the read-out model's frozen interaction 0.000 under type-mean and sampled references (free 0.013-0.014), the dense
+  toy keeps 54-59 % frozen.
+
+What doesn't work / a bug found:
+- **A6 pair draws could share a cell between receivers of one pass** (attribution.pairwise_interactions, random pairs): every receiver's j (and k) is
+  removed in the same forward, so a cell drawn for two receivers, or a receiver drawn as a sender, was removed once in the joint pass and twice in
+  the singles: a false interaction even for an exactly additive model. Found with the attention held (a frozen read-out read 0.015 instead of 0);
+  a mutant of the old draw gives 0.024 on a model that is additive by construction. Fixed: within one pass no cell is drawn twice and no receiver is
+  a sender; overlapping given pairs are refused (test_attention_tape.py). Which earlier numbers it touches: only where receivers sit closer than
+  about twice the candidate reach. CosMx A6 (receivers >= 150 um apart, 32-NN within ~35 um) and the AND planted pairs (receivers >= 400 um apart,
+  4-neighbour pairs) should be untouched; synth A6 (600 um, 24-NN ~280 um) at most marginally; the AND job's random near pairs (400 um apart, 24-NN
+  ~280 um) can overlap, so their 0.013-0.035 is an upper bound. New runs use the fixed draw (and_eval re-reads the AND random pairs with it).
