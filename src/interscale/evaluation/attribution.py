@@ -1073,6 +1073,11 @@ def pairwise_interactions(
             raise ValueError(f"given_pairs must be [Q={q}, P, 2], got {given_pairs.shape}.")
         if ((given_pairs[..., 0] == given_pairs[..., 1]) & (given_pairs[..., 0] >= 0)).any():
             raise ValueError("a given pair names one cell twice.")
+        for p in range(given_pairs.shape[1]):
+            cells = given_pairs[:, p][given_pairs[:, p, 0] >= 0].ravel()
+            if len(np.unique(cells)) < len(cells) or np.isin(cells, receivers).any():
+                raise ValueError(f"given pairs of pair index {p} share a cell between receivers, or name a receiver: one pass reads them all, "
+                                 "so the shared cell would be removed once in the joint pass and twice in the singles (a false interaction).")
         pairs = given_pairs.shape[1]
     inter, single = np.full((q, pairs), np.nan), np.full((q, pairs), np.nan)
     drops = {name: np.full((q, pairs), np.nan) for name in ("d_j", "d_k", "d_jk")}
@@ -1092,11 +1097,16 @@ def pairwise_interactions(
                 js, ks = given_pairs[:, p, 0], given_pairs[:, p, 1]
                 ok = (js >= 0) & (ks >= 0)
             else:
+                # One pass removes every receiver's j (and k) at once: a cell drawn for two receivers, or a receiver drawn as a sender, would be
+                # removed once in the joint pass and twice in the singles -- a false interaction even for an additive model (found 2026-11-28 with
+                # the attention held; earlier A6 reads drew without this rule).
+                used = set(int(r) for r in receivers)
                 js, ks = [], []
                 for row in candidates:
-                    pool = row[row >= 0]
+                    pool = np.array([c for c in row[row >= 0] if int(c) not in used], dtype=np.int64)
                     if len(pool) >= 2:
                         j, k = rng.choice(pool, size=2, replace=False)
+                        used.update((int(j), int(k)))
                     else:
                         j = k = -1
                     js.append(j), ks.append(k)

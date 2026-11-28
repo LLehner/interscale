@@ -158,3 +158,66 @@ def test_closed_form_interaction_of_a_known_head(ir, monkeypatch):
     expected = -(a_j * b_k + a_k * b_j)
     np.testing.assert_allclose(run[2]["interaction"], expected, rtol=1e-3, atol=1e-6)
     assert np.nanmax(np.abs(expected)) > 1e-4  # not vacuous
+
+
+def test_the_tape_also_holds_a_routed_hierarchy_s_candidates(monkeypatch):
+    """typeres (the CosMx reference) routes: each parent reads the children of its top-k parents, chosen from the previous level's attention.
+    The tape replays those weights, so the routing replays with them: under replay a perturbed input reads the recorded candidates exactly,
+    while without the tape the same perturbation changes them (the check is not vacuous)."""
+    spec = importlib.util.spec_from_file_location("hier_base", Path(__file__).with_name("test_hierarchical_attention.py"))
+    hb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hb)
+    from interscale.module.global_modules.hierarchical_attention import HierarchicalEncoderLayer
+
+    settings = {"prior_mode": "none", "readout": "concat", "levels": [9], "neighbors": 0, "candidates.mode": "routed", "candidates.topk": [1]}  # typeres-like
+    module = hb._stir(hb._build(hb._config(settings)), scale=0.5).eval()
+    seen = []
+    original = HierarchicalEncoderLayer._candidates
+
+    def spy(self, *args, **kwargs):
+        out = original(self, *args, **kwargs)
+        seen.append(out[0].detach().clone())
+        return out
+
+    monkeypatch.setattr(HierarchicalEncoderLayer, "_candidates", spy)
+
+    def step(batch):
+        hb.random.seed(0)
+        seen.clear()
+        with torch.no_grad():
+            y = module._common_step(batch, "regression", "node").y_pred.detach().clone()
+        return y, [c.clone() for c in seen]
+
+    batch = hb._batch((12,))
+    moved = batch.clone()
+    moved.x = moved.x.clone()
+    moved.x[:, 2:] = moved.x[:, 2:] + 3.0 * torch.rand(moved.x[:, 2:].shape, generator=torch.Generator().manual_seed(1))  # visible genes only
+    tape = at.AttentionTape()
+    with tape.record():
+        y0, base = step(batch)
+    assert base, "the routed layer was not called"
+    _, free = step(moved)
+    with tape.replay():
+        _, held = step(moved)
+    assert any(not torch.equal(a, b) for a, b in zip(base, free, strict=True))  # the perturbation moves the routing ...
+    assert all(torch.equal(a, b) for a, b in zip(base, held, strict=True))  # ... the tape holds it
+    with tape.replay():
+        y1, _ = step(batch)
+    torch.testing.assert_close(y1, y0)
+
+
+def test_many_close_receivers_in_one_pass_read_no_false_interaction(ir):
+    """Every receiver's pair is removed in the same pass. A cell drawn for two receivers (or a receiver drawn as a sender) is removed once in the
+    joint pass and twice in the singles: before 2026-11-28 that gave an additive model a false interaction when receivers sat close together. With
+    the attention held, the read-out is additive, so every interaction must be 0 however dense the receivers; overlapping given pairs are refused."""
+    module, graph, labels = ir
+    receivers = np.arange(0, 48, 4)  # twelve receivers, close on a 500 um field
+    w = at.gene_targets([0, 2], len(receivers), base.G)
+    cand = at.near_candidates(graph.pos.numpy(), receivers, np.ones(graph.num_nodes, bool), k=8)
+    held = at.pairwise_interactions(module, graph.clone(), receivers, w, cand, pairs=4, labels=labels, reference="type_mean", seed=2, freeze_attention=True)
+    assert np.isfinite(held["interaction"]).sum() > 10
+    assert np.nanmax(np.abs(held["interaction"])) < 1e-5
+    given = np.full((2, 1, 2), -1, dtype=np.int64)
+    given[0, 0], given[1, 0] = (int(cand[0][0]), int(cand[0][1])), (int(cand[0][1]), int(cand[1][2]))
+    with pytest.raises(ValueError, match="share a cell"):
+        at.pairwise_interactions(module, graph.clone(), receivers[:2], w[:2], None, given_pairs=given)
