@@ -586,3 +586,22 @@ def test_the_all_cell_map_refuses_a_model_that_reads_its_own_token(tmp_path, mon
     monkeypatch.setattr(attribution, "token_blind", lambda module: True)  # past the static check: the empirical one must catch it
     with pytest.raises(ValueError, match="not blind"):
         all_cell_map(module, graph.clone(), w, reference="graph_mean", steps=2, retry_steps=2)
+
+
+def test_subtract_fields_on_a_common_scale_keeps_a_small_noisy_twin_small():
+    """weekend_plan.md B9 (2026-11-28): scaled each to its own quantile, a twin of pure noise 100x smaller than the trained map comes back at the
+    trained map's size and the difference is half noise (the 2026-11-27 synth figure); on the common (trained) scale it stays small."""
+    from interscale.evaluation.attribution import map_fields, subtract_fields
+
+    rng = np.random.default_rng(1)
+    pos = rng.uniform(0, 300, size=(400, 2))
+    signal = np.where(np.arange(400) % 9 == 0, 1.0, 0.0) + 0.1 * rng.normal(size=400)
+    trained = map_fields(pos, signal, np.zeros(400), np.ones(400, np.int8))
+    twin = map_fields(pos, 0.01 * rng.normal(size=400), np.zeros(400), np.ones(400, np.int8))
+    each = subtract_fields(trained, twin, normalise="each")["flow_out"]
+    common = subtract_fields(trained, twin, normalise="common")
+    assert common["scale_twin"] == common["scale_trained"]
+    assert np.corrcoef(common["flow_out"], signal)[0, 1] > 0.99 > np.corrcoef(each, signal)[0, 1]
+    np.testing.assert_allclose(subtract_fields(trained, twin, normalise=True)["flow_out"], each)
+    with pytest.raises(ValueError, match="normalise"):
+        subtract_fields(trained, twin, normalise="twin")

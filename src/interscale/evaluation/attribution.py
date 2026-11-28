@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import math
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -288,22 +288,61 @@ def _secant_activations(module, mode: str, store: list):
                 m.activation = old
 
 
+def _attention_patch_points() -> list[tuple[object, str]]:
+    """Every name an attention normaliser or the SDPA kernel is reached by. ``F.softmax`` / ``F.log_softmax`` (and the vendored attention's
+    ``transformer_utils.softmax``, the same function) call the ``Tensor`` methods, so patching those reaches them once, never twice (tested);
+    ``torch.softmax`` / ``torch.log_softmax`` are separate kernels. The SDPA kernel is reached as ``F.scaled_dot_product_attention`` and, in
+    the vendored attention's own module, under the name it imported (that path is taken only without returned weights, which the encoder
+    layer never asks of it; patched for safety)."""
+    from interscale.module.global_modules import transformer_utils as tu
+
+    return [(torch, "softmax"), (torch, "log_softmax"), (torch.Tensor, "softmax"), (torch.Tensor, "log_softmax"),
+            (F, "scaled_dot_product_attention"), (tu, "scaled_dot_product_attention")]  # fmt: skip
+
+
 @contextmanager
-def _conservative_rules():
-    """Inside, softmax outputs (``torch.softmax``, ``F.softmax``, ``Tensor.softmax``; ``log_softmax`` likewise) are detached, the SDPA
-    kernel is computed explicitly with detached weights, and ``F.layer_norm`` divides by a detached standard deviation: the forward values
-    are unchanged, the backward treats attention weights and LayerNorm scales as constants."""
-    t_softmax, f_softmax, f_log_softmax = torch.softmax, F.softmax, F.log_softmax
-    m_softmax, m_log_softmax = torch.Tensor.softmax, torch.Tensor.log_softmax
-    f_sdpa, f_layer_norm = F.scaled_dot_product_attention, F.layer_norm
+def _patched_attention(normalise, layer_norm=None):
+    """Inside, every softmax / log_softmax (all names of :func:`_attention_patch_points`) returns ``normalise(original, out)`` of its own output,
+    and the SDPA kernel is computed explicitly through the patched ``torch.softmax`` (no dropout, eval only). ``layer_norm`` replaces
+    ``F.layer_norm`` when given. Every name is put back on exit."""
+    points = _attention_patch_points()
+    saved = [(obj, name, getattr(obj, name)) for obj, name in points]
+    f_layer_norm = F.layer_norm
+    originals = {(id(obj), name): fn for obj, name, fn in saved}
+    t_softmax = originals[(id(torch), "softmax")]
+
+    def wrapped(fn, method: bool):
+        if method:
+            return lambda self, *a, **k: normalise(fn(self, *a, **k))
+        return lambda *a, **k: normalise(fn(*a, **k))
 
     def sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
         if is_causal:
-            raise ValueError("conservative: causal attention is not supported.")
+            raise ValueError("patched attention: causal attention is not supported.")
         scores = (q @ k.transpose(-2, -1)) * (scale if scale is not None else 1.0 / math.sqrt(q.shape[-1]))
         if attn_mask is not None:
             scores = scores.masked_fill(~attn_mask, float("-inf")) if attn_mask.dtype == torch.bool else scores + attn_mask
-        return t_softmax(scores, dim=-1).detach() @ v
+        return normalise(t_softmax(scores, dim=-1)) @ v
+
+    try:
+        for obj, name, fn in saved:
+            if name == "scaled_dot_product_attention":
+                setattr(obj, name, sdpa)
+            else:
+                setattr(obj, name, wrapped(fn, obj is torch.Tensor))
+        if layer_norm is not None:
+            F.layer_norm = layer_norm
+        yield
+    finally:
+        for obj, name, fn in saved:
+            setattr(obj, name, fn)
+        F.layer_norm = f_layer_norm
+
+
+@contextmanager
+def _conservative_rules():
+    """Inside, softmax outputs (``torch.softmax``, ``F.softmax``, ``Tensor.softmax``; ``log_softmax`` likewise) are detached, the SDPA kernel is computed explicitly with detached weights, and ``F.layer_norm`` divides by a detached standard deviation:
+    the forward values are unchanged, the backward treats attention weights and LayerNorm scales as constants."""
 
     def layer_norm(x, normalized_shape, weight=None, bias=None, eps=1e-5):
         dims = tuple(range(-len(normalized_shape), 0))
@@ -316,19 +355,55 @@ def _conservative_rules():
             y = y + bias
         return y
 
-    torch.softmax = lambda *a, **k: t_softmax(*a, **k).detach()
-    F.softmax = lambda *a, **k: f_softmax(*a, **k).detach()
-    F.log_softmax = lambda *a, **k: f_log_softmax(*a, **k).detach()
-    torch.Tensor.softmax = lambda self, *a, **k: m_softmax(self, *a, **k).detach()
-    torch.Tensor.log_softmax = lambda self, *a, **k: m_log_softmax(self, *a, **k).detach()
-    F.scaled_dot_product_attention = sdpa
-    F.layer_norm = layer_norm
-    try:
+    with _patched_attention(lambda w: w.detach(), layer_norm=layer_norm):
         yield
-    finally:
-        torch.softmax, F.softmax, F.log_softmax = t_softmax, f_softmax, f_log_softmax
-        torch.Tensor.softmax, torch.Tensor.log_softmax = m_softmax, m_log_softmax
-        F.scaled_dot_product_attention, F.layer_norm = f_sdpa, f_layer_norm
+
+
+class AttentionTape:
+    """The attention weights of one pass, to hold them fixed in later passes (the frozen-attention control of the pairwise interaction,
+    weekend_plan.md A1, 2026-11-28). :meth:`record`: every softmax / log_softmax output and every SDPA kernel's weights, in call order.
+    :meth:`replay`: each call returns the recorded weights instead (same order; the shape is checked, and every recorded call must be used),
+    so a perturbed input moves the values but never the weights. What it holds: softmax-normalised attention of every backend that
+    normalises with ``torch.softmax`` / ``F.softmax`` / ``Tensor.softmax`` or the SDPA kernel (dense, vendored dense, fused, read-out,
+    hierarchical, top-k); entmax and Exphormer's scatter softmax are not taped (``calls`` tells: a model with neither records nothing).
+    Any other softmax in the step (none in the GlobalModel's regression step) would be held as well."""
+
+    def __init__(self):
+        self.weights: list[torch.Tensor] = []
+        self.calls = 0
+
+    @contextmanager
+    def record(self):
+        self.weights = []
+
+        def keep(w):
+            self.weights.append(w.detach())
+            return w
+
+        with _patched_attention(keep):
+            yield self
+        self.calls = len(self.weights)
+        if not self.calls:
+            raise ValueError("AttentionTape recorded no attention weights: this backend does not normalise with softmax (entmax, Exphormer?).")
+
+    @contextmanager
+    def replay(self):
+        position = [0]
+
+        def give(w):
+            i = position[0]
+            if i >= len(self.weights):
+                raise ValueError(f"AttentionTape: call {i + 1} has no recorded weights ({len(self.weights)} recorded): the step changed.")
+            kept = self.weights[i]
+            if kept.shape != w.shape:
+                raise ValueError(f"AttentionTape: call {i + 1} has weights {tuple(w.shape)}, recorded {tuple(kept.shape)}: the step changed.")
+            position[0] = i + 1
+            return kept.to(w.dtype)
+
+        with _patched_attention(give):
+            yield self
+        if position[0] != len(self.weights):
+            raise ValueError(f"AttentionTape: {len(self.weights)} weights recorded, {position[0]} replayed: the step changed.")
 
 
 # ----------------------------------------------------------------------------------------------- the interface
@@ -970,14 +1045,24 @@ def pairwise_interactions(
     removal: str = "reference",
     seed: int = 0,
     given_pairs: np.ndarray | None = None,
+    freeze_attention: bool = False,
 ) -> dict:
     """``I_jk = Delta_jk - Delta_j - Delta_k`` for ``pairs`` random pairs from each receiver's ``candidates`` (its nearby cells), ``Delta``
     the drop of the target when those cells take their reference tokens; all receivers in one forward per pair index and condition.
-    Returns ``interaction``, ``single`` (``|Delta_j| + |Delta_k|``) and ``relative`` (``|I| / single``), each ``[Q, pairs]``.
+    Returns ``interaction``, ``single`` (``|Delta_j| + |Delta_k|``), ``relative`` (``|I| / single``) and the drops ``d_j``, ``d_k``, ``d_jk``,
+    each ``[Q, pairs]``.
 
     ``given_pairs`` (``[Q, P, 2]`` cell indices, ``-1`` for none) replaces the random draw: e.g. a receiver's two planted senders (the
-    planted-AND control, attribution_plan.md S13); ``candidates`` and ``pairs`` are then not read. The reference draw is the same."""
+    planted-AND control, attribution_plan.md S13); ``candidates`` and ``pairs`` are then not read. The reference draw is the same.
+
+    ``freeze_attention``: every perturbed pass replays the unperturbed pass's attention weights (:class:`AttentionTape`), so removing a sender
+    changes only what is read from it, never how much the others are weighed. For a model whose context is a weighted sum of per-sender values
+    and a linear decoder (the read-out), the interaction is then 0 by construction: what remains of it unfrozen is the softmax's
+    re-weighting; what remains frozen is token-wise non-linearity (MLPs, LayerNorm, a non-linear decoder). Removal by the reference only
+    (the model's own mask changes the step's shapes)."""
     _check_removal(module, removal)
+    if freeze_attention and removal != "reference":
+        raise ValueError("freeze_attention needs removal='reference': the model's own mask changes the step, so no weights can be replayed.")
     batch = _on_module_device(module, batch)
     rng = np.random.default_rng(seed)
     receivers = np.asarray(receivers, dtype=np.int64)
@@ -990,10 +1075,18 @@ def pairwise_interactions(
             raise ValueError("a given pair names one cell twice.")
         pairs = given_pairs.shape[1]
     inter, single = np.full((q, pairs), np.nan), np.full((q, pairs), np.nan)
+    drops = {name: np.full((q, pairs), np.nan) for name in ("d_j", "d_k", "d_jk")}
     with _evaluating(module), torch.no_grad():
         tokens = _actual_tokens(module, batch)
         ref = reference_tokens(tokens, labels if labels is not None else np.zeros(len(tokens)), reference, rng=rng)
-        base = _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, [], removal)
+        tape = AttentionTape() if freeze_attention else None
+        with tape.record() if tape is not None else nullcontext():
+            base = _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, [], removal)
+
+        def drop(rows):
+            with tape.replay() if tape is not None else nullcontext():
+                return base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, rows, removal)
+
         for p in range(pairs):
             if given_pairs is not None:
                 js, ks = given_pairs[:, p, 0], given_pairs[:, p, 1]
@@ -1011,14 +1104,16 @@ def pairwise_interactions(
                 ok = js >= 0
             if not ok.any():
                 continue
-            d_j = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(js[ok]), removal)
-            d_k = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(ks[ok]), removal)
-            d_jk = base - _perturbed_targets(module, batch, receivers, weights, head, tokens, ref, np.unique(np.concatenate([js[ok], ks[ok]])), removal)
+            d_j = drop(np.unique(js[ok]))
+            d_k = drop(np.unique(ks[ok]))
+            d_jk = drop(np.unique(np.concatenate([js[ok], ks[ok]])))
             inter[ok, p] = (d_jk - d_j - d_k)[ok]
+            for name, d in (("d_j", d_j), ("d_k", d_k), ("d_jk", d_jk)):
+                drops[name][ok, p] = d[ok]
             single[ok, p] = (np.abs(d_j) + np.abs(d_k))[ok]
     with np.errstate(invalid="ignore", divide="ignore"):
         relative = np.where(single > 0, np.abs(inter) / single, np.nan)
-    return {"interaction": inter, "single": single, "relative": relative}
+    return {"interaction": inter, "single": single, "relative": relative, **drops}
 
 
 # ----------------------------------------------------------------------------------------------- A3 / A4: maps and distance
@@ -1256,24 +1351,27 @@ def map_fields(pos_um, out, into, visible, *, grid_um: float = 10.0) -> dict:
             "visible": np.asarray(visible, dtype=np.int8), "flow_grid_um": float(grid_um), "flow_origin": origin, "flow_cells": cells}  # fmt: skip
 
 
-def subtract_fields(trained: dict, twin: dict, *, normalise: bool = True, quantile: float = 0.99) -> dict:
+def subtract_fields(trained: dict, twin: dict, *, normalise: bool | str = True, quantile: float = 0.99) -> dict:
     """The twin-subtracted map (1.6, ``.claude/comparison.md``): fields as :func:`map_fields` (or ``flow_maps``' npz) writes them, for the
     same cells, the trained model's ``out - in`` minus the untrained twin's. What both share -- the mask layout, density, the tissue edge -- cancels;
     what training added stays.
 
-    ``normalise``: each map's ``out - in`` divided first by its ``quantile`` of ``|out - in|`` over the cells (a trained model's attributions
-    are orders of magnitude larger than its twin's, so a raw difference would be the trained map again); the scales are returned as
-    ``scale_trained`` / ``scale_twin``. The result keeps the trained map's grid and positions, the difference as ``flow_out`` with
-    ``flow_in`` 0, so ``plot_source_sink`` draws it as it is."""
+    ``normalise``: ``True`` / ``"each"``: each map's ``out - in`` divided first by its own ``quantile`` of ``|out - in|`` over the cells (shapes
+    compared; a twin's map, orders of magnitude smaller, is blown up to the trained one's size, its noise included: the 2026-11-27 synth figure
+    was that noise). ``"common"`` (weekend_plan.md B9, 2026-11-28): both divided by the *trained* map's quantile, so the difference is in the
+    trained map's units and a small twin stays small. ``False``: raw. The scales are returned as ``scale_trained`` / ``scale_twin``. The result
+    keeps the trained map's grid and positions, the difference as ``flow_out`` with ``flow_in`` 0, so ``plot_source_sink`` draws it as it is."""
+    if normalise not in (True, False, "each", "common"):
+        raise ValueError(f"normalise must be True, False, 'each' or 'common', got {normalise!r}.")
     pos_a, pos_b = np.asarray(trained["pos_um"], dtype=np.float64), np.asarray(twin["pos_um"], dtype=np.float64)
     if pos_a.shape != pos_b.shape or not np.allclose(pos_a, pos_b):
         raise ValueError("subtract_fields needs the same cells in the same order in both maps.")
     net_a = np.asarray(trained["flow_out"], dtype=np.float64) - np.asarray(trained["flow_in"], dtype=np.float64)
     net_b = np.asarray(twin["flow_out"], dtype=np.float64) - np.asarray(twin["flow_in"], dtype=np.float64)
     scale_a = scale_b = 1.0
-    if normalise:
+    if normalise in (True, "each", "common"):
         scale_a = float(np.quantile(np.abs(net_a), quantile)) or 1.0
-        scale_b = float(np.quantile(np.abs(net_b), quantile)) or 1.0
+        scale_b = scale_a if normalise == "common" else (float(np.quantile(np.abs(net_b), quantile)) or 1.0)
     out = {key: value for key, value in trained.items()}
     out["flow_out"] = net_a / scale_a - net_b / scale_b
     out["flow_in"] = np.zeros_like(out["flow_out"])
