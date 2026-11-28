@@ -72,3 +72,27 @@ def test_and_edges_join_receivers_to_their_lattice_neighbours(pair):
             assert both[r].all() and set(np.flatnonzero(both)) == set(r)
         else:
             assert (new.obs["R56_state"].astype(str).to_numpy()[r] != "none").all()
+
+
+def test_the_strong_and_keeps_every_other_gene_and_the_default_levels_are_unchanged(pair):
+    """weekend_plan.md A2 (2026-11-28): ``and_rate`` / ``and_high`` change only S5 / S6 / R5 / R6; the defaults are the 2026-11-27 control;
+    R6 stays a constant log step (the geometric middle); out-of-range values are refused."""
+    from interscale.evaluation.synth_spot import and_levels
+
+    base, new = pair
+    assert and_levels() == {g: tuple(map(float, v)) for g, v in AND_LEVELS.items()}
+    strong = make_synth_spot(**SMALL, and_programme=True, and_rate=0.15, and_high=40.0)
+    g = list(base.var_names)
+    np.testing.assert_array_equal(strong[:, g].layers["counts"], base.layers["counts"])
+    lv = strong.uns["synthetic"]["params"]["and_levels"]
+    np.testing.assert_allclose(lv["R5"], [2.5, 2.5, 40.0])
+    np.testing.assert_allclose(lv["R6"], [2.5, 10.0, 40.0])
+    assert np.log(lv["R6"][1]) - np.log(lv["R6"][0]) == pytest.approx(np.log(lv["R6"][2]) - np.log(lv["R6"][1]))
+    assert strong.obs["is_S5"].mean() > new.obs["is_S5"].mean()  # more senders at rate 0.15 than 0.08
+    expected = strong[:, ["R5"]].layers["expected"][:, 0] / SIGNAL_SCALE
+    both = strong.obs["R56_state"].astype(str).to_numpy() == "both"
+    np.testing.assert_allclose(expected[both], 40.0)
+    with pytest.raises(ValueError, match="and_rate"):
+        make_synth_spot(**SMALL, and_programme=True, and_rate=0.6)
+    with pytest.raises(ValueError, match="and_high"):
+        make_synth_spot(**SMALL, and_programme=True, and_high=2.0)

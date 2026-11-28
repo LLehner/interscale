@@ -193,6 +193,16 @@ SPARSE = (
 #: would not be: log1p makes it strongly non-additive at a zero baseline.
 AND_RATE = 0.08
 AND_LEVELS = {"R5": (2.5, 2.5, 10.0), "R6": (2.5, 5.0, 10.0)}  # base mean with 0, 1 or 2 of the sender types next to the spot
+AND_BASE = 2.5
+
+
+def and_levels(high: float = 10.0, base: float = AND_BASE) -> dict[str, tuple[float, float, float]]:
+    """R5 / R6 base means with 0, 1 or 2 sender types next to the spot for a both-state level ``high``: R5 ``(base, base, high)``, R6 the
+    geometric middle ``(base, sqrt(base * high), high)``, a constant step in log space. ``high`` 10 gives :data:`AND_LEVELS` exactly
+    (the default dataset); a larger ``high`` makes the AND stronger (weekend_plan.md A2, 2026-11-28)."""
+    if not high > base:
+        raise ValueError(f"and_high must exceed the base mean {base}, got {high}.")
+    return {"R5": (base, base, float(high)), "R6": (base, float(np.sqrt(base * high)), float(high))}
 AND_PROGRAMMES = {"R5": "S5&S6>R5", "R6": "S5+S6>R6"}
 
 #: Source clusters are compact on purpose: M is down to ~0.1 counts at 600 µm, so a receiver past
@@ -640,7 +650,7 @@ def _short_range(r: np.random.Generator, grid: _Grid, rates: dict[str, float]):
     return mean, obs, frames
 
 
-def _and_programme(r: np.random.Generator, grid: _Grid, rate: float = AND_RATE):
+def _and_programme(r: np.random.Generator, grid: _Grid, rate: float = AND_RATE, levels: dict | None = None):
     """The planted AND and its matched additive control (see :data:`AND_LEVELS`), on the 4-neighbourhood as items 8.
 
     S5 and S6 are disjoint (one draw per spot), so hiding one spot never removes both signals. A spot's state counts the sender
@@ -659,8 +669,8 @@ def _and_programme(r: np.random.Generator, grid: _Grid, rate: float = AND_RATE):
     k = (n5 > 0).astype(int) + (n6 > 0).astype(int)
     high = LEVELS["high"]
     mean = {"S5": high * s5, "S6": high * s6}
-    for gene, levels in AND_LEVELS.items():
-        mean[gene] = np.asarray(levels)[k]
+    for gene, lv in (levels or AND_LEVELS).items():
+        mean[gene] = np.asarray(lv)[k]
     obs = {
         "is_S5": s5,
         "is_S6": s6,
@@ -1028,6 +1038,8 @@ def _simulate_slide(
     sender_rates,
     cutoff,
     and_programme=False,
+    and_rate=AND_RATE,
+    and_high=10.0,
 ):
     """Simulate one slide: lattice, every programme, counts, and its ground-truth records."""
     slide = info.slide
@@ -1049,7 +1061,7 @@ def _simulate_slide(
     mean |= sr_mean | lr_mean | sv_mean | rg_mean | sp_mean
     and_obs, and_edges = {}, []
     if and_programme:  # its own keyed stream: every other gene is unchanged
-        and_mean, and_obs, and_edges = _and_programme(_rng(seed, slide, "and_programme"), grid)
+        and_mean, and_obs, and_edges = _and_programme(_rng(seed, slide, "and_programme"), grid, and_rate, and_levels(and_high))
         mean |= and_mean
     sources += sp_sources
     # Every structured gene, before its counts are drawn; the background genes below are untouched.
@@ -1128,6 +1140,8 @@ def make_synth_spot(
     graph_radius: float | None = None,
     edge_weight_cutoff: float = 0.1,
     and_programme: bool = False,
+    and_rate: float = AND_RATE,
+    and_high: float = 10.0,
     seed: int = 0,
 ) -> AnnData:
     """Simulate the full synth_spot dataset.
@@ -1166,6 +1180,10 @@ def make_synth_spot(
     and_programme
         Add the planted-AND positive control (:data:`AND_LEVELS`: senders S5 / S6, responses R5 = AND, R6 = the matched
         log-additive control) as the last four genes. Off by default: the dataset is then the one made before 2026-11-27.
+    and_rate, and_high
+        With ``and_programme``: the share of spots that are S5 (and as many S6; at most 0.5) and R5's / R6's both-state base mean
+        (:func:`and_levels`). The defaults (0.08, 10) are the 2026-11-27 control, value for value; larger ones give a stronger, more
+        frequent AND (weekend_plan.md A2).
     seed
         Root seed; every slide and programme derives its own generator from it.
 
@@ -1188,6 +1206,10 @@ def make_synth_spot(
     # compared against this value exactly.
     graph_radius = round(1.1 * spacing, 6) if graph_radius is None else float(graph_radius)
 
+    if and_programme:
+        if not 0.0 < and_rate <= 0.5:
+            raise ValueError(f"and_rate must be in (0, 0.5] (S5 and S6 are disjoint draws of one uniform), got {and_rate}.")
+        and_levels(and_high)  # refuses a level at or below the base
     genes = _gene_table(spacing, n_hv, n_nb, n_zinb, n_poi, n_hk, and_programme)
     _draw_gene_params(seed, genes)
     design = _design(
@@ -1215,6 +1237,8 @@ def make_synth_spot(
             sender_rates=rates,
             cutoff=edge_weight_cutoff,
             and_programme=and_programme,
+            and_rate=and_rate,
+            and_high=and_high,
         )
         # Edges refer to cells by position in the final object, which survives the obs_names
         # renaming prepare_geome_dataset does.
@@ -1299,7 +1323,7 @@ def make_synth_spot(
             "graph_radius": graph_radius,
             "edge_weight_cutoff": edge_weight_cutoff,
             "seed": seed,
-            **({"and_programme": True, "and_rate": AND_RATE, "and_levels": {g: np.asarray(v) for g, v in AND_LEVELS.items()}} if and_programme else {}),
+            **({"and_programme": True, "and_rate": float(and_rate), "and_levels": {g: np.asarray(v) for g, v in and_levels(and_high).items()}} if and_programme else {}),
         },
         "slides": slides,
         "holes": pd.DataFrame(holes, columns=["slide", "row", "col", "n_rows", "n_cols"]),
@@ -1472,6 +1496,8 @@ def main() -> None:
     parser.add_argument("--graph-radius", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--and-programme", action="store_true", help="add the planted-AND control S5/S6 -> R5 (AND), R6 (additive)")
+    parser.add_argument("--and-rate", type=float, default=AND_RATE, help="share of spots that are S5 (and as many S6); default 0.08")
+    parser.add_argument("--and-high", type=float, default=10.0, help="R5 / R6 base mean with both sender types; default 10")
     parser.add_argument("--plot-slide", type=str, default=None, help="slide to map; default: the most damaged one")
     parser.add_argument("--no-plot", action="store_true", help="skip the per-gene maps")
     args = parser.parse_args()
@@ -1483,6 +1509,8 @@ def main() -> None:
         signal_scale=args.signal_scale,
         graph_radius=args.graph_radius,
         and_programme=args.and_programme,
+        and_rate=args.and_rate,
+        and_high=args.and_high,
         seed=args.seed,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
