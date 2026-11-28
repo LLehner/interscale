@@ -28,7 +28,7 @@ wants this for newer models on the more relevant data (the flow pipeline waits f
 | A4 | Item 3: influence against distance (trained, twin, permuted; attention next to it) | in both jobs (`attr_distance`), **not run** | 2026-11-22 |
 | A5 | Optional: positive / negative split (RevealCancel idea), multi-reference DeepLIFT (DeepSHAP), conservative transformer propagation | signs kept everywhere; `deeplift` with `reference="sampled"` is the DeepSHAP-like average; `conservative` built; RevealCancel not built (only if a model learns an AND-type programme) | 2026-11-22 |
 | A7 | **Later (user, 2026-11-21):** the attribution methods on data without cell-type annotation (legnini the candidate): what replaces the type-mean reference and the deviation target there | to note, not planned in detail | 2026-11-21 |
-| A6 | **Must pursue (user, 2026-11-21):** is the learned neighbourhood function linear? Method agreement, Sensitivity-n and pairwise sender interactions on real data, with synth_spot's thresholded programme as the positive control | measures built (`sensitivity_n`, `pairwise_interactions`, `agreement`) with small and large perturbations (type mean, sampled cells, the model's mask), in all jobs (MC23 / MC20 / M11 named on synth); run 2026-11-24/25 (read: synth control weak, typeres ~4x twin); **S13 built 2026-11-27**: planted-AND control (`attr_submit.sh and`, trains + reads), CosMx read-out twins + sections 4-6 (`attr_submit.sh cosmx_s13`), NCEM check done (section "S13 build 2026-11-27"); not run | 2026-11-27 |
+| A6 | **Must pursue (user, 2026-11-21):** is the learned neighbourhood function linear? Method agreement, Sensitivity-n and pairwise sender interactions on real data, with synth_spot's thresholded programme as the positive control | measures built (`sensitivity_n`, `pairwise_interactions`, `agreement`) with small and large perturbations (type mean, sampled cells, the model's mask), in all jobs (MC23 / MC20 / M11 named on synth); run 2026-11-24/25 (read: synth control weak, typeres ~4x twin); **S13 built 2026-11-27**: planted-AND control (`attr_submit.sh and`, trains + reads), CosMx read-out twins + sections 4-6 (`attr_submit.sh cosmx_s13`), NCEM check done (section "S13 build 2026-11-27"); weekend build 2026-11-28 (frozen attention, AND-capable arms, paired rule v2; jobs and_eval / and_mlp / and_strong not run); run + read 2026-11-27 (notes.md): AND control NOT passed, no model learned the AND (index 0.43-0.45 vs 1) and the additive R6 reads as large as R5 (0.17 / 0.17); instrument unvalidated; cosmx_s13 read 2026-11-27 (read-out arms additive by construction, 0.006-0.010 over 3 seeds, singles not tiny; typeres 0.078 = 4.3x twin, not separable from the floor) | 2026-11-27 |
 | M | Retrain one model per dataset with the best settings so far (CosMx, synth_spot, vannan; legnini skipped, user 2026-11-21) | recipes proposed below, to confirm | 2026-11-21 |
 | check | Status check after the CCC runs (J1 / J3 / J4 read; section "Status check 2026-11-22" at the end): nothing of A0-A6 built; Stage M answered by J1 / J4 for synth_spot and CosMx with checkpoints that exist (no retraining), vannan untrained; A6 has its first architecture-level evidence | **done**; building waits for the user | 2026-11-22 |
 
@@ -732,3 +732,31 @@ to `MA/slurm/`: attr_submit.sh, attr_job.sbatch. Then `bash slurm/attr_submit.sh
   missing set skipped with a message; `configure` and the run list (ir_ch_s42, ir_ch_s43) checked.
 - Read: the two test sections are slide4_A2-3 (control) and slide4_B2-2 (SHH): the SHH readouts' map should differ between them (senders near
   the induced region in the SHH section); a map counts only beyond the twin's and where type_mean and sampled agree (Spearman of net >= 0.5).
+
+
+## Weekend build 2026-11-28 (weekend_plan.md A-C; the user: "implement A, B and C now")
+
+Library (fork): `AttentionTape` (record / replay every softmax and SDPA kernel's weights, in call order, shape-checked, every recorded call must be
+used; patches `torch.softmax` / `log_softmax`, the `Tensor` methods, which `F.softmax` and the vendored attention's `softmax` dispatch to, and both
+SDPA names), `pairwise_interactions(freeze_attention=)` (reference removal only) returning the drops `d_j`, `d_k`, `d_jk`; `subtract_fields(normalise=
+"common")`; `make_synth_spot(and_rate=, and_high=)` with `and_levels(high)` (R6 the geometric middle; defaults = the 11-27 data value for value).
+`_conservative_rules` now uses the same patcher (forward and every existing test unchanged).
+Tests: tests/test_attention_tape.py (5: replay exact, changed step refused, mutant without the Tensor methods records nothing, every softmax name
+reached once, frozen read-out additive to float precision, closed-form bilinear head), test_synth_spot_and.py (+1), test_attribution_methods.py (+1).
+
+Cluster (slurm/November, copy to MA/scripts: attr_common.py, attr_job.py, attr_read.py, allmap_checks.py, make_and_synth_yaml.py, legnini_truth.py;
+MA/slurm: attr_submit.sh, attr_job.sbatch, compare_job.sbatch; sync the fork):
+- `bash slurm/attr_submit.sh and_eval`: the 27_11 `and` checkpoints, AND block only, free + frozen pairs, per-receiver table -> 28_11_results/attr_and_eval
+  (minutes per model; ir2_rate's AND block was ~10 min of its 40).
+- `bash slurm/attr_submit.sh and_mlp`: ref_mlp, ir2_rate_mlp (decoder nonlinear [64, 64], no dropout) x 42 / 43 + twins on synth_spot_and.
+- `bash slurm/attr_submit.sh and_strong`: prep makes synth_spot_and_strong.h5ad (`--and-rate 0.15 --and-high 40`); ref, ref_mlp x 2 + twins.
+- `bash slurm/attr_submit.sh allmap_synth_refs`: allmap_synth with 10 sampled draws, both references kept per cell (B7).
+- Every allmap report now also runs allmap_checks.py into `<results>/checks`. Locally: `python allmap_checks.py --maps <allcell_maps> --out <dir>
+  [--labels cosmx_pancreas.h5ad]`; `python legnini_shh_region.py --maps ... --data legnini23_pp.h5ad --out ...`; `python legnini_truth.py ...`.
+
+Rule v2 for S13 (fixed before the runs, attr_read.py docstring): per run, the paired R5 - R6 relative interaction (graph mean, planted, attention
+free) has median >= 0.1 and bootstrap lo95 > 0 for a run that learned both rules (AND index within 0.2 of the truth on R5 and R6), every seed;
+twin |median| < 0.05. The frozen reading is reported beside it and decides nothing.
+
+Read locally 2026-11-28 (notes.md): A3 R5 - R6 = 0.000 +- 0.005 on the 11-27 tables; maps: synth and CosMx seed-stable, legnini not; CosMx
+Alpha / Beta / Immune / Endothelial draw beyond a within-100-um label null in all 3 seeds; the legnini SHH map's sender block is not at the source.

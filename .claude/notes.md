@@ -2808,3 +2808,232 @@ What doesn't work / limits:
   The two ir_ch seeds differ much (V1 near 0.64 vs 0.45); 2 test sections. Near and far top lists overlap heavily (ir_ch_s42: 9 of 15 genes in
   both): the lists rank amplitude more than distance, as on synth.
 - v3_profiles.png (all three datasets): the log x-axis labels its minor ticks ("2x10^1 4x10^1 ..." overlap) and the 8-panel row is too wide to read.
+
+## 2026-11-27 -- S13 planted-AND control (attr_and), all-cell IG maps (synth, CosMx, legnini), cosmx_s13 and legnini E7 logs read
+
+Results: MA/27_11_results/{attr_and (44050776 prep, 44050889 array), allmap_synth (44051454), allmap_cosmx (44051446), allmap_legnini (44051488)}; logs only
+(no tables synced): cosmx_s13 (44051003, tables in MA/22_11_results/attr_cosmx_s13) and the legnini E7 compare (44051619, tables in
+MA/25_11_results/compare_legnini). Every job ran clean (docrep SyntaxWarnings; an IPMI energy message on cosmx_s13; no crash, no resubmit). Times:
+attr_and ir2_rate ~2,400 s per run (twin 2,270 s), ref ~490 s; allmap_cosmx 130-515 s per model; allmap_legnini 8-29 s; allmap_synth 14-48 s; cosmx_s13
+~2,400-3,000 s per model (far under the 5 h budget). Details and rules: attribution_plan.md "S13 build" and "The all-cell IG map".
+
+### S13 positive control (synth_spot + planted AND S5 & S6 -> R5, R6 the log-additive twin): the instrument is NOT validated, and the reason is not the model
+- Neither model learned the AND. AND index (both - one) / (both - none), truth R5 1.00 / R6 0.49: ref 0.42 / 0.43, ir2_rate 0.44 / 0.45 (twins
+  0.16-2.9, noise). R5 predictions none / one / both 4.00 / 4.27 / 4.47 (ref) against truth 4.07 / 4.06 / 5.40: the models give a single sender an effect
+  the truth does not have (+0.27) and recover a third of the both-state step (0.47 of 1.34). R6 is fit better (span 0.94-1.05 of 1.34, index right
+  at 0.43-0.45 ~ additive). So the rule's precondition ("a model that learned the AND") is not met by the free dense ref either (lin_dist_skipraw,
+  linear decoder); ir2_rate cannot express it by design. Fit itself is fine (hidden spots centred cosine 0.951 ref, 0.932 ir2_rate; val SCE ref
+  0.0077 / 0.0089; oracle 0.995).
+- The R6 clause fails on its own: planted-pair median |I| / (|D_j| + |D_k|), graph-mean reference: ref R5 0.170 / R6 0.169, ir2_rate 0.105 / 0.105 (rule:
+  R5 >= 0.25, R6 <= 0.1; twins 0.014-0.034, random near pairs 0.013-0.035). Planted pairs read 5-8x random pairs and the trained models 5-8x their
+  twins, but R5 = R6 to three decimals: the measure does not separate the AND from the additive rule. Sampled reference the same (0.077 / 0.078,
+  0.084 / 0.086). Even ir2_rate, additive in its read-out, reads 0.105 on a planted pair: the floor is probably the softmax (hiding one sender
+  re-weights the other) plus the log / decoder non-linearity, not a tissue interaction. UNTESTED guess; test before it is written down as a cause.
+- Consequence for the CosMx claim (to carry into 5.2): "typeres reads ~4x its twin" is not evidence of non-additivity, because the additive-by-design
+  ir2_rate is 7-9x its twin on synth (A6 per run, graph mean: ir2_rate s42 / s43 0.018 / 0.013, twin 0.002; ref 0.027 / 0.044, twin 0.008) and the
+  planted additive R6 is as large as the AND. The relative interaction is only comparable between arms on the same data; and the random near
+  pairs of A6 have tiny single effects on synth (median_single 0.00-0.02 graph-mean, <= 0.09 sampled), so that ratio is a noise-floor read; CosMx's singles
+  are in the cosmx_s13 / attr_cosmx tables, not synced here: check them before saying the same of CosMx. Hypothesis "CosMx linear" still unsupported,
+  instrument still unvalidated -> the plan's fallback paragraph (read-out additive by construction, measure not validated, future work) stands.
+- What does validate: IG finds the planted senders at the planted pairs (planted in the top 2: 0.998 ir2_rate, 1.000 ref; both in the top 2: 0.983 /
+  0.995, median gap 0.003 / 0.025) while grad x input / DeepLIFT are worse (top-2 0.98-0.99, both 0.77-0.84, median gap 0.26-0.47); twins 0.61-0.68.
+  A1 rule: no cheap method replaces IG on trained models (median gap 0.85-1.18, 93-95 % of receivers over the limit; decomposition exact (gap 0)
+  but Spearman 0.39 with IG50; attention 0.02). Cheap methods agree with IG only on twins (0.90-0.98) and for ir2_rate (0.84); ref 0.51-0.53, equal
+  for R5 and R6, so method agreement does not separate them either.
+- A1 by class (AND data): attention and IG both find short (1.00 / 0.98) and mid (0.99 / 1.00) senders in ir2_rate, none dense (0.04), sparse (0.03) or
+  directional (0.03-0.10); only ref's IG finds some dense senders (0.30 vs twin 0.02). Reproduces attr_synth and the influence-readouts note.
+- Open for the AND: a model that can express it (nonlinear decoder / MLP head on the attended context, or the free typeres-style transformer), trained
+  until the AND index is within 0.2 of 1; amplitude bigger than 1.34 in log space; check the floor on R6 with a model whose context mix is a fixed
+  sum (no softmax) -> if that reads ~0 on R6 the floor is the attention normalisation.
+
+### All-cell IG maps (read rules fixed before the run: gap <= 0.05, self share ~0, net Spearman between references >= 0.5, value only beyond the twin)
+- Technically sound everywhere: gap 0.000-0.019 (legnini up to 0.011 after retries at 8.75 steps), self share 0.000, seconds per section 10-60 on
+  CosMx (the 5 h budget was ~100x too large), 1-2 s on synth, ~1 s legnini. The all-cell pass replaces ~50 receivers x 2-3 h by minutes.
+- synth_spot (ir2_rate, programme mask, context part): the map finds the planted senders beyond the twin. AUROC of out, trained / twin (mean of 2 seeds,
+  graph-mean reference): all 0.784 / 0.525, short 0.853 / 0.506, mid 0.994 / 0.525; dense 0.587 / 0.523 (s42 0.57, s43 0.60), directional 0.51 (abs
+  0.60) / 0.50, sparse 0.552 / 0.586 (no gain). In for planted receivers 0.636 / 0.479 (short 0.654, mid 0.650, directional 0.614 vs twin 0.398, dense
+  and sparse at chance). Both seeds equal within 0.02. Same ranking of classes as attention / IG per receiver, now over every cell: short + mid
+  found, dense / sparse / directional not (a pass of the map, not new evidence about the model).
+  **But the references disagree: Spearman of net 0.30 (s42) / 0.29 (s43), in -0.50 / -0.53, out 0.46 / 0.49 -> fails the 0.5 rule.** The AUROC above
+  uses the graph-mean reference; the sampled one orders the receivers' "in" the other way round. "in" is the less reliable half; do not draw
+  the in or net map for synth as a result. The trained-minus-twin figure (each map scaled to its own 99th percentile) is speckle: the twin's
+  noise survives the subtraction; the trained map alone (graph0.png: two hot blobs at the lesions of short / mid senders, nothing smoothed) is
+  readable. Change the subtraction (common scale, or twin as a grey panel) before using it.
+- CosMx (ir_c_ktype x 3 seeds, ir_c_s42, 6 sections, 9,753 cells per section mean): total change 5.6-8.1e4 vs twin 1.1-1.4e4 (5-6x). References agree:
+  net Spearman 0.53 (ir_c), 0.62 / 0.67 / 0.68 (ktype seeds) -> readable, narrowly for ir_c; twins agree more (0.78) = their maps are smooth in
+  geometry. By type (per-cell means, share of |out|; ktype seeds 42 / 43 / 44): Acinar sends (out 5.3-7.7, net +0.2 to +0.9, share 0.59-0.60 against a
+  cell share of 0.55, i.e. no enrichment); Alpha / Beta draw: net -1.8 to -4.1 / -1.3 to -4.7 in all three seeds (ir_c: -4.4 / -5.4), twin ~0; Immune
+  net negative in all three (-3.2, -7.0, -1.9; out -1.3 to 2.1). Not stable across seeds: Fibroblasts (net -2.3 ... +1.4), Endocrine (-3.3 ... +0.7),
+  Ductal ~0. "In" is nearly type-independent (4-7 per cell in the trained arms, ~1 in the twins), so type differences are in "out": the large
+  exocrine types (Acinar, Ductal) send, the minority types (islet, immune, endothelial) send little and draw. That is what spillover from
+  neighbours of the big types would also produce (typeres first run: "Acinar senders lead"); not read as communication.
+  Outlier: ir_c (no type keys) s42 Endothelial out 44.6 per cell (11 % of |out| from 2 % of cells; ktype seeds 1.6-4.2): a few cells with huge out,
+  one arm and one seed; look at the per-cell maximum before any type statement. ir_c's mean |out| 13.7 vs ktype 9.7 fits heavy tails.
+  Map (ir_c_ktype_s42 graph0): smooth blobs of 100-300 um, one large blue block (cells that draw) on section 1; no relation to labels checked.
+- legnini (ir_ch x 2 seeds + twin, 8 x 8 patches as labels, 5 gene folds, 2 test sections, ~1,880 cells): gaps fine, trained total change 150-380 vs twin
+  45-210 (only 2-3x). Net Spearman between references 0.545 (all genes; seeds 0.533 / 0.558, narrowly), SHH-readouts map 0.513 (s42 0.462 FAILS, s43
+  0.563). Hot patches are seed-specific edge outliers: s42 p0_0 (9 cells at the section's corner) out 60.5 per cell (7 % of |out| from 0.5 % of
+  cells) and p7_6 (17 cells) 35.4; s43's largest patch is 6.3. Shared in the top 6 of both seeds: p0_5 (8.6 / 6.3). Spread over patches (median
+  1.4, max 21) is dominated by those. Untrained twin: flat (0.0-0.8). So the all-genes map is not seed-stable at the cell level; only the smooth
+  central hot region appears in both. SHH readouts alone: in the SHH section (graph1) both seeds put the strongest sender block in the centre
+  (s42 scale +-2.7, s43 +-0.85), in the control section the same map is ~10x / 3x weaker (+-0.28) with a hot / cold pair at the lower centre.
+  Consistent with the plan's expectation (map differs between control and SHH), not yet tested: the minus-twin figures and where the induced
+  region is on slide4_B2-2 were not read; s42 misses the reference rule.
+- Honest state: the maps are cheap and reproducible in cost; what they say beyond the twin is robust only for synth's short + mid senders. CosMx
+  type pattern = abundance / spillover, legnini = noise at the edges plus one central region. Do not put a CosMx or legnini map in the thesis as a
+  communication result; it is a method demonstration (4.7 / 5.2) with the synth AUROC as its validation.
+
+### Logs only (tables not synced)
+- cosmx_s13: all 4 array tasks + report finished (ir_c_ktype s42 / s43 / s44 and ir_c_s42 on sections 4-6, twins of ir_c and ir_c_ktype s42 on all 6),
+  attr_read.md written on the cluster at MA/22_11_results/attr_cosmx_s13. Not read: sync it. Given the AND read, the twin ratio of the read-out arms
+  on CosMx will again be uninformative on its own; read the three seeds' agreement and the A6 per-run table only.
+- legnini E7 (first run, compare_submit.sh legnini; ir_ch x 2, proto_ch x 2, proto_ch_pe x 2, 78 targets, no truth): fit (centred cosine hidden) ir_ch
+  0.434, proto_ch_pe 0.402, proto_ch 0.405 (twins 0.036 / -0.004). Seed RBO responders ir_ch 0.644, proto_ch 0.666, proto_ch_pe 0.686; **drivers
+  ir_ch 0.361 vs 0.652 / 0.685**: the prototypes' driver rankings are far more seed-stable on legnini. Agreement with proto_ch's responders: ir_ch
+  0.62, proto_ch_pe 0.90; twins 0.31 / 0.13. flagged_top50 0 for all (no region markers flagged; no labels, so S1-S3 of the fix ladder have no
+  legnini rows, only S0). No truth on legnini: this says stable, not right. Sync MA/25_11_results/compare_legnini to read the lists.
+
+## 2026-11-27 -- cosmx_s13 (CosMx read-out twins, sections 4-6) and the first legnini gene rankings (compare_legnini) read
+
+Results: MA/22_11_results/attr_cosmx_s13 (44051003; merged with the 11-24 typeres tables, 263 receivers x 6 sections per run) and
+MA/25_11_results/compare_legnini (44051619, `compare.md`, `ranking/*.csv`, no truth). Clean runs (see the entry above for the logs).
+
+### cosmx_s13: CosMx pairwise interactions (A6, receivers x 6 sections, type-mean reference)
+- The read-out arms are additive in the senders, and the earlier suspicion that the ratio was a noise floor is wrong for CosMx: the median single-sender
+  effect is NOT tiny (Acinar receivers 0.57 ir_c_ktype / 0.77 ir_c; other types 0.14-0.40; twins 0.05-0.09) while the median relative interaction is
+  0.006-0.014. Per run (type-mean reference): ir_c_ktype s42 / s43 / s44 0.006 / 0.006 / 0.007, ir_c_s42 0.007; twins 0.000 / 0.003; sampled
+  reference 0.006-0.008. The three seeds agree. (The `mask` variant gives 0.008-0.010 for trained and twin alike: uninformative.) So on the read-out
+  arms the cell-cell effect of two near senders adds up, 10-15x below what the same architecture family reads on a planted pair on synth (0.105,
+  ir2_rate): for these arms "additive" is the architecture (the read-out sums per-sender values) and the measure agrees; it says nothing new
+  about the tissue. The correct line for the thesis: additive by construction, confirmed numerically on 3 seeds.
+- typeres (free dense transformer): 0.078 (type-mean), 0.092 (sampled) vs twin 0.018 / 0.020, 4.3-4.6x; its single effects are large (2-4 vs twin 0.03)
+  and the target change is 125 vs 1.6 for the twin. By receiver type: Fibroblasts 0.19 (share of pairs over 0.2: 0.38), Beta 0.156 (0.46), Endothelial
+  0.11, Ductal 0.10, Endocrine 0.09, Immune 0.09, Mast 0.08, Alpha 0.025; twin 0.009-0.059. For scale: on synth the free `ref` reads 0.027-0.044 on
+  random near pairs (twin 0.008, ratio 3.4-5.5x, truth additive) and 0.17 on the planted pair for the AND and the additive rule alike (previous entry).
+  So typeres' 4x twin ratio is what a free dense transformer reads on a nearly additive truth too; its absolute value (0.08) is 2-3x the synth `ref`
+  random-pair level, which fits "some non-additivity or a larger fit error", and cannot be separated from the floor. Conclusion unchanged: no
+  support for "CosMx linear", none for "CosMx non-linear".
+- The two linearity diagnostics disagree on the trained read-out arms: pairwise interaction ~0.007, but the first-order methods fail completeness
+  (median gap, trained: grad x input 0.71 ir_c / 2.45 ir_c_ktype, DeepLIFT 0.67 / 1.42, conservative 1.05 / 1.33; IG5 0.02 / 0.065; twins ~1 but with
+  ~0 IG gap) and agree with IG only at Spearman 0.51-0.70 (twins 0.87-0.95; typeres 0.45-0.53, twin 0.45-0.55). Interpretation, untested: a sum over senders
+  (additive pairwise) of functions that are non-linear in each sender's content (attention scores, decoder), i.e. additive across senders, not linear in
+  the input; the pairwise test answers the first, Prop. 4 the second. Occlusion is the closest to IG (0.81 / 0.85, typeres 0.65). IG stays the method.
+- A2 (sender type x receiver type, trained minus within-type permuted share): Acinar as sender dominates in every arm, for every receiver type
+  (typeres Acinar->Acinar +0.23, Endothelial +0.15, Ductal +0.14, Fibroblasts +0.14, Mast +0.13; ir_c_ktype Acinar->Endothelial +0.23, Acinar +0.22,
+  Immune +0.16, Mast +0.15), which fits the all-cell map (Acinar sends, minority types draw) and the abundance / spillover reading; the permuted twin
+  carries 0.08-0.18 of the same on Acinar receivers, the within-type permutation does not remove it. The one non-abundance pair that repeats across
+  arms: **Beta -> Alpha** (ir_c_ktype +0.17, ir_c +0.15; typeres has the reverse, Alpha -> Beta +0.06), the pair already seen on 11-25 (+0.21 / +0.24);
+  ir_c_ktype also Alpha -> Alpha +0.09, Ductal -> Immune +0.09. These are the only islet pairs; one arm family, a shared share-of-contribution
+  measure: a lead for the ranking tests, not a finding.
+- A4 (share of |IG| by distance): trained and within-type permuted nearly coincide (ir_c_ktype at 15 / 30 / 60 / 120 um: 0.214 / 0.328 / 0.513 / 0.602 vs
+  permuted 0.184 / 0.292 / 0.478 / 0.572; typeres 0.141 / 0.221 / 0.389 / 0.564 vs 0.123 / 0.203 / 0.368 / 0.540) and the twin's profile is close
+  (read-out twin 0.188 / 0.367 / 0.484 / 0.639): the distance profile of the IG share does not tell trained from permuted or untrained. Attention is
+  flatter (0.09 / 0.17 / 0.30 / 0.41, half of it beyond 250 um). Do not read a CosMx distance claim from this share.
+- Cost: IG5 4.6-5.8 s per receiver, occlusion 21 s, trained runs 12,400-17,900 s in total, twins 7,500 s.
+
+### legnini gene rankings (E7, channel folds, 78 targets, one receiver group, 2 seeds; ranking/*.csv). No truth: stability and agreement only
+- Fit and stability as in the log (previous entry): fit ir_ch 0.434 / proto_ch_pe 0.402 / proto_ch 0.405; seed RBO responders 0.644 / 0.686 / 0.666,
+  drivers 0.361 / 0.685 / 0.652. Nothing flagged as region markers (no labels on legnini, so the flag is empty by construction).
+- Responders (who changes): the same domain genes lead every model: ir_ch PAX7, NKX6.1, DBX1, MSX2, **GLI1 (5th)**, DBX2; proto_ch NKX6.1, PAX7, DBX1,
+  FOSL2, FOXA1; proto_ch_pe NKX6.1, PAX7, DBX1, FOSL2, FOXA1. These are dorso-ventral patterning genes (the ventral / dorsal domain markers), i.e.
+  genes whose level is set by position, not obviously signalling responders: the same set as the 11-26 far lists and the 'amplitude not distance'
+  finding. The twin's top is partly the same (ir_ch twin: PAX7, PAX6, NEUROG2, DBX1, MAP2, MSX2), so PAX7 / DBX1 / MSX2 at the top are partly gene
+  baseline; Spearman of ir_ch with its twin -0.03 over all 78 though. The SHH readouts: GLI1 5 / 33 / 23 (ir_ch / proto_ch / proto_ch_pe, of 78), HHIP
+  23 / 35 / 25, PTCH1 78 / 58 / 65 (last for ir_ch): only ir_ch lifts GLI1, none PTCH1. Consistent with the memory note that the readouts are a weak control.
+- Drivers (who acts; 88 sender genes; the csv has every sender twice, receiver `*` and `all`, ranks halved here): ir_ch NKX6.1, NR4A3, OLIG2, NKX6.2, GAD1,
+  CHAT, NEUROG2, SMO, ISL1, KLF4 (ventral progenitor TFs NKX6.1 / OLIG2 / NKX6.2 / NKX2.2 in the top 12; SMO, the SHH transducer, 8th); proto_ch FOXA2
+  (1st, floor plate), GLI2, PAX6, ISL1, OTP; proto_ch_pe FOXA2 (1st), FOS, OTP, GLI2, PROM1, FOSB, HHIP (7th). GLI1 / PTCH1 / HHIP as drivers: ir_ch 87 / 78 / 88
+  (of 88; last), proto_ch 34 / 45 / 19, proto_ch_pe 86 / 52 / 7. The two prototypes agree (Spearman 0.94 responders, 0.80 drivers, top-10 overlap 5);
+  ir_ch vs the prototypes 0.57 / 0.65 on responders but 0.11 / 0.21 on drivers (top-10 overlap 1-2): the global-only model and the GCN prototypes
+  name different driver genes; without truth nothing says which is right. Ventral-domain drivers (ir_ch) vs floor-plate / GLI2 drivers (prototypes)
+  are both biologically plausible readings of the same ventral SHH region.
+- Magnitudes: ir_ch's driver influences are 0.0003-0.0005 (twin 0.005 at the top), the prototypes' 0.0008-0.001 (twin 0.002): the trained models use
+  sender genes less than the untrained twin by raw influence, which may be scale only (twin outputs differ); not interpreted.
+- Open: the S1-S3 fix ladder has no rows (needs labels); a legnini truth set would need the known SHH targets by distance from the SHH-induced
+  region (slide4_B2-2), which the allmap_legnini SHH-readout map also needs. Ask the user if they have such a list.
+
+## 2026-11-28 -- Weekend plan A-C built (S13 repair, all-cell map checks, legnini SHH scaffold); local reads of the saved maps; two corrections
+
+Built today (details and status: weekend_plan.md, attribution_plan.md "Weekend build 2026-11-28"); cluster jobs written, not run. Local reads below
+used only saved maps / tables and the local data files (no model run).
+
+What worked:
+- **A1 frozen attention** (`attribution.AttentionTape`, `pairwise_interactions(freeze_attention=True)`): on the toy read-out model (2 read layers,
+  linear decoder) the interaction falls from 1.6e-3 to 2e-7 (float precision) with the attention held; the toy dense encoder keeps ~60 % of its
+  interaction frozen (token-wise MLP / LayerNorm). So for read-out arms "additive by construction" is exact once the softmax is held, and the
+  0.105 the additive ir2_rate read on the planted pair (2026-11-27) can only be softmax re-weighting: `and_eval` measures that on the real checkpoints.
+- **A4 closed form** (tests): the same read-out with a known head f(c) = (c.u1)(c.u2) under frozen attention gives exactly
+  I = -((d_j.u1)(d_k.u2) + (d_k.u1)(d_j.u2)), linear heads exactly 0: the instrument computes what it should on a known non-additive function.
+- **A3 paired contrast, read today from the 2026-11-27 tables** (group medians, unpaired, since no per-receiver table exists yet): R5 - R6 of the
+  planted pair's relative interaction = 0.000 / -0.001 (ir2_rate s42 / s43), 0.002 / 0.001 (ref s42 / s43), twins -0.003 / -0.005. Per-run AND index
+  0.42-0.44 on R5 (truth 1.00), 0.43-0.45 on R6 (truth 0.49) in every seed. Clean sentence for 5.2: the measure did not tell the AND from the
+  additive rule at all, and no model learned the AND. Rule v2 (paired, per seed, learned-both precondition) fixed in attr_read.py before any new run.
+- **B5 seed stability of the all-cell maps** (allmap_checks.py on the 27_11 npz): synth ir2_rate Spearman of net between seeds 0.86 (0.84-0.88 per
+  slide; out 0.72, in 0.96): readable. CosMx ir_c_ktype 0.76 (min 0.73 over seed pairs; Spearman-Brown reliability of the 3-seed mean 0.90): readable.
+  legnini ir_ch 0.48 (all genes), 0.38 (SHH readouts): **below the 0.5 rule, so no legnini map is described.**
+- **B8 CosMx type null** (labels by exact position from the local cosmx_pancreas.h5ad, matched to 1e-3 um, 100 % of cells; 200 permutations within
+  100 um squares, which keep abundance and local composition, and 200 across the section): for ir_c_ktype, with the same sign in all 3 seeds and
+  beyond the within-block null: Alpha net -3.0 (z -4.8), Beta -2.7 (z -2.4), Immune -4.0 (z -6.4), Endothelial -1.9 (z -3.2) draw more than they
+  send; Acinar +0.64 (z +5.3, 2 of 3 seeds). Twins: Alpha -0.16, Beta -0.88, Immune -0.13, Endothelial +0.81 (z +7.2), Acinar -0.36: the trained
+  pattern is not the twin's. Acinar's share of |out| is its abundance (enrichment 1.04). So the 11-27 reading "abundance / spillover" was too
+  quick for Alpha / Beta / Immune / Endothelial: these cells send less than the cells around them, beyond local composition. Still a reading of
+  the model's map, not communication (net = out - in mixes what a cell gives and what its own deviation target draws).
+- **B6 outliers**: CosMx ir_c_ktype has no heavy tail (top 1 % of cells hold 5 % of |out|, as the twin); ir_c (one seed) does (22 %, max / median
+  378): the Endothelial 44.6 of 11-27 is that tail. Degree-normalising (out per neighbour) makes every map more concentrated: not adopted.
+- **B9 figures**: trained | twin | trained - twin on one scale (the trained map's p99), empty gaps between tissue blocks collapsed. The synth panel
+  shows the two lesion blobs in trained and difference and a twin at 1 % of the scale: the 11-27 speckle was the per-map scaling.
+- **C10** legnini_truth.py scores the rankings against a target list (AUROC / AP, permutation p, ranks, per class / distance); runs in the
+  legnini compare report once MA/shh_targets.txt exists. Smoke on a placeholder list only.
+
+What doesn't work / corrections:
+- **Correction to the 2026-11-27 legnini E7 entry:** I ranked drivers by the `influence` column; the pipeline ranks by `top`. By `top`, ir_ch and
+  the prototypes largely agree on drivers: Spearman 0.77 (proto_ch) / 0.81 (proto_ch_pe), top-10 overlap 4 / 5 (prototypes among themselves 0.97,
+  8). ir_ch: OLIG2, NKX6.1, NKX2.2, NKX6.2, NR4A3, JUNB, GAD1, NEUROG2, FOS, ISL1; prototypes: FOXA2, NKX6.2, (DBX1 | OLIG2), NKX6.1, ... As drivers
+  (of 88): GLI1 54 / 13 / 14, PTCH1 29 / 41 / 37, HHIP 13 / 17 / 10, SMO 14 / 47 / 48, FOXA2 30 / 1 / 1. The "families name different drivers"
+  sentence is withdrawn. The drivers csv's duplicate rows are the pooled `*` row and the single receiver group `all`, not a bug.
+- **Correction to the 2026-11-27 all-cell map entry (legnini):** the top-1 % senders of the trained maps are not edge cells (median distance to
+  the tissue border 68-200 um vs 117-126 um for all cells; |out| vs border Spearman ~0.05; vs degree ~0); it is the untrained twin whose top
+  cells sit at the border (24-60 um). The corner patch p0_0 was a few cells, not an edge effect. The maps are seed-unstable (B5), which is the
+  reason not to read them.
+- **C11, legnini SHH map vs the SHH source** (legnini_shh_region.py; source = smoothed SHH expression, response = smoothed GLI1 / PTCH1 / HHIP,
+  100 um): in the SHH section the source sits at the bottom centre and the response is low at the source and high around it (source vs response
+  Spearman -0.35; control -0.25). The SHH-readout map's central sender block is at neither: Spearman of out / net with source and response
+  |rho| <= 0.06, top-5 % senders in the source region 5 % (10 % expected), farther from the source than the average cell (370 vs 365 um). The
+  11-27 "consistent with the plan's expectation" is not supported. The twin is no different. Figure: shh_region_graph1_named_SHH_readouts.png.
+- An earlier suspicion of mine (today, in the session, not in any note) that the conservative rules missed the vendored dense attention was
+  wrong: `F.softmax` dispatches to `Tensor.softmax`, which the rules patch, and the vendored attention always asks for weights. Now guarded by a
+  test (every softmax name reached exactly once).
+- C12 (semi-synthetic legnini) not built: it needs cluster labels from training cells, count recovery (X is normalize_total to 279), a spike-in file
+  and new training arms, ~1 day; waits for the user's decision after the SHH list.
+
+## 2026-11-28 -- legnini gene rankings against the SHH gene sets of Legnini et al. 2023 (first truth read on legnini)
+
+Source: to_read/Legnini.pdf (Nat. Methods 20:1544). The paper has no single "SHH target" list; four overlapping sets, all in the 88-gene panel
+except the IGF genes: (1) Fig. 3i, genes ordered by distance from the nearest SHH+ cell (FOXA1, FOXA2, NKX2-2, MNX1 nearest; OLIG1/2, NKX6-2/6-1,
+NEUROG2, NEUROD1; then PAX6, IRX3, OTP, OTX2, DBX2, DBX1); (2) text p. 1548: NKX2-2, OLIG1/2, NKX6-1/2, DBX1/2 induced, PAX7 and MSX2 "almost
+completely depleted", PTCH1 strongly and SMO weakly up near SHH (Visium); (3) Methods, the scRNA SHH module: SHH, FOXA2, NKX2-2, OLIG2, NKX6-1,
+NKX6-2, PTCH1, HHIP; (4) the Visium SHH gene set: SHH, NKX6-1, NKX6-2, NKX2-2, NKX2-1, FOXA2, FOXG1, OLIG2. Written as
+slurm/November/shh_targets.txt (classes source / induced / depleted / readout / positional; distance near / mid / far read BY EYE from Fig. 3i's
+boxplots), scored with legnini_truth.py on MA/25_11_results/compare_legnini/ranking (R0, 2 seeds per arm, 5,000 random gene sets).
+The user still has to confirm the list.
+
+What worked:
+- **Induced ventral genes rank as responders in the prototypes, beyond their twin:** AUROC proto_ch 0.76, proto_ch_pe 0.77 (p 0.003 both; twin
+  0.49); ir_ch 0.61 (p 0.13; twin 0.32). NKX6.1 is responder 1 for both prototypes and 2 for ir_ch; DBX1 3 in all three; DBX2 6-10.
+- **Depleted dorsal genes (PAX7, MSX2) rank at the very top as responders** for every trained model (AUROC 0.89-0.99; PAX7 rank 1-2, MSX2 4-17),
+  but ir_ch's twin ranks them as high (0.95; PAX7 1, MSX2 9): for ir_ch that is the gene, not the training; for the prototypes the twin is at 0.37,
+  so it is learned.
+- **As drivers, the induced genes lead** (AUROC ir_ch 0.86, prototypes 0.96-0.97; twins 0.67 / 0.77; mid-distance genes 0.92-0.94): OLIG2,
+  NKX6.1, NKX2.2, NKX6.2 (ir_ch ranks 1-4), FOXA2 1st for both prototypes. The models treat the ventral identity code as what predicts the rest.
+
+What doesn't work:
+- **SHH itself is not found as the driver.** Driver rank of SHH: ir_ch 45 of 88 (twin 18), proto_ch 12, proto_ch_pe 15 (their twin 23): no
+  model ranks the true source above what an untrained model gives it. The ranking reads co-varying identity genes (the domain code the SHH source
+  set up), not the source.
+- **The pathway readouts are not found** as responders: AUROC 0.43-0.52 (PTCH1 rank 58-78 of 78, SMO 37-74, HHIP 23-35, GLI1 ir_ch 5 but
+  prototypes 23-33). As before (legnini_plan.md), the readouts are a weak signal in this panel; the paper's own PTCH1 claim is from Visium on 2D
+  cultures, not from the organoid panel.
+- Genes nearest the source (FOXA1, FOXA2, NKX2.2, MNX1) are not ranked high as responders (AUROC 0.33 ir_ch, 0.55-0.58 prototypes); the
+  mid-distance genes are (0.58 / 0.69 / 0.77). FOXA1 is cell-autonomous to SHH+ cells (p. 1548), so a context model should not read it.
+- 2 seeds, 2 test sections (one control, one SHH), no per-section split of the ranking; the induced set overlaps the identity code the model was
+  trained to reconstruct (channel folds), so "ranks the induced genes" partly means "they vary most between sections".
